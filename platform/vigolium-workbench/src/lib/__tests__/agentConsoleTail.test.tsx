@@ -10,6 +10,7 @@ const tail = vi.hoisted(() => ({
   logs: 'retained console text', isStreaming: false, connection: 'exhausted',
   error: 'Automatic retries exhausted', truncated: true, logSize: 9000000, retry: vi.fn(),
 }));
+vi.mock('@tanstack/react-query', async importOriginal => ({ ...await importOriginal<typeof import('@tanstack/react-query')>(), useQueryClient: () => ({ invalidateQueries: vi.fn() }) }));
 vi.mock('@/contexts/ProjectContext', () => ({ useProjectContext: () => ({ projectUUID: 'project-a' }) }));
 vi.mock('@/lib/useAgentSessionLogs', () => ({ useAgentSessionLogs: () => tail }));
 vi.mock('@/components/shared/AgentArtifactsPanel', () => ({

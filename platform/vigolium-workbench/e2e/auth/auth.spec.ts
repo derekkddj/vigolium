@@ -30,8 +30,9 @@ test.describe('AuthGate — auth required', () => {
   test.beforeEach(async ({ page }) => {
     await page.route('**/server-info', async (route) => {
       const auth = route.request().headers()['authorization'] ?? '';
-      const expected = `Bearer ${FIXTURE_API_KEY}`;
-      if (auth === expected) {
+      // Accept both the API key and the token issued by the login fixture;
+      // otherwise the dashboard's first server-info poll logs the user out.
+      if (auth === `Bearer ${FIXTURE_API_KEY}` || auth === 'Bearer e2e-issued-token') {
         await route.fulfill({
           status: 200,
           contentType: 'application/json',
@@ -59,16 +60,11 @@ test.describe('AuthGate — auth required', () => {
     await page.getByPlaceholder(/vgl_/).fill(FIXTURE_API_KEY);
     await page.getByRole('button', { name: /sign in/i }).click();
 
-    // Sign-in button disappears once we land in the "ready" branch.
-    await expect(page.getByRole('button', { name: /sign in/i })).toHaveCount(0, {
-      timeout: 5_000,
-    });
-
-    // Token is persisted for subsequent requests.
-    const stored = await page.evaluate(() =>
+    // Wait for persistence and the ready branch, not the temporary spinner.
+    await expect.poll(() => page.evaluate(() =>
       window.localStorage.getItem('vigolium_api_token'),
-    );
-    expect(stored).toBe(FIXTURE_API_KEY);
+    )).toBe(FIXTURE_API_KEY);
+    await expect(page.getByPlaceholder(/vgl_/)).toHaveCount(0);
   });
 
   test('invalid api key surfaces an error and stays on the login form', async ({ page }) => {
@@ -98,11 +94,12 @@ test.describe('AuthGate — auth required', () => {
       timeout: 5_000,
     });
 
-    // The login mock returns token='e2e-issued-token'.
-    const stored = await page.evaluate(() =>
+    // The button also loses its "Sign in" name while showing the spinner, so
+    // its disappearance is not evidence that the login response has settled.
+    await expect.poll(() => page.evaluate(() =>
       window.localStorage.getItem('vigolium_api_token'),
-    );
-    expect(stored).toBe('e2e-issued-token');
+    )).toBe('e2e-issued-token');
+    await expect(page.getByPlaceholder('username')).toHaveCount(0);
   });
 
   test('credentials login surfaces backend error message', async ({ page }) => {

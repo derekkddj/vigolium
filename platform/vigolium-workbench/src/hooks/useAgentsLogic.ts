@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo, type SetStateAction } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { useFollowTail } from '@/lib/useFollowTail';
 import { zipSync } from 'fflate';
 import { useAgentSessions, useAgentSessionDetail, useUploadRepo, useStartAutopilotRun, useStartAgentRun, useCancelAgentRun, useAgentRunStatus } from '@/api/hooks';
@@ -236,6 +237,19 @@ export function useAgentsLogic() {
   const [streamingOpen, setStreamingOpen] = useState(false);
   const startAgentRun = useStartAgentRun();
   const cancelAgentRun = useCancelAgentRun();
+  // Separate observer: row mutations must not replace the active-panel callbacks.
+  const rowCancelAgentRun = useCancelAgentRun();
+  const queryClient = useQueryClient();
+  const rowRequests = useRef(new Map<string, symbol>());
+  const rowCancellationMounted = useRef(false);
+  const [rowCancellations, setRowCancellations] = useState({ projectUUID, pending: new Set<string>(), errors: {} as Record<string, string> });
+  const cancelingUuids = rowCancellations.projectUUID === projectUUID ? rowCancellations.pending : new Set<string>();
+  const cancelErrorForUuid = (uuid: string) => rowCancellations.projectUUID === projectUUID ? rowCancellations.errors[uuid] ?? '' : '';
+  useEffect(() => {
+    rowCancellationMounted.current = true;
+    const requests = rowRequests.current;
+    return () => { rowCancellationMounted.current = false; requests.clear(); };
+  }, []);
   const activeRunQuery = useAgentRunStatus(activeRunId);
   const activeRunStatus = activeRunId ? activeRunQuery.data : undefined;
   const activeRunStatusError = activeRunId ? errorMessage(activeRunQuery.error, 'Failed to load run status') : '';
@@ -330,6 +344,8 @@ export function useAgentsLogic() {
     if (lastProjectRef.current !== projectUUID) {
       lastProjectRef.current = projectUUID;
       projectGenerationRef.current++;
+      rowRequests.current.clear();
+      setRowCancellations({ projectUUID, pending: new Set(), errors: {} });
       writeSessionURL(null, true);
       selectedSessionRef.current = null;
       setSelection({ projectUUID, uuid: null });
@@ -410,6 +426,30 @@ export function useAgentsLogic() {
       },
     });
   }, [activeRunId, cancelAgentRun, projectUUID]);
+
+  const cancellationGeneration = projectGenerationRef.current;
+  const cancelRunByUuid = useCallback((uuid: string) => {
+    if (!rowCancellationMounted.current || !uuid || !projectUUID || currentProjectRef.current !== projectUUID || projectGenerationRef.current !== cancellationGeneration || rowRequests.current.has(uuid)) return;
+    const ticket = Symbol(uuid);
+    rowRequests.current.set(uuid, ticket); // Synchronous guard, before a second click/rerender.
+    const stillCurrent = () => rowCancellationMounted.current && currentProjectRef.current === projectUUID
+      && projectGenerationRef.current === cancellationGeneration && rowRequests.current.get(uuid) === ticket;
+    setRowCancellations(previous => ({ projectUUID, pending: new Set([...previous.pending, uuid]), errors: { ...previous.errors, [uuid]: '' } }));
+    // Per-call mutate callbacks only run for the latest observer. Independent
+    // promises preserve every row's settlement when several scans stop together.
+    void rowCancelAgentRun.mutateAsync({ runId: uuid, projectUUID, isCurrent: stillCurrent }).then(() => {
+      if (stillCurrent()) void queryClient.invalidateQueries({ queryKey: [projectUUID, 'agent-sessions'] });
+    }).catch((error: unknown) => {
+      if (stillCurrent()) setRowCancellations(previous => ({ ...previous, errors: { ...previous.errors, [uuid]: errorMessage(error, 'Failed to cancel run') } }));
+    }).finally(() => {
+      if (!stillCurrent()) return;
+      rowRequests.current.delete(uuid);
+      setRowCancellations(previous => {
+        const pending = new Set(previous.pending); pending.delete(uuid);
+        return { ...previous, pending };
+      });
+    });
+  }, [projectUUID, cancellationGeneration, rowCancelAgentRun, queryClient]);
 
   const handleChatCancel = useCallback(() => {
     chatAbortRef.current?.abort();
@@ -785,6 +825,7 @@ export function useAgentsLogic() {
         ? (activeRunStatus?.error || 'run failed')
         : ''),
     isScanStreaming, handleScanCancel,
+    cancelRunByUuid, cancelingUuids, cancelErrorForUuid,
     activeRunStatusError, cancelError,
     activeRunStatusRetry: () => activeRunQuery.refetch?.(),
     streamingOpen, setStreamingOpen,

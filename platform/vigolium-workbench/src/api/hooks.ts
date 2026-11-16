@@ -669,8 +669,13 @@ export function useStartAgentRun() {
 // which the status poll picks up.
 export function useCancelAgentRun() {
   return useMutation({
-    mutationFn: (runId: string) =>
-      apiPost<AgentRunResponse>(`/api/agent/scans/${runId}/cancel`),
+    mutationFn: (request: string | { runId: string; projectUUID: string; isCurrent: () => boolean }) => {
+      if (typeof request === 'string') return apiPost<AgentRunResponse>(`/api/agent/scans/${request}/cancel`);
+      // Recheck at execution, including offline resumption; submission-time
+      // guards alone cannot prevent a queued request crossing project/lifetime.
+      if (!request.isCurrent()) throw new Error('Cancellation request is no longer current');
+      return apiPost<AgentRunResponse>(`/api/agent/scans/${request.runId}/cancel`, undefined, { projectUUID: request.projectUUID });
+    },
   });
 }
 
