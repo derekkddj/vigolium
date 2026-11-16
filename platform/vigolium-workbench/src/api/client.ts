@@ -327,12 +327,13 @@ async function request<T>(
   method: string,
   path: string,
   body?: unknown,
-  opts: { allowText?: boolean; retried?: boolean } = {},
+  opts: { allowText?: boolean; retried?: boolean; projectUUID?: string } = {},
 ): Promise<T> {
   guardDemoMutation(method, path);
 
   const url = buildApiUrl(path);
   const headers = buildAuthHeaders({ json: true, path });
+  if (opts.projectUUID !== undefined) headers['X-Project-UUID'] = opts.projectUUID;
 
   const res = await fetch(url, {
     method,
@@ -349,7 +350,7 @@ async function request<T>(
     const err = await apiErrorFromResponse(res);
     // The stored project is gone (DB reset, deleted elsewhere): forget it,
     // let ProjectContext refetch the list, and retry once without it.
-    if (err.code === PROJECT_NOT_FOUND && headers['X-Project-UUID'] && !opts.retried) {
+    if (err.code === PROJECT_NOT_FOUND && headers['X-Project-UUID'] && !opts.retried && opts.projectUUID === undefined) {
       const stale = getProjectUUID();
       setProjectUUID(null);
       emitProjectNotFound(stale);
@@ -385,8 +386,9 @@ export function apiGetJSONOrText<T>(path: string, params?: Record<string, string
   return request<T | string>('GET', withQuery(path, params), undefined, { allowText: true });
 }
 
-export function apiPost<T>(path: string, body?: unknown): Promise<T> {
-  return request<T>('POST', path, body);
+/** A pinned project must never fall back to an unscoped retry after deletion. */
+export function apiPost<T>(path: string, body?: unknown, opts: { projectUUID?: string } = {}): Promise<T> {
+  return request<T>('POST', path, body, opts);
 }
 
 export function apiPut<T>(path: string, body?: unknown): Promise<T> {

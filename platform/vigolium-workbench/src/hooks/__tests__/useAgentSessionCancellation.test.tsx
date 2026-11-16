@@ -1,6 +1,6 @@
-import type { ReactNode } from 'react';
+import { StrictMode, type ReactNode } from 'react';
 import { act, renderHook, waitFor } from '@testing-library/react';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { QueryClient, QueryClientProvider, onlineManager } from '@tanstack/react-query';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { setBaseUrl, setProjectUUID, setToken } from '@/api/client';
 import { useAgentsLogic } from '../useAgentsLogic';
@@ -23,11 +23,11 @@ function deferred() {
   const promise = new Promise<Response>(done => { resolve = done; });
   return { promise, resolve };
 }
-function mount() {
+function mount(strict = false) {
   const client = new QueryClient({ defaultOptions: { mutations: { retry: false }, queries: { retry: false } } });
   const invalidations = vi.spyOn(client, 'invalidateQueries');
-  const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>;
-  return { ...renderHook(() => useAgentsLogic(), { wrapper }), invalidations };
+  const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{strict ? <StrictMode>{children}</StrictMode> : children}</QueryClientProvider>;
+  return { ...renderHook(() => useAgentsLogic(), { wrapper }), invalidations, client };
 }
 const success = () => new Response(JSON.stringify({ status: 'cancelling' }), { headers: { 'Content-Type': 'application/json' } });
 const refused = () => new Response(JSON.stringify({ error: 'run not found or already finished' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
@@ -90,6 +90,44 @@ describe('session row cancellation', () => {
     await act(async () => { current.resolve(success()); });
     await waitFor(() => expect(result.current.cancelingUuids.size).toBe(0));
     expect(invalidations).toHaveBeenCalledOnce();
+  });
+
+  it('does not dispatch an offline queued cancellation after A → B → A', async () => {
+    onlineManager.setOnline(false);
+    const { result, rerender, client, invalidations } = mount();
+    try {
+      act(() => result.current.cancelRunByUuid('queued-run'));
+      await waitFor(() => expect(client.getMutationCache().getAll().some(mutation => mutation.state.isPaused)).toBe(true));
+      expect(fetch).not.toHaveBeenCalled();
+      project.projectUUID = 'project-b'; setProjectUUID('project-b'); rerender();
+      project.projectUUID = 'project-a'; setProjectUUID('project-a'); rerender();
+      onlineManager.setOnline(true);
+      await act(async () => { await client.resumePausedMutations(); });
+      expect(fetch).not.toHaveBeenCalled();
+      expect(invalidations).not.toHaveBeenCalled();
+      expect(result.current.cancelingUuids.size).toBe(0);
+      act(() => result.current.cancelRunByUuid('queued-run'));
+      await waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    } finally { onlineManager.setOnline(true); }
+  });
+
+  it('still dispatches a current request after StrictMode effect replay', async () => {
+    const { result, invalidations } = mount(true);
+    act(() => result.current.cancelRunByUuid('strict-run'));
+    await waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    await waitFor(() => expect(invalidations).toHaveBeenCalledOnce());
+    expect(result.current.cancelErrorForUuid('strict-run')).toBe('');
+  });
+
+  it('rejects a retained handler invoked after unmount', async () => {
+    const { result, unmount, client, invalidations } = mount();
+    const retained = result.current.cancelRunByUuid;
+    unmount();
+    act(() => retained('after-unmount'));
+    await act(async () => { await client.resumePausedMutations(); });
+    expect(client.getMutationCache().getAll()).toHaveLength(0);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(invalidations).not.toHaveBeenCalled();
   });
 
   it('does not submit without a project or an UUID, and ignores completions after unmount', async () => {

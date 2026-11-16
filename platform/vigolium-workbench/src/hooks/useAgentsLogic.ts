@@ -241,12 +241,14 @@ export function useAgentsLogic() {
   const rowCancelAgentRun = useCancelAgentRun();
   const queryClient = useQueryClient();
   const rowRequests = useRef(new Map<string, symbol>());
+  const rowCancellationMounted = useRef(false);
   const [rowCancellations, setRowCancellations] = useState({ projectUUID, pending: new Set<string>(), errors: {} as Record<string, string> });
   const cancelingUuids = rowCancellations.projectUUID === projectUUID ? rowCancellations.pending : new Set<string>();
   const cancelErrorForUuid = (uuid: string) => rowCancellations.projectUUID === projectUUID ? rowCancellations.errors[uuid] ?? '' : '';
   useEffect(() => {
+    rowCancellationMounted.current = true;
     const requests = rowRequests.current;
-    return () => { requests.clear(); };
+    return () => { rowCancellationMounted.current = false; requests.clear(); };
   }, []);
   const activeRunQuery = useAgentRunStatus(activeRunId);
   const activeRunStatus = activeRunId ? activeRunQuery.data : undefined;
@@ -427,15 +429,15 @@ export function useAgentsLogic() {
 
   const cancellationGeneration = projectGenerationRef.current;
   const cancelRunByUuid = useCallback((uuid: string) => {
-    if (!uuid || !projectUUID || currentProjectRef.current !== projectUUID || projectGenerationRef.current !== cancellationGeneration || rowRequests.current.has(uuid)) return;
+    if (!rowCancellationMounted.current || !uuid || !projectUUID || currentProjectRef.current !== projectUUID || projectGenerationRef.current !== cancellationGeneration || rowRequests.current.has(uuid)) return;
     const ticket = Symbol(uuid);
     rowRequests.current.set(uuid, ticket); // Synchronous guard, before a second click/rerender.
-    const stillCurrent = () => currentProjectRef.current === projectUUID
+    const stillCurrent = () => rowCancellationMounted.current && currentProjectRef.current === projectUUID
       && projectGenerationRef.current === cancellationGeneration && rowRequests.current.get(uuid) === ticket;
     setRowCancellations(previous => ({ projectUUID, pending: new Set([...previous.pending, uuid]), errors: { ...previous.errors, [uuid]: '' } }));
     // Per-call mutate callbacks only run for the latest observer. Independent
     // promises preserve every row's settlement when several scans stop together.
-    void rowCancelAgentRun.mutateAsync(uuid).then(() => {
+    void rowCancelAgentRun.mutateAsync({ runId: uuid, projectUUID, isCurrent: stillCurrent }).then(() => {
       if (stillCurrent()) void queryClient.invalidateQueries({ queryKey: [projectUUID, 'agent-sessions'] });
     }).catch((error: unknown) => {
       if (stillCurrent()) setRowCancellations(previous => ({ ...previous, errors: { ...previous.errors, [uuid]: errorMessage(error, 'Failed to cancel run') } }));
