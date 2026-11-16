@@ -712,7 +712,7 @@ export default function AgentsPage() {
                                     aria-label={`Stop run ${s.uuid}`}
                                     disabled={canceling}
                                     onClick={(e) => { e.stopPropagation(); h.cancelRunByUuid(s.uuid); }}
-                                    className="ml-auto px-4 py-1 text-xs font-bold bg-[#e34e1c]/10 text-[#e34e1c] border border-[#e34e1c]/30 hover:bg-[#e34e1c]/20 transition-colors flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:cursor-wait"
+                                    className="ml-auto px-4 py-1 text-xs font-bold bg-[#e34e1c]/10 text-[#b42318] border border-[#e34e1c]/30 hover:bg-[#e34e1c]/20 transition-colors flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:cursor-wait"
                                   >
                                     {canceling ? <Loader2 className="w-3 h-3 animate-spin" /> : <Square className="w-3 h-3" />}
                                     {canceling ? 'STOPPING…' : 'STOP'}
