@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { setBaseUrl, setProjectUUID, setToken } from '@/api/client';
 import { ARTIFACT_BLOB_LIMIT, ARTIFACT_PREVIEW_BYTES } from '@/lib/runArtifacts';
@@ -49,9 +49,9 @@ for (const theme of ['dark', 'light'] as const) {
       const size = ARTIFACT_PREVIEW_BYTES + 4;
       const head = 'x'.repeat(ARTIFACT_PREVIEW_BYTES);
       vi.mocked(fetch).mockResolvedValueOnce(list([{ ...item, size }])).mockResolvedValueOnce(page(head, size)).mockResolvedValueOnce(page('tail', size, ARTIFACT_PREVIEW_BYTES)).mockResolvedValueOnce(page(head, size));
-      const { container } = render(view('run-a', theme));
+      render(view('run-a', theme));
       fireEvent.click(await screen.findByRole('button', { name: item.name }));
-      await waitFor(() => expect(container.querySelector('pre')?.textContent).toBe(head));
+      await waitFor(() => expect(screen.getByLabelText('Artifact content').textContent).toBe(head));
       fireEvent.click(screen.getByRole('button', { name: 'Later bytes' }));
       expect(await screen.findByText('tail', { exact: true })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Later bytes' })).toBeDisabled();
@@ -61,21 +61,21 @@ for (const theme of ['dark', 'light'] as const) {
       expect(await screen.findByText('Visible page copied (not the full file).')).toBeInTheDocument();
       expect(screen.queryByRole('button', { name: /Copy full/ })).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole('button', { name: 'Earlier bytes' }));
-      await waitFor(() => expect(container.querySelector('pre')?.textContent).toBe(head));
+      await waitFor(() => expect(screen.getByLabelText('Artifact content').textContent).toBe(head));
       expect(screen.getByText(/Partial preview — bytes have been omitted/)).toBeInTheDocument();
     });
     it('reports unsupported large downloads with a scoped secret-free template and no API anchor', async () => {
       const size = ARTIFACT_BLOB_LIMIT + 1;
       vi.mocked(fetch).mockResolvedValueOnce(list([{ ...item, size }])).mockResolvedValueOnce(page('head', size));
-      const { container } = render(view('run-a', theme));
+      render(view('run-a', theme));
       fireEvent.click(await screen.findByRole('button', { name: item.name }));
       expect(await screen.findByText('head', { exact: true })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Download exact bytes' })).toBeDisabled();
       expect(screen.getByText(/Streaming download unsupported in this browser/)).toBeInTheDocument();
-      expect(container.querySelectorAll('a')).toHaveLength(0);
-      expect(container.textContent).toContain('${VIGOLIUM_TOKEN:?Set token locally}');
-      expect(container.textContent).toContain('${VIGOLIUM_PROJECT_UUID:?Set active project UUID}');
-      expect(container.textContent).not.toContain('test-secret');
+      expect(screen.getByRole('dialog', { name: 'Run artifacts workspace' }).querySelectorAll('a')).toHaveLength(0);
+      expect(screen.getByRole('dialog', { name: 'Run artifacts workspace' }).textContent).toContain('${VIGOLIUM_TOKEN:?Set token locally}');
+      expect(screen.getByRole('dialog', { name: 'Run artifacts workspace' }).textContent).toContain('${VIGOLIUM_PROJECT_UUID:?Set active project UUID}');
+      expect(screen.getByRole('dialog', { name: 'Run artifacts workspace' }).textContent).not.toContain('test-secret');
       expect(fetch).toHaveBeenCalledTimes(2);
     });
   });
@@ -123,7 +123,7 @@ describe('identity resets and stale asynchronous work', () => {
     render(view());
     fireEvent.click(await screen.findByRole('button', { name: item.name }));
     const oldSignal = vi.mocked(fetch).mock.calls[1][1]?.signal;
-    fireEvent.click(screen.getByRole('button', { name: 'second.txt' }));
+    fireEvent.click(within(screen.getByRole('dialog', { name: 'Run artifacts workspace' })).getByRole('button', { name: 'second.txt' }));
     expect(oldSignal?.aborted).toBe(true);
     expect(await screen.findByText('next', { exact: true })).toBeInTheDocument();
     await act(async () => { late.resolve(page('late')); });
