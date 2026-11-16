@@ -1,6 +1,7 @@
 package modkit
 
 import (
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -32,9 +33,27 @@ func FetchAssetBytes(
 	path string,
 	maxBytes int64,
 ) ([]byte, bool) {
+	body, _, ok := fetchAssetBytes(ctx, httpClient, path, maxBytes, false)
+	return body, ok
+}
+
+// FetchAssetBytesCapture applies exactly the bytes-only API's transport and
+// guards, but also owns the operation's HTTP receipt before Close. The returned
+// comparison body may be capped by maxBytes; the receipt retains the captured
+// HTTP body and its transport fidelity/size states, never a reconstructed asset.
+func FetchAssetBytesCapture(
+	ctx *httpmsg.HttpRequestResponse,
+	httpClient *http.Requester,
+	path string,
+	maxBytes int64,
+) ([]byte, *evidence.Exchange, bool) {
+	return fetchAssetBytes(ctx, httpClient, path, maxBytes, true)
+}
+
+func fetchAssetBytes(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, path string, maxBytes int64, capture bool) ([]byte, *evidence.Exchange, bool) {
 	raw, err := httpmsg.SetPath(ctx.Request().Raw(), path)
 	if err != nil {
-		return nil, false
+		return nil, nil, false
 	}
 	raw, _ = httpmsg.SetMethod(raw, "GET")
 
@@ -43,16 +62,22 @@ func FetchAssetBytes(
 	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(req, http.Options{NoRedirects: true, NoClustering: true})
-	if err != nil {
-		return nil, false
+	var exchange *evidence.Exchange
+	if capture {
+		exchange = http.CaptureEvidence(resp)
 	}
-	defer resp.Close()
+	if resp != nil {
+		defer resp.Close()
+	}
+	if err != nil {
+		return nil, exchange, false
+	}
 
 	if resp.Response() == nil || resp.Response().StatusCode != 200 || infra.IsBlockedResponse(resp) {
-		return nil, false
+		return nil, exchange, false
 	}
 	if ClassifyContentType(resp.Response().Header.Get("Content-Type")) == ContentClassHTML {
-		return nil, false
+		return nil, exchange, false
 	}
 
 	body := resp.Body().Bytes()
@@ -61,5 +86,5 @@ func FetchAssetBytes(
 	}
 	out := make([]byte, len(body))
 	copy(out, body)
-	return out, true
+	return out, exchange, true
 }

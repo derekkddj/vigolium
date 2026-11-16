@@ -15,6 +15,7 @@ package salesforce
 import (
 	"strings"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra/saasprobe"
@@ -98,7 +99,12 @@ func MatchResponse(body string) (ok bool, signals []string) {
 // returns the first that answers with the Aura framework's session error
 // (aura:invalidSession / clientOutOfSync) — the definitive signal that a live
 // Aura gateway is mounted at that path. Returns ("", false) when none respond.
-func FindLiveAuraGateway(ctx *httpmsg.HttpRequestResponse, client *http.Requester) (string, bool) {
+func FindLiveAuraGateway(ctx *httpmsg.HttpRequestResponse, client *http.Requester, receipts ...**evidence.Exchange) (string, bool) {
+	for _, receipt := range receipts {
+		if receipt != nil {
+			*receipt = nil
+		}
+	}
 	for _, p := range AuraGatewayPaths {
 		res := saasprobe.Post(ctx, client, p, "{}", map[string]string{
 			"Content-Type": "application/x-www-form-urlencoded",
@@ -109,6 +115,11 @@ func FindLiveAuraGateway(ctx *httpmsg.HttpRequestResponse, client *http.Requeste
 		if strings.Contains(res.Body, "aura:invalidSession") ||
 			strings.Contains(res.Body, "aura:clientOutOfSync") ||
 			strings.Contains(res.Body, "markup://aura:") {
+			for _, receipt := range receipts {
+				if receipt != nil {
+					*receipt = res.Exchange
+				}
+			}
 			return p, true
 		}
 	}

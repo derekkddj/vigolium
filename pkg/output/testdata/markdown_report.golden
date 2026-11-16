@@ -52,6 +52,14 @@ The `id` parameter reaches a SQL query.
 **Extracted Results:**
 - `You have an error in your SQL syntax`
 
+**Stored finding evidence status:** missing / unclassified
+
+Original finding metadata; each occurrence retains its own role/primary flag. Later selections do not reclassify legacy evidence.
+
+Missing / unclassified selected evidence. Legacy inline text and traffic links are not proof.
+
+Legacy inline text — role unknown (not proof).
+
 <details>
 <summary>HTTP Request</summary>
 
@@ -72,7 +80,7 @@ Content-Type: text/plain
 You have an error in your SQL syntax near ```'``` — 日本語 üüüüüüü
 ````
 
-… [truncated, 139 of 205 bytes; full: vigolium traffic body --uuid aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee]
+… [truncated, 139 of 205 bytes; full: vigolium finding --id 12 --markdown --full-body]
 
 </details>
 

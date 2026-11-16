@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	node2shellinfra "github.com/vigolium/vigolium/pkg/modules/infra/node2shell"
@@ -115,7 +116,17 @@ func (m *Module) scan(ctx *httpmsg.HttpRequestResponse, httpClient *http.Request
 // an exposure record whatever the gate showed.
 func buildResult(g node2shellinfra.Gate, scanCtx *modkit.ScanContext, ctx *httpmsg.HttpRequestResponse, target, lane string) *output.ResultEvent {
 	decoder := node2shellinfra.LikelyDecoder(scanCtx, modkit.RegistryHostKey(ctx), g.Decoded.Header)
-	return &output.ResultEvent{
+	proof := modkit.NewEvidenceCollector()
+	proof.AddExchange(g.Unknown.Receipt, evidence.RoleControl, "unknown encoding")
+	proof.AddExchange(g.Empty.Receipt, evidence.RoleControl, "plain empty JSON")
+	proof.AddExchange(g.Malformed.Receipt, evidence.RoleControl, "plain malformed JSON")
+	proof.AddExchange(g.Noise.Receipt, evidence.RoleControl, "irrelevant header")
+	proof.AddExchange(g.Misplaced.Receipt, evidence.RoleControl, "encoding in irrelevant header")
+	proof.AddExchange(g.Failed.Receipt, evidence.RoleControl, "decoder-refused stream")
+	for i, round := range g.Confirmations {
+		proof.AddExchange(round.Receipt, evidence.RoleConfirmation, fmt.Sprintf("encoded pair confirmation %d", i+1))
+	}
+	result := &output.ResultEvent{
 		ModuleID:      ModuleID,
 		RecordKind:    output.RecordKindCandidate,
 		EvidenceGrade: output.EvidenceGradeDifferential,
@@ -137,9 +148,8 @@ func buildResult(g node2shellinfra.Gate, scanCtx *modkit.ScanContext, ctx *httpm
 			fmt.Sprintf("A stream the decoder refuses -> HTTP %d (a decode failure is observable here)", g.Failed.Sig.StatusCode),
 			"Decoder version not observable here: run the node2shell module, or check it against the " + node2shellinfra.CVE + " fixed releases",
 		},
-		AdditionalEvidence: []string{
-			"Unknown-encoding control request:\n" + g.Unknown.Request + "\n\nControl response:\n" + g.Unknown.Response,
-		},
+		Evidence:           proof.Evidence(),
+		AdditionalEvidence: proof.Entries(),
 		Info: output.Info{
 			Name:        "Potential Brotli request-body decoding (" + node2shellinfra.CVE + " exposure)",
 			Description: fmt.Sprintf("The %s at %s decodes Content-Encoding: %s request bodies. If that decoder is an affected Brotli build, %s is reachable.", lane, target, g.Encoding(), node2shellinfra.CVE),
@@ -154,4 +164,6 @@ func buildResult(g node2shellinfra.Gate, scanCtx *modkit.ScanContext, ctx *httpm
 			"decoder":  decoder,
 		},
 	}
+	modkit.SetPrimaryEvidence(result, g.Decoded.Receipt, evidence.RoleAttack, "encoded empty JSON decoded like plain JSON")
+	return result
 }

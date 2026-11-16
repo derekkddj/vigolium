@@ -8,6 +8,9 @@ import { agentStatusTone, type AgentStatusTone } from '@/api/types';
 import { formatDate, formatDuration, truncate } from '@/lib/formatters';
 import PageShell from './PageShell';
 import Dropdown from './Dropdown';
+import AgentArtifactsPanel from '@/components/shared/AgentArtifactsPanel';
+import AgentRuntimeLogPanel from '@/components/shared/AgentRuntimeLogPanel';
+import AgentRunContext, { formatAgentRunCount } from '@/components/shared/AgentRunContext';
 import { useAgentsLogic, AGENT_OPTIONS, AUDIT_PREP_MODE_OPTIONS, INTENSITY_OPTIONS, AUDIT_MODE_OPTIONS, type DetectedInputType } from '@/hooks/useAgentsLogic';
 
 const INPUT_TYPE_LABELS: Record<DetectedInputType, { label: string; color: string }> = {
@@ -56,7 +59,7 @@ function SessionDetailPanel({ session, onClose }: { session: AgentSessionDetail;
     <div className="border-l border-[#bbc3c4] flex flex-col h-full min-h-0">
       <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#bbc3c4] shrink-0">
         <span className="text-xs font-bold text-[#0078c8]">SESSION DETAILS</span>
-        <button onClick={onClose} className="text-[#708e8e] hover:text-[#005661] text-xs font-bold px-1">&#10005;</button>
+        <button aria-label="Close session details" onClick={onClose} className="text-[#708e8e] hover:text-[#005661] text-xs font-bold px-1">&#10005;</button>
       </div>
       <div className="shrink-0 border-b border-[#bbc3c4] px-3 py-2 text-xs space-y-1">
         <div className="text-[#0078c8] font-mono break-all">{session.uuid}</div>
@@ -69,10 +72,10 @@ function SessionDetailPanel({ session, onClose }: { session: AgentSessionDetail;
         {session.target_url && (
           <div><span className="text-[#708e8e]">target </span><span className="text-[#005661] break-all">{session.target_url}</span></div>
         )}
-        <div className="flex flex-wrap gap-x-4 gap-y-0.5">
-          <span><span className="text-[#708e8e]">findings </span><span className="text-[#005661]">{session.finding_count}</span></span>
-          <span><span className="text-[#708e8e]">records </span><span className="text-[#005661]">{session.record_count}</span></span>
-          <span><span className="text-[#708e8e]">saved </span><span className="text-[#00b368]">{session.saved_count}</span></span>
+        <div className="flex flex-wrap gap-x-4 gap-y-0.5" aria-label="Session summary counts">
+          <span><span className="text-[#708e8e]">findings </span><span className="text-[#005661]">{formatAgentRunCount(session.finding_count)}</span></span>
+          <span><span className="text-[#708e8e]">records </span><span className="text-[#005661]">{formatAgentRunCount(session.record_count)}</span></span>
+          <span><span className="text-[#708e8e]">saved </span><span className="text-[#00b368]">{formatAgentRunCount(session.saved_count)}</span></span>
         </div>
         <div className="flex flex-wrap gap-x-4 gap-y-0.5">
           <span><span className="text-[#708e8e]">duration </span><span className="text-[#005661]">{formatDuration(session.duration_ms)}</span></span>
@@ -92,6 +95,8 @@ function SessionDetailPanel({ session, onClose }: { session: AgentSessionDetail;
         )}
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto text-xs">
+        <AgentRunContext session={session} theme="light" />
+        <AgentArtifactsPanel runUUID={session.uuid} theme="light" />
         {session.prompt_sent && (
           <details className="border-b border-[#bbc3c4]">
             <summary className="px-3 py-1.5 cursor-pointer text-[#0078c8] font-bold hover:bg-[#ede4d1] flex items-center gap-1.5">
@@ -108,7 +113,7 @@ function SessionDetailPanel({ session, onClose }: { session: AgentSessionDetail;
         {session.agent_raw_output && (
           <details open className="border-b border-[#bbc3c4]">
             <summary className="px-3 py-1.5 cursor-pointer text-[#0078c8] font-bold hover:bg-[#ede4d1] flex items-center gap-1.5">
-              <ScrollText className="w-3 h-3" />RAW OUTPUT
+              <ScrollText className="w-3 h-3" />RETAINED CONSOLE SNAPSHOT
             </summary>
             <div className="relative">
               <button onClick={() => copyToClipboard(session.agent_raw_output!, 'output')} className="absolute top-1.5 right-2 z-10 text-[#708e8e] hover:text-[#005661] p-0.5" title="Copy to clipboard">
@@ -644,18 +649,31 @@ export default function AgentsPage() {
         </div>
 
         {/* ── Bottom: Output ── */}
-        <div className="flex-1 flex flex-col overflow-hidden">
+        <div className="flex-1 min-h-0 flex flex-col overflow-auto">
           {/* Sessions — open by default when there are sessions and no active scan */}
-          <details open={!h.scanOutput && !!(h.sessionsData?.data?.length)} className="border border-t-0 border-[#bbc3c4] bg-[#f6edda] overflow-hidden shrink-0">
+          <details open={!!h.expandedSessionUuid || (!h.scanOutput && (!!h.sessionsCount || h.sessionsLoading || !!h.sessionsError))} className="border border-t-0 border-[#bbc3c4] bg-[#f6edda] overflow-hidden shrink-0">
             <summary className="px-3 py-1.5 border-b border-[#bbc3c4] cursor-pointer hover:bg-[#ede4d1]/80 list-none [&::-webkit-details-marker]:hidden flex items-center gap-1.5">
               <ChevronDown className="w-3 h-3 text-[#0078c8] transition-transform [[open]>&]:rotate-0 [details:not([open])>&]:-rotate-90" />
               <span className="text-[#0078c8] text-xs font-bold inline-flex items-center gap-1.5">
                 <Layers className="w-3 h-3" />AGENT SESSIONS
-                {h.sessionsData?.total != null && <span className="text-[#708e8e] font-normal ml-1">({h.sessionsData.total})</span>}
+                {h.sessionsTotal != null && <span className="text-[#708e8e] font-normal ml-1">({h.sessionsTotal})</span>}
               </span>
             </summary>
-            <div className="flex max-h-[300px]" style={{ minHeight: h.expandedSessionUuid && h.sessionDetail ? 280 : undefined }}>
-              <div className={`${h.expandedSessionUuid && h.sessionDetail ? 'w-1/2' : 'w-full'} overflow-auto`}>
+            <div className="flex items-center justify-between gap-3 px-3 py-2 text-xs text-[#708e8e] border-b border-[#bbc3c4]">
+              <span>{h.sessionsLoading ? 'Loading agent sessions…' : h.sessionsError && !h.sessionsData ? 'Session history unavailable' : `Showing ${h.sessionsCount ? h.sessionsOffset + 1 : 0}–${h.sessionsCount ? h.sessionsOffset + h.sessionsCount : 0} of ${h.sessionsTotal ?? 'unknown'} sessions`}</span>
+              <div className="flex gap-3">
+                <button type="button" disabled={h.sessionsOffset === 0 || h.sessionsBusy} onClick={h.sessionsPrevious} className="underline disabled:opacity-40">Previous sessions</button>
+                <button type="button" disabled={!h.sessionsHasNext || h.sessionsBusy || !!h.sessionsError} onClick={h.sessionsNext} className="underline disabled:opacity-40">Next sessions</button>
+              </div>
+            </div>
+            {h.sessionsError && (
+              <div role="alert" className="px-3 py-2 text-xs text-[#b42318] border-b border-[#bbc3c4]">
+                Session history: {h.sessionsError}
+                <button type="button" onClick={h.sessionsRetry} className="ml-3 underline">Retry session history</button>
+              </div>
+            )}
+            <div className="flex max-h-[300px]" style={{ minHeight: h.expandedSessionUuid ? 280 : undefined }}>
+              <div className={`${h.expandedSessionUuid ? 'w-1/2' : 'w-full'} overflow-auto`}>
                 <table className="w-full text-xs">
                   <thead>
                     <tr className="border-b border-[#bbc3c4] text-[#bbc3c4]">
@@ -680,27 +698,44 @@ export default function AgentsPage() {
                           <td className="px-2 py-1 text-[#0078c8] font-mono">{s.uuid.slice(0, 8)}</td>
                           <td className="px-2 py-1 text-[#708e8e]">{s.mode}</td>
                           <td className="px-2 py-1 text-[#005661]">{s.target_url ? truncate(s.target_url, 30) : '\u2014'}</td>
-                          <td className="px-2 py-1 text-right text-[#005661]">{s.finding_count}</td>
-                          <td className="px-2 py-1 text-right text-[#00b368]">{s.saved_count}</td>
+                          <td className="px-2 py-1 text-right text-[#005661]">{formatAgentRunCount(s.finding_count)}</td>
+                          <td className="px-2 py-1 text-right text-[#00b368]">{formatAgentRunCount(s.saved_count)}</td>
                           <td className="px-2 py-1 text-right text-[#005661]">{formatDuration(s.duration_ms)}</td>
                         </tr>
                       ))
                     ) : (
-                      <tr><td colSpan={7} className="px-3 py-3 text-center text-[#bbc3c4]">no sessions</td></tr>
+                      <tr><td colSpan={7} className="px-3 py-3 text-center text-[#708e8e]">{h.sessionsLoading ? 'Loading session history…' : h.sessionsError ? 'Could not load session history' : h.sessionsOffset ? 'No sessions on this page' : 'No session history in the active project'}</td></tr>
                     )}
                   </tbody>
                 </table>
               </div>
-              {h.expandedSessionUuid && h.sessionDetail && (
-                <div className="w-1/2">
-                  <SessionDetailPanel session={h.sessionDetail} onClose={() => h.setExpandedSessionUuid(null)} />
+              {h.expandedSessionUuid && (
+                <div key={h.sessionSelectionKey} className="w-1/2 min-w-0 overflow-auto">
+                  {h.sessionDetailError && (
+                    <div role="alert" className="px-3 py-2 text-xs text-[#b42318] border-b border-[#bbc3c4]">
+                      Session details: {h.sessionDetailError}
+                      <button type="button" onClick={h.sessionDetailRetry} className="ml-3 underline">Retry session details</button>
+                    </div>
+                  )}
+                  {h.sessionDetail ? (
+                    <SessionDetailPanel session={h.sessionDetail} onClose={() => h.setExpandedSessionUuid(null)} />
+                  ) : (
+                    <div className="px-3 py-2 text-xs text-[#708e8e]">
+                      <div className="flex justify-between gap-2">
+                        <span className="font-bold">SESSION DETAILS — active project</span>
+                        <button type="button" aria-label="Close session details" onClick={() => h.setExpandedSessionUuid(null)}>&#10005;</button>
+                      </div>
+                      <div className="font-mono break-all py-2">{h.expandedSessionUuid}</div>
+                      <p>{h.sessionDetailLoading ? 'Loading session details…' : h.sessionDetailError ? 'Session details unavailable in the active project.' : 'No session details available in the active project.'}</p>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
           </details>
 
-          {/* Streaming Output — collapsible, takes remaining height when open */}
-          <div className={`border border-t-0 border-[#bbc3c4] bg-[#ede4d1] flex flex-col overflow-hidden ${h.streamingOpen ? 'flex-1' : 'shrink-0'}`}>
+          {/* Full runtime.log by default; following the bounded tail is explicit and optional. */}
+          <div className={`border border-t-0 border-[#bbc3c4] bg-[#ede4d1] flex flex-col overflow-hidden ${h.streamingOpen ? h.consoleMode === 'full' ? 'flex-1 min-h-[24rem]' : 'flex-1' : 'shrink-0'}`}>
             <button
               type="button"
               onClick={() => h.setStreamingOpen(!h.streamingOpen)}
@@ -708,11 +743,15 @@ export default function AgentsPage() {
             >
               <span className="text-[#0078c8] text-xs font-bold flex items-center gap-1.5">
                 <ChevronDown className={`w-3 h-3 text-[#0078c8] transition-transform ${h.streamingOpen ? '' : '-rotate-90'}`} />
-                <ScrollText className="w-3 h-3" />STREAMING RESPONSE
+                <ScrollText className="w-3 h-3" />{h.consoleMode === 'tail' ? 'AGENT CONSOLE TAIL' : 'AGENT RUNTIME LOG'}
               </span>
               <div className="flex items-center gap-3">
-                {h.panelIsStreaming && (
-                  <span className="text-xs text-[#0078c8] flex items-center gap-1"><Loader2 className="w-3 h-3 animate-spin" /> streaming...</span>
+                {h.panelIsRunning && <span className="text-xs text-[#00b368]">run active</span>}
+                {h.consoleMode === 'tail' && h.panelConnection !== 'idle' && (
+                  <span className="text-xs text-[#0078c8] flex items-center gap-1">
+                    {(h.panelConnection === 'connecting' || h.panelConnection === 'retrying') && <Loader2 className="w-3 h-3 animate-spin" />}
+                    {h.panelConnection === 'complete' ? 'tail loaded' : `tail ${h.panelConnection}`}
+                  </span>
                 )}
                 {h.scanResult && (
                   <span className="text-xs text-[#708e8e]">
@@ -722,12 +761,48 @@ export default function AgentsPage() {
                 )}
               </div>
             </button>
+            {h.activeRunStatusError && (
+              <div role="alert" className="shrink-0 px-3 py-2 text-xs text-[#b42318] border-b border-[#bbc3c4]">
+                Run status: {h.activeRunStatusError}. The run may still be active.
+                <button type="button" onClick={h.activeRunStatusRetry} className="ml-3 underline">Retry run status</button>
+              </div>
+            )}
+            {h.cancelError && (
+              <div role="alert" className="shrink-0 px-3 py-2 text-xs text-[#b42318] border-b border-[#bbc3c4]">
+                Cancel run: {h.cancelError}
+                <button type="button" onClick={h.handleScanCancel} className="ml-3 underline">Retry cancel run</button>
+              </div>
+            )}
             {h.streamingOpen && (
-              <pre ref={h.scanOutputRef} onScroll={h.onScanOutputScroll} className="flex-1 overflow-auto p-3 text-xs text-[#708e8e] font-mono whitespace-pre-wrap leading-relaxed">
-                {h.panelOutput || (
-                  <span className="text-[#bbc3c4]">{h.panelError || h.panelPlaceholder}</span>
+              <>
+                <div className="shrink-0 flex gap-3 px-3 py-2 border-b border-[#bbc3c4] text-xs" aria-label="Log display mode">
+                  <button type="button" aria-pressed={h.consoleMode === 'full'} onClick={() => h.setConsoleMode('full')} className={h.consoleMode === 'full' ? 'text-[#0078c8] font-bold' : 'text-[#708e8e] underline'}>Full log (paged)</button>
+                  <button type="button" aria-pressed={h.consoleMode === 'tail'} onClick={() => h.setConsoleMode('tail')} className={h.consoleMode === 'tail' ? 'text-[#0078c8] font-bold' : 'text-[#708e8e] underline'}>Live tail (bounded)</button>
+                </div>
+                {h.consoleMode === 'full' ? (
+                  <div className="flex-1 min-h-0 overflow-auto"><AgentRuntimeLogPanel runUUID={h.expandedSessionUuid ?? ''} theme="light" /></div>
+                ) : (
+                  <>
+                    {h.expandedSessionUuid && (
+                      <div role="status" className="shrink-0 px-3 py-1.5 text-xs text-[#708e8e] border-b border-[#bbc3c4]">
+                        {h.panelTruncated ? 'Earlier output omitted from this bounded console tail.' : 'Bounded console tail; not a full log download.'}
+                        {h.panelLogSize !== null && ` Saved log size: ${h.panelLogSize.toLocaleString()} bytes.`}
+                      </div>
+                    )}
+                    {h.panelError && (
+                      <div role="alert" className="shrink-0 px-3 py-2 text-xs text-[#b42318] whitespace-pre-wrap border-b border-[#bbc3c4]">
+                        {h.panelError}
+                      </div>
+                    )}
+                    {(h.panelConnection === 'error' || h.panelConnection === 'exhausted') && (
+                      <button type="button" onClick={h.panelRetry} className="shrink-0 self-start mx-3 my-2 text-xs text-[#0078c8] underline">Retry console tail</button>
+                    )}
+                    <pre ref={h.scanOutputRef} onScroll={h.onScanOutputScroll} className="flex-1 overflow-auto p-3 text-xs text-[#708e8e] font-mono whitespace-pre-wrap leading-relaxed">
+                      {h.panelOutput || <span className="text-[#bbc3c4]">{h.panelPlaceholder}</span>}
+                    </pre>
+                  </>
                 )}
-              </pre>
+              </>
             )}
           </div>
         </div>

@@ -164,7 +164,10 @@ func emitAuditStatelessReport(ctx context.Context, db *database.DB, projectUUID,
 	if !ok {
 		return fmt.Errorf("html report generator unavailable")
 	}
-	gen, defaultTitle := rf.Render, rf.DefaultTitle
+	gen, defaultTitle := rf.RenderStream, rf.DefaultTitle
+	if gen == nil {
+		return fmt.Errorf("html report has no bounded producer renderer")
+	}
 
 	localOutput, finalize, err := resolveExportOutput(ctx, outputArg)
 	if err != nil {
@@ -181,19 +184,17 @@ func emitAuditStatelessReport(ctx context.Context, db *database.DB, projectUUID,
 		}
 	}
 
-	// The throwaway temp DB holds only this run's data, so a project-scoped
-	// query returns exactly the audit's findings.
-	var findings []*database.Finding
-	q := scopeProjectBun(db.NewSelect().Model(&findings).
-		Where("record_kind IS NULL OR record_kind = '' OR record_kind = ?", database.RecordKindFinding).
-		OrderExpr("found_at DESC"), projectUUID)
-	if err := q.Scan(ctx); err != nil {
-		return fmt.Errorf("query findings for report: %w", err)
+	// Close bounded metadata queries before receipt hydration. No raw findings
+	// slice survives this producer; receipt-only audit findings are included.
+	filters := database.QueryFilters{ProjectUUID: projectUUID, SortBy: "found_at"}
+	count, err := database.NewFindingsQueryBuilder(db, filters).Count(ctx)
+	if err != nil {
+		return fmt.Errorf("count findings for report: %w", err)
 	}
-
-	items := make([]any, 0, len(findings))
-	for _, f := range findings {
-		items = append(items, exportEnvelope{Type: "finding", Data: f})
+	produce := func(emit func(any) error) error {
+		return iterateFilteredEvidenceFindings(ctx, db, filters, func(f *database.Finding) error {
+			return emit(exportEnvelope{Type: "finding", Data: f})
+		})
 	}
 
 	meta := output.HTMLReportMeta{
@@ -209,16 +210,18 @@ func emitAuditStatelessReport(ctx context.Context, db *database.DB, projectUUID,
 
 	if !globalJSON {
 		fmt.Fprintf(os.Stderr, "%s %s\n", terminal.InfoSymbol(),
-			terminal.BoldCyan(fmt.Sprintf("Generating HTML report — %d findings ...", len(findings))))
+			terminal.BoldCyan(fmt.Sprintf("Generating HTML report — %d findings ...", count)))
 	}
-	if err := gen(items, localOutput, meta); err != nil {
+	if err := gen(produce, localOutput, meta); err != nil {
 		return err
 	}
 	if err := finalize(); err != nil {
 		return err
 	}
 
-	fmt.Printf("%s Report written: %s (%d findings)\n",
-		terminal.SuccessSymbol(), terminal.Cyan(outputArg), len(findings))
+	if !globalJSON {
+		fmt.Printf("%s Report written: %s (%d findings)\n",
+			terminal.SuccessSymbol(), terminal.Cyan(outputArg), count)
+	}
 	return nil
 }

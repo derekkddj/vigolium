@@ -104,9 +104,34 @@ func (r *Runner) runSecretScanBatch(ctx context.Context, infra *phaseInfra, onRe
 	return nil
 }
 
+// secretScanRecordEvidenceContext keeps the decoded detector body separate from
+// the immutable stored receipt. Only persisted capture metadata permits a typed
+// supplied view; historical rows without it retain legacy unknown evidence.
+func secretScanRecordEvidenceContext(record *database.HTTPRecord, resp *httpmsg.HttpResponse) (secret_detect.EvidenceContext, error) {
+	ev := secret_detect.EvidenceContext{
+		Body:         resp.Body(),
+		Host:         record.Hostname,
+		URL:          record.URL,
+		Request:      string(record.RawRequest),
+		RespHead:     string(resp.Head()),
+		StatusCode:   resp.StatusCode(),
+		ContentType:  record.ResponseContentType,
+		HeaderValues: secret_detect.JoinHeaderValues(resp.Headers()),
+	}
+	if record.CaptureRequestState == "" && record.CaptureResponseState == "" {
+		return ev, nil
+	}
+	rr, err := database.RecordToHttpRequestResponse(record)
+	if err != nil {
+		return ev, err
+	}
+	ev.Exchange = rr.Evidence()
+	return ev, nil
+}
+
 // secretEmitOptions varies the parts of a secret finding that differ by corpus.
 type secretEmitOptions struct {
-	// RecordUUIDs anchors the finding to the traffic it came from. May be empty.
+	// RecordUUIDs is a context link, not proof of a captured exchange. May be empty.
 	RecordUUIDs []string
 	// ModuleShort is the one-line label shown in reports.
 	ModuleShort string
@@ -252,6 +277,9 @@ func (r *Runner) scanRecoveredSourcesForSecrets(
 				return nil
 			}
 
+			// Recovered content is an analysis artifact, not the bundle's HTTP
+			// response. Its record UUID below is only a context link; do not attach
+			// that record's receipt to this different body.
 			ev := secret_detect.EvidenceContext{
 				Body: artifact.Content,
 				Host: hostname,
@@ -453,15 +481,19 @@ func (r *Runner) scanSecretRecordBatch(
 			return found, err
 		}
 		record, resp := it.record, it.resp
-		ev := secret_detect.EvidenceContext{
-			Body:         it.body,
-			Host:         record.Hostname,
-			URL:          record.URL,
-			Request:      string(record.RawRequest),
-			RespHead:     string(resp.Head()),
-			StatusCode:   resp.StatusCode(),
-			ContentType:  record.ResponseContentType,
-			HeaderValues: secret_detect.JoinHeaderValues(resp.Headers()),
+		if record.CaptureRequestState != "" || record.CaptureResponseState != "" {
+			// The batch projection contains only response-scan fields. Hydrate
+			// the immutable row for matching records with known fidelity so the
+			// central converter has the actual request, destination and time.
+			fullRecord, err := r.repository.GetRecordByUUID(ctx, record.UUID)
+			if err != nil {
+				return found, fmt.Errorf("secret scan: failed to hydrate record %s: %w", record.UUID, err)
+			}
+			record = fullRecord
+		}
+		ev, err := secretScanRecordEvidenceContext(record, resp)
+		if err != nil {
+			return found, fmt.Errorf("secret scan: invalid stored receipt for record %s: %w", record.UUID, err)
 		}
 		found += r.emitSecretFindings(ctx, infra, m, ev, seenSecret, onResult, secretEmitOptions{
 			RecordUUIDs: []string{record.UUID},

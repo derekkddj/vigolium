@@ -7,6 +7,7 @@ import (
 
 	"github.com/uptrace/bun"
 	"github.com/vigolium/vigolium/pkg/agent/recon"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/tlsprobe"
 )
 
@@ -325,6 +326,12 @@ type HTTPRecord struct {
 	// with Content-Length set to the decoded size. Empty means raw_response is
 	// stored exactly as received.
 	ResponseDecodedFrom string `bun:"response_decoded_from,nullzero" json:"response_decoded_from,omitempty"`
+	// Capture states describe fidelity of the stored bytes, not execution identity.
+	// Empty/NULL means no receipt metadata was recorded (legacy behavior). These
+	// fields are immutable alongside RawRequest/RawResponse; reload creates an
+	// independently identified supplied-input view, never a captured execution.
+	CaptureRequestState  evidence.State `bun:"capture_request_state,nullzero" json:"capture_request_state,omitempty"`
+	CaptureResponseState evidence.State `bun:"capture_response_state,nullzero" json:"capture_response_state,omitempty"`
 
 	// Parameters (JSON array, replaces http_parameters table)
 	Parameters []EmbeddedParam `bun:"parameters,type:jsonb,nullzero" json:"parameters,omitempty"`
@@ -559,6 +566,11 @@ type Finding struct {
 	ExtractedResults   []string `bun:"extracted_results,type:jsonb,nullzero" json:"extracted_results,omitempty"`
 	AdditionalEvidence []string `bun:"additional_evidence,type:jsonb,nullzero" json:"additional_evidence,omitempty"`
 
+	// Selected receipts are hydrated as manifests by default; bytes are fetched
+	// only by exact exchange identity within this finding's project.
+	Evidence       []evidence.Entry `bun:"-" json:"evidence,omitempty"`
+	EvidenceStatus string           `bun:"evidence_status,nullzero" json:"evidence_status,omitempty"`
+
 	Request  string `bun:"request,nullzero" json:"request,omitempty"`
 	Response string `bun:"response,nullzero" json:"response,omitempty"`
 
@@ -643,16 +655,17 @@ type FindingStatusEvent struct {
 type OASTPayload struct {
 	bun.BaseModel `bun:"table:oast_payloads,alias:op" json:"-"`
 
-	Nonce       string    `bun:"nonce,pk" json:"nonce"`
-	ProjectUUID string    `bun:"project_uuid,notnull" json:"project_uuid"`
-	ScanUUID    string    `bun:"scan_uuid,nullzero" json:"scan_uuid,omitempty"`
-	Class       string    `bun:"class,nullzero" json:"class,omitempty"`
-	ModuleID    string    `bun:"module_id,nullzero" json:"module_id,omitempty"`
-	TargetURL   string    `bun:"target_url,nullzero" json:"target_url,omitempty"`
-	Param       string    `bun:"param,nullzero" json:"param,omitempty"`
-	RequestHash string    `bun:"request_hash,nullzero" json:"request_hash,omitempty"`
-	Payload     string    `bun:"payload,nullzero" json:"payload,omitempty"`
-	CreatedAt   time.Time `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
+	Nonce         string    `bun:"nonce,pk" json:"nonce"`
+	ProjectUUID   string    `bun:"project_uuid,notnull" json:"project_uuid"`
+	ScanUUID      string    `bun:"scan_uuid,nullzero" json:"scan_uuid,omitempty"`
+	Class         string    `bun:"class,nullzero" json:"class,omitempty"`
+	InjectionType string    `bun:"injection_type,nullzero" json:"injection_type,omitempty"`
+	ModuleID      string    `bun:"module_id,nullzero" json:"module_id,omitempty"`
+	TargetURL     string    `bun:"target_url,nullzero" json:"target_url,omitempty"`
+	Param         string    `bun:"param,nullzero" json:"param,omitempty"`
+	RequestHash   string    `bun:"request_hash,nullzero" json:"request_hash,omitempty"`
+	Payload       string    `bun:"payload,nullzero" json:"payload,omitempty"`
+	CreatedAt     time.Time `bun:"created_at,notnull,type:text,default:current_timestamp" json:"created_at"`
 }
 
 // AuthenticationHostname persists per-hostname session auth configs in the DB.
@@ -696,17 +709,18 @@ type AuthenticationHostname struct {
 type OASTInteraction struct {
 	bun.BaseModel `bun:"table:oast_interactions,alias:oi" json:"-"`
 
-	ID            int64     `bun:"id,pk,autoincrement" json:"id"`
-	ProjectUUID   string    `bun:"project_uuid,notnull" json:"project_uuid"`
-	ScanUUID      string    `bun:"scan_uuid,nullzero" json:"scan_uuid,omitempty"`
-	UniqueID      string    `bun:"unique_id,notnull" json:"unique_id"`
-	FullID        string    `bun:"full_id,notnull" json:"full_id"`
-	Protocol      string    `bun:"protocol,notnull" json:"protocol"`
-	QType         string    `bun:"q_type,nullzero" json:"q_type,omitempty"`
-	RawRequest    string    `bun:"raw_request,nullzero" json:"raw_request,omitempty"`
-	RawResponse   string    `bun:"raw_response,nullzero" json:"raw_response,omitempty"`
-	RemoteAddress string    `bun:"remote_address,nullzero" json:"remote_address,omitempty"`
-	InteractedAt  time.Time `bun:"interacted_at,notnull" json:"interacted_at"`
+	ID            int64  `bun:"id,pk,autoincrement" json:"id"`
+	ProjectUUID   string `bun:"project_uuid,notnull" json:"project_uuid"`
+	ScanUUID      string `bun:"scan_uuid,nullzero" json:"scan_uuid,omitempty"`
+	UniqueID      string `bun:"unique_id,notnull" json:"unique_id"`
+	FullID        string `bun:"full_id,notnull" json:"full_id"`
+	Protocol      string `bun:"protocol,notnull" json:"protocol"`
+	QType         string `bun:"q_type,nullzero" json:"q_type,omitempty"`
+	RawRequest    string `bun:"raw_request,nullzero" json:"raw_request,omitempty"`
+	RawResponse   string `bun:"raw_response,nullzero" json:"raw_response,omitempty"`
+	RemoteAddress string `bun:"remote_address,nullzero" json:"remote_address,omitempty"`
+	// Canonical UTC text preserves supplied nanoseconds for duplicate detection.
+	InteractedAt time.Time `bun:"interacted_at,notnull,type:text" json:"interacted_at"`
 
 	// Correlated context from payload tracker
 	TargetURL     string `bun:"target_url,nullzero" json:"target_url,omitempty"`

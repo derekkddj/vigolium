@@ -3,6 +3,7 @@ package node2shell
 import (
 	nethttp "net/http"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 )
 
@@ -21,9 +22,11 @@ const (
 	ContentEncoding = "Content-Encoding"
 )
 
-// Exchange is one sent probe's outcome. Request and Response are evidence
-// strings the caller has already truncated or elided as it sees fit.
+// Exchange is one sent probe's outcome. Request and Response are bounded legacy
+// projections; Receipt owns the full messages captured before the chain closes.
+// Analysis uses Sig, never a truncated receipt or a prober-global last response.
 type Exchange struct {
+	Receipt  *evidence.Exchange
 	Sig      modkit.ResponseSignature
 	Header   nethttp.Header
 	Request  string
@@ -54,6 +57,9 @@ type Gate struct {
 	// decoder itself refuses, as opposed to bytes it decodes into malformed
 	// JSON. See BadStream.
 	Failed Exchange
+	// Confirmations retains each encoded-pair round by execution identity, rather
+	// than only the last malformed response. Bounded by 2*ConfirmRounds-1.
+	Confirmations []Exchange
 }
 
 // RunGate runs the differential over every known encoding. See RunGateFor.
@@ -121,13 +127,16 @@ func RunGateFor(send SendFunc, candidates []EncodedBodies) (Gate, bool) {
 
 	for round := range ConfirmRounds {
 		if round > 0 {
-			if d, ok := send(ContentEncoding, enc.Encoding, enc.Empty); !ok || !Same(d, empty) {
+			d, sent := send(ContentEncoding, enc.Encoding, enc.Empty)
+			if !sent || !Same(d, empty) {
 				return Gate{}, false
 			}
+			g.Confirmations = append(g.Confirmations, d)
 		}
 		if g.DecodedMalformed, ok = send(ContentEncoding, enc.Encoding, enc.Malformed); !ok || !Same(g.DecodedMalformed, malformed) {
 			return Gate{}, false
 		}
+		g.Confirmations = append(g.Confirmations, g.DecodedMalformed)
 	}
 
 	if g.Unknown, ok = send(ContentEncoding, UnknownEncoding, enc.Empty); !ok || Same(g.Unknown, empty) {

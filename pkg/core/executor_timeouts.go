@@ -266,8 +266,9 @@ type moduleCallResult struct {
 // moduleResultChanPool recycles the 1-slot result channels used by the per-module
 // timeout wrappers — the single highest-frequency allocation site in the
 // dispatch loop (one per active and passive module call). A channel is returned
-// to the pool ONLY on the normal completion path, where the watchdog goroutine
-// has finished sending and will never touch it again; on the timeout / parent-
+// to the pool ONLY on the normal completion path, where its send was consumed
+// and the watchdog goroutine will never touch it again (its lifecycle defers may
+// still be running, so realTaskWG separately joins those); on the timeout / parent-
 // cancel paths the abandoned goroutine still owns the channel (it sends when the
 // slow scanFn eventually returns), so those channels are left for the GC.
 var moduleResultChanPool = sync.Pool{
@@ -325,6 +326,32 @@ func (e *Executor) runPassiveCall(
 		}
 	}
 
+	// The parallel-passive semaphore only bounds wrappers: a watchdog timeout
+	// returns its slot while scanFn may still hold the response body. Bound real
+	// work independently, including per-host, sequential and inline calls, and
+	// acquire before spawning so abandoned calls cannot accumulate goroutines.
+	// nil preserves direct test fixtures built without NewExecutor.
+	sem := e.pool.realPassiveSem
+	if sem != nil {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return callOutcome{}
+		}
+	}
+	releaseSem := func() {
+		if sem != nil {
+			<-sem
+		}
+	}
+	// Cancellation can race with a successful semaphore send. Do not start a
+	// call or acquire an item reference in that case.
+	if ctx.Err() != nil {
+		releaseSem()
+		return callOutcome{}
+	}
+	releaseWork := acquireRealWork(ctx)
+
 	// Fast inline path for the common case: a non-contextual passive module with
 	// no explicit timeout hint. Passive modules send no traffic (no network I/O
 	// to block on), read a size-capped body, and Go's regexp is RE2 (linear-time,
@@ -340,6 +367,8 @@ func (e *Executor) runPassiveCall(
 	// counted against the module that caused it (error_kind panic).
 	runInline := !isContextual && !hintedTimeout
 	if runInline {
+		defer releaseWork()
+		defer releaseSem()
 		start := time.Now()
 		events, err := e.runScanFnGuarded(ctx, module.ID(), scanFn)
 		return callOutcome{events: e.recordPassiveResult(module, item, start, events, err), completed: true, err: err}
@@ -352,7 +381,14 @@ func (e *Executor) runPassiveCall(
 
 	start := time.Now()
 	ch := moduleResultChanPool.Get().(chan moduleCallResult)
+	// Add while the worker/wrapper still owns the item. Execute joins workers
+	// and detached tasks before waiting for realTaskWG, so Add cannot race a
+	// zero-counter shutdown Wait.
+	e.pool.realTaskWG.Add(1)
 	go func() {
+		defer e.pool.realTaskWG.Done()
+		defer releaseWork()
+		defer releaseSem()
 		// runScanFnGuarded recovers a module panic into an error: this goroutine
 		// is outside the worker's and the active task's panic recovery, so an
 		// unrecovered panic here would crash the process.
@@ -435,7 +471,9 @@ func isTransientCallErr(err error) bool {
 // runActiveWithTimeout executes an active module scan function under a timeout
 // derived from the phase context and returns what the call came to (see
 // callOutcome). When the per-module timeout fires OR the phase deadline (ctx)
-// is reached, it returns an incomplete outcome immediately so the task returns, its item can complete, and the phase ends on time. The scan function
+// is reached, it returns an incomplete outcome immediately so the wrapper task
+// returns and bounded shutdown can proceed. The real-work tracker reference
+// keeps its item outstanding until scanFn actually exits. The scan function
 // receives callCtx for explicit use. The executor also hands the module a
 // requester bound to the PHASE context (http.Requester.WithContext), so
 // context-less Execute calls abort in-flight requests on scan shutdown / phase
@@ -524,7 +562,13 @@ func (e *Executor) runActiveWithTimeout(
 	ms := e.moduleMetrics.For(module.ID())
 	start := time.Now()
 	ch := moduleResultChanPool.Get().(chan moduleCallResult)
+	releaseWork := acquireRealWork(ctx)
+	e.pool.realTaskWG.Add(1)
 	go func() {
+		// Keep the item reference through slot release and make realTaskWG.Done
+		// last: receiving the buffered result does not join these exit defers.
+		defer e.pool.realTaskWG.Done()
+		defer releaseWork()
 		// Hold the active-task slot for the whole life of the real work. On the
 		// normal path this fires just as the wrapper receives the result; on the
 		// timeout / parent-cancel paths the wrapper has already returned but this

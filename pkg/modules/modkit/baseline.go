@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 )
@@ -18,6 +19,9 @@ const baselineTTL = 5 * time.Minute
 
 // BaselineEntry caches a clean baseline response for a given endpoint.
 type BaselineEntry struct {
+	// Receipt is the owned exchange captured by the baseline fetch, including
+	// the actual final request after redirects. Nil means no receipt was supplied.
+	Receipt    *evidence.Exchange
 	Response   *httpmsg.HttpResponse
 	StatusCode int
 	BodyLen    int
@@ -50,7 +54,7 @@ func (sc *ScanContext) GetOrFetchBaseline(
 
 	cache := sc.getBaselineCache()
 	if entry, ok := cache.Get(key); ok && !entry.Expired() {
-		return entry, nil
+		return cloneBaselineEntry(entry), nil
 	}
 
 	// Use singleflight to coalesce concurrent fetches for the same endpoint.
@@ -67,6 +71,7 @@ func (sc *ScanContext) GetOrFetchBaseline(
 			return nil, err
 		}
 
+		receipt := http.CaptureEvidence(respChain)
 		fullResp := respChain.FullResponseBytes()
 		rawCopy := make([]byte, len(fullResp))
 		copy(rawCopy, fullResp)
@@ -74,6 +79,7 @@ func (sc *ScanContext) GetOrFetchBaseline(
 
 		resp := httpmsg.NewHttpResponse(rawCopy)
 		entry := &BaselineEntry{
+			Receipt:    receipt,
 			Response:   resp,
 			StatusCode: resp.StatusCode(),
 			BodyLen:    len(resp.Body()),
@@ -87,7 +93,17 @@ func (sc *ScanContext) GetOrFetchBaseline(
 	if err != nil {
 		return nil, err
 	}
-	return result.(*BaselineEntry), nil
+	return cloneBaselineEntry(result.(*BaselineEntry)), nil
+}
+
+// Keep cache-owned receipts immutable even when a consumer edits its copy.
+func cloneBaselineEntry(entry *BaselineEntry) *BaselineEntry {
+	if entry == nil {
+		return nil
+	}
+	copy := *entry
+	copy.Receipt = entry.Receipt.Clone()
+	return &copy
 }
 
 // baselineRequestKey intentionally returns only a digest. Request bodies,

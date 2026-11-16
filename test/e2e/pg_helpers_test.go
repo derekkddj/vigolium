@@ -52,7 +52,17 @@ func pgTestConfigFromEnv() *config.DatabaseConfig {
 // Kept in dependency-safe drop order (children before parents) although
 // DROP ... CASCADE makes order non-critical.
 var allVigoliumTables = []string{
+	"agent_finding_candidates",
+	"agent_sections",
 	"scan_logs",
+	"host_observations",
+	"finding_status_events",
+	"finding_observations",
+	"analysis_artifacts",
+	"finding_evidence",
+	"oast_planting_receipts",
+	"evidence_exchanges",
+	"oast_payloads",
 	"oast_interactions",
 	"authentication_hostnames",
 	"agentic_scans",
@@ -63,6 +73,7 @@ var allVigoliumTables = []string{
 	"scans",
 	"projects",
 	"users",
+	"schema_meta",
 }
 
 // dropAllVigoliumTables issues DROP TABLE IF EXISTS ... CASCADE for every

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -36,6 +37,8 @@ type apiOperation struct {
 }
 
 type runtimeBypass struct {
+	primary  *evidence.Exchange
+	selected []evidence.Entry
 	detail   string
 	evidence []string
 }
@@ -139,18 +142,21 @@ func (m *Module) ScanPerRequest(
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + "/openapi.json"
 	if len(bypasses) > 0 {
-		var extracted, evidence []string
+		var extracted, additional []string
+		selected := []evidence.Entry{evidence.Select(http.CaptureEvidence(resp), evidence.RoleObservation, false, "security metadata document")}
 		for _, bypass := range bypasses {
 			extracted = append(extracted, bypass.detail)
-			evidence = append(evidence, bypass.evidence...)
+			additional = append(additional, bypass.evidence...)
+			selected = append(selected, bypass.selected...)
 		}
-		return []*output.ResultEvent{{
+		result := &output.ResultEvent{
 			ModuleID:           ModuleID,
 			URL:                targetURL,
 			Matched:            targetURL,
 			Request:            string(modifiedRaw),
 			Response:           resp.FullResponseString(),
-			AdditionalEvidence: evidence,
+			AdditionalEvidence: additional,
+			Evidence:           selected,
 			ExtractedResults:   extracted,
 			RecordKind:         output.RecordKindFinding,
 			EvidenceGrade:      output.EvidenceGradeBypass,
@@ -162,7 +168,9 @@ func (m *Module) ScanPerRequest(
 				Tags:        []string{"python", "fastapi", "openapi", "auth", "misconfiguration"},
 				Reference:   []string{"https://fastapi.tiangolo.com/tutorial/security/"},
 			},
-		}}, nil
+		}
+		modkit.SetPrimaryEvidence(result, bypasses[0].primary, evidence.RoleAttack, "selected probe")
+		return []*output.ResultEvent{result}, nil
 	}
 
 	if len(unprotected) == 0 {
@@ -176,7 +184,7 @@ func (m *Module) ScanPerRequest(
 		}
 		extracted = append(extracted, detail+" - "+op.reason)
 	}
-	return []*output.ResultEvent{{
+	result := &output.ResultEvent{
 		ModuleID:         ModuleID,
 		URL:              targetURL,
 		Matched:          targetURL,
@@ -193,7 +201,9 @@ func (m *Module) ScanPerRequest(
 			Tags:        []string{"python", "fastapi", "openapi", "auth", "observation"},
 			Reference:   []string{"https://fastapi.tiangolo.com/tutorial/security/"},
 		},
-	}}, nil
+	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected probe")
+	return []*output.ResultEvent{result}, nil
 }
 
 func classifyOperations(spec openAPISpec) (unprotected, protected []apiOperation) {
@@ -278,6 +288,8 @@ func verifyDeclaredProtection(ctx *httpmsg.HttpRequestResponse, client *http.Req
 		return nil
 	}
 	return &runtimeBypass{
+		primary:  first.exchange,
+		selected: []evidence.Entry{evidence.Select(first.exchange, evidence.RoleAttack, false, "anonymous protected operation"), evidence.Select(second.exchange, evidence.RoleConfirmation, false, "anonymous operation replay")},
 		detail:   fmt.Sprintf("Confirmed anonymous data response: %s %s returned stable %d JSON despite %s", op.method, op.path, first.status, op.reason),
 		evidence: []string{first.request, first.response, second.request, second.response},
 	}
@@ -311,6 +323,7 @@ func anonymousOperationRequest(ctx *httpmsg.HttpRequestResponse, op apiOperation
 }
 
 type runtimeProbe struct {
+	exchange    *evidence.Exchange
 	status      int
 	body        string
 	request     string
@@ -336,6 +349,7 @@ func fetchRuntimeProbe(ctx *httpmsg.HttpRequestResponse, client *http.Requester,
 		body:        body,
 		request:     string(raw),
 		response:    resp.FullResponseString(),
+		exchange:    http.CaptureEvidence(resp),
 		substantive: status >= 200 && status < 300 && substantiveJSONResponse(contentType, body),
 	}
 }

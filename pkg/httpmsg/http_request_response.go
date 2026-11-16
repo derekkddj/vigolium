@@ -21,6 +21,7 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"github.com/projectdiscovery/retryablehttp-go"
 	urlutil "github.com/projectdiscovery/utils/url"
+	"github.com/vigolium/vigolium/pkg/evidence"
 )
 
 // HttpRequestResponse is a unified struct containing HTTP request and response.
@@ -32,6 +33,9 @@ import (
 type HttpRequestResponse struct {
 	request  *HttpRequest
 	response *HttpResponse
+	// snapshot is captured before analysis transforms/truncation. It is never
+	// modified after publication to modules; selection returns an owned copy.
+	snapshot *evidence.Exchange
 }
 
 // NewHttpRequestResponse creates a new HttpRequestResponse from request and optional response.
@@ -127,7 +131,9 @@ func (h *HttpRequestResponse) GetScanHash(templateId string) string {
 	return string(bin[:])
 }
 
-// Clone creates a deep copy of the HttpRequestResponse.
+// Clone owns independent mutable request/response messages. The private capture
+// receipt is immutable and can be shared; Evidence still returns an owned copy,
+// so neither message mutations nor a caller's selection can change that receipt.
 func (h *HttpRequestResponse) Clone() *HttpRequestResponse {
 	cloned := &HttpRequestResponse{}
 	if h.request != nil {
@@ -136,14 +142,39 @@ func (h *HttpRequestResponse) Clone() *HttpRequestResponse {
 	if h.response != nil {
 		cloned.response = h.response.Clone()
 	}
+	cloned.snapshot = h.snapshot
 	return cloned
+}
+
+// HasEvidence checks receipt presence without copying either message. It does
+// not validate or select evidence; callers needing bytes must use Evidence.
+func (h *HttpRequestResponse) HasEvidence() bool {
+	return h != nil && h.snapshot != nil
+}
+
+// Evidence returns an owned capture receipt, if the caller captured the exchange
+// before handing it to analysis. Absence is unknown, not reconstructed capture.
+func (h *HttpRequestResponse) Evidence() *evidence.Exchange {
+	if h == nil {
+		return nil
+	}
+	return h.snapshot.Clone()
+}
+
+// WithEvidence attaches an owned snapshot without changing either live message.
+func (h *HttpRequestResponse) WithEvidence(snapshot *evidence.Exchange) *HttpRequestResponse {
+	return &HttpRequestResponse{request: h.request, response: h.response, snapshot: snapshot.Clone()}
 }
 
 // WithService sets the service on the request and returns the same HttpRequestResponse.
 // This is a mutating method for convenience when building requests.
 func (h *HttpRequestResponse) WithService(service *Service) *HttpRequestResponse {
+	h.snapshot = nil // a different service is not the captured exchange
 	if h.request != nil {
 		h.request.mu.Lock()
+		if h.request.service != nil && h.request.service.destinationPinned {
+			service = pinServiceDestination(service)
+		}
 		h.request.service = service
 		// Invalidate the cached URL since it depends on the service.
 		h.request.cachedURL = nil
@@ -165,6 +196,10 @@ func (h *HttpRequestResponse) WithResponse(response *HttpResponse) *HttpRequestR
 }
 
 // BuildRetryableRequest builds a retryablehttp request from the request response.
+// Receipt-restored services control the connection URL; Host remains explicit.
+// Native request-target normalization is exposed by RequestTargetPolicyFromContext.
+// HTTP proxies with a differing Host require a destination-aware transport (e.g.
+// proxytarget.Wrap), as in the native Requester; this builder does not own routing.
 // Note: This method builds a fresh request every time (no caching).
 func (h *HttpRequestResponse) BuildRetryableRequest() (*retryablehttp.Request, error) {
 	urlx, err := h.URL()
@@ -173,7 +208,10 @@ func (h *HttpRequestResponse) BuildRetryableRequest() (*retryablehttp.Request, e
 	}
 	// URL() already returns this caller's own copy, so it can be handed to
 	// retryablehttp (which keeps and may mutate it) without another Clone.
-	body := h.request.Body()
+	// The retryable client's default GetBody can return the same reusable
+	// reader at its current cursor. Own the submitted bytes and return a fresh
+	// reader for each replay/capture, including after the sent body is closed.
+	body := bytes.Clone(h.request.Body())
 	var bodyReader io.Reader = nil
 	if len(body) > 0 {
 		bodyReader = bytes.NewReader(body)
@@ -181,6 +219,11 @@ func (h *HttpRequestResponse) BuildRetryableRequest() (*retryablehttp.Request, e
 	req, err := retryablehttp.NewRequestFromURL(h.request.Method(), urlx, bodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("could not create request: %w", err)
+	}
+	if len(body) > 0 {
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(body)), nil
+		}
 	}
 	for _, header := range h.request.Headers() {
 		req.Header.Add(header.Name, header.Value)
@@ -192,7 +235,9 @@ func (h *HttpRequestResponse) BuildRetryableRequest() (*retryablehttp.Request, e
 			req.Host = header.Value
 		}
 	}
-	return req, nil
+	// Preserve the intended absolute target as metadata, never by overwriting
+	// RequestURI (net/http rejects client requests with RequestURI set).
+	return req.WithContext(withRequestTargetPolicy(req.Context(), h.request.Raw())), nil
 }
 
 // BuildRetryableRequestWithContext is BuildRetryableRequest with ctx attached to
@@ -204,7 +249,7 @@ func (h *HttpRequestResponse) BuildRetryableRequestWithContext(ctx context.Conte
 	if err != nil {
 		return nil, err
 	}
-	return req.WithContext(ctx), nil
+	return req.WithContext(withRequestTargetPolicy(ctx, h.request.Raw())), nil
 }
 
 // CreateInsertionPoints creates insertion points from the request.
@@ -242,7 +287,17 @@ var jsonFast = jsoniter.ConfigFastest
 // Uses jsoniter with shadow structs for single-pass serialization,
 // eliminating the previous triple-marshal pattern.
 func (h *HttpRequestResponse) MarshalJSON() ([]byte, error) {
+	service := h.Service()
+	serviceURL := ""
+	if service != nil {
+		serviceURL = (&url.URL{Scheme: service.Protocol(), Host: net.JoinHostPort(service.Host(), strconv.Itoa(service.Port()))}).String()
+	}
 	urlx, err := h.sharedURL()
+	if err != nil && h.snapshot != nil && h.request != nil && len(h.request.Raw()) == 0 && serviceURL != "" {
+		// A response-only receipt has no request target. Keep its request missing,
+		// but satisfy the legacy URL envelope with the recorded destination root.
+		urlx, err = urlutil.ParseAbsoluteURL(serviceURL+"/", false)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get URL for marshaling: %w", err)
 	}
@@ -255,20 +310,30 @@ func (h *HttpRequestResponse) MarshalJSON() ([]byte, error) {
 	type responsePayload struct {
 		StatusCode int          `json:"status_code"`
 		Headers    []HttpHeader `json:"headers"`
-		Raw        string       `json:"raw"`
-		// Note: the body is intentionally not serialized separately — Raw already
-		// contains it verbatim, and UnmarshalJSON reconstructs the response from
-		// Raw alone. Emitting a redundant "body" field meant a second full
-		// JSON-escape pass over the body and ~doubled the serialized body size.
+		Raw        string       `json:"raw"` // Legacy text view, not authoritative bytes.
+		RawBase64  []byte       `json:"raw_base64"`
+		// The body is not serialized separately: RawBase64 contains it verbatim.
+		// Keep Raw for older readers, but new readers must prefer RawBase64 since
+		// JSON strings cannot represent arbitrary non-UTF-8 response bytes.
 	}
 	type envelope struct {
-		URL      string           `json:"url"`
-		Request  requestPayload   `json:"request"`
-		Response *responsePayload `json:"response,omitempty"`
+		URL      string             `json:"url"`
+		Service  string             `json:"service"`
+		Request  requestPayload     `json:"request"`
+		Response *responsePayload   `json:"response,omitempty"`
+		Evidence *evidence.Exchange `json:"evidence,omitempty"`
 	}
 
+	snapshot := h.Evidence()
+	if snapshot != nil {
+		if err := snapshot.Validate(); err != nil {
+			return nil, err
+		}
+	}
 	env := envelope{
-		URL: urlx.String(),
+		URL:      urlx.String(),
+		Service:  serviceURL,
+		Evidence: snapshot,
 		Request: requestPayload{
 			Method:  h.request.Method(),
 			Headers: h.request.Headers(),
@@ -280,79 +345,74 @@ func (h *HttpRequestResponse) MarshalJSON() ([]byte, error) {
 		env.Response = &responsePayload{
 			StatusCode: h.response.StatusCode(),
 			Headers:    h.response.Headers(),
-			Raw:        string(h.response.Raw()),
+			Raw:        strings.ToValidUTF8(string(h.response.Raw()), "\uFFFD"),
+			RawBase64:  h.response.Raw(),
 		}
 	}
 
 	return jsonFast.Marshal(env)
 }
 
-// UnmarshalJSON unmarshals the request response from JSON.
+// UnmarshalJSON restores authoritative raw bytes and an optional capture receipt.
+// Older payloads containing only a response raw string remain readable, but the
+// absence of a receipt must never be promoted to captured evidence.
 func (h *HttpRequestResponse) UnmarshalJSON(data []byte) error {
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(data, &m); err != nil {
+	var env struct {
+		URL     *string `json:"url"`
+		Service string  `json:"service"`
+		Request *struct {
+			Raw []byte `json:"raw"`
+		} `json:"request"`
+		Response *struct {
+			Raw       string          `json:"raw"`
+			RawBase64 json.RawMessage `json:"raw_base64"`
+		} `json:"response"`
+		Evidence *evidence.Exchange `json:"evidence"`
+	}
+	if err := json.Unmarshal(data, &env); err != nil {
 		return err
 	}
-	urlStr, ok := m["url"]
-	if !ok {
+	if env.URL == nil {
 		return fmt.Errorf("missing url in request response")
 	}
-	// Remove quotes from JSON string
-	var urlString string
-	if err := json.Unmarshal(urlStr, &urlString); err != nil {
-		return err
+	serviceURL := env.Service
+	if serviceURL == "" {
+		serviceURL = *env.URL // Legacy payloads stored the destination only in URL.
 	}
-	parsed, err := urlutil.ParseAbsoluteURL(urlString, false)
+	service, err := parseEvidenceServiceURL(serviceURL)
 	if err != nil {
 		return err
 	}
-
-	// Unmarshal request
-	reqBin, ok := m["request"]
-	if ok {
-		var reqData struct {
-			Method  string       `json:"method"`
-			Headers []HttpHeader `json:"headers"`
-			Raw     []byte       `json:"raw"`
-		}
-		if err := json.Unmarshal(reqBin, &reqData); err != nil {
+	if env.Evidence != nil {
+		if err := env.Evidence.Validate(); err != nil {
 			return err
-		}
-
-		// Create service from URL
-		port := 80
-		protocol := "http"
-		if parsed.Scheme == "https" {
-			protocol = "https"
-			port = 443
-		}
-		urlPort := parsed.Port()
-		if urlPort != "" {
-			port = parsePort(urlPort)
-		}
-		service, _ := NewService(parsed.Host, port, protocol)
-
-		h.request = &HttpRequest{
-			raw:     reqData.Raw,
-			service: service,
 		}
 	}
 
-	// Unmarshal response if present
-	respBin, ok := m["response"]
-	if ok {
-		var respData struct {
-			StatusCode int          `json:"status_code"`
-			Headers    []HttpHeader `json:"headers"`
-			Raw        string       `json:"raw"`
-		}
-		if err := json.Unmarshal(respBin, &respData); err != nil {
-			return err
-		}
-		h.response = &HttpResponse{
-			raw: []byte(respData.Raw),
-		}
+	if env.Service != "" || env.Evidence != nil {
+		// New envelopes explicitly separate destination from request/display URL.
+		// Legacy URL-only ingestion keeps its absolute-target inference contract.
+		service = pinServiceDestination(service)
 	}
+
+	// Decode into a fresh value so reusing a receiver cannot retain a stale
+	// response or capture receipt, and malformed input cannot partially replace it.
+	decoded := HttpRequestResponse{snapshot: env.Evidence.Clone()}
+	if env.Request != nil {
+		decoded.request = NewHttpRequestWithService(service, env.Request.Raw)
+	}
+	if env.Response != nil {
+		raw := []byte(env.Response.Raw)
+		if len(env.Response.RawBase64) != 0 {
+			// Presence, not length of the decoded bytes, selects the authoritative
+			// field. Empty/null bytes must not fall back to a legacy text preview.
+			if err := json.Unmarshal(env.Response.RawBase64, &raw); err != nil {
+				return fmt.Errorf("invalid response raw_base64: %w", err)
+			}
+		}
+		decoded.response = NewHttpResponse(raw)
+	}
+	*h = decoded
 	return nil
 }
 
@@ -387,6 +447,63 @@ func (h *HttpRequestResponse) marshalToBuffer() (bytes.Buffer, error) {
 }
 
 // ============== Factory Functions ==============
+
+// FromEvidenceExchange restores an owned exchange without repairing or reconciling
+// either message. Declared Content-Length and the actual bytes may intentionally
+// disagree; the capture receipt, not a parser, is authoritative.
+//
+// Service is the recorded destination, independent of the finding/selection URL.
+// Only producer-supplied receipts without a service may derive it from their URL.
+func FromEvidenceExchange(x *evidence.Exchange) (*HttpRequestResponse, error) {
+	if err := x.Validate(); err != nil {
+		return nil, err
+	}
+	serviceURL := x.Service
+	if serviceURL == "" && x.Provenance == evidence.ProvenanceSupplied {
+		serviceURL = x.URL
+	}
+	service, err := parseEvidenceServiceURL(serviceURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid evidence service: %w", err)
+	}
+	var response *HttpResponse
+	if len(x.Response) != 0 {
+		response = NewHttpResponse(bytes.Clone(x.Response))
+	}
+	return &HttpRequestResponse{
+		request:  NewHttpRequestWithService(pinServiceDestination(service), bytes.Clone(x.Request)),
+		response: response,
+		snapshot: x.Clone(),
+	}, nil
+}
+
+// parseEvidenceServiceURL validates a destination with net/url instead of the
+// permissive legacy service parser. Explicit ports must be numeric and in range;
+// an absent port defaults to the HTTP(S) scheme's port. Hostname handles IPv6.
+func parseEvidenceServiceURL(rawURL string) (*Service, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid service URL: %w", err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.Opaque != "" {
+		return nil, fmt.Errorf("service URL must have an http/https scheme and host without user information")
+	}
+	port := GetDefaultPort(u.Scheme)
+	if p := u.Port(); p != "" {
+		port, err = strconv.Atoi(p)
+		if err != nil || port < 1 || port > 65535 {
+			return nil, fmt.Errorf("invalid service port %q", p)
+		}
+	} else if strings.HasSuffix(u.Host, ":") {
+		return nil, fmt.Errorf("service URL has an empty explicit port")
+	}
+	// net/url permits an unbracketed IPv6 authority; require the unambiguous URL
+	// form so its final address component cannot masquerade as a port.
+	if strings.Contains(u.Hostname(), ":") && !strings.HasPrefix(u.Host, "[") {
+		return nil, fmt.Errorf("IPv6 service host must be bracketed")
+	}
+	return NewService(u.Hostname(), port, u.Scheme)
+}
 
 // NewRequestResponseRaw wraps already-built raw request bytes and a known service
 // into an HttpRequestResponse WITHOUT re-parsing them. It is the fast-path

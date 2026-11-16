@@ -95,6 +95,9 @@ type Executor struct {
 	// only honest one for an ingest is the third.
 	stored      atomic.Int64
 	storeFailed atomic.Int64
+	// findingStoreFailed counts synchronous finding persistence failures; async
+	// writer failures are reported separately by its shutdown outcome.
+	findingStoreFailed atomic.Int64
 
 	// drops says WHY an item stored nothing: one counter per DropReason plus the
 	// first few examples. Without it an ingest that stored 0 of 40 could only
@@ -136,8 +139,8 @@ type Executor struct {
 	// reportBase holds the cumulative counters' values at the start of the
 	// current Execute, so Report() describes this run only (see Execute).
 	reportBase struct {
-		responded, scopeRejected, feedbackDropped int64
-		scopeByClass                              map[string]int64
+		responded, scopeRejected, feedbackDropped, findingStoreFailed int64
+		scopeByClass                                                  map[string]int64
 	}
 
 	// Database storage (optional)
@@ -171,6 +174,10 @@ type Executor struct {
 	// atomic and lives outside the struct.
 	report  ExecutionReport
 	unacked atomic.Int64
+	// abandoned is permanent: the real module call may outlive Execute and
+	// mutate shared state even after a later watchdog exit. Never start another
+	// run on this executor or erase the report that explains its abandonment.
+	abandoned atomic.Bool
 }
 
 // perHostClaimCacheSize bounds each per-host claim LRU. With ~31 per-host
@@ -247,6 +254,12 @@ type workerPool struct {
 	// taskWG tracks every detached active-module task so Execute can join them
 	// at shutdown (bounded by workerExitGrace).
 	taskWG sync.WaitGroup
+	// realTaskWG joins the underlying watchdog calls, not just wrappers that
+	// may have timed out. Additions occur while a worker/task is still joined.
+	realTaskWG sync.WaitGroup
+	// realPassiveSem remains held until the passive scan function exits, even
+	// when its watchdog wrapper stops waiting. It also covers inline calls.
+	realPassiveSem chan struct{}
 
 	// feedbackCh lets modules inject discovered requests back into the pipeline;
 	// feeder wraps it to track drop metrics.
@@ -363,6 +376,7 @@ func NewExecutor(
 		passiveTaskLimit = 64
 	}
 	e.pool.passiveTaskSem = make(chan struct{}, passiveTaskLimit)
+	e.pool.realPassiveSem = make(chan struct{}, passiveTaskLimit)
 
 	// Wire risk/surface score updaters, remarks and technology annotators,
 	// record-response rewriter, and request UUID resolver into ScanContext
@@ -389,6 +403,13 @@ func NewExecutor(
 			e.scanCtx = &modules.ScanContext{}
 		}
 		e.scanCtx.OASTProvider = cfg.OASTProvider
+	}
+	// OAST probes often return no synchronous finding. Selective transport
+	// observation captures the actual planting exchange independently of module
+	// output, on an executor-local view inherited by task/credential clones.
+	if observer, ok := cfg.OASTProvider.(http.PlantingReceiptObserver); ok && e.httpClient != nil {
+		e.httpClient = e.httpClient.WithPlantingReceiptObserver(observer)
+		e.cfg.HTTPRequester = e.httpClient
 	}
 
 	// Wire feedback feeder and cross-module finding dedup into ScanContext
@@ -460,11 +481,13 @@ func (e *Executor) Execute(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("executor already running")
 	}
 	defer e.running.Store(false)
+	if e.abandoned.Load() {
+		return false, fmt.Errorf("executor cannot be reused after abandoning unfinished work")
+	}
 	notifyExecutorObserver(ctx, e)
 
-	// Fresh report per run. An executor is normally single-use (dynamic
-	// assessment builds one per feedback round), but a reused one must not
-	// inherit a previous run's abandonment.
+	// Fresh report for an eligible run. Abandoned executors are permanently
+	// retired above, including after their actual module calls exit late.
 	e.report = ExecutionReport{}
 	e.unacked.Store(0)
 	// Responded() and the scopeRejected counter stay cumulative for the
@@ -473,6 +496,7 @@ func (e *Executor) Execute(ctx context.Context) (bool, error) {
 	e.reportBase.scopeRejected = e.scopeRejected.Load()
 	e.reportBase.scopeByClass = e.scopeByClass.snapshot()
 	e.reportBase.feedbackDropped = e.FeedbackDropped()
+	e.reportBase.findingStoreFailed = e.findingStoreFailed.Load()
 	e.quarantine.reset()
 
 	// Observe server-error probe responses so a leaked database error surfaced by
@@ -500,6 +524,8 @@ func (e *Executor) Execute(ctx context.Context) (bool, error) {
 		ctx, cancel = context.WithTimeout(ctx, e.cfg.MaxDuration)
 		defer cancel()
 	}
+
+	ctx, pendingItems := withRunPending(ctx)
 
 	// Start periodic stats printing only when ShowStats is enabled
 	if e.cfg.Services != nil && e.cfg.Services.Options != nil &&
@@ -583,10 +609,15 @@ func (e *Executor) Execute(ctx context.Context) (bool, error) {
 		})
 	}
 
-	e.report.StoppedEarly = !e.feedItems(ctx, itemCh)
+	exhausted, feedErr := e.feedItems(ctx, itemCh)
+	e.report.StoppedEarly = !exhausted
+	// A fatal source error is not cancellation of already accepted items. Drain
+	// them normally so their ACKs/findings remain valid, then return the exact
+	// error. The unread offending record remains behind the durable cursor.
 
-	// After source EOF, drain remaining feedback items from in-flight workers.
-	// Wait until all workers finish (inFlight == 0) and the feedback channel is empty.
+	// After source EOF, drain queued input and feedback as well as dispatched
+	// items. pendingItems spans enqueue through completion, including the window
+	// before a worker increments inFlight; an unscheduled worker is not idle.
 	// When FeedbackDrainTimeout is configured, require the executor to remain idle
 	// for that duration before completing the drain.
 	// Backing-off poll rather than a fixed tick; see drainPollMin/drainPollMax.
@@ -604,6 +635,7 @@ func (e *Executor) Execute(ctx context.Context) (bool, error) {
 	var idleSince time.Time
 	lastProgress := time.Now()
 	prevInFlight := e.pool.inFlight.Load()
+	prevPending := pendingItems.Load()
 drainLoop:
 	for {
 		select {
@@ -626,10 +658,11 @@ drainLoop:
 			drainDelay = min(drainDelay*2, drainPollMax)
 			drainTimer.Reset(drainDelay)
 			cur := e.pool.inFlight.Load()
-			if cur < prevInFlight {
+			pending := pendingItems.Load()
+			if cur < prevInFlight || pending < prevPending {
 				lastProgress = time.Now() // a worker completed an item
 			}
-			prevInFlight = cur
+			prevInFlight, prevPending = cur, pending
 			// Overflowed feedback waits behind the channel; move a batch.
 			if e.pool.feeder.overflowLen() > 0 {
 				idleSince = time.Time{}
@@ -639,20 +672,21 @@ drainLoop:
 				}
 				continue
 			}
-			// Parked items go back once their host drains; with nothing in
-			// flight no host can drain further, so send them all.
+			// Parked items go back once their host drains; with nothing queued
+			// or in flight no host can drain further, so send them all.
 			if e.pool.deferred.len() > 0 {
-				if !e.requeueDeferred(ctx, itemCh, cur == 0) {
+				if !e.requeueDeferred(ctx, itemCh, cur == 0 && pending == 0) {
 					break drainLoop
 				}
 				idleSince = time.Time{}
 				continue
 			}
-			if cur != 0 || len(e.pool.feedbackCh) != 0 {
+			if e.drainBusy(pendingItems) {
 				idleSince = time.Time{}
 				if stallTimeout > 0 && time.Since(lastProgress) >= stallTimeout {
 					zap.L().Warn("feedback drain abandoned: workers still in flight but no progress within stall timeout (a module may be ignoring cancellation)",
 						zap.Int64("in_flight", cur),
+						zap.Int64("pending_items", pending),
 						zap.Int("feedback_queued", len(e.pool.feedbackCh)),
 						zap.Duration("stall_timeout", stallTimeout))
 					e.report.DrainStalled = true
@@ -710,6 +744,10 @@ drainLoop:
 		}()
 		wg.Wait()
 		e.pool.taskWG.Wait()
+		// Watchdog wrappers can exit before their actual module calls. All Add
+		// sites are now fenced by the joined workers/tasks; no flush may race a
+		// call still retaining its item or updating module aggregation state.
+		e.pool.realTaskWG.Wait()
 	}()
 	exitGrace := e.workerExitGrace()
 	workersExited := true
@@ -720,6 +758,7 @@ drainLoop:
 		}
 	case <-time.After(exitGrace):
 		workersExited = false
+		e.abandoned.Store(true)
 		e.report.WorkersAbandoned = true
 		zap.L().Warn("abandoning scan worker(s) or active task(s) that did not exit within the shutdown grace to avoid hanging the scan; leaking goroutine(s)",
 			zap.Int64("in_flight", e.pool.inFlight.Load()),
@@ -779,7 +818,7 @@ drainLoop:
 
 	e.logInsertionPointCacheStats()
 
-	return e.results.Load(), nil
+	return e.results.Load(), feedErr
 }
 
 // logInsertionPointCacheStats reports the insertion-point cache's behaviour once

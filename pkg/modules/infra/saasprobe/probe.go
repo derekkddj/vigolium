@@ -17,6 +17,7 @@ import (
 	nethttp "net/http"
 	"strings"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -31,6 +32,9 @@ type Result struct {
 	Body   string
 	Header nethttp.Header
 	OK     bool
+	// Exchange owns this operation's current HTTP message before the chain closes.
+	// It remains separate from OK: a blocked or failed probe is not a positive.
+	Exchange *evidence.Exchange
 }
 
 // Get issues a fresh GET to path on the observed host, reusing the observed
@@ -82,14 +86,17 @@ func do(ctx *httpmsg.HttpRequestResponse, client *http.Requester, method, path, 
 
 	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
 	resp, _, err := client.Execute(req, http.Options{NoRedirects: !follow, NoClustering: true})
-	if err != nil {
-		return Result{}
+	exchange := http.CaptureEvidence(resp)
+	if resp != nil {
+		defer resp.Close()
 	}
-	defer resp.Close()
+	if err != nil {
+		return Result{Exchange: exchange}
+	}
 
 	r := resp.Response()
 	if r == nil {
-		return Result{}
+		return Result{Exchange: exchange}
 	}
 	// Drop WAF/CDN edge challenges and rate-limit interstitials (including a
 	// 200-status challenge body) so a block page can never satisfy a content
@@ -97,13 +104,14 @@ func do(ctx *httpmsg.HttpRequestResponse, client *http.Requester, method, path, 
 	// these families reason about those statuses (a 401 from a ServiceNow widget is
 	// a token failure, a 403 from a Dataverse table is a permission signal).
 	if infra.GetBlockDetectionValidator().Validate(resp) != nil {
-		return Result{}
+		return Result{Exchange: exchange}
 	}
 	return Result{
-		Status: r.StatusCode,
-		Body:   resp.BodyString(),
-		Header: r.Header,
-		OK:     true,
+		Status:   r.StatusCode,
+		Body:     resp.BodyString(),
+		Header:   r.Header,
+		OK:       true,
+		Exchange: exchange,
 	}
 }
 

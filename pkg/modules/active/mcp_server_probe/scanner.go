@@ -49,14 +49,16 @@ func (m *Module) CanProcess(ctx *httpmsg.HttpRequestResponse) bool {
 
 // mcpEndpoint holds state for a discovered MCP endpoint.
 type mcpEndpoint struct {
-	path       string
-	transport  string // "streamable-http" or "sse"
-	serverInfo *mcpinfra.ServerInfo
-	sessionID  string
-	tools      []mcpinfra.Tool
-	resources  []mcpinfra.Resource
-	prompts    []mcpinfra.Prompt
-	callables  []toolCallEvidence
+	proof       *mcpinfra.Proof
+	secretProof *mcpinfra.Proof
+	path        string
+	transport   string // "streamable-http" or "sse"
+	serverInfo  *mcpinfra.ServerInfo
+	sessionID   string
+	tools       []mcpinfra.Tool
+	resources   []mcpinfra.Resource
+	prompts     []mcpinfra.Prompt
+	callables   []toolCallEvidence
 	// skipped names tools that were NOT invoked because their name suggests a
 	// state-changing/destructive operation — surfaced so an operator can verify
 	// callability by hand rather than have the scanner trigger side effects.
@@ -148,6 +150,7 @@ func (m *Module) tryStreamableHTTP(
 	return &mcpEndpoint{
 		path:       path,
 		transport:  "streamable-http",
+		proof:      mcpinfra.NewProof(initResult.Exchange),
 		serverInfo: initResult.ServerInfo,
 		sessionID:  client.SessionID(),
 	}
@@ -169,6 +172,7 @@ func (m *Module) trySSETransport(
 		body = resp.Body().String()
 	}
 	isSSE := mcpinfra.HasSSEContentType(resp)
+	handshake := http.CaptureEvidence(resp)
 	resp.Close()
 
 	if !isSSE {
@@ -197,10 +201,13 @@ func (m *Module) trySSETransport(
 
 	initResult, err := client.Initialize()
 	if err != nil {
-		return &mcpEndpoint{path: path, transport: "sse"}
+		return &mcpEndpoint{path: path, transport: "sse", proof: mcpinfra.NewProof(handshake)}
 	}
 
+	proof := mcpinfra.NewProof(initResult.Exchange)
+	proof.Confirmation(handshake)
 	return &mcpEndpoint{
+		proof:      proof,
 		path:       path,
 		transport:  "sse",
 		serverInfo: initResult.ServerInfo,
@@ -222,12 +229,15 @@ func (m *Module) enumerateAndInvoke(
 
 	if tools, err := client.ListTools(); err == nil && tools != nil {
 		ep.tools = tools.Tools
+		ep.proof.Observe(tools.Exchange)
 	}
 	if resources, err := client.ListResources(); err == nil && resources != nil {
 		ep.resources = resources.Resources
+		ep.proof.Observe(resources.Exchange)
 	}
 	if prompts, err := client.ListPrompts(); err == nil && prompts != nil {
 		ep.prompts = prompts.Prompts
+		ep.proof.Observe(prompts.Exchange)
 	}
 
 	maxTools := 10
@@ -244,7 +254,7 @@ func (m *Module) enumerateAndInvoke(
 			continue
 		}
 		args := mcpinfra.GenerateSampleArgs(tool.InputSchema)
-		callResult, _, err := client.CallTool(100+i, tool.Name, args)
+		callResult, _, exchange, err := client.CallToolEvidence(100+i, tool.Name, args)
 		if err != nil || callResult == nil {
 			continue
 		}
@@ -263,7 +273,25 @@ func (m *Module) enumerateAndInvoke(
 		}
 		// A tool that returns a live credential in its output is a direct data
 		// leak — scan the (unauthenticated) response for high-confidence secrets.
+		if ep.proof == nil {
+			ep.proof = &mcpinfra.Proof{}
+		}
+		if len(ep.callables) == 0 {
+			ep.proof.Observe(ep.proof.Primary)
+			ep.proof.Primary = exchange
+			ep.proof.Payload = string(mcpinfra.BuildToolsCallRequest(100+i, tool.Name, args))
+		} else {
+			ep.proof.Observe(exchange)
+		}
 		secretKinds := scanSecrets(respText)
+		if len(secretKinds) > 0 {
+			if ep.secretProof == nil {
+				ep.secretProof = mcpinfra.NewProof(exchange)
+				ep.secretProof.Payload = string(mcpinfra.BuildToolsCallRequest(100+i, tool.Name, args))
+			} else {
+				ep.secretProof.Observe(exchange)
+			}
+		}
 		for _, kind := range secretKinds {
 			ep.secretLeaks = append(ep.secretLeaks, fmt.Sprintf("%s -> %s", tool.Name, kind))
 		}
@@ -404,8 +432,39 @@ func (m *Module) buildResults(ctx *httpmsg.HttpRequestResponse, endpoints []mcpE
 		desc = fmt.Sprintf("Credential-free probing invoked %d non-state-changing MCP tool(s) successfully at %s. Public tools may be intentional; privileged data access or harmful side effects were not established.", len(callableNames), urlx.Host)
 	}
 
+	proof, secretProof := &mcpinfra.Proof{}, &mcpinfra.Proof{}
+	// Select a returned successful invocation when present; otherwise an actual
+	// endpoint observation. The grouped report keeps bounded supporting receipts.
+	for _, ep := range endpoints {
+		if ep.proof != nil && (proof.Primary == nil || len(ep.callables) > 0) {
+			proof.Primary, proof.Payload = ep.proof.Primary, ep.proof.Payload
+			if len(ep.callables) > 0 {
+				break
+			}
+		}
+	}
+	for _, ep := range endpoints {
+		if ep.proof != nil {
+			if ep.proof.Primary != nil && proof.Primary != nil && ep.proof.Primary.ID != proof.Primary.ID {
+				proof.Observe(ep.proof.Primary)
+			}
+			for _, entry := range ep.proof.Context.Evidence() {
+				proof.Context.AddExchange(entry.Exchange, entry.Role, entry.Label)
+			}
+		}
+		if ep.secretProof != nil {
+			if secretProof.Primary == nil {
+				secretProof.Primary, secretProof.Payload = ep.secretProof.Primary, ep.secretProof.Payload
+			} else {
+				secretProof.Observe(ep.secretProof.Primary)
+			}
+			for _, entry := range ep.secretProof.Context.Evidence() {
+				secretProof.Context.AddExchange(entry.Exchange, entry.Role, entry.Label)
+			}
+		}
+	}
 	results := []*output.ResultEvent{
-		{
+		proof.Observation(&output.ResultEvent{
 			ModuleID:         ModuleID,
 			RecordKind:       kind,
 			EvidenceGrade:    grade,
@@ -427,13 +486,13 @@ func (m *Module) buildResults(ctx *httpmsg.HttpRequestResponse, endpoints []mcpE
 				},
 			},
 			Metadata: map[string]any{"anonymous_tested": anonymousTested, "endpoint_count": len(endpoints), "capability_count": len(toolNames), "callable_count": len(callableNames), "privileged_impact_confirmed": false},
-		},
+		}),
 	}
 
 	// A tool that returned a live credential in its (unauthenticated) output is
 	// a distinct, higher-signal data-leak finding.
 	if len(secretLeaks) > 0 {
-		results = append(results, &output.ResultEvent{
+		results = append(results, secretProof.Observation(&output.ResultEvent{
 			ModuleID:         ModuleID,
 			RecordKind:       output.RecordKindFinding,
 			EvidenceGrade:    output.EvidenceGradeImpact,
@@ -452,7 +511,7 @@ func (m *Module) buildResults(ctx *httpmsg.HttpRequestResponse, endpoints []mcpE
 				Reference:   []string{"https://modelcontextprotocol.io/specification/2025-11-25/server/tools"},
 			},
 			Metadata: map[string]any{"anonymous_tested": anonymousTested, "secret_values_redacted": true, "private_secret_format_confirmed": true},
-		})
+		}))
 	}
 
 	return results

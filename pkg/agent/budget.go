@@ -21,8 +21,9 @@ const (
 // RunBudget caps the cumulative spend of every agent call an Engine makes:
 // tool calls (--max-commands), input+output tokens (--token-budget) and
 // estimated USD cost (--max-cost-usd, priced for Model with claudecost). A
-// zero field is no cap. It is charged after each Engine.Run call completes, so
-// one call can overshoot by its own spend; the next call is never started.
+// zero field is no cap. It is charged after each runtime-call attempt in
+// Engine.Run, including failed attempts. One attempt can overshoot by its own
+// spend; subsequent attempts/calls do not start after the cap is reached.
 type RunBudget struct {
 	MaxCommands int
 	TokenBudget int64

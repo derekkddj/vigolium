@@ -89,12 +89,14 @@ func (m *Module) ScanPerInsertionPoint(
 		zap.String("param", paramName),
 		zap.String("baseValue", baseValue))
 
+	diffOptions := *m.options.DiffScanOptions
+	diffOptions.CaptureEvidence = true
 	payloadInjector := diffscan.NewPayloadInjector(
 		ctx.Request().Raw(),
 		ip,
 		httpService,
 		httpClient,
-		m.options.DiffScanOptions,
+		&diffOptions,
 	)
 
 	softBase, crudeFuzz, err := m.buildBaselines(payloadInjector, baseValue)
@@ -138,7 +140,8 @@ func (m *Module) ScanPerInsertionPoint(
 	// response diff, so a non-deterministic endpoint makes the break and escape
 	// probes diverge on every metric the differ tracks — here reported as a
 	// confidently matched template engine.
-	if modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+	guardProof := modkit.NewEvidenceCollector()
+	if modkit.EndpointVolatileWithEvidence(scanCtx, ctx, httpClient, guardProof) {
 		return nil, nil
 	}
 
@@ -152,15 +155,30 @@ func (m *Module) ScanPerInsertionPoint(
 	// pages), so it is surfaced as an informational lead for a human to confirm
 	// rather than an actionable High. The per-probe severity and the matched
 	// engines remain in the report body for triage context.
-	return []*output.ResultEvent{{
+	result := &output.ResultEvent{
 		URL:              urlx.String(),
-		Request:          string(ctx.Request().Raw()),
 		FuzzingParameter: paramName,
-		Info: output.Info{
-			Severity:    severity.Info,
-			Description: report,
-		},
-	}}, nil
+		Evidence:         selectAttackEvidence(results, softBase, modkit.MaxEvidencePairs-min(4, guardProof.Len())),
+		Info:             output.Info{Severity: severity.Info, Description: report},
+	}
+	result.EvidenceStatus = "missing"
+	for _, entry := range result.Evidence {
+		if entry.Primary && entry.Exchange != nil {
+			result.Request, result.Response = string(entry.Exchange.Request), string(entry.Exchange.Response)
+			result.EvidenceStatus = "selected"
+			// Payload and compatibility messages must describe the same selected
+			// break, including when earlier pairs were filtered from the report.
+			for _, attack := range results {
+				if attack != nil && attack.FirstSnapshot != nil && attack.FirstSnapshot.Exchange != nil && attack.FirstSnapshot.Exchange.ID == entry.ExchangeID {
+					result.Payload = attack.FirstSnapshot.Payload
+					break
+				}
+			}
+			break
+		}
+	}
+	modkit.AppendEvidence(result, guardProof)
+	return []*output.ResultEvent{result}, nil
 }
 
 // buildBaselines creates soft and crude baselines for SSTI detection.

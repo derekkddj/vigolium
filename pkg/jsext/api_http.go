@@ -23,7 +23,7 @@ func httpCoreFuncDefs() []JSFuncDef {
 			Effect:      EffectNetwork,
 			Category:    CatHTTP,
 			Signature:   ".get(url: string, opts?: {headers})",
-			Returns:     "{status, headers, body, raw}",
+			Returns:     "{status, headers, body, raw, request, url, exchange}",
 			Description: "Send an HTTP GET request.",
 			Example:     exHTTPGet,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -39,7 +39,7 @@ func httpCoreFuncDefs() []JSFuncDef {
 			Effect:      EffectNetwork,
 			Category:    CatHTTP,
 			Signature:   ".post(url: string, body: string, opts?: {headers})",
-			Returns:     "{status, headers, body, raw}",
+			Returns:     "{status, headers, body, raw, request, url, exchange}",
 			Description: "Send an HTTP POST request.",
 			Example:     exHTTPPost,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -56,7 +56,7 @@ func httpCoreFuncDefs() []JSFuncDef {
 			Effect:      EffectNetwork,
 			Category:    CatHTTP,
 			Signature:   ".request({method, url, headers, body})",
-			Returns:     "{status, headers, body, raw}",
+			Returns:     "{status, headers, body, raw, request, url, exchange}",
 			Description: "Send a custom HTTP request with full control over method, headers, and body.",
 			Example:     exHTTPRequest,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -92,7 +92,7 @@ func httpCoreFuncDefs() []JSFuncDef {
 			Effect:      EffectNetwork,
 			Category:    CatHTTP,
 			Signature:   ".send(rawRequest: string)",
-			Returns:     "{status, headers, body, raw}",
+			Returns:     "{status, headers, body, raw, request, url, exchange}",
 			Description: "Send a raw HTTP request string (as built by insertion.buildRequest).",
 			Example:     exHTTPSend,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -176,7 +176,7 @@ func doRawRequestTo(vm *sobek.Runtime, httpClient *http.Requester, rawReq, targe
 
 	hrr := httpmsg.NewHttpRequestResponse(req, nil)
 
-	respChain, elapsed, err := httpClient.Execute(hrr, http.Options{})
+	respChain, elapsed, err := httpClient.Execute(hrr, http.Options{NoClustering: true})
 	// The requester's own measurement, which starts after rate/host admission —
 	// so elapsed_ms reports the target's latency rather than vigolium's queue.
 	elapsedMs := elapsed.Milliseconds()
@@ -192,6 +192,7 @@ func doRawRequestTo(vm *sobek.Runtime, httpClient *http.Requester, rawReq, targe
 		return sobek.Undefined()
 	}
 
+	exchange := http.CaptureEvidence(respChain)
 	fullResp := respChain.FullResponseBytes()
 	rawResponseCopy := make([]byte, len(fullResp))
 	copy(rawResponseCopy, fullResp)
@@ -204,6 +205,7 @@ func doRawRequestTo(vm *sobek.Runtime, httpClient *http.Requester, rawReq, targe
 	_ = result.Set("body", string(httpResp.Body()))
 	_ = result.Set("raw", string(rawResponseCopy))
 	_ = result.Set("elapsed_ms", elapsedMs)
+	attachResponseExchange(vm, result, exchange)
 
 	_ = result.Set("headers", newHeadersObject(vm, httpResp.Headers()))
 

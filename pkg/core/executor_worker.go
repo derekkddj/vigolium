@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/vigolium/vigolium/internal/config"
@@ -14,68 +15,68 @@ import (
 	"go.uber.org/zap"
 )
 
-// feedItems pumps the input source into itemCh. It returns whether the source
-// was EXHAUSTED — true only on io.EOF. Every other way out (cancellation, a
-// deadline, a stop while paused, a blocked send) means items were left unread,
-// which is the one fact the caller needs to know and could not previously learn:
-// the function returned nothing, so a cancelled feed and a fully consumed one
-// were the same event.
-func (e *Executor) feedItems(ctx context.Context, itemCh chan<- *work.WorkItem) (exhausted bool) {
-	// Sources report per-item failures by returning a non-EOF error from Next();
-	// we log and skip the bad item, then keep reading. This must NOT abort the
-	// feed: e.g. TargetSource advances its cursor before validating a URL, so a
-	// malformed entry returns an error but the next call yields the next valid
-	// target — bailing out here would silently drop the rest of the input.
-	// Exhaustion is signalled by io.EOF (a source that can't make progress, like
-	// a FileSource whose parse failed, reports its error once and then EOFs).
-	//
-	// The only hazard is a source that returns the same error on every call
-	// without ever yielding an item or EOF; an unconditional retry would peg a
-	// CPU. We guard against that with a small backoff once errors arrive
-	// back-to-back with no item in between — a spin guard only, never a reason
-	// to drop input. A source that interleaves errors with items resets the
-	// streak and never pays the cost.
+// fatalSourceError lets a source declare that retrying cannot make progress.
+// The structural contract avoids coupling input adapters to the executor or DB.
+// errors.As also recognizes this declaration through wrapped errors.
+type fatalSourceError interface {
+	FatalSourceError() bool
+}
+
+// feedItems returns exhausted only on EOF. A declared terminal source failure
+// stops further pulls and is returned unchanged after Execute drains accepted
+// work. It is never acknowledged, silently skipped, or retried indefinitely.
+func (e *Executor) feedItems(ctx context.Context, itemCh chan<- *work.WorkItem) (exhausted bool, feedErr error) {
+	// Ordinary per-item errors retain their historical retry/skip behavior:
+	// TargetSource, for example, advances past an invalid URL before returning
+	// its error. Only an explicitly fatal error forbids reading another item.
+	// Backoff prevents a non-fatal, non-progressing source from spinning a CPU.
 	const spinGuardThreshold = 4
 	consecutiveErrors := 0
+	next := e.source.Next
+	if !e.cfg.DisableFeedback {
+		pull, stop := e.sourceReader(ctx, itemCh)
+		defer stop()
+		next = func(context.Context) (*work.WorkItem, error) { return pull() }
+	}
 	for {
 		select {
 		case <-ctx.Done():
-			return false
+			return false, nil
 		default:
 		}
 
-		// Drain any pending feedback items (non-blocking) before pulling from source
+		// Drain pending feedback before pulling from source.
 		e.drainFeedback(ctx, itemCh)
 		if !e.requeueDeferred(ctx, itemCh, false) {
-			return false
+			return false, nil
 		}
 
-		// Block feeding while paused
 		if e.cfg.PauseCtrl != nil {
 			if !e.cfg.PauseCtrl.WaitIfPaused(ctx) {
-				return false
+				return false, nil
 			}
 		}
 
-		item, err := e.source.Next(ctx)
+		item, err := next(ctx)
 		if err != nil {
+			var fatal fatalSourceError
+			if errors.As(err, &fatal) && fatal.FatalSourceError() {
+				return false, err
+			}
 			if source.IsEOF(err) {
-				return true
+				return true, nil
 			}
 			if ctx.Err() != nil {
-				return false
+				return false, nil
 			}
 			consecutiveErrors++
 			zap.L().Warn("Error reading from source",
 				zap.Error(err),
 				zap.Int("consecutive_errors", consecutiveErrors))
-			// Spin guard: only sleep once errors come back-to-back with no item
-			// in between (a source stuck returning the same error). This never
-			// fires for sources that keep making progress between errors.
 			if consecutiveErrors >= spinGuardThreshold {
 				select {
 				case <-ctx.Done():
-					return false
+					return false, nil
 				case <-time.After(50 * time.Millisecond):
 				}
 			}
@@ -84,7 +85,7 @@ func (e *Executor) feedItems(ctx context.Context, itemCh chan<- *work.WorkItem) 
 		consecutiveErrors = 0
 
 		if !e.sendItem(ctx, item, itemCh) {
-			return false
+			return false, nil
 		}
 	}
 }
@@ -125,45 +126,66 @@ func (e *Executor) drainFeedbackOverflow(ctx context.Context, itemCh chan<- *wor
 // sendItem applies scope/static filters and sends the item to itemCh.
 // Returns false if context is cancelled.
 func (e *Executor) sendItem(ctx context.Context, item *work.WorkItem, itemCh chan<- *work.WorkItem) bool {
+	if !e.admitRequest(item, item.Request) {
+		item.Complete()
+		return true
+	}
+
+	// Admission precedes enqueue so EOF cannot look idle while a worker is
+	// unscheduled or between dequeue and tracker creation. Filtered items above
+	// are already complete and never enter this run's pending count.
+	pending := runPendingFromContext(ctx)
+	if pending != nil {
+		pending.Add(1)
+	}
+	select {
+	case <-ctx.Done():
+		if pending != nil {
+			pending.Add(-1)
+		}
+		return false
+	case itemCh <- item:
+		return true
+	}
+}
+
+// admitRequest is shared by initial admission and transformed pre-hook requests.
+// It must run before fetch; a post-response scope check cannot undo an egress.
+func (e *Executor) admitRequest(item *work.WorkItem, req *httpmsg.HttpRequestResponse) bool {
+	if req == nil || req.Request() == nil || req.Service() == nil {
+		return false
+	}
+	item.StaticMeta = false
 	// Always filter static files before HTTP fetch — EXCEPT object-storage
 	// assets, which are kept and recorded metadata-only (HEAD, body stripped)
 	// so the CDN traversal modules can probe storage-fronted static URLs.
 	if e.cfg.StaticFileMatcher != nil &&
-		e.cfg.StaticFileMatcher.IsStaticFile(item.Request.Request().Path()) {
-		if e.staticStorageCandidate(item.Request) {
+		e.cfg.StaticFileMatcher.IsStaticFile(req.Request().Path()) {
+		if e.staticStorageCandidate(req) {
 			item.StaticMeta = true
 		} else {
 			e.noteUnanswered(item, SkipStaticFile, nil)
-			item.Complete()
-			return true
+			return false
 		}
 	}
 
 	// Pre-request scope check (host/path only — avoids HTTP call)
-	if e.cfg.ScopeMatcher != nil && item.Request.Service() != nil {
-		host, path := item.Request.Service().Host(), item.Request.Request().Path()
+	if e.cfg.ScopeMatcher != nil {
+		host, path := req.Service().Host(), req.Request().Path()
 		if class := e.cfg.ScopeMatcher.RequestRejectClass(host, path, e.cfg.FetchStaticFiles); class != "" {
 			e.noteScopeRejected(class)
 			e.noteUnanswered(item, DropOutOfScope, nil)
-			item.Complete()
-			return true
+			return false
 		}
 	}
 
 	// Dead-host breaker: drop items for a quarantined host:port, with a count
 	// (skipped_quarantined). Read-only — see skipQuarantined.
-	if e.skipQuarantined(item.Request) {
+	if e.skipQuarantined(req) {
 		e.noteUnanswered(item, DropQuarantined, hosterrors.ErrUnresponsiveHost)
-		item.Complete()
-		return true
-	}
-
-	select {
-	case <-ctx.Done():
 		return false
-	case itemCh <- item:
-		return true
 	}
+	return true
 }
 
 // worker pulls items and runs each one up to the end of its dispatch phase:
@@ -216,6 +238,7 @@ func (e *Executor) worker(ctx context.Context, _ int, itemCh <-chan *work.WorkIt
 				continue
 			}
 			t := e.newItemTracker(ctx, item, true)
+			t.runPending = runPendingFromContext(ctx)
 			// PauseCtrl covers the worker's own part only. Tasks already
 			// dispatched keep running after Pause returns; see PauseController.
 			if e.cfg.PauseCtrl != nil {
@@ -311,6 +334,27 @@ func (e *Executor) processItemDetached(t *itemTracker) {
 	default:
 	}
 
+	// Pre-hooks transform what will be sent, not an already answered exchange.
+	// Retaining the previous response for a changed request would fabricate a
+	// pair before even reaching evidence selection.
+	if e.hooks != nil {
+		// Only the mutable request and destination are needed to detect a hook
+		// transformation. Copying the response/receipt here doubled large inputs,
+		// including on the overwhelmingly common path with no hooks at all.
+		before := httpmsg.NewHttpRequestResponse(req.Request().Clone(), nil)
+		var ok bool
+		req, ok = e.applyPreHooks(req)
+		if !ok {
+			return
+		}
+		if !sameInputRequest(before, req) {
+			req = req.WithResponse(nil)
+			if !e.admitRequest(item, req) {
+				return
+			}
+		}
+	}
+
 	var fetched baselineFetch
 	var ok bool
 	if item.StaticMeta {
@@ -336,6 +380,7 @@ func (e *Executor) processItemDetached(t *itemTracker) {
 	// the last active task is done with the item.
 	httpResp := fetched.resp
 	req, t.pooledBuf = fetched.req, fetched.pooledBuf
+	req = suppliedInputSnapshot(req)
 	redirectHops := fetched.hops
 	if fetched.blockedRemark != "" {
 		item.Remarks = append(item.Remarks, fetched.blockedRemark)
@@ -382,11 +427,6 @@ func (e *Executor) processItemDetached(t *itemTracker) {
 		}
 	}
 
-	req, ok = e.applyPreHooks(req)
-	if !ok {
-		return
-	}
-
 	// Body size enforcement — truncate oversized bodies but defer drop/skip
 	// decisions until after passive modules run (they are read-only).
 	var bodySizeAction config.BodySizeAction
@@ -426,7 +466,10 @@ func (e *Executor) processItemDetached(t *itemTracker) {
 	// findings can link to the existing http_record instead of creating
 	// duplicate "finding" records.
 	if item.RecordUUID != "" && e.repo != nil {
-		e.caches.requestUUIDs.Store(req.Request().ID(), item.RecordUUID)
+		record, err := e.repo.GetRecordByUUID(ctx, item.RecordUUID)
+		if err == nil && e.recordMatchesInput(record, req) {
+			e.caches.requestUUIDs.Store(req.Request().ID(), item.RecordUUID)
+		}
 	}
 
 	// Pre-compute scope status before passive modules so scope-aware

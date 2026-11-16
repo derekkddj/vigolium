@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/uptrace/bun"
 
 	"github.com/vigolium/vigolium/pkg/agent"
 	"github.com/vigolium/vigolium/pkg/apicontract"
@@ -121,6 +120,7 @@ func init() {
 // overrides from `vigolium import` into emitImportReport. Empty fields fall
 // back to the auto-detected scan metadata / defaults, matching `vigolium export`.
 type importReportOpts struct {
+	projectUUID string // capture the write scope; do not re-resolve a pinned read scope
 	title       string
 	target      string
 	duration    string
@@ -378,6 +378,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 		reportSeverity, _ := cmd.Flags().GetString("severity")
 		reportSearch := importSearchFilter
 		opts := importReportOpts{
+			projectUUID: projectUUID,
 			title:       reportTitle,
 			target:      reportTarget,
 			duration:    reportDuration,
@@ -508,9 +509,9 @@ func importChanged(r *dbimport.Result) bool {
 	}
 	if m := r.MergeStats; m != nil {
 		return m.ProjectsMerged+m.ScansMerged+m.AgenticScansMerged+m.RecordsMerged+m.FindingsMerged+
-			m.FindingRecordsMerged+m.OASTMerged+m.ObservationsMerged+m.StatusEventsMerged > 0
+			m.FindingRecordsMerged+m.OASTMerged+m.OASTPlantingReceiptsMerged+m.ObservationsMerged+m.StatusEventsMerged > 0
 	}
-	if r.AgenticScanUUID() != "" || r.RecordsImported > 0 || r.FindingsSaved > 0 {
+	if r.AgenticScanUUID() != "" || r.RecordsImported > 0 || r.FindingsSaved > 0 || r.OASTPayloadsImported > 0 || r.OASTPlantingReceiptsImported > 0 {
 		return true
 	}
 	for _, n := range r.ImportedByType {
@@ -726,6 +727,12 @@ func importResultJSON(localPath string, r *dbimport.Result) map[string]any {
 	if r.RecordsSkippedDuplicate > 0 {
 		out["records_skipped_duplicate"] = r.RecordsSkippedDuplicate
 	}
+	if r.OASTPayloadsImported > 0 {
+		out["oast_payloads_imported"] = r.OASTPayloadsImported
+	}
+	if r.OASTPlantingReceiptsImported > 0 {
+		out["oast_planting_receipts_imported"] = r.OASTPlantingReceiptsImported
+	}
 	out["findings_total"] = r.FindingsTotal
 	out["findings_saved"] = r.FindingsSaved
 	out["findings_skipped"] = r.FindingsSkipped
@@ -770,7 +777,7 @@ func nonNilCounts(m map[string]int) map[string]int {
 
 // mergeResultJSON builds the -j document for a SQLite→SQLite merge import.
 func mergeResultJSON(srcPath string, s *database.MergeStats) map[string]any {
-	return map[string]any{
+	out := map[string]any{
 		"merged_from":            srcPath,
 		"records_merged":         s.RecordsMerged,
 		"findings_merged":        s.FindingsMerged,
@@ -781,6 +788,10 @@ func mergeResultJSON(srcPath string, s *database.MergeStats) map[string]any {
 		"finding_records_merged": s.FindingRecordsMerged,
 		"oast_merged":            s.OASTMerged,
 	}
+	if s.OASTPlantingReceiptsMerged > 0 {
+		out["oast_planting_receipts_merged"] = s.OASTPlantingReceiptsMerged
+	}
+	return out
 }
 
 // printImportResult renders the human CLI summary for the import. The shape
@@ -832,6 +843,12 @@ func printImportResult(localPath string, r *dbimport.Result) {
 		}
 	}
 
+	if r.OASTPayloadsImported > 0 {
+		fmt.Printf("  OAST payload context: %d retained\n", r.OASTPayloadsImported)
+	}
+	if r.OASTPlantingReceiptsImported > 0 {
+		fmt.Printf("  OAST planting receipts: %d retained\n", r.OASTPlantingReceiptsImported)
+	}
 	if sev := r.SeverityCounts; sev["high"] > 0 || sev["critical"] > 0 || sev["medium"] > 0 || sev["low"] > 0 {
 		fmt.Printf("  Severity: %s, %s, %s, %s\n",
 			terminal.BoldMagenta(fmt.Sprintf("%d critical", sev["critical"])),
@@ -885,6 +902,9 @@ func printMergeResult(srcPath string, s *database.MergeStats) {
 	if s.OASTMerged > 0 {
 		fmt.Printf("  OAST:         %d interactions merged\n", s.OASTMerged)
 	}
+	if s.OASTPlantingReceiptsMerged > 0 {
+		fmt.Printf("  OAST planting receipts: %d merged\n", s.OASTPlantingReceiptsMerged)
+	}
 }
 
 // emitImportReport renders a static report for the data just imported, reusing
@@ -905,7 +925,10 @@ func emitImportReport(ctx context.Context, db *database.DB, scan *database.Agent
 	if !ok {
 		return "", fmt.Errorf("unsupported report format %q", format)
 	}
-	gen, defaultTitle := rf.Render, rf.DefaultTitle
+	gen, defaultTitle := rf.RenderStream, rf.DefaultTitle
+	if gen == nil {
+		return "", fmt.Errorf("report format %q has no bounded producer renderer", format)
+	}
 
 	dest, err := expandOutputPlaceholders(outputArg)
 	if err != nil {
@@ -922,29 +945,36 @@ func emitImportReport(ctx context.Context, db *database.DB, scan *database.Agent
 	if scan != nil {
 		scanUUID = scan.UUID
 	}
-	var findings []*database.Finding
-	q := db.NewSelect().Model(&findings).
-		Where("record_kind IS NULL OR record_kind = '' OR record_kind = ?", database.RecordKindFinding).
-		OrderExpr("found_at DESC")
-	if scanUUID != "" {
-		q = q.Where("agentic_scan_uuid = ?", scanUUID)
+	projectUUID := opts.projectUUID
+	if scan != nil && scan.ProjectUUID != "" {
+		if projectUUID != "" && projectUUID != scan.ProjectUUID {
+			return "", fmt.Errorf("import report scan belongs to another project")
+		}
+		projectUUID = scan.ProjectUUID
 	}
-	// Finding filters mirror `vigolium export`'s findings query so the report
-	// contents stay consistent between the two commands.
-	if opts.search != "" {
-		p := database.LikeContains(opts.search)
-		q = q.Where(database.WithLikeEscape("(module_id LIKE ? OR module_name LIKE ? OR description LIKE ? OR matched_at LIKE ? OR severity LIKE ? OR url LIKE ? OR hostname LIKE ? OR extracted_results LIKE ?)"), p, p, p, p, p, p, p, p)
+	if projectUUID == "" {
+		projectUUID, err = effectiveProjectUUID()
+		if err != nil {
+			return "", err
+		}
+	}
+	filters := database.QueryFilters{ProjectUUID: projectUUID, FuzzyTerm: opts.search, SortBy: "found_at"}
+	if scanUUID != "" {
+		filters.AgenticScanUUIDs = []string{scanUUID}
 	}
 	if opts.severity != "" {
-		sevs := strings.Split(strings.ToLower(opts.severity), ",")
-		q = q.Where("LOWER(severity) IN (?)", bun.List(sevs))
+		for _, sev := range strings.Split(strings.ToLower(opts.severity), ",") {
+			filters.Severity = append(filters.Severity, strings.TrimSpace(sev))
+		}
 	}
-	if err := q.Scan(ctx); err != nil {
-		return "", fmt.Errorf("query findings for report: %w", err)
+	count, err := database.NewFindingsQueryBuilder(db, filters).Count(ctx)
+	if err != nil {
+		return "", fmt.Errorf("count findings for report: %w", err)
 	}
-	items := make([]any, 0, len(findings))
-	for _, f := range findings {
-		items = append(items, exportEnvelope{Type: "finding", Data: f})
+	produce := func(emit func(any) error) error {
+		return iterateFilteredEvidenceFindings(ctx, db, filters, func(f *database.Finding) error {
+			return emit(exportEnvelope{Type: "finding", Data: f})
+		})
 	}
 
 	title := defaultTitle
@@ -982,9 +1012,9 @@ func emitImportReport(ctx context.Context, db *database.DB, scan *database.Agent
 			detail = " (headless Chrome)"
 		}
 		fmt.Fprintf(os.Stderr, "%s %s\n", terminal.InfoSymbol(),
-			terminal.BoldCyan(fmt.Sprintf("Generating %s report%s — %d findings ...", format, detail, len(findings))))
+			terminal.BoldCyan(fmt.Sprintf("Generating %s report%s — %d findings ...", format, detail, count)))
 	}
-	if err := gen(items, localOutput, meta); err != nil {
+	if err := gen(produce, localOutput, meta); err != nil {
 		return "", err
 	}
 	if err := finalize(); err != nil {
@@ -1005,7 +1035,7 @@ func emitImportReport(ctx context.Context, db *database.DB, scan *database.Agent
 	// result document, which the caller emits after every artifact has landed.
 	if !globalJSON {
 		fmt.Printf("%s Report written: %s (%d findings, %s, format=%s)\n",
-			terminal.SuccessSymbol(), terminal.Cyan(dest), len(findings), scope, format)
+			terminal.SuccessSymbol(), terminal.Cyan(dest), count, scope, format)
 	}
 	return published, nil
 }

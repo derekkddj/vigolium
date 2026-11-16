@@ -37,6 +37,11 @@ type Result struct {
 	FindingsSkipped int
 	ParseErrors     int
 
+	// Accepted OAST metadata envelopes, including idempotent repeats. Unlike
+	// traffic/findings these preserve immutable nonce project/scan ownership.
+	OASTPayloadsImported         int
+	OASTPlantingReceiptsImported int
+
 	// RecordsSkippedDuplicate counts HTTP records whose uuid was already in the
 	// destination, so they were not inserted. Reported separately from
 	// RecordsImported because "0 imported" out of a 10,000-line export means
@@ -126,7 +131,8 @@ type Options struct {
 	// made an explicit project filter over such a source meaningless.
 	//
 	// Persistent `vigolium import` deliberately does NOT set it: importing into a
-	// project means the rows join that project.
+	// project means traffic/findings join that project. OAST metadata is never
+	// rehomed: without this option, a foreign or absent project binding is fatal.
 	PreserveProjectUUID bool
 
 	// MaxLineBytes caps a single JSONL line. 0 means DefaultMaxLineBytes.
@@ -169,6 +175,16 @@ const recordFlushBatch = 500
 // A single record larger than the budget is still written on its own — the
 // budget bounds batching, it never rejects data.
 const recordFlushBytes = 32 << 20
+
+// Findings may carry hydrated binary receipts as well as legacy inline proof.
+// Bound BOTH count and bytes before the repository clones/prepares a batch.
+// JSON envelope data size conservatively accounts for decoded receipt bytes,
+// strings and manifest metadata without serializing them a second time. A single
+// finding wider than the budget is still saved, alone; data is never truncated.
+const (
+	findingFlushBatch = 64
+	findingFlushBytes = 8 << 20
+)
 
 // ImportPath dispatches based on filesystem inspection of path: directory →
 // audit folder, .tar.gz/.tgz/.zip → archive, a vigolium SQLite result database
@@ -451,6 +467,13 @@ func ImportAudit(ctx context.Context, repo *database.Repository, folderPath, pro
 // envelopes ({"type": "...", "data": {...}}). When opts.AgenticScanUUID is
 // supplied, findings are tagged with that UUID; HTTP records are not tagged
 // (the schema does not carry an agentic_scan_uuid on records).
+//
+// Each record/finding batch commits independently. A later read/line-limit error
+// does not roll back earlier batches; finding save failures are reported in
+// Result.FindingsFailed while other findings continue to import. Callers needing
+// source-wide rollback must import into a disposable scratch database first.
+// Exact record UUID associations are soft references and survive findings being
+// committed before later records; no URL matching or inferred proof is needed.
 func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, projectUUID string, opts Options) (*Result, error) {
 	res := newResult()
 
@@ -467,21 +490,19 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 	}
 
 	var (
-		records      []*database.HTTPRecord
-		findings     []*database.Finding
-		scans        []*database.Scan
-		oasts        []*database.OASTInteraction
-		scopes       []*database.Scope
-		lineNum      int
-		recordLines  int
-		pendingBytes int
+		records             []*database.HTTPRecord
+		findings            []*database.Finding
+		scans               []*database.Scan
+		oasts               []*database.OASTInteraction
+		scopes              []*database.Scope
+		lineNum             int
+		recordLines         int
+		pendingBytes        int
+		pendingFindingBytes int
 	)
 
-	// flushRecords writes the buffered records and empties the buffer. Records
-	// are written as they are parsed rather than at the end so peak memory is the
-	// batch, not the file; findings stay buffered because SaveFindingsDirectBatch
-	// dedups on finding_hash across the whole batch and its per-finding results
-	// are what the summary is built from.
+	// Release buffered models after each independently committed batch so peak
+	// memory depends on the batch, not the size of the stream.
 	flushRecords := func() error {
 		if len(records) == 0 {
 			return nil
@@ -492,8 +513,30 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 		}
 		res.RecordsImported += len(inserted)
 		res.RecordsSkippedDuplicate += len(records) - len(inserted)
+		clear(records)
 		records = records[:0]
 		pendingBytes = 0
+		return nil
+	}
+
+	flushFindings := func() error {
+		if len(findings) == 0 {
+			return nil
+		}
+		// Make already parsed records visible to the project-ownership checks.
+		// Records not yet parsed remain exact soft references, safely retained in
+		// both the UUID array and junction without a foreign-key requirement.
+		if err := flushRecords(); err != nil {
+			return err
+		}
+		results, _ := repo.SaveFindingsDirectBatch(ctx, findings)
+		saved, skipped, failed := tallyFindingSaves(findings, results, res.SeverityCounts)
+		res.FindingsSaved += saved
+		res.FindingsSkipped += skipped
+		res.FindingsFailed += failed
+		clear(findings)
+		findings = findings[:0]
+		pendingFindingBytes = 0
 		return nil
 	}
 
@@ -507,15 +550,16 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 	}
 
 	// processLine parses a single JSONL envelope and appends to records/findings.
-	// A bare return here behaves like the old `continue` (skip this line, keep going).
-	processLine := func(line []byte) {
+	// A nil return skips invalid/unknown lines and continues; only persistence
+	// errors stop the stream.
+	processLine := func(line []byte) error {
 		var envelope struct {
 			Type string          `json:"type"`
 			Data json.RawMessage `json:"data"`
 		}
 		if err := json.Unmarshal(line, &envelope); err != nil {
 			res.ParseErrors++
-			return
+			return nil
 		}
 
 		switch envelope.Type {
@@ -523,7 +567,7 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 			var rec database.HTTPRecord
 			if err := json.Unmarshal(envelope.Data, &rec); err != nil {
 				res.ParseErrors++
-				return
+				return nil
 			}
 			rec.ProjectUUID = homeProject(rec.ProjectUUID)
 			if rec.UUID == "" {
@@ -543,7 +587,7 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 			var scan database.Scan
 			if err := json.Unmarshal(envelope.Data, &scan); err != nil || scan.UUID == "" {
 				res.ParseErrors++
-				return
+				return nil
 			}
 			scan.ProjectUUID = homeProject(scan.ProjectUUID)
 			scans = append(scans, &scan)
@@ -552,7 +596,7 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 			var oi database.OASTInteraction
 			if err := json.Unmarshal(envelope.Data, &oi); err != nil || oi.FullID == "" {
 				res.ParseErrors++
-				return
+				return nil
 			}
 			oi.ProjectUUID = homeProject(oi.ProjectUUID)
 			oasts = append(oasts, &oi)
@@ -560,12 +604,12 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 		case "scope":
 			if !opts.ImportScopes {
 				res.SkippedTypes[envelope.Type]++
-				return
+				return nil
 			}
 			var sc database.Scope
 			if err := json.Unmarshal(envelope.Data, &sc); err != nil || sc.RuleType == "" {
 				res.ParseErrors++
-				return
+				return nil
 			}
 			sc.ProjectUUID = homeProject(sc.ProjectUUID)
 			scopes = append(scopes, &sc)
@@ -574,7 +618,7 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 			var finding database.Finding
 			if err := json.Unmarshal(envelope.Data, &finding); err != nil {
 				res.ParseErrors++
-				return
+				return nil
 			}
 			finding.ProjectUUID = homeProject(finding.ProjectUUID)
 			if finding.FindingSource == "" {
@@ -589,11 +633,50 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 			if attachedScan != nil {
 				finding.AgenticScanUUID = attachedScan.UUID
 			}
+			// Flush before adding a finding that would exceed the byte budget.
+			// Only the single parsed outlier may be larger than a batch.
+			if len(findings) > 0 && pendingFindingBytes+len(envelope.Data) > findingFlushBytes {
+				if err := flushFindings(); err != nil {
+					return err
+				}
+			}
 			findings = append(findings, &finding)
+			pendingFindingBytes += len(envelope.Data)
+			res.FindingsTotal++
+			if len(findings) >= findingFlushBatch || pendingFindingBytes >= findingFlushBytes {
+				return flushFindings()
+			}
+
+		case "oast_payload":
+			var p database.OASTPayload
+			if err := json.Unmarshal(envelope.Data, &p); err != nil {
+				return fmt.Errorf("invalid OAST payload metadata: %w", err)
+			}
+			if p.ProjectUUID == "" || (!opts.PreserveProjectUUID && p.ProjectUUID != projectUUID) {
+				return fmt.Errorf("OAST nonce metadata cannot be rehomed from project %q to %q; preserve project UUIDs explicitly", p.ProjectUUID, projectUUID)
+			}
+			if err := repo.ImportOASTPayloadContext(ctx, &p); err != nil {
+				return err
+			}
+			res.OASTPayloadsImported++
+
+		case "oast_planting_receipt":
+			var row database.OASTPlantingReceipt
+			if err := json.Unmarshal(envelope.Data, &row); err != nil {
+				return fmt.Errorf("invalid OAST planting metadata: %w", err)
+			}
+			if row.ProjectUUID == "" || (!opts.PreserveProjectUUID && row.ProjectUUID != projectUUID) {
+				return fmt.Errorf("OAST planting receipt cannot be rehomed from project %q to %q; preserve project UUIDs explicitly", row.ProjectUUID, projectUUID)
+			}
+			if err := repo.SaveOASTPlantingReceipt(ctx, &row); err != nil {
+				return err
+			}
+			res.OASTPlantingReceiptsImported++
 
 		default:
 			res.SkippedTypes[envelope.Type]++
 		}
+		return nil
 	}
 
 	maxLine := opts.MaxLineBytes
@@ -616,8 +699,8 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 		partial bool
 	)
 	tooLong := func() error {
-		return fmt.Errorf("line %d exceeds %d bytes (%d records already committed); raise Options.MaxLineBytes if this file is genuinely that wide",
-			lineNum+1, maxLine, res.RecordsImported)
+		return fmt.Errorf("line %d exceeds %d bytes (%d records already committed) (%d findings already committed); raise Options.MaxLineBytes if this file is genuinely that wide",
+			lineNum+1, maxLine, res.RecordsImported, res.FindingsSaved+res.FindingsSkipped)
 	}
 	for {
 		chunk, readErr := reader.ReadSlice('\n')
@@ -640,7 +723,9 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 		}
 		if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 {
 			lineNum++
-			processLine(trimmed)
+			if err := processLine(trimmed); err != nil {
+				return nil, err
+			}
 			if len(records) >= recordFlushBatch || pendingBytes >= recordFlushBytes {
 				if err := flushRecords(); err != nil {
 					return nil, err
@@ -651,7 +736,7 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 		// outlier's capacity for the rest of the import: MaxLineBytes allows a
 		// single 256 MiB line, and holding that array live behind thousands of
 		// small lines would dwarf the whole flush budget this function bounds.
-		if cap(acc) > recordFlushBytes {
+		if cap(acc) > findingFlushBytes {
 			acc = nil
 		} else {
 			acc = acc[:0]
@@ -666,19 +751,15 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 		}
 	}
 
-	if recordLines == 0 && len(findings) == 0 && len(scans) == 0 && len(oasts) == 0 && len(scopes) == 0 {
+	if recordLines == 0 && res.FindingsTotal == 0 && len(scans) == 0 && len(oasts) == 0 && len(scopes) == 0 && res.OASTPayloadsImported == 0 && res.OASTPlantingReceiptsImported == 0 {
 		return nil, fmt.Errorf("no importable data found (parsed %d lines, %d errors)", lineNum, res.ParseErrors)
 	}
 	if err := flushRecords(); err != nil {
 		return nil, err
 	}
-
-	results, _ := repo.SaveFindingsDirectBatch(ctx, findings)
-	saved, skipped, failed := tallyFindingSaves(findings, results, res.SeverityCounts)
-	res.FindingsTotal = len(findings)
-	res.FindingsSaved = saved
-	res.FindingsSkipped = skipped
-	res.FindingsFailed = failed
+	if err := flushFindings(); err != nil {
+		return nil, err
+	}
 
 	if err := importSideTables(ctx, repo, res, scans, oasts, scopes); err != nil {
 		return nil, err
@@ -691,8 +772,8 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 	if attachedScan != nil {
 		update := &database.AgenticScan{
 			UUID:         attachedScan.UUID,
-			SavedCount:   attachedScan.SavedCount + saved,
-			FindingCount: attachedScan.FindingCount + len(findings),
+			SavedCount:   attachedScan.SavedCount + res.FindingsSaved,
+			FindingCount: attachedScan.FindingCount + res.FindingsTotal,
 		}
 		// See ImportAudit: the scan row is the link between these findings and the
 		// run they belong to, so a failed update is reported rather than dropped.
@@ -821,6 +902,8 @@ func mergeResult(dst, src *Result) {
 	dst.FindingsSkipped += src.FindingsSkipped
 	dst.FindingsFailed += src.FindingsFailed
 	dst.ParseErrors += src.ParseErrors
+	dst.OASTPayloadsImported += src.OASTPayloadsImported
+	dst.OASTPlantingReceiptsImported += src.OASTPlantingReceiptsImported
 	for k, v := range src.SeverityCounts {
 		dst.SeverityCounts[k] += v
 	}

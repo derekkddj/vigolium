@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -119,15 +120,24 @@ func (m *Module) ScanPerRequest(
 	// to a real author slug. Whatever it yields is the site's generic redirect for
 	// an unknown author; any real probe matching it is reading that same catch-all,
 	// not a leak.
-	baseline := m.probeAuthor(anonymousCtx, anonymousClient, baselineAuthorID)
+	var controlReceipt, authorReceipt *evidence.Exchange
+	baseline := m.probeAuthor(anonymousCtx, anonymousClient, baselineAuthorID, &controlReceipt)
+	authorEvidence := modkit.NewEvidenceCollector()
+	authorEvidence.AddExchange(controlReceipt, evidence.RoleControl, "nonexistent author ID")
 
 	var rawSlugs []string
 	seen := map[string]bool{}
 	var authorUsers []string
 	for i := 1; i <= 5; i++ {
-		username := m.probeAuthor(anonymousCtx, anonymousClient, i)
+		var receipt *evidence.Exchange
+		username := m.probeAuthor(anonymousCtx, anonymousClient, i, &receipt)
 		if username == "" || username == baseline {
 			continue
+		}
+		if authorReceipt == nil {
+			authorReceipt = receipt
+		} else {
+			authorEvidence.AddExchange(receipt, evidence.RoleObservation, "distinct public author probe")
 		}
 		rawSlugs = append(rawSlugs, username)
 		if !seen[username] {
@@ -145,13 +155,15 @@ func (m *Module) ScanPerRequest(
 	}
 
 	if len(authorUsers) > 0 {
-		results = append(results, &output.ResultEvent{
-			ModuleID:         ModuleID,
-			RecordKind:       output.RecordKindObservation,
-			EvidenceGrade:    output.EvidenceGradeObservation,
-			URL:              baseURL + "/?author=1",
-			Matched:          baseURL + "/?author=1",
-			ExtractedResults: authorUsers,
+		result := &output.ResultEvent{
+			Evidence:           authorEvidence.Evidence(),
+			AdditionalEvidence: authorEvidence.Entries(),
+			ModuleID:           ModuleID,
+			RecordKind:         output.RecordKindObservation,
+			EvidenceGrade:      output.EvidenceGradeObservation,
+			URL:                baseURL + "/?author=1",
+			Matched:            baseURL + "/?author=1",
+			ExtractedResults:   authorUsers,
 			Info: output.Info{
 				Name:        "WordPress Public Author Slugs Observed",
 				Description: fmt.Sprintf("Observed %d distinct WordPress author slug(s) through public /?author=N canonical redirects: %s. Public author archives are normal CMS behavior; no login weakness was tested.", len(authorUsers), strings.Join(authorUsers, ", ")),
@@ -165,13 +177,16 @@ func (m *Module) ScanPerRequest(
 				"credential_free":         true,
 				"authentication_weakness": false,
 			},
-		})
+		}
+		modkit.SetPrimaryEvidence(result, authorReceipt, evidence.RoleObservation, "selected public author redirect")
+		results = append(results, result)
 	}
 
 	// 2. REST API user enumeration: /wp-json/wp/v2/users
-	restUsers := m.probeRESTUsers(anonymousCtx, anonymousClient)
+	var restReceipt *evidence.Exchange
+	restUsers := m.probeRESTUsers(anonymousCtx, anonymousClient, &restReceipt)
 	if len(restUsers) > 0 {
-		results = append(results, &output.ResultEvent{
+		result := &output.ResultEvent{
 			ModuleID:         ModuleID,
 			RecordKind:       output.RecordKindObservation,
 			EvidenceGrade:    output.EvidenceGradeObservation,
@@ -191,13 +206,15 @@ func (m *Module) ScanPerRequest(
 				"credential_free":         true,
 				"private_accounts_proven": false,
 			},
-		})
+		}
+		modkit.SetPrimaryEvidence(result, restReceipt, evidence.RoleObservation, "public REST author collection")
+		results = append(results, result)
 	}
 
 	return results, nil
 }
 
-func (m *Module) probeAuthor(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, authorID int) string {
+func (m *Module) probeAuthor(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, authorID int, receiptOut ...**evidence.Exchange) string {
 	path := fmt.Sprintf("/?author=%d", authorID)
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
@@ -217,6 +234,9 @@ func (m *Module) probeAuthor(ctx *httpmsg.HttpRequestResponse, httpClient *http.
 		return ""
 	}
 	defer resp.Close()
+	if len(receiptOut) > 0 && receiptOut[0] != nil {
+		*receiptOut[0] = http.CaptureEvidence(resp)
+	}
 
 	if resp.Response() == nil {
 		return ""
@@ -298,7 +318,7 @@ func isNumeric(s string) bool {
 	return len(s) > 0
 }
 
-func (m *Module) probeRESTUsers(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) []string {
+func (m *Module) probeRESTUsers(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, receiptOut ...**evidence.Exchange) []string {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
@@ -347,6 +367,9 @@ func (m *Module) probeRESTUsers(ctx *httpmsg.HttpRequestResponse, httpClient *ht
 		if u.Slug != "" {
 			slugs = append(slugs, u.Slug)
 		}
+	}
+	if len(slugs) > 0 && len(receiptOut) > 0 && receiptOut[0] != nil {
+		*receiptOut[0] = http.CaptureEvidence(resp)
 	}
 	return slugs
 }

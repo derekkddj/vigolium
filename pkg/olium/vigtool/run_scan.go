@@ -2,7 +2,6 @@ package vigtool
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -183,31 +182,12 @@ func (r *runScanTool) Execute(ctx context.Context, args map[string]any, onUpdate
 	r.count.Add(1)
 
 	res, err := runner.LaunchScan(ctx, params)
+	details := reconcileScanReceipt(ctx, r.ctx, res)
 	if err != nil {
-		uuid := ""
-		if res != nil {
-			uuid = res.ScanUUID
-		}
-		return tool.Result{
-			Content: fmt.Sprintf("scan failed (uuid=%s): %v", uuid, err),
-			IsError: true,
-		}, nil
+		return failedScanReceipt("scan", res, err, details), nil
 	}
 
-	// Attribute this child scan (and its findings) to the parent agentic scan.
-	// The scan blocked to completion above, so every finding exists by now.
-	r.ctx.attributeChildScan(ctx, res.ScanUUID)
-
-	body, _ := json.Marshal(res)
-	return tool.Result{
-		Content: string(body),
-		Details: map[string]any{
-			"scan_uuid":     res.ScanUUID,
-			"status":        res.Status,
-			"finding_count": res.FindingCount,
-			"duration_ms":   res.DurationMs,
-		},
-	}, nil
+	return successfulScanReceipt(res, details), nil
 }
 
 // parseAgentRawRequest accepts either a curl command or a raw HTTP request

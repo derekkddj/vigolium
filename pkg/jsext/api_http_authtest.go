@@ -143,8 +143,10 @@ func httpAuthTestFuncDefs() []JSFuncDef {
 						origResp := doRawRequestBytes(httpClient, rec.rawReq)
 						origBody := ""
 						origStatus := 0
+						var original sobek.Value = sobek.Undefined()
 						if !origResp.err && len(origResp.raw) > 0 {
-							builtResp := buildResponseObject(vm, origResp.raw, origResp.elapsed)
+							builtResp := buildResponseObject(vm, origResp.raw, origResp.elapsed, origResp.exchange)
+							original = builtResp
 							if !sobek.IsUndefined(builtResp) {
 								respObj := builtResp.ToObject(vm)
 								if v := respObj.Get("body"); v != nil && !sobek.IsUndefined(v) {
@@ -156,41 +158,37 @@ func httpAuthTestFuncDefs() []JSFuncDef {
 							}
 						}
 
-						// Test each session concurrently
-						type sessionResult struct {
-							label      string
-							status     int
-							body       string
-							similarity float64
-							accessible bool
-						}
-						sessionResults := make([]sessionResult, numSessions)
-						var wg sync.WaitGroup
-
+						// Like sessionPool.broadcast, all session JS calls happen on the
+						// VM thread. Workers only send prepared Go requests into owned slots.
+						preparedReqs := make([]string, numSessions)
 						for si, sess := range sessions {
+							preparedReqs[si] = injectSessionHeaders(vm, rec.rawReq, sess.obj)
+						}
+						sessionResponses := make([]respSlot, numSessions)
+						var wg sync.WaitGroup
+						for si, rawReq := range preparedReqs {
 							wg.Add(1)
-							go func(idx int, s sessionEntry) {
+							go func(idx int, raw string) {
 								defer wg.Done()
+								sessionResponses[idx] = doRawRequestBytes(httpClient, raw)
+							}(si, rawReq)
+						}
+						wg.Wait()
 
-								// Inject session headers into the raw request
-								modifiedReq := injectSessionHeaders(vm, rec.rawReq, s.obj)
-
-								resp := doRawRequestBytes(httpClient, modifiedReq)
-								if resp.err {
-									sessionResults[idx] = sessionResult{
-										label:      s.label,
-										status:     0,
-										similarity: 0,
-										accessible: false,
-									}
-									return
-								}
-
-								builtResp := buildResponseObject(vm, resp.raw, resp.elapsed)
-								respStatus := 0
-								respBody := ""
-								if !sobek.IsUndefined(builtResp) {
-									respObj := builtResp.ToObject(vm)
+						// Build response objects and register invocation receipts only
+						// after workers finish, back on the VM thread.
+						sessResultsJS := make([]interface{}, numSessions)
+						accessibleCount := 0
+						for si, resp := range sessionResponses {
+							var response sobek.Value = sobek.Undefined()
+							respStatus := 0
+							respBody := ""
+							sim := 0.0
+							accessible := false
+							if !resp.err {
+								response = buildResponseObject(vm, resp.raw, resp.elapsed, resp.exchange)
+								if !sobek.IsUndefined(response) {
+									respObj := response.ToObject(vm)
 									if v := respObj.Get("status"); v != nil && !sobek.IsUndefined(v) {
 										respStatus = int(v.ToInteger())
 									}
@@ -198,38 +196,21 @@ func httpAuthTestFuncDefs() []JSFuncDef {
 										respBody = v.String()
 									}
 								}
-
-								sim := jaccardSimilarity(origBody, respBody)
-
-								// Heuristic: accessible if same status class + high body similarity
-								accessible := false
+								sim = jaccardSimilarity(origBody, respBody)
+								// Same heuristic and summary fields as before; selection
+								// remains the script's explicit decision, not this score.
 								if origStatus > 0 && respStatus > 0 {
-									sameStatusClass := (origStatus / 100) == (respStatus / 100)
-									accessible = sameStatusClass && sim > 0.8
+									accessible = (origStatus/100) == (respStatus/100) && sim > 0.8
 								}
-
-								sessionResults[idx] = sessionResult{
-									label:      s.label,
-									status:     respStatus,
-									body:       respBody,
-									similarity: sim,
-									accessible: accessible,
-								}
-							}(si, sess)
-						}
-						wg.Wait()
-
-						// Build result object for this record
-						sessResultsJS := make([]interface{}, numSessions)
-						accessibleCount := 0
-						for i, sr := range sessionResults {
-							sessResultsJS[i] = map[string]interface{}{
-								"session_label":   sr.label,
-								"status":          sr.status,
-								"body_similarity": sr.similarity,
-								"accessible":      sr.accessible,
 							}
-							if sr.accessible {
+							sessResultsJS[si] = map[string]interface{}{
+								"session_label":   sessions[si].label,
+								"status":          respStatus,
+								"body_similarity": sim,
+								"accessible":      accessible,
+								"response":        response,
+							}
+							if accessible {
 								accessibleCount++
 							}
 						}
@@ -248,6 +229,7 @@ func httpAuthTestFuncDefs() []JSFuncDef {
 						}
 
 						results[ri] = map[string]interface{}{
+							"original":      original,
 							"record_uuid":   rec.uuid,
 							"url":           rec.url,
 							"results":       sessResultsJS,

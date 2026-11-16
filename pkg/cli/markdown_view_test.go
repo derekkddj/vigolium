@@ -69,7 +69,7 @@ func TestRenderFindingMarkdownWindowsResponse(t *testing.T) {
 	renderFindingMarkdown(f, nil, &sb, true) // compact = true
 	out := sb.String()
 
-	for _, want := range []string{"## [HIGH] Reflected XSS", "### Request", "### Response", "```http", "**Module:** `xss-light`"} {
+	for _, want := range []string{"## [HIGH] Reflected XSS", "### Legacy inline request — role unknown (not proof)", "### Legacy inline response — role unknown (not proof)", "```http", "**Module:** `xss-light`"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("markdown missing %q\n---\n%s", want, out)
 		}

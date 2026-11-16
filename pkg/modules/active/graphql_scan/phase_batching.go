@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/output"
@@ -84,6 +85,7 @@ func (m *Module) phaseBatching(
 	httpClient *http.Requester,
 	endpointPath, target string,
 ) *output.ResultEvent {
+	arrayProof, aliasProof := &gqlProof{}, &gqlProof{}
 	arrayConfirmed := confirmRounds(defaultConfirmRounds, func() (bool, error) {
 		r, err := m.send(ctx, httpClient, "POST", endpointPath, "application/json", buildArrayBatch(batchProbeSize))
 		if err != nil {
@@ -92,6 +94,7 @@ func (m *Module) phaseBatching(
 		if r.blocked {
 			return false, nil
 		}
+		arrayProof.attack(r, buildArrayBatch(batchProbeSize))
 		return countArrayResults(r.body) == batchProbeSize, nil
 	})
 
@@ -103,6 +106,7 @@ func (m *Module) phaseBatching(
 		if r.blocked {
 			return false, nil
 		}
+		aliasProof.attack(r, buildAliasBatch(batchProbeSize))
 		return countAliasResults(r.body, batchProbeSize) == batchProbeSize, nil
 	})
 
@@ -119,7 +123,17 @@ func (m *Module) phaseBatching(
 	}
 	formsStr := strings.Join(forms, " and ")
 
-	return &output.ResultEvent{
+	proof := aliasProof
+	if arrayConfirmed {
+		proof = arrayProof
+		if aliasConfirmed {
+			proof.context.AddExchange(aliasProof.primary, evidence.RoleObservation, "Alias batch observation")
+			for _, entry := range aliasProof.context.Evidence() {
+				proof.context.AddExchange(entry.Exchange, entry.Role, entry.Label)
+			}
+		}
+	}
+	return proof.observation(&output.ResultEvent{
 		ModuleID:      ModuleID,
 		RecordKind:    output.RecordKindCandidate,
 		EvidenceGrade: output.EvidenceGradeCandidate,
@@ -148,5 +162,5 @@ func (m *Module) phaseBatching(
 			"sensitive_operation": false,
 			"confirmation_rounds": defaultConfirmRounds,
 		},
-	}
+	})
 }

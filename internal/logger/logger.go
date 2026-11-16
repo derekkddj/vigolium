@@ -206,11 +206,7 @@ func Init(cfg Config) *zap.Logger {
 	// Sample high-volume debug/info logs: first 5 of each message per second,
 	// then every 100th thereafter. Warn/Error are never sampled.
 	if zapLevel <= zapcore.InfoLevel {
-		core = zapcore.NewSamplerWithOptions(core,
-			time.Second,
-			5,
-			100,
-		)
+		core = sampleLowPriority(core)
 	}
 
 	opts := []zap.Option{zap.AddCallerSkip(0)}

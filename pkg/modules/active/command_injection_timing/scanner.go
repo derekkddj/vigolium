@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -193,7 +194,7 @@ func (m *Module) confirmTiming(
 	var rounds []roundTiming
 	// The no-sleep control (fast) and high-sleep proof (slow) from the final
 	// round, captured with their raw request/response for the finding's evidence.
-	var control, proof timedResult
+	var control, proof, lowProof timedResult
 
 	for round := 0; round < timeRounds; round++ {
 		// Capture request/response on the final round only — earlier rounds just
@@ -216,7 +217,7 @@ func (m *Module) confirmTiming(
 			return nil, nil // No delay from the high sleep payload
 		}
 
-		low, err := m.sendTimedPayload(ctx, httpClient, ip, render(sleepLow), false)
+		low, err := m.sendTimedPayload(ctx, httpClient, ip, render(sleepLow), capture)
 		if err != nil {
 			return nil, err
 		}
@@ -234,7 +235,7 @@ func (m *Module) confirmTiming(
 
 		rounds = append(rounds, roundTiming{noSleep.elapsed, low.elapsed, high.elapsed})
 		if capture {
-			control, proof = noSleep, high
+			control, proof, lowProof = noSleep, high, low
 		}
 	}
 
@@ -246,8 +247,9 @@ func (m *Module) confirmTiming(
 	sleepPayload := render(sleepHigh)
 
 	ev := modkit.NewEvidenceCollector()
-	ev.Add("baseline (unmodified request)", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
-	ev.Add("control: no-sleep payload returned fast", control.request, control.response)
+	ev.AddBaseline("baseline (unmodified request)", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
+	ev.AddExchange(control.exchange, evidence.RoleControl, "control: no-sleep payload returned fast")
+	ev.AddExchange(lowProof.exchange, evidence.RoleConfirmation, "low-sleep scaling confirmation")
 
 	extracted := []string{sleepPayload, render(0), tmpl.Label}
 	for i, r := range rounds {
@@ -257,12 +259,13 @@ func (m *Module) confirmTiming(
 	}
 
 	last := rounds[len(rounds)-1]
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		Request:            proof.request,
 		Response:           proof.response,
 		FuzzingParameter:   ip.Name(),
 		ExtractedResults:   extracted,
 		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
 		MatcherStatus:      true,
 		Info: output.Info{
 			Name: ModuleName,
@@ -289,13 +292,16 @@ func (m *Module) confirmTiming(
 			"sleep_high_s":        sleepHigh,
 			"sleep_low_s":         sleepLow,
 		},
-	}, nil
+	}
+	modkit.SetPrimaryEvidence(result, proof.exchange, evidence.RoleAttack, "selected probe")
+	return result, nil
 }
 
 // timedResult is one timed probe: its wall-clock latency plus, when capture is
 // requested, the raw request/response so a confirmed finding can carry the
 // actual proof pair as evidence instead of discarding it.
 type timedResult struct {
+	exchange *evidence.Exchange
 	elapsed  time.Duration
 	request  string
 	response string
@@ -331,6 +337,7 @@ func (m *Module) sendTimedPayload(
 	if capture {
 		res.request = string(fuzzedRaw)
 		res.response = resp.FullResponseString()
+		res.exchange = http.CaptureEvidence(resp)
 	}
 	resp.Close()
 

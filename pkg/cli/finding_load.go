@@ -185,6 +185,9 @@ func readFileContent(path string) (string, error) {
 
 // detectAndParse tries multiple format parsers and returns the first successful result.
 func detectAndParse(raw string, scanUUID string, projectUUID string) ([]*database.Finding, string, error) {
+	if findings, format, recognized, err := parseFindingBundle(raw, scanUUID, projectUUID); recognized {
+		return findings, format, err
+	}
 	// 0. vigolium's own dialects: export envelopes, then a finding -j document.
 	// Tried first because the agent parser below accepts any JSON array and
 	// would read them as untitled agent findings.
@@ -194,7 +197,11 @@ func detectAndParse(raw string, scanUUID string, projectUUID string) ([]*databas
 	if findings, err := tryParseFindingDocument(raw, scanUUID, projectUUID); err == nil && len(findings) > 0 {
 		return findings, "finding-json", nil
 	}
-
+	// Stored findings have a stable schema; decode them before a permissive
+	// agent parser can reinterpret module metadata and discard raw evidence.
+	if findings, err := tryParseDBFindings(raw, projectUUID); err == nil && len(findings) > 0 {
+		return findings, "db-finding", nil
+	}
 	// 1. Try agent findings format (handles markdown fences, {"findings":[...]}, bare arrays)
 	if findings, err := tryParseAgentFindings(raw, scanUUID, projectUUID); err == nil && len(findings) > 0 {
 		return findings, "agent-findings", nil
@@ -271,7 +278,7 @@ func tryParseResultEventJSONL(raw string, scanUUID string, projectUUID string) (
 		}
 
 		var event output.ResultEvent
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
+		if err := unmarshalFindingResultEvent([]byte(line), &event); err != nil {
 			return nil, fmt.Errorf("not JSONL format: %w", err)
 		}
 		// Detect ResultEvent by its distinctive field
@@ -304,7 +311,7 @@ func tryParseSingleResultEvent(raw string, scanUUID string, projectUUID string) 
 	raw = strings.TrimSpace(raw)
 
 	var event output.ResultEvent
-	if err := json.Unmarshal([]byte(raw), &event); err != nil {
+	if err := unmarshalFindingResultEvent([]byte(raw), &event); err != nil {
 		return nil, err
 	}
 	if event.ModuleID == "" {
@@ -333,6 +340,9 @@ func tryParseDBFindings(raw string, projectUUID string) ([]*database.Finding, er
 	var arr []*database.Finding
 	if err := json.Unmarshal([]byte(raw), &arr); err == nil && len(arr) > 0 {
 		for _, f := range arr {
+			if f == nil || (f.ModuleID == "" && f.FindingHash == "") {
+				return nil, fmt.Errorf("not a valid database Finding array")
+			}
 			if f.ProjectUUID == "" {
 				f.ProjectUUID = projectUUID
 			}

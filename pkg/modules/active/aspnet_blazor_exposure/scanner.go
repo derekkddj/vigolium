@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -132,7 +133,9 @@ func (m *Module) probeEndpoint(
 	httpClient *http.Requester,
 	p probe,
 	fp *notFoundFingerprint,
-) *output.ResultEvent {
+) (guardResult *output.ResultEvent) {
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(guardResult, guardProof) }()
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
@@ -231,14 +234,14 @@ func (m *Module) probeEndpoint(
 	// exposed resource has no such sibling (the decoy 404s), so this costs no true
 	// positives, and it survives the body-truncation quirk because the decoy is run
 	// through the same marker predicate rather than a body-similarity compare.
-	if modkit.MultiRoundExtDecoyCatchAll(ctx, httpClient, p.path, body, status, decoyRounds, p.markerMatch) {
+	if modkit.MultiRoundExtDecoyCatchAllWithEvidence(ctx, httpClient, p.path, body, status, decoyRounds, p.markerMatch, guardProof) {
 		return nil
 	}
 
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + p.path
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,
 		Request:          string(modifiedRaw),
@@ -253,6 +256,8 @@ func (m *Module) probeEndpoint(
 			Reference:   []string{"https://learn.microsoft.com/en-us/aspnet/core/blazor/"},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+	return result
 }
 
 // probeBootManifest fetches the boot manifest and extracts assembly names as
@@ -313,7 +318,7 @@ func (m *Module) probeBootManifest(
 		extracted = append(extracted, fmt.Sprintf("... and %d more", len(assemblies)-20))
 	}
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,
 		Request:          string(modifiedRaw),
@@ -328,6 +333,8 @@ func (m *Module) probeBootManifest(
 			Reference:   []string{"https://learn.microsoft.com/en-us/aspnet/core/blazor/host-and-deploy/webassembly"},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+	return result
 }
 
 // extractAssemblyNames parses the Blazor boot manifest JSON to find assembly names.

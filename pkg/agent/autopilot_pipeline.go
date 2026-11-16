@@ -177,6 +177,9 @@ type auditContextStruct struct {
 // 2. Freeze context into native plan + artifacts
 // 3. Launch the autonomous operator agent with full tool access
 func (r *AutopilotPipelineRunner) RunAutonomous(ctx context.Context, cfg AutopilotPipelineConfig) (*AutopilotPipelineResult, error) {
+	// Every producer must share this same wrapper, including concurrent audit
+	// and auth/source-analysis work. Later wrappers preserve its block lock.
+	cfg.StreamWriter = NewSynchronizedWriter(cfg.StreamWriter)
 	start := time.Now()
 
 	var preflightErr error
@@ -294,7 +297,17 @@ func (r *AutopilotPipelineRunner) RunAutonomous(ctx context.Context, cfg Autopil
 		if auditWait != nil {
 			auditWait()
 		}
-		auditCtx = loadAuditDriverContext(cfg.SessionDir, cfg.AuditHarness)
+		var contextErr error
+		auditCtx, contextErr = completedBackgroundAuditContext(auditRunner)
+		if contextErr != nil {
+			result.Degraded = true
+			result.Warnings = append(result.Warnings, "audit evidence degraded; unverified incremental context was not consumed")
+			auditStatus = auditRunner.Outcome().Status
+			if auditStatus == "" {
+				auditStatus = "failed"
+			}
+			auditLogFn("audit evidence degraded; continuing without source audit context")
+		}
 		if auditCtx != nil && len(auditCtx.Findings) > 0 {
 			result.FindingsCount = len(auditCtx.Findings)
 			auditLogFn(fmt.Sprintf("loaded %d frozen findings", len(auditCtx.Findings)))
@@ -304,10 +317,8 @@ func (r *AutopilotPipelineRunner) RunAutonomous(ctx context.Context, cfg Autopil
 	if auditRunner != nil && cfg.SessionDir != "" {
 		var stats FindingStats
 		stats = auditRunner.FindingStats()
-		if r.repo != nil {
-			fallback := r.importFindings(cfg.SessionDir, cfg.ProjectUUID, cfg.ScanUUID, cfg.ParentAgenticScanUUID, cfg.AuditHarness)
-			stats = mergeFindingStats(stats, fallback)
-		}
+		// The audit runner already imported its verified authority. Do not repeat
+		// import from an incremental tree or reassign the child's provenance.
 		if stats.Parsed > 0 {
 			result.FindingsCount = stats.Parsed
 			result.FindingsSaved = stats.Saved
@@ -473,6 +484,10 @@ func (r *AutopilotPipelineRunner) RunAutonomous(ctx context.Context, cfg Autopil
 		return nil, fmt.Errorf("autonomous agent failed: %w", err)
 	}
 	if autopilotResult != nil {
+		if autopilotResult.RecordingError != "" {
+			result.Warnings = append(result.Warnings, autopilotResult.RecordingError)
+			result.Degraded = true
+		}
 		result.OperatorFindingsCount = int(autopilotResult.FindingCount)
 		result.Reentries = autopilotResult.Reentries
 		result.BudgetStop = autopilotResult.BudgetStop
@@ -618,7 +633,9 @@ func (r *AutopilotPipelineRunner) importFindings(sessionDir, projectUUID, scanUU
 	}
 	auditDir := filepath.Join(sessionDir, harness.SessionSubdir)
 
-	result, err := audit.ParseFolder(auditDir)
+	parseCtx, cancelParse := context.WithTimeout(context.Background(), auditIOTimeout)
+	defer cancelParse()
+	result, err := parseAuditEvidence(parseCtx, auditDir)
 	if err != nil {
 		// ParseFolder tolerates a missing/empty output dir (it returns a nil
 		// error with zero findings), so a non-nil error here always means the
@@ -797,6 +814,26 @@ func resolveGitMeta(sourceDir string) (commit, branch, repository string) {
 	return
 }
 
+// completedBackgroundAuditContext never reads an incremental tree after a failed
+// archive/import, and does not repeat persistence or claim a child's findings.
+func completedBackgroundAuditContext(runner *AuditAgenticScanner) (*auditContextStruct, error) {
+	out := runner.Outcome()
+	if out.Status != "completed" || out.ProcessErr != nil || out.EvidenceErr != nil || out.ArchiveDir == "" {
+		return nil, fmt.Errorf("audit context unavailable: run or evidence finalization incomplete")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), auditIOTimeout)
+	defer cancel()
+	parsed, err := parseAuditEvidence(ctx, out.ArchiveDir)
+	if err != nil {
+		return nil, err
+	}
+	data, err := readAuditControl(ctx, out.ArchiveDir, "knowledge-base-report.md", maxAuditControlBytes)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	return &auditContextStruct{Findings: parsed.RawFindings, KnowledgeBase: string(data)}, nil
+}
+
 // loadAuditDriverContext loads audit findings and knowledge base from the session
 // directory's harness subdir. The schema is shared across audit and piolium
 // (knowledge-base-report.md filename is the same).
@@ -809,7 +846,9 @@ func loadAuditDriverContext(sessionDir string, harness HarnessSpec) *auditContex
 	}
 	auditDir := filepath.Join(sessionDir, harness.SessionSubdir)
 
-	auditImport, err := audit.ParseFolder(auditDir)
+	ctx, cancel := context.WithTimeout(context.Background(), auditIOTimeout)
+	defer cancel()
+	auditImport, err := parseAuditEvidence(ctx, auditDir)
 	if err != nil {
 		// A non-nil error means corrupt on-disk output (missing/empty dirs
 		// parse cleanly to zero findings), so the audit context can't be
@@ -825,8 +864,7 @@ func loadAuditDriverContext(sessionDir string, harness HarnessSpec) *auditContex
 		Findings: auditImport.RawFindings,
 	}
 
-	kbPath := filepath.Join(auditDir, "knowledge-base-report.md")
-	if kbData, readErr := os.ReadFile(kbPath); readErr == nil {
+	if kbData, readErr := readAuditControl(ctx, auditDir, "knowledge-base-report.md", maxAuditControlBytes); readErr == nil {
 		ac.KnowledgeBase = string(kbData)
 	}
 
@@ -1372,21 +1410,75 @@ func emitProgress(cfg *AutopilotPipelineConfig, phase, message string) {
 }
 
 // progressWriter wraps an io.Writer and emits progress callbacks at byte intervals.
+// Configuration is immutable after use. Counters are safe for concurrent writes;
+// callbacks run outside both the counter mutex and the shared stream's block lock.
 type progressWriter struct {
-	inner       io.Writer
-	callback    func(phase string, message string)
-	phase       string
-	interval    int64 // bytes between progress emissions
+	inner    io.Writer
+	callback func(phase string, message string)
+	phase    string
+	interval int64 // bytes between progress emissions
+
+	mu          sync.Mutex
 	written     int64
 	lastEmitted int64
 }
 
 func (pw *progressWriter) Write(p []byte) (n int, err error) {
 	n, err = pw.inner.Write(p)
-	pw.written += int64(n)
-	if pw.written-pw.lastEmitted >= pw.interval {
-		pw.callback(pw.phase, fmt.Sprintf("agent output: %dKB", pw.written/1024))
-		pw.lastEmitted = pw.written
+	pw.recordProgress(int64(n))
+	return n, err
+}
+
+// WriteBlock preserves the shared sink's atomic streaming capability. Count
+// actual accepted bytes inside the block, but notify only after releasing it:
+// a progress callback may itself write a metadata line to the shared stream.
+func (pw *progressWriter) WriteBlock(write func(io.Writer) error) error {
+	counter := &progressBlockWriter{}
+	render := func(out io.Writer) error {
+		counter.writer = out
+		return write(counter)
 	}
+	var err error
+	if out, ok := pw.inner.(interface {
+		WriteBlock(func(io.Writer) error) error
+	}); ok {
+		err = out.WriteBlock(render)
+	} else {
+		err = render(pw.inner)
+	}
+	counter.mu.Lock()
+	written := counter.written
+	counter.mu.Unlock()
+	pw.recordProgress(written)
+	return err
+}
+
+func (pw *progressWriter) recordProgress(n int64) {
+	pw.mu.Lock()
+	pw.written += n
+	notify := n > 0 && pw.written-pw.lastEmitted >= pw.interval
+	written := pw.written
+	if notify {
+		pw.lastEmitted = written
+	}
+	pw.mu.Unlock()
+	if notify && pw.callback != nil {
+		pw.callback(pw.phase, fmt.Sprintf("agent output: %dKB", written/1024))
+	}
+}
+
+// progressBlockWriter bypasses progress callbacks while the sink is locked.
+// It retains no payload, and preserves the underlying Write return values.
+type progressBlockWriter struct {
+	writer  io.Writer
+	mu      sync.Mutex
+	written int64
+}
+
+func (w *progressBlockWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.writer.Write(p)
+	w.written += int64(n)
 	return n, err
 }

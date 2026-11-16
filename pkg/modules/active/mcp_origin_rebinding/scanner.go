@@ -92,8 +92,10 @@ func (m *Module) ScanPerHost(
 			"domain to the local address, can speak to the local MCP server on behalf of the user."
 	}
 
+	proof := mcpinfra.NewProof(res.Exchange)
+	proof.Payload = foreignOrigin
 	return []*output.ResultEvent{
-		{
+		proof.Attack(&output.ResultEvent{
 			URL:              urlx.String(),
 			Matched:          urlx.String(),
 			ExtractedResults: []string{"Origin: " + foreignOrigin, "initialize succeeded", "host: " + urlx.Host},
@@ -105,7 +107,7 @@ func (m *Module) ScanPerHost(
 				Tags:        []string{"mcp", "dns-rebinding", "origin"},
 				Reference:   []string{"https://modelcontextprotocol.io/specification/2025-11-25/basic/transports"},
 			},
-		},
+		}),
 	}, nil
 }
 

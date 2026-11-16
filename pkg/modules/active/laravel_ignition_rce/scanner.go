@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -206,7 +207,7 @@ func (m *Module) probeEndpoint(
 	httpClient *http.Requester,
 	p probe,
 	fp *notFoundFingerprint,
-) *output.ResultEvent {
+) (finding *output.ResultEvent) {
 	method := p.method
 	if method == "" {
 		method = "GET"
@@ -322,16 +323,22 @@ func (m *Module) probeEndpoint(
 	// run through the same predicate rather than a body-similarity compare. The
 	// genuine hit here is legitimately an HTML error/stack-trace page, so a
 	// content-type=HTML reject would be wrong — the decoy disproof is used instead.
-	if modkit.MultiRoundExtDecoyCatchAll(ctx, httpClient, p.path, body, status, decoyRounds, func(b string) bool {
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(finding, guardProof) }()
+	if modkit.MultiRoundExtDecoyCatchAllWithEvidence(ctx, httpClient, p.path, body, status, decoyRounds, func(b string) bool {
 		_, sibOK := p.accepts(b)
 		return sibOK
-	}) {
+	}, guardProof) {
 		return nil
 	}
 
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + p.path
 
+	selectedExchange := http.CaptureEvidence(resp)
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, selectedExchange, evidence.RoleAttack, "selected Ignition probe")
+	}()
 	return &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,

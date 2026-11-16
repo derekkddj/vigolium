@@ -7,6 +7,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -30,6 +31,7 @@ var variants = []pollutionVariant{
 }
 
 type probeObservation struct {
+	exchange *evidence.Exchange
 	status   int
 	body     string
 	request  string
@@ -154,7 +156,7 @@ func (m *Module) proveMarkerPersistence(ctx *httpmsg.HttpRequestResponse, client
 	return proof, proof.sameRequest || proof.persistent
 }
 
-func (m *Module) proveStatusPersistence(ctx *httpmsg.HttpRequestResponse, client *http.Requester, originalBody string, baselineStatus int, host, target string) *output.ResultEvent {
+func (m *Module) proveStatusPersistence(ctx *httpmsg.HttpRequestResponse, client *http.Requester, originalBody string, baselineStatus int, host, target string) (finding *output.ResultEvent) {
 	if baselineStatus == 510 {
 		return nil
 	}
@@ -175,7 +177,16 @@ func (m *Module) proveStatusPersistence(ctx *httpmsg.HttpRequestResponse, client
 		return nil
 	}
 
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, injection.exchange, evidence.RoleAttack, "prototype status mutation")
+	}()
 	return &output.ResultEvent{
+		Evidence: []evidence.Entry{
+			evidence.Select(normal.exchange, evidence.RoleControl, false, "top-level status control"),
+			evidence.Select(normalFollow.exchange, evidence.RoleControl, false, "normal status follow-up"),
+			evidence.Select(followFirst.exchange, evidence.RoleConfirmation, false, "persistent status readback"),
+			evidence.Select(followReplay.exchange, evidence.RoleConfirmation, false, "persistent status replay"),
+		},
 		ModuleID:      ModuleID,
 		RecordKind:    output.RecordKindFinding,
 		EvidenceGrade: output.EvidenceGradeImpact,
@@ -204,7 +215,10 @@ func (m *Module) proveStatusPersistence(ctx *httpmsg.HttpRequestResponse, client
 	}
 }
 
-func (m *Module) markerResult(host, target string, proof markerProof) *output.ResultEvent {
+func (m *Module) markerResult(host, target string, proof markerProof) (finding *output.ResultEvent) {
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, proof.injection.exchange, evidence.RoleAttack, "prototype-key mutation")
+	}()
 	kind := output.RecordKindCandidate
 	grade := output.EvidenceGradeDifferential
 	sev := severity.Medium
@@ -232,6 +246,11 @@ func (m *Module) markerResult(host, target string, proof markerProof) *output.Re
 		Request:            proof.injection.request,
 		Response:           proof.injection.response,
 		AdditionalEvidence: additional,
+		Evidence: []evidence.Entry{
+			evidence.Select(proof.controlFollow.exchange, evidence.RoleControl, false, "normal-property follow-up"),
+			evidence.Select(proof.followFirst.exchange, evidence.RoleConfirmation, false, "benign marker readback"),
+			evidence.Select(proof.followReplay.exchange, evidence.RoleConfirmation, false, "benign marker replay"),
+		},
 		ExtractedResults: []string{
 			"variant=" + proof.variant.name,
 			"property=" + proof.property,
@@ -258,6 +277,7 @@ func (m *Module) sendBody(ctx *httpmsg.HttpRequestResponse, client *http.Request
 	}
 	defer resp.Close()
 	return probeObservation{
+		exchange: http.CaptureEvidence(resp),
 		status:   resp.Response().StatusCode,
 		body:     resp.Body().String(),
 		request:  string(raw),

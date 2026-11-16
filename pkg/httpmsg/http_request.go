@@ -135,7 +135,10 @@ func (r *HttpRequest) BodyToString() string {
 	return string(body)
 }
 
-// URL constructs and returns the full URL.
+// URL constructs and returns the full URL. Restored receipt destinations are
+// authoritative: their scheme/authority wins over an absolute request target.
+// Raw() and Path() still retain that original target; this URL is a native
+// network locator, not a claim of exact request-line reproduction.
 //
 // The URL is parsed once and memoized (raw bytes are immutable; the cache is
 // invalidated when the service changes via HttpRequestResponse.WithService),
@@ -421,6 +424,9 @@ func (r *HttpRequest) TruncateBody(maxSize int) {
 
 // WithService returns a new HttpRequest with the given service.
 func (r *HttpRequest) WithService(service *Service) *HttpRequest {
+	if r.service != nil && r.service.destinationPinned {
+		service = pinServiceDestination(service)
+	}
 	return &HttpRequest{
 		raw:     r.raw,
 		service: service,
@@ -501,7 +507,8 @@ func (r *HttpRequest) Clone() *HttpRequest {
 
 	var serviceCopy *Service
 	if r.service != nil {
-		serviceCopy = NewServiceSecure(r.service.Host(), r.service.Port(), r.service.Protocol() == "https")
+		copy := *r.service
+		serviceCopy = &copy // includes the restored destination pin
 	}
 
 	return &HttpRequest{
@@ -817,6 +824,9 @@ func (b *requestBuilder) build(original *HttpRequest) *HttpRequest {
 	service := original.service
 	if b.serviceChanged {
 		service = b.service
+		if original.service != nil && original.service.destinationPinned {
+			service = pinServiceDestination(service)
+		}
 	}
 
 	return &HttpRequest{

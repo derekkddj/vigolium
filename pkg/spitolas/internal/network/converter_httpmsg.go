@@ -2,16 +2,19 @@ package network
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 )
 
-// ToHttpRequestResponse converts a TrafficEntry captured by CDP into
-// vigolium's httpmsg.HttpRequestResponse by building raw HTTP request/response bytes.
+// ToHttpRequestResponse converts CDP's normalized HTTP event fields into
+// vigolium's httpmsg.HttpRequestResponse, retaining the constructed bytes in a
+// producer-supplied receipt rather than claiming transport capture fidelity.
 func ToHttpRequestResponse(entry *TrafficEntry) (*httpmsg.HttpRequestResponse, error) {
 	if entry == nil {
 		return nil, fmt.Errorf("nil TrafficEntry")
@@ -35,8 +38,9 @@ func ToHttpRequestResponse(entry *TrafficEntry) (*httpmsg.HttpRequestResponse, e
 
 	// Build response if present
 	var httpResp *httpmsg.HttpResponse
+	var rawResp []byte
 	if entry.Response != nil {
-		rawResp := buildRawResponse(entry)
+		rawResp = buildRawResponse(entry)
 		// Browser-captured records are persisted like any other, so the timing
 		// the capture layer measured has to ride along here or it is lost —
 		// the converter cannot recover it from the raw bytes.
@@ -44,7 +48,20 @@ func ToHttpRequestResponse(entry *TrafficEntry) (*httpmsg.HttpRequestResponse, e
 			time.Duration(entry.DurationMs)*time.Millisecond)
 	}
 
-	return httpmsg.NewHttpRequestResponse(httpReq, httpResp), nil
+	// CDP supplies header maps and decoded bodies, not the original messages.
+	// Keep exactly what we constructed (including omitted bodies/headers), with
+	// unknown fidelity for present halves and missing for an absent response.
+	x := evidence.NewExchange(service.Protocol()+"://"+net.JoinHostPort(service.Host(), strconv.Itoa(service.Port())),
+		entry.Request.URL, rawReq, rawResp, evidence.ProvenanceSupplied)
+	if len(rawReq) > 0 {
+		x.RequestState = evidence.StateUnknown
+	}
+	if len(rawResp) > 0 {
+		x.ResponseState = evidence.StateUnknown
+	}
+	x.ContentHash = x.Hash()
+
+	return httpmsg.NewHttpRequestResponse(httpReq, httpResp).WithEvidence(x), nil
 }
 
 // buildRawRequest constructs raw HTTP/1.1 request bytes from TrafficEntry fields.

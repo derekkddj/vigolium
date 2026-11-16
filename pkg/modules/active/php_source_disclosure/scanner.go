@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -289,7 +290,7 @@ func (m *Module) probeFile(
 	httpClient *http.Requester,
 	p probe,
 	fp *notFoundFingerprint,
-) *output.ResultEvent {
+) (finding *output.ResultEvent) {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
@@ -400,16 +401,22 @@ func (m *Module) probeFile(
 	// positives, and it is robust to the body-truncation quirk because the decoy is run
 	// through the same predicate rather than a body-similarity compare. This is the
 	// guard for the .phps/.phtml probes that cannot use the content-type gate.
-	if modkit.MultiRoundExtDecoyCatchAll(ctx, httpClient, p.path, body, status, decoyRounds, func(b string) bool {
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(finding, guardProof) }()
+	if modkit.MultiRoundExtDecoyCatchAllWithEvidence(ctx, httpClient, p.path, body, status, decoyRounds, func(b string) bool {
 		_, sibOK := p.match(b)
 		return sibOK
-	}) {
+	}, guardProof) {
 		return nil
 	}
 
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + p.path
 
+	selectedExchange := http.CaptureEvidence(resp)
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, selectedExchange, evidence.RoleObservation, "selected source observation")
+	}()
 	return &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,

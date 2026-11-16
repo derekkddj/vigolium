@@ -413,6 +413,34 @@
       },
       "type": "object"
     },
+    "httpmsg.RequestTargetPolicy": {
+      "properties": {
+        "intended_target": {
+          "type": "string"
+        },
+        "direct_target": {
+          "type": "string"
+        },
+        "policy": {
+          "type": "string"
+        },
+        "fidelity": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "intended_target",
+        "direct_target",
+        "policy",
+        "fidelity",
+        "note"
+      ]
+    },
     "replay.Diff": {
       "properties": {
         "status_changed": {
@@ -541,6 +569,9 @@
         },
         "redirects": {
           "type": "integer"
+        },
+        "request_target_policy": {
+          "$ref": "#/$defs/httpmsg.RequestTargetPolicy"
         }
       },
       "additionalProperties": false,

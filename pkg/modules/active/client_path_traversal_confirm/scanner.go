@@ -22,6 +22,7 @@ import (
 
 	urlutil "github.com/projectdiscovery/utils/url"
 	"github.com/vigolium/vigolium/pkg/deparos/jstangle"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	vhttp "github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra/csptflow"
@@ -67,8 +68,9 @@ type NavRequest struct {
 
 // CapturedRequest is a request the browser made during navigation.
 type CapturedRequest struct {
-	URL    string
-	Method string
+	Exchange *evidence.Exchange // Owned browser record, if the navigation seam retained one.
+	URL      string
+	Method   string
 }
 
 type Module struct {
@@ -232,14 +234,18 @@ func (m *Module) defaultRecoverCandidates(ctx context.Context, js, sourceURL str
 
 func (m *Module) buildResult(ctx *httpmsg.HttpRequestResponse, u *urlutil.URL, cr *confirmResult) *output.ResultEvent {
 	sev, primitive := severityFor(cr.Method, cr.Candidate.Credentialed)
-	return &output.ResultEvent{
-		URL:           u.String(),
-		Host:          u.Host,
-		Request:       string(ctx.Request().Raw()),
-		Matched:       cr.NormPath,
-		MatcherStatus: true,
-		RecordKind:    output.RecordKindFinding,
-		EvidenceGrade: output.EvidenceGradeDifferential,
+	ev := modkit.NewEvidenceCollector()
+	ev.AddExchange(cr.control, evidence.RoleControl, "browser control")
+	ev.AddExchange(cr.replay, evidence.RoleConfirmation, "browser escape replay")
+	result := &output.ResultEvent{
+		URL:            u.String(),
+		Host:           u.Host,
+		EvidenceStatus: "missing", // A URL/method-only browser seam has no HTTP proof.
+		Matched:        cr.NormPath,
+		Evidence:       ev.Evidence(),
+		MatcherStatus:  true,
+		RecordKind:     output.RecordKindFinding,
+		EvidenceGrade:  output.EvidenceGradeDifferential,
 		AdditionalEvidence: []string{
 			"control (stays under prefix): " + cr.ControlMethod + " " + cr.ControlURL,
 			"payload #1 (escaped): " + cr.Method + " " + cr.Payload1URL,
@@ -254,6 +260,8 @@ func (m *Module) buildResult(ctx *httpmsg.HttpRequestResponse, u *urlutil.URL, c
 			Tags:        ModuleTags,
 		},
 	}
+	modkit.SetPrimaryEvidence(result, cr.attack, evidence.RoleAttack, "selected probe")
+	return result
 }
 
 // severityFor grades the confirmed primitive: a plain GET path escape is
@@ -327,7 +335,32 @@ func (s *memSink) captured() []CapturedRequest {
 		if err != nil || u == nil {
 			continue
 		}
-		out = append(out, CapturedRequest{URL: u.String(), Method: rr.Request().Method()})
+		out = append(out, CapturedRequest{URL: u.String(), Method: rr.Request().Method(), Exchange: browserReceipt(rr)})
 	}
 	return out
+}
+
+// browserReceipt retains actual CDP record bytes, never reconstructing a request
+// from the URL/method summary. CDP's raw-message fidelity has no transport stamp;
+// mark it unknown rather than claiming CaptureEvidence completeness.
+func browserReceipt(rr *httpmsg.HttpRequestResponse) *evidence.Exchange {
+	if x := rr.Evidence(); x != nil {
+		return x.Clone()
+	}
+	var request, response []byte
+	if rr.Request() != nil {
+		request = rr.Request().Raw()
+	}
+	if rr.Response() != nil {
+		response = rr.Response().Raw()
+	}
+	x := evidence.NewExchange("", rr.Target(), request, response, evidence.ProvenanceSupplied)
+	if len(request) > 0 {
+		x.RequestState = evidence.StateUnknown
+	}
+	if len(response) > 0 {
+		x.ResponseState = evidence.StateUnknown
+	}
+	x.ContentHash = x.Hash()
+	return x
 }

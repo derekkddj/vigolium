@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -106,6 +107,7 @@ type probeResponse struct {
 	status   int
 	request  string
 	response string
+	receipt  *evidence.Exchange
 }
 
 // Module implements the Unauthenticated Infrastructure Service Exposure scanner.
@@ -223,14 +225,15 @@ func (m *Module) fetch(httpClient *http.Requester, url string) (probeResponse, b
 		status:   r.StatusCode,
 		request:  string(rr.Request().Raw()),
 		response: resp.FullResponseString(),
+		receipt:  http.CaptureEvidence(resp),
 	}, true
 }
 
 func (m *Module) result(host, base string, service serviceProbe, endpoint endpointProbe, assessment probeAssessment, first, second probeResponse) *output.ResultEvent {
 	target := base + endpoint.path
-	evidence := strings.TrimSpace(first.body)
-	if len(evidence) > 600 {
-		evidence = evidence[:600]
+	proofText := strings.TrimSpace(first.body)
+	if len(proofText) > 600 {
+		proofText = proofText[:600]
 	}
 
 	namePrefix := "Observed"
@@ -241,7 +244,10 @@ func (m *Module) result(host, base string, service serviceProbe, endpoint endpoi
 		namePrefix = "Confirmed"
 	}
 
-	return &output.ResultEvent{
+	ev := modkit.NewEvidenceCollector()
+	ev.AddExchange(second.receipt, evidence.RoleConfirmation, "credential-free confirmation")
+	result := &output.ResultEvent{
+		Evidence:      ev.Evidence(),
 		ModuleID:      ModuleID,
 		RecordKind:    assessment.kind,
 		EvidenceGrade: assessment.grade,
@@ -257,7 +263,7 @@ func (m *Module) result(host, base string, service serviceProbe, endpoint endpoi
 			"service=" + service.name,
 			"endpoint=" + target,
 			"proof=" + assessment.proof,
-			"evidence=" + evidence,
+			"evidence=" + proofText,
 		},
 		Info: output.Info{
 			Name:        namePrefix + " Unauthenticated " + service.name + " Exposure",
@@ -274,6 +280,8 @@ func (m *Module) result(host, base string, service serviceProbe, endpoint endpoi
 			"proof":               assessment.proof,
 		},
 	}
+	modkit.SetPrimaryEvidence(result, first.receipt, evidence.RoleObservation, "credential-free service response")
+	return result
 }
 
 func observation(claim, proof string) probeAssessment {

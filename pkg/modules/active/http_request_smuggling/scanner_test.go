@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/modules/modtest"
@@ -379,33 +380,51 @@ func TestConnectionWillClose(t *testing.T) {
 
 // TestBuildResult_CarriesConfirmationEvidence asserts the confirmation
 // differential — the reconfirmed slow probe and the re-measured fast control —
-// is preserved on the finding as AdditionalEvidence and Metadata, rather than
-// collapsed to a one-line prose claim that "the control returned fast".
+// is preserved as a confirmation primary plus typed control support and timing
+// metadata, rather than collapsed to a prose claim or duplicated primary pair.
 func TestBuildResult_CarriesConfirmationEvidence(t *testing.T) {
 	ctx, err := httpmsg.ParseRawRequest("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
 	require.NoError(t, err)
 	probeRaw, ok := buildRequest(ctx, probes[0])
 	require.True(t, ok)
 
-	ev := desyncEvidence{
-		reElapsed:   8 * time.Second,
-		probeResp:   "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
-		ctrlElapsed: 300 * time.Millisecond,
-		ctrlResp:    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
-	}
 	control := controlReading{
 		median: 280 * time.Millisecond,
 		raw:    []byte("POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1\r\n\r\n1"),
 	}
+	ev := desyncEvidence{
+		reElapsed:   8 * time.Second,
+		probeResp:   "HTTP/1.1 200 OK\r\nX-Fixture: reconfirmation\r\nContent-Length: 2\r\n\r\nok",
+		ctrlElapsed: 300 * time.Millisecond,
+		ctrlResp:    "HTTP/1.1 200 OK\r\nX-Fixture: control\r\nContent-Length: 2\r\n\r\nok",
+	}
+	// This constructor fixture supplies bytes; it does not simulate a sender
+	// capture or infer receipt identity from the intended request or URL.
+	ev.probeExchange = evidence.NewExchange("http://example.com", ctx.Target(), probeRaw, []byte(ev.probeResp), evidence.ProvenanceSupplied)
+	ev.controlExchange = evidence.NewExchange("http://example.com", ctx.Target(), control.raw, []byte(ev.ctrlResp), evidence.ProvenanceSupplied)
 
 	res := buildResult(ctx, probeRaw, probes[0], control, 7*time.Second, false, ev)
 	require.NotNil(t, res)
 
-	assert.NotEmpty(t, res.Response, "the reconfirmed probe response should be the primary response pair")
-	require.NotEmpty(t, res.AdditionalEvidence, "the confirmation differential must travel as evidence")
+	require.Len(t, res.Evidence, 2, "reconfirmation primary plus the actual comparison receipt")
+	primary, support := res.Evidence[0], res.Evidence[1]
+	assert.True(t, primary.Primary)
+	assert.Equal(t, evidence.RoleConfirmation, primary.Role)
+	assert.Equal(t, ev.probeExchange, primary.Exchange)
+	assert.Equal(t, string(ev.probeExchange.Request), res.Request)
+	assert.Equal(t, string(ev.probeExchange.Response), res.Response)
+	assert.False(t, support.Primary)
+	assert.Equal(t, evidence.RoleControl, support.Role)
+	assert.Equal(t, ev.controlExchange, support.Exchange)
+	assert.NotEqual(t, primary.ExchangeID, support.ExchangeID)
+	assert.Equal(t, evidence.ProvenanceSupplied, primary.Exchange.Provenance)
+	assert.Equal(t, evidence.ProvenanceSupplied, support.Exchange.Provenance)
+	require.Len(t, res.AdditionalEvidence, 1, "the primary must not be duplicated as support")
 	joined := strings.Join(res.AdditionalEvidence, "\n")
-	assert.Contains(t, joined, "# [reconfirm probe", "expected the reconfirmed probe pair")
 	assert.Contains(t, joined, "# [well-formed control", "expected the fast control pair")
+	assert.Contains(t, joined, string(ev.controlExchange.Request))
+	assert.Contains(t, joined, string(ev.controlExchange.Response))
+	assert.NotContains(t, joined, "X-Fixture: reconfirmation")
 
 	require.NotNil(t, res.Metadata)
 	assert.Equal(t, ev.reElapsed.Milliseconds(), res.Metadata["reconfirm_ms"])

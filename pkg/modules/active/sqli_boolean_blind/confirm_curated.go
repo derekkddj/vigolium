@@ -3,8 +3,10 @@ package sqli_boolean_blind
 import (
 	"regexp"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
+	"github.com/vigolium/vigolium/pkg/modules/modkit"
 )
 
 // The curated, bypass and WAF-evasion payload pairs detect a differential with a
@@ -103,24 +105,35 @@ func (m *Module) confirmRandomized(
 	truePayload, falsePayload string,
 	requireOperands bool,
 	prof branchProfile,
+	collectors ...*modkit.EvidenceCollector,
 ) (bool, error) {
+	var ev *modkit.EvidenceCollector
+	if len(collectors) > 0 {
+		ev = collectors[0]
+	}
 	rw, ok := newOperandRewriter(truePayload)
 	if !ok {
 		if requireOperands {
 			return false, nil
 		}
-		return m.confirmRepeat(ctx, httpClient, ip, truePayload, falsePayload, prof)
+		return m.confirmRepeat(ctx, httpClient, ip, truePayload, falsePayload, prof, collectors...)
 	}
 
 	var trueSigs, falseSigs []responseSignature
 	for i := 0; i < confirmRounds; i++ {
 		a, b := distinctNums()
 
-		_, tSig, tBlocked, err := m.sendPayload(ctx, httpClient, ip, rw.boolean(a, a))
+		_, tSig, tBlocked, tReceipt, err := m.sendPayloadReceipt(ctx, httpClient, ip, rw.boolean(a, a))
+		if i == 0 || i == confirmRounds-1 {
+			ev.AddExchange(tReceipt, evidence.RoleConfirmation, "random-operand TRUE condition")
+		}
 		if err != nil {
 			return false, err
 		}
-		_, fSig, fBlocked, err := m.sendPayload(ctx, httpClient, ip, rw.boolean(a, b))
+		_, fSig, fBlocked, fReceipt, err := m.sendPayloadReceipt(ctx, httpClient, ip, rw.boolean(a, b))
+		if i == 0 {
+			ev.AddExchange(fReceipt, evidence.RoleControl, "random-operand FALSE condition")
+		}
 		if err != nil {
 			return false, err
 		}
@@ -148,7 +161,8 @@ func (m *Module) confirmRandomized(
 	// Invalid-syntax probe: a malformed expression must NOT render the TRUE page.
 	// If it does, the endpoint ignores SQL validity and the differential is spurious.
 	c, d := distinctNums()
-	_, invSig, invBlocked, err := m.sendPayload(ctx, httpClient, ip, rw.invalid(c, d))
+	_, invSig, invBlocked, invReceipt, err := m.sendPayloadReceipt(ctx, httpClient, ip, rw.invalid(c, d))
+	ev.AddExchange(invReceipt, evidence.RoleControl, "invalid SQL syntax")
 	if err != nil {
 		return false, err
 	}

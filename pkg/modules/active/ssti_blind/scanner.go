@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -166,9 +167,13 @@ func (m *Module) testTimingPair(
 ) (*output.ResultEvent, error) {
 	slowTimes := make([]time.Duration, 0, confirmSlowRounds)
 	fastTimes := make([]time.Duration, 0, confirmFastRounds)
+	var primary *evidence.Exchange
+	ev := modkit.NewEvidenceCollector()
+	ev.AddBaseline("input baseline", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
 
 	for i := 0; i < confirmSlowRounds; i++ {
-		elapsed, err := m.sendTimedPayload(ctx, httpClient, ip, slowPayload)
+		slow, err := m.sendTimedPayload(ctx, httpClient, ip, slowPayload)
+		elapsed := slow.elapsed
 		if err != nil {
 			return nil, err
 		}
@@ -176,10 +181,16 @@ func (m *Module) testTimingPair(
 			return nil, nil
 		}
 		slowTimes = append(slowTimes, elapsed)
+		if i == 0 {
+			primary = slow.receipt
+		} else {
+			ev.AddExchange(slow.receipt, evidence.RoleConfirmation, "slow-payload replay")
+		}
 
 		// Interleave a baseline probe between slow probes (not after the last).
 		if i < confirmFastRounds {
-			fastElapsed, err := m.sendTimedPayload(ctx, httpClient, ip, fastPayload)
+			fast, err := m.sendTimedPayload(ctx, httpClient, ip, fastPayload)
+			fastElapsed := fast.elapsed
 			if err != nil {
 				return nil, err
 			}
@@ -187,6 +198,7 @@ func (m *Module) testTimingPair(
 				return nil, nil // Server is just slow today.
 			}
 			fastTimes = append(fastTimes, fastElapsed)
+			ev.AddExchange(fast.receipt, evidence.RoleControl, "fast template payload")
 		}
 	}
 
@@ -199,11 +211,11 @@ func (m *Module) testTimingPair(
 		return nil, nil
 	}
 
-	fuzzedRaw := ip.BuildRequest([]byte(slowPayload))
-	return &output.ResultEvent{
-		Request:          string(fuzzedRaw),
-		FuzzingParameter: ip.Name(),
-		ExtractedResults: []string{slowPayload, fastPayload, engine},
+	result := &output.ResultEvent{
+		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
+		FuzzingParameter:   ip.Name(),
+		ExtractedResults:   []string{slowPayload, fastPayload, engine},
 		Info: output.Info{
 			Description: fmt.Sprintf(
 				"Blind SSTI detected via time-delay in %s template engine. "+
@@ -213,7 +225,9 @@ func (m *Module) testTimingPair(
 				len(fastTimes), fastMax.Round(time.Millisecond),
 			),
 		},
-	}, nil
+	}
+	modkit.SetPrimaryEvidence(result, primary, evidence.RoleAttack, "slow template payload")
+	return result, nil
 }
 
 // minDuration returns the smallest duration in d. Empty slice → 0.
@@ -241,13 +255,18 @@ func maxDuration(d []time.Duration) time.Duration {
 	return m
 }
 
-// sendTimedPayload sends a payload and returns the elapsed wall-clock duration.
+type timedProbe struct {
+	elapsed time.Duration
+	receipt *evidence.Exchange
+}
+
+// sendTimedPayload sends a payload and owns its receipt before closing the chain.
 func (m *Module) sendTimedPayload(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	ip httpmsg.InsertionPoint,
 	payload string,
-) (time.Duration, error) {
+) (timedProbe, error) {
 	fuzzedRaw := ip.BuildRequest([]byte(payload))
 
 	// BuildRequest produces well-formed raw, so wrap directly instead
@@ -261,9 +280,10 @@ func (m *Module) sendTimedPayload(
 	// never be confirmed (a false negative). Every send must be a genuine round-trip.
 	resp, elapsed, err := modkit.SendTimed(httpClient, fuzzedReq, http.Options{})
 	if err != nil {
-		return 0, err
+		return timedProbe{}, err
 	}
+	receipt := http.CaptureEvidence(resp)
 	resp.Close()
 
-	return elapsed, nil
+	return timedProbe{elapsed: elapsed, receipt: receipt}, nil
 }

@@ -16,10 +16,19 @@ type Repository struct {
 	// the equivalent for newly inserted findings (a dedup-append to an existing
 	// finding does not fire). Both run synchronously on the save goroutine, so
 	// implementations must be fast and non-blocking (e.g. enqueue and return).
-	// Used by the server's --mirror-fs filesystem mirror; left nil elsewhere, so
-	// CLI scans and other repo users are unaffected.
+	// Left nil when callers do not need save notifications.
 	OnRecordSaved  func(*HTTPRecord)
 	OnFindingSaved func(*Finding)
+
+	// OnFindingOccurrenceSaved runs after a successful commit, for both new
+	// findings and dedup-appends. It receives an owned finding snapshot with the
+	// canonical row ID, incoming occurrence context and only the incoming evidence
+	// entries (including supplied receipt bytes), NOT the survivor's aggregate
+	// manifest. Manifest-only/missing receipts stay manifest-only. Consumers may
+	// retain or modify the snapshot, but must merge prior manifest entries rather
+	// than replace them. Like the other hooks, this runs synchronously: enqueue
+	// and return. Set hooks before starting concurrent saves.
+	OnFindingOccurrenceSaved func(*Finding)
 }
 
 // emitRecordSaved fires the OnRecordSaved hook when set. Centralized so every

@@ -22,7 +22,7 @@ func TestSchemaMigrate_RelabelsLegacyKISEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, db, "UPDATE schema_meta SET version = ? WHERE id = 1", currentSchemaVersion-1)
+	mustExec(t, db, "UPDATE schema_meta SET version = ? WHERE id = 1", identityV2Version-1)
 	_ = db.Close()
 
 	w := openDBFile(t, path, false)

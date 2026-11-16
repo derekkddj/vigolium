@@ -48,9 +48,10 @@ func (e *Executor) runPassivePerRequestFiltered(ctx context.Context, item *httpm
 
 	if e.cfg.ParallelPassive {
 		var g conc.WaitGroup
-		// sem bounds live passive goroutines across all record workers. nil (an
-		// executor built without NewExecutor, e.g. in a unit test) means an
-		// unbounded fan-out.
+		// sem bounds parallel-passive wrappers across all record workers. The
+		// independent realPassiveSem in runPassiveWithTimeout bounds actual calls
+		// even after a wrapper times out, and covers inline/per-host calls too.
+		// nil preserves fixtures built without NewExecutor.
 		sem := e.pool.passiveTaskSem
 		for _, module := range eligible {
 			mod := module

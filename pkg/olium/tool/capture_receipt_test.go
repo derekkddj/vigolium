@@ -99,8 +99,11 @@ func TestWebFetchHTTPReportsPersistFailure(t *testing.T) {
 	}
 
 	res, _ = NewWebFetch().Execute(context.Background(), map[string]any{"url": srv.URL}, nil)
-	if _, ok := res.Details["persisted"]; ok {
-		t.Errorf("the no-capture variant must not report persistence: %v", res.Details)
+	if res.Details["persisted"] != false || res.Details["persistence_status"] != "disabled" {
+		t.Errorf("the no-sink variant must explicitly report persistence disabled: %v", res.Details)
+	}
+	if _, ok := res.Details["record_uuid"]; ok {
+		t.Error("the no-sink variant must not claim a saved record UUID")
 	}
 }
 

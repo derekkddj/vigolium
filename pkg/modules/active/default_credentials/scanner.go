@@ -9,6 +9,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -26,6 +27,7 @@ import (
 // raw keeps the full response string (headers+body) for evidence and edge-block
 // detection only.
 type credentialResponse struct {
+	exchange     *evidence.Exchange
 	statusCode   int
 	body         string
 	raw          string
@@ -178,16 +180,21 @@ func (m *Module) ScanPerHost(
 		// fetched invalid-credential response (a negative control). This rejects
 		// both transient one-off differentials and plain login-page variance that
 		// merely looks different from the original baseline.
-		if !m.confirmCredentialSuccess(ctx, httpClient, endpoint, cred, baseline, cr) {
+		ev := modkit.NewEvidenceCollector()
+		ev.AddExchange(baseline.exchange, evidence.RoleControl, "invalid baseline")
+		ev.AddExchange(baseline2.exchange, evidence.RoleControl, "invalid baseline replay")
+		if !m.confirmCredentialSuccess(ctx, httpClient, endpoint, cred, baseline, cr, ev) {
 			continue
 		}
 
 		rawReq := m.buildCredentialRequest(ctx, endpoint, cred.username, cred.password)
-		results = append(results, &output.ResultEvent{
-			URL:              ctx.Target(),
-			Request:          string(rawReq),
-			Response:         cr.raw,
-			FuzzingParameter: endpoint.usernameField,
+		result := &output.ResultEvent{
+			URL:                ctx.Target(),
+			Request:            string(rawReq),
+			Response:           cr.raw,
+			Evidence:           ev.Evidence(),
+			AdditionalEvidence: ev.Entries(),
+			FuzzingParameter:   endpoint.usernameField,
 			ExtractedResults: []string{
 				fmt.Sprintf("Username: %s", cred.username),
 				fmt.Sprintf("Password: %s", cred.password),
@@ -195,7 +202,9 @@ func (m *Module) ScanPerHost(
 			Info: output.Info{
 				Description: fmt.Sprintf("Default credentials found: %s/%s", cred.username, cred.password),
 			},
-		})
+		}
+		modkit.SetPrimaryEvidence(result, cr.exchange, evidence.RoleAttack, "selected probe")
+		results = append(results, result)
 		return results, nil // Stop on first confirmed success
 	}
 
@@ -214,6 +223,7 @@ func (m *Module) confirmCredentialSuccess(
 	endpoint *loginEndpoint,
 	cred credentialPair,
 	baseline, candidate credentialResponse,
+	collectors ...*modkit.EvidenceCollector,
 ) bool {
 	repeat, err := m.sendCredentials(ctx, httpClient, endpoint, cred.username, cred.password)
 	if err != nil || repeat.blocked {
@@ -235,6 +245,10 @@ func (m *Module) confirmCredentialSuccess(
 	// — it is not authentication, it is the endpoint's uniform rejection.
 	if responsesEquivalent(candidate, control) {
 		return false
+	}
+	if len(collectors) > 0 {
+		collectors[0].AddExchange(repeat.exchange, evidence.RoleConfirmation, "credential replay")
+		collectors[0].AddExchange(control.exchange, evidence.RoleControl, "fresh invalid credential")
 	}
 	return true
 }
@@ -286,6 +300,7 @@ func (m *Module) sendCredentials(
 	}
 	cr.body = resp.BodyString()
 	cr.raw = resp.FullResponseString()
+	cr.exchange = http.CaptureEvidence(resp)
 
 	// Flag only vendor-identified WAF/CDN edge blocks/challenges (Cloudflare,
 	// Akamai, CloudFront, Incapsula — including 200-status challenge bodies), NOT a

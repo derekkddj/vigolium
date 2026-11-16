@@ -25,9 +25,18 @@ type curlItem struct {
 	// ID / FindingHash / RecordUUID identify the finding and the record whose
 	// request was rendered (finding --curl); RecordUUID is empty when the
 	// finding's own stored evidence was used.
-	ID          int64  `json:"id,omitempty"`
-	FindingHash string `json:"finding_hash,omitempty"`
-	RecordUUID  string `json:"record_uuid,omitempty"`
+	ID              int64  `json:"id,omitempty"`
+	FindingHash     string `json:"finding_hash,omitempty"`
+	RecordUUID      string `json:"record_uuid,omitempty"`
+	ExchangeID      string `json:"exchange_id,omitempty"`
+	EvidenceRole    string `json:"evidence_role,omitempty"`
+	EvidenceStatus  string `json:"evidence_status,omitempty"`
+	RequestSource   string `json:"request_source,omitempty"`
+	OccurrenceID    string `json:"occurrence_id,omitempty"`
+	FindingURL      string `json:"finding_url,omitempty"`
+	ScanUUID        string `json:"scan_uuid,omitempty"`
+	EvidenceLabel   string `json:"evidence_label,omitempty"`
+	EvidencePrimary bool   `json:"evidence_primary,omitempty"`
 
 	Method string   `json:"method"`
 	URL    string   `json:"url"`

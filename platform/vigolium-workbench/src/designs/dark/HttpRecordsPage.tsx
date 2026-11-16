@@ -5,7 +5,8 @@ import { AgGridReact } from 'ag-grid-react';
 import type { ColDef, RowClickedEvent, SelectionChangedEvent } from 'ag-grid-community';
 import { Activity, Globe, Server, Search, RefreshCw, List, Layers, ChevronRight, ChevronDown, X } from 'lucide-react';
 import { useHttpRecords, useScanRecords, useDeleteHttpRecord } from '@/api/hooks';
-import { withDemoKey } from '@/api/client';
+import { useDetailSelection } from '@/hooks/useDetailSelection';
+import { DETAIL_LINK_CONTEXT } from '@/lib/detailSelection';
 import { useToast } from '@/contexts/ToastContext';
 import { useProjectContext } from '@/contexts/ProjectContext';
 import type { HTTPRecord, HttpRecordsQueryParams } from '@/api/types';
@@ -189,7 +190,7 @@ export default function HttpRecordsPage({ initialId }: { initialId?: string | nu
   const [hostnameFilter, setHostnameFilter] = useState('');
   const [sourceFilter, setSourceFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
-  const [selectedRecordUuid, setSelectedRecordUuid] = useState<string | null>(initialId ?? null);
+  const { selectedId: selectedRecordUuid, selectDetail: navigateToRecord, projectKey } = useDetailSelection('http-record', initialId);
   const [selectedRows, setSelectedRows] = useState<HTTPRecord[]>([]);
   const gridRef = useRef<AgGridReact<HTTPRecord>>(null);
   const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set(EXTRA_HIDDEN_FIELDS));
@@ -203,13 +204,9 @@ export default function HttpRecordsPage({ initialId }: { initialId?: string | nu
   const { toast } = useToast();
 
   useEffect(() => {
-    setSelectedRecordUuid(initialId ?? null);
-  }, [initialId]);
-
-  const navigateToRecord = useCallback((uuid: string | null) => {
-    setSelectedRecordUuid(uuid);
-    window.history.pushState(null, '', withDemoKey(uuid !== null ? `/http-records/${uuid}` : '/http-records'));
-  }, []);
+    setSelectedRows([]);
+    gridRef.current?.api?.deselectAll();
+  }, [projectKey]);
 
   const handleDeleteSelected = useCallback(async () => {
     const uuids = selectedRows.map((r) => r.uuid);
@@ -638,7 +635,8 @@ export default function HttpRecordsPage({ initialId }: { initialId?: string | nu
 
         {/* Detail panel */}
         {selectedRecordUuid !== null && (
-          <div className="w-1/2">
+          <div className="w-1/2 flex flex-col min-h-0">
+            <p role="note" className="px-3 py-1 text-xs text-[#918175] border-b border-[#2e2b26]">{DETAIL_LINK_CONTEXT}</p>
             <HttpRecordDetailPanel
               uuid={selectedRecordUuid}
               onClose={() => navigateToRecord(null)}

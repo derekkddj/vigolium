@@ -647,6 +647,9 @@
         "failed": {
           "type": "integer"
         },
+        "rejected": {
+          "type": "integer"
+        },
         "unknown": {
           "type": "integer"
         },

@@ -4,6 +4,7 @@ import (
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/apicontract"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/verify"
 )
 
@@ -65,7 +66,9 @@ var SwaggerSchemaTypes = map[string]any{
 	"ChatCompletionResponse":    ChatCompletionResponse{},
 
 	// Data
-	"Finding": database.Finding{},
+	"Finding":          database.Finding{},
+	"EvidenceEntry":    evidence.Entry{},
+	"EvidenceExchange": evidence.Exchange{},
 	// POST /api/findings/:id/verify
 	"VerifyFindingRequest": VerifyFindingRequest{},
 	"VerifyFindingResult":  verify.Result{},

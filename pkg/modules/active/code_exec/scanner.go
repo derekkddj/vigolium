@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -217,14 +218,16 @@ ipScan:
 			fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
 
 			// Probe 1: fuzzed must be slow.
-			isSlow, sendErr := sendTimedRequest(fuzzedReq, httpClient)
+			var attack, control *evidence.Exchange
+			ev := modkit.NewEvidenceCollector()
+			isSlow, sendErr := sendTimedRequest(fuzzedReq, httpClient, &attack)
 			if sendErr != nil || !isSlow {
 				continue
 			}
 
 			// Probe 2: baseline must be fast. Skips if baseline build failed.
 			if baselineOk {
-				baselineSlow, err := isResponseSlow(baselineReq, httpClient, baselineMaxSeconds)
+				baselineSlow, err := isResponseSlow(baselineReq, httpClient, baselineMaxSeconds, &control)
 				if err != nil || baselineSlow {
 					// Server is generically slow; treat the slow fuzzed
 					// probe as inconclusive and move on to the next payload.
@@ -232,10 +235,13 @@ ipScan:
 				}
 			}
 
+			ev.AddExchange(control, evidence.RoleControl, "fast original parameter")
 			// Probes 3..N: confirm fuzzed stays slow across multiple sends.
 			allConfirmed := true
 			for range confirmSlowRounds {
-				isSlow, sendErr = sendTimedRequest(fuzzedReq, httpClient)
+				var replay *evidence.Exchange
+				isSlow, sendErr = sendTimedRequest(fuzzedReq, httpClient, &replay)
+				ev.AddExchange(replay, evidence.RoleConfirmation, "slow payload replay")
 				if sendErr != nil || !isSlow {
 					allConfirmed = false
 					break
@@ -243,11 +249,21 @@ ipScan:
 			}
 
 			if allConfirmed {
-				results = append(results, &output.ResultEvent{
-					URL:              urlx.String(),
-					Request:          string(fuzzedRaw),
-					FuzzingParameter: ip.Name(),
-					ExtractedResults: []string{payload},
+				if attack == nil {
+					// A timeout can confirm the timing oracle without returning any
+					// HTTP receipt. Preserve intent as supplied/unknown, not capture.
+					attack = evidence.NewExchange("", urlx.String(), fuzzedRaw, nil, evidence.ProvenanceSupplied)
+					attack.RequestState = evidence.StateUnknown
+					attack.ContentHash = attack.Hash()
+				}
+				result := &output.ResultEvent{
+					URL:                urlx.String(),
+					Request:            string(fuzzedRaw),
+					Evidence:           ev.Evidence(),
+					AdditionalEvidence: ev.Entries(),
+					EvidenceStatus:     "missing", // Timeout-only success may have no HTTP response receipt.
+					FuzzingParameter:   ip.Name(),
+					ExtractedResults:   []string{payload},
 					Info: output.Info{
 						// Detection is purely time-based (sleep/ping/timeout), so it
 						// is prone to backend-delay false positives — flag as
@@ -255,7 +271,9 @@ ipScan:
 						Severity:   severity.Suspect,
 						Confidence: severity.Tentative,
 					},
-				})
+				}
+				modkit.SetPrimaryEvidence(result, attack, evidence.RoleAttack, "selected probe")
+				results = append(results, result)
 				continue ipScan
 			}
 		}
@@ -283,12 +301,15 @@ func buildBaselineRequest(ctx *httpmsg.HttpRequestResponse, ip httpmsg.Insertion
 // threshold truncated to 5 and read as "not slow" — a false negative on
 // exactly the injected delay this module asks for. Now that the requester
 // returns a time.Duration, the threshold means what it says.
-func isResponseSlow(req *httpmsg.HttpRequestResponse, httpClient *http.Requester, thresholdSeconds int) (bool, error) {
+func isResponseSlow(req *httpmsg.HttpRequestResponse, httpClient *http.Requester, thresholdSeconds int, receipts ...**evidence.Exchange) (bool, error) {
 	// NoClustering: timing-based blind RCE re-sends the identical delay payload across
 	// confirmation rounds. The 500ms request-cluster cache keys on raw request bytes,
 	// so a clustered re-send returns the first response's cached copy with duration ~0
 	// (< the delay threshold), and the confirmation never passes (a false negative).
 	resp, duration, err := httpClient.Execute(req, http.Options{IgnoreTimeoutTracking: true, NoClustering: true})
+	if len(receipts) > 0 {
+		*receipts[0] = http.CaptureEvidence(resp)
+	}
 	defer func() {
 		if resp != nil {
 			resp.Close()
@@ -367,11 +388,14 @@ func getPayloadsForExtension(request []byte) []string {
 // ">= 10 nanoseconds", so every response on earth is "slow" — the module went
 // from detecting a 10-second sleep to reporting command injection on any host
 // that answers at all.
-func sendTimedRequest(req *httpmsg.HttpRequestResponse, httpClient *http.Requester) (bool, error) {
+func sendTimedRequest(req *httpmsg.HttpRequestResponse, httpClient *http.Requester, receipts ...**evidence.Exchange) (bool, error) {
 	timeout := false
 	// NoClustering: see isResponseSlow — a clustered re-send of the identical delay
 	// payload returns a cached ~0ms duration and defeats timing confirmation.
 	resp, duration, err := httpClient.Execute(req, http.Options{IgnoreTimeoutTracking: true, NoClustering: true})
+	if len(receipts) > 0 {
+		*receipts[0] = http.CaptureEvidence(resp)
+	}
 	if err != nil {
 		if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
 			return false, nil

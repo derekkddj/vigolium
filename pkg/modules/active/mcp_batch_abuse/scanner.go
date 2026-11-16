@@ -73,8 +73,11 @@ func (m *Module) ScanPerHost(
 	// access). Only a server that refuses the singleton but honours the batched
 	// call has an actual batch-specific auth weakness, so we require the singleton
 	// path to be gated before flagging the batch.
-	if r, serr := client.ListTools(); serr == nil && r != nil && len(r.Tools) > 0 {
-		return nil, nil
+	control, serr := client.PostRawEvidence(mcpinfra.BuildToolsListRequest())
+	if serr == nil && control != nil {
+		if r, err := mcpinfra.ParseToolsListResponse(control.Body); err == nil && r != nil && len(r.Tools) > 0 {
+			return nil, nil
+		}
 	}
 
 	// Build a batch with initialize + tools/list, NO session header.
@@ -87,12 +90,12 @@ func (m *Module) ScanPerHost(
 		return nil, err
 	}
 
-	respBody, _, err := client.PostRaw(body)
-	if err != nil || respBody == "" {
+	op, err := client.PostRawEvidence(body)
+	if err != nil || op.Body == "" {
 		return nil, nil
 	}
 
-	respBody = mcpinfra.ExtractJSONFromSSE(respBody)
+	respBody := mcpinfra.ExtractJSONFromSSE(op.Body)
 
 	// Some servers reject batches with -32600 (invalid request) - that's the
 	// safe behaviour. We're looking for the case where they happily process it.
@@ -122,8 +125,13 @@ func (m *Module) ScanPerHost(
 		return nil, nil
 	}
 
+	proof := mcpinfra.NewProof(op.Exchange)
+	if control != nil {
+		proof.Control(control.Exchange)
+	}
+	proof.Payload = string(body)
 	return []*output.ResultEvent{
-		{
+		proof.Attack(&output.ResultEvent{
 			URL:              urlx.String(),
 			Matched:          urlx.String(),
 			ExtractedResults: []string{smuggledMethod, fmt.Sprintf("batch responses: %d", len(multiple))},
@@ -135,6 +143,6 @@ func (m *Module) ScanPerHost(
 				Tags:        []string{"mcp", "auth-bypass", "json-rpc"},
 				Reference:   []string{"https://www.jsonrpc.org/specification"},
 			},
-		},
+		}),
 	}, nil
 }

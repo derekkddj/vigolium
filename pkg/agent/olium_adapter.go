@@ -21,6 +21,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/olium/tool"
 	"github.com/vigolium/vigolium/pkg/olium/toollog"
 	"github.com/vigolium/vigolium/pkg/olium/vigtool"
+	"go.uber.org/zap"
 )
 
 // oliumRunOutput is the structured return of runOliumPrompt — text plus the
@@ -31,6 +32,9 @@ type oliumRunOutput struct {
 	// ToolCalls counts the tools the engine dispatched during the call, for
 	// the run-wide --max-commands budget (RunBudget).
 	ToolCalls int
+	// RecordingError is a non-fatal, sanitized operator log degradation. It
+	// must not cause tool re-execution or alter the parsed assistant answer.
+	RecordingError string
 }
 
 // oliumProviderSem caps the number of in-flight olium provider calls
@@ -75,7 +79,7 @@ func acquireProviderSlot(ctx context.Context, cfg *config.OliumConfig) (release 
 // to discard. sourcePath, when set, is appended to the system prompt so the
 // agent knows it has filesystem access to local source code.
 func runOliumPromptWithThinking(ctx context.Context, cfg *config.OliumConfig, prompt string, streamWriter, thinkingWriter io.Writer, sourcePath string, verbose bool, rec RecordSpec) (oliumRunOutput, error) {
-	eng, err := buildOliumEngineWithSpec(cfg, SessionSpec{SourcePath: sourcePath, IncludeTools: true, Record: rec})
+	eng, err := buildOliumEngineWithSpec(cfg, SessionSpec{SourcePath: sourcePath, IncludeTools: true, Record: rec}, streamWriter)
 	if err != nil {
 		return oliumRunOutput{}, err
 	}
@@ -87,12 +91,25 @@ func runOliumPromptWithThinking(ctx context.Context, cfg *config.OliumConfig, pr
 	return runOliumOnEngineWithThinking(ctx, cfg, eng, prompt, streamWriter, thinkingWriter, verbose)
 }
 
+// sessionMaxTurns gives specialized sessions priority over the ordinary phase
+// budget. Non-positive values keep the bounded engine default; they never mean
+// unlimited execution. Autopilot constructs its engine separately.
+func sessionMaxTurns(cfg *config.OliumConfig, spec SessionSpec) int {
+	if spec.MaxTurns > 0 {
+		return spec.MaxTurns
+	}
+	if cfg != nil && cfg.MaxTurns > 0 {
+		return cfg.MaxTurns
+	}
+	return 0
+}
+
 // buildOliumEngineWithSpec is the general engine constructor behind the
 // AgentRuntime seam. It resolves the provider from olium config, then applies
 // the SessionSpec (system prompt, source-path suffix, turn cap, tool set,
 // prompt cache). Concrete olium engine/provider/tool types are confined to this
 // file so the rest of pkg/agent depends only on the AgentRuntime interface.
-func buildOliumEngineWithSpec(cfg *config.OliumConfig, spec SessionSpec) (*oengine.Engine, error) {
+func buildOliumEngineWithSpec(cfg *config.OliumConfig, spec SessionSpec, recordingSink ...io.Writer) (*oengine.Engine, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("olium config is nil")
 	}
@@ -119,6 +136,14 @@ func buildOliumEngineWithSpec(cfg *config.OliumConfig, spec SessionSpec) (*oengi
 		return nil, fmt.Errorf("olium provider: %w", err)
 	}
 
+	if spec.PlanningOnly {
+		// These providers execute their own hidden tool loops, outside olium's
+		// dispatch boundary. Do not claim a no-probe guarantee they cannot honor.
+		if err := planningProviderPolicy(prov); err != nil {
+			return nil, err
+		}
+	}
+
 	system := spec.System
 	if system == "" {
 		system = cfg.SystemPrompt
@@ -129,23 +154,33 @@ func buildOliumEngineWithSpec(cfg *config.OliumConfig, spec SessionSpec) (*oengi
 	if spec.SourcePath != "" {
 		system += "\n\nApplication source code is available at: " + spec.SourcePath
 	}
+	if spec.PlanningOnly {
+		system = planningSystemPrompt(spec.Skills)
+	}
 
 	ecfg := oengine.Config{
 		Provider:          prov,
 		Model:             model,
 		System:            system,
-		MaxTurns:          spec.MaxTurns,
+		MaxTurns:          sessionMaxTurns(cfg, spec),
 		EnablePromptCache: spec.EnablePromptCache,
+		SpillDir:          spec.Record.SessionDir, // private, project-scoped full tool archive
 		// Skills, when set, are rendered into the system prompt as an
 		// <available_skills> block by engine.New. The load_skill tool that
 		// serves their bodies is registered below (requires IncludeTools).
 		Skills: spec.Skills,
 	}
-	if spec.IncludeTools && spec.OfflineTools {
+	if spec.PlanningOnly {
+		ecfg.Skills = nil // selection metadata above, never load/follow guidance
+		ecfg.DisableTools = true
+		ecfg.RequireFinalAnswer = true
+	}
+	if !spec.PlanningOnly && spec.IncludeTools && spec.OfflineTools {
+		ecfg.Skills = nil // this registry has no load_skill tool
 		reg := tool.NewRegistry()
 		tool.RegisterOfflineBuiltins(reg)
 		ecfg.Tools = reg
-	} else if spec.IncludeTools {
+	} else if !spec.PlanningOnly && spec.IncludeTools {
 		reg := tool.NewRegistry()
 		tool.RegisterBuiltins(reg, nil)
 		if spec.Skills != nil && spec.Skills.Len() > 0 {
@@ -184,17 +219,91 @@ func buildOliumEngineWithSpec(cfg *config.OliumConfig, spec SessionSpec) (*oengi
 			sessID = filepath.Base(spec.Record.SessionDir)
 		}
 		cwd, _ := os.Getwd()
-		if rec, rerr := sessionlog.New(filepath.Join(spec.Record.SessionDir, name), sessionlog.Meta{
+		rec, rerr := sessionlog.New(filepath.Join(spec.Record.SessionDir, name), sessionlog.Meta{
 			SessionID: sessID,
 			Provider:  prov.Name(),
 			Model:     model,
 			Cwd:       cwd,
-		}); rerr == nil {
-			ecfg.Recorder = rec
+		})
+		var sink io.Writer
+		if len(recordingSink) > 0 {
+			sink = recordingSink[0]
 		}
+		ec := &adapterRecorder{rec: rec, err: rerr, sink: sink}
+		ec.warnIfDegraded()
+		ecfg.Recorder = ec
 	}
 
 	return oengine.New(ecfg), nil
+}
+
+// adapterRecorder keeps evidence failure non-fatal but observable. The safe
+// metadata warning never includes prompts, arguments, HTTP bodies, or results.
+// Fresh calls also mirror it to their runtime sink; session callers still get
+// the sticky error from Close and the configured logger warning.
+type adapterRecorder struct {
+	mu     sync.Mutex
+	rec    *sessionlog.Recorder
+	err    error
+	sink   io.Writer
+	warned bool
+}
+
+func (r *adapterRecorder) warnIfDegraded() {
+	err := r.err
+	if err == nil && r.rec != nil {
+		err = r.rec.Err()
+	}
+	if err != nil && !r.warned {
+		r.warned = true
+		zap.L().Warn("Agent transcript recording degraded; evidence may be incomplete", zap.Error(err))
+		_ = WriteRuntimeProgress(r.sink, "agent", "recording", "Evidence degraded: transcript recording failed; transcript may be incomplete")
+	}
+}
+
+func (r *adapterRecorder) UserPrompt(prompt string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.rec != nil {
+		r.rec.UserPrompt(prompt)
+	}
+	r.warnIfDegraded()
+}
+
+func (r *adapterRecorder) Record(ev oengine.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.rec != nil {
+		r.rec.Record(ev)
+	}
+	r.warnIfDegraded()
+}
+
+func (r *adapterRecorder) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.rec != nil {
+		r.err = r.rec.Close()
+	}
+	r.warnIfDegraded()
+	return r.err
+}
+
+// classifyOliumEventError restores context sentinels lost at the engine's
+// string-only event boundary. A per-call deadline remains retryable while a
+// cancelled/expired parent is still rejected by isRetryableAgentError.
+func classifyOliumEventError(ctx context.Context, msg string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%s: %w", msg, err)
+	}
+	lower := strings.ToLower(msg)
+	if strings.Contains(lower, context.DeadlineExceeded.Error()) {
+		return fmt.Errorf("%s: %w", msg, context.DeadlineExceeded)
+	}
+	if strings.Contains(lower, context.Canceled.Error()) {
+		return fmt.Errorf("%s: %w", msg, context.Canceled)
+	}
+	return classifyOliumError(msg)
 }
 
 // transcriptSeqCacheSize bounds the (sessionDir, template) → counter LRU. The
@@ -260,21 +369,32 @@ func runOliumOnEngineWithThinking(ctx context.Context, cfg *config.OliumConfig, 
 		}
 	}
 
-	var captured strings.Builder
+	var captured, currentTurn strings.Builder
+	var terminalErr error
 	var usage agenttypes.TokenUsage
 	toolCalls := 0
-	// Surface tool exec start/end on streamWriter so swarm phases match the
-	// autopilot/headless format. Per-turn usage is *not* echoed here — swarm
+	archiveWarned := false
+	// Surface full tool arguments/results for recorded operator streams;
+	// unrecorded runs keep concise tool cards. Per-turn usage is *not* echoed here — swarm
 	// drives many short phases and a [turn done ...] line per phase is too
 	// noisy. Adapter still tallies usage from the same event below. The
 	// reasoning lane is pinned to stderr (not streamWriter, which is stdout
 	// for swarm/query) so piped stdout stays clean; it's gated on --verbose
 	// inside the logger.
-	tlog := toollog.NewWith(streamWriter, verbose).WithThinkingWriter(os.Stderr)
+	tlog := toollog.NewWith(streamWriter, verbose).WithThinkingWriter(os.Stderr).WithFullOutput(eng.ToolArchiveDir())
 	ch := eng.Run(ctx, prompt)
 	for ev := range ch {
 		if ev.Type == oengine.EventToolExecStart {
 			toolCalls++
+		}
+		if ev.Type == oengine.EventToolExecEnd && !archiveWarned {
+			if receipt, ok := ev.ToolDetails[tool.ArchiveDetailsKey].(map[string]any); ok {
+				if complete, _ := receipt["complete"].(bool); !complete {
+					archiveWarned = true
+					zap.L().Warn("Agent tool archive degraded; full output retention is not guaranteed")
+					_ = WriteRuntimeProgress(streamWriter, "agent", "recording", "Evidence degraded: tool archive incomplete; full output retention is not guaranteed")
+				}
+			}
 		}
 		if tlog.HandleTool(ev) {
 			continue
@@ -294,24 +414,55 @@ func runOliumOnEngineWithThinking(ctx context.Context, cfg *config.OliumConfig, 
 			// operator reads think → answer (a text-only phase never hits a
 			// tool card to trigger the flush).
 			tlog.FlushThinking()
-			captured.WriteString(ev.Delta)
+			currentTurn.WriteString(ev.Delta)
 			if streamWriter != nil {
 				_, _ = io.WriteString(streamWriter, ev.Delta)
 			}
+		case oengine.EventStreamRetry:
+			if ev.Usage != nil {
+				usage.InputTokens += ev.Usage.Input
+				usage.OutputTokens += ev.Usage.Output
+			}
+			// The recorder retains this abandoned attempt separately. Only the
+			// current turn is discarded from parsed output; earlier completed
+			// turns and their tool work must survive recovery.
+			tlog.FlushThinking()
+			currentTurn.Reset()
 		case oengine.EventTurnDone:
+			captured.WriteString(currentTurn.String())
+			currentTurn.Reset()
 			if ev.Usage != nil {
 				usage.InputTokens += ev.Usage.Input
 				usage.OutputTokens += ev.Usage.Output
 			}
 		case oengine.EventError:
 			tlog.FlushThinking()
-			return oliumRunOutput{Text: captured.String(), Usage: usage, ToolCalls: toolCalls}, fmt.Errorf("olium: %w", classifyOliumError(ev.Err))
+			if ev.Usage != nil {
+				usage.InputTokens += ev.Usage.Input
+				usage.OutputTokens += ev.Usage.Output
+			}
+			cause := classifyOliumEventError(ctx, ev.Err)
+			if ev.BudgetExhausted && ctx.Err() == nil {
+				kind := "turns"
+				if strings.Contains(ev.Err, "max tool calls") {
+					kind = "tool_calls"
+				}
+				cause = &RuntimeBudgetError{Kind: kind, Reason: ev.Err}
+			}
+			terminalErr = fmt.Errorf("olium: %w", cause)
 		}
 	}
 	// Flush reasoning from a final turn that produced no assistant text and no
 	// tool card (otherwise it'd be silently dropped at phase end).
 	tlog.FlushThinking()
-	return oliumRunOutput{Text: captured.String(), Usage: usage, ToolCalls: toolCalls}, nil
+	// A terminal failure still returns the final attempt's partial output.
+	captured.WriteString(currentTurn.String())
+	var recordingError string
+	if err := tlog.Err(); err != nil {
+		recordingError = err.Error()
+		tlog.ReportIncomplete()
+	}
+	return oliumRunOutput{Text: captured.String(), Usage: usage, ToolCalls: toolCalls, RecordingError: recordingError}, terminalErr
 }
 
 // WrapProviderWithSemaphore returns a provider.Provider that gates each

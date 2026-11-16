@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -514,10 +515,9 @@ type ReconfirmConfig struct {
 	// NoRedirects controls whether the requester follows 3xx. Default true so a
 	// redirect isn't transparently followed and mistaken for a content diff.
 	NoRedirects bool
-	// Evidence, when non-nil, collects the request/response pairs this helper
-	// fetches (each payload replay and the fresh baseline) so the module can
-	// attach the confirmation evidence to its finding instead of discarding it.
-	// nil-safe: leave unset to skip evidence capture.
+	// Evidence, when non-nil, also collects the selected captured exchanges
+	// returned in BodyDifferentialResult.Evidence. Only the first two payload
+	// replays and fresh clean control are retained, independently of PayloadRounds.
 	Evidence *EvidenceCollector
 }
 
@@ -539,6 +539,11 @@ type BodyDifferentialResult struct {
 	Ran bool
 	// Reason is a short human-readable explanation, suitable for debug logging.
 	Reason string
+	// Evidence owns selected actual sends, including completed exchanges before
+	// an inconclusive failure. The first payload replay is primary confirmation;
+	// at most two payload replays and one fresh clean control are retained.
+	// Cached baseline text is comparison input only, never a new captured send.
+	Evidence []evidence.Entry
 }
 
 // ConfirmBodyDifferential re-issues a payload-applied request and a clean
@@ -591,21 +596,37 @@ func ConfirmBodyDifferential(
 	// Replay the payload request; collect the introduced-content token set of each
 	// replay so per-request dynamic tokens (varying run-to-run) drop out.
 	payloadTokenSets := make([]map[string]int, 0, cfg.PayloadRounds)
-	for i := 0; i < cfg.PayloadRounds; i++ {
-		_, raw, ok := fetchResponseParsed(client, payloadReq, cfg.NoRedirects)
-		if !ok {
-			return BodyDifferentialResult{Ran: false, Reason: "payload request fetch failed"}
+	var selected []evidence.Entry
+	retain := func(x *evidence.Exchange, role evidence.Role, label string) {
+		if x == nil {
+			return
 		}
-		cfg.Evidence.Add(fmt.Sprintf("confirm-payload round %d", i+1), string(payloadRaw), raw)
-		payloadTokenSets = append(payloadTokenSets, deltaTokenSet(raw))
+		selected = append(selected, evidence.Select(x, role, len(selected) == 0 && role == evidence.RoleConfirmation, label))
+		cfg.Evidence.AddExchange(x, role, label)
+	}
+	for i := 0; i < cfg.PayloadRounds; i++ {
+		fetched := fetchConfirmationResponse(client, payloadReq, cfg.NoRedirects, i < 2)
+		retain(fetched.exchange, evidence.RoleConfirmation, fmt.Sprintf("confirm-payload round %d", i+1))
+		if !fetched.ok {
+			return BodyDifferentialResult{Ran: false, Reason: "payload request fetch failed", Evidence: selected}
+		}
+		payloadTokenSets = append(payloadTokenSets, deltaTokenSet(fetched.full))
 	}
 
-	// Fetch a fresh clean baseline.
-	_, baseRaw, ok := fetchResponse(client, service, baselineRaw, cfg.NoRedirects)
-	if !ok {
-		return BodyDifferentialResult{Ran: false, Reason: "baseline request fetch failed"}
+	// Fetch a fresh clean control. Cached baseline bytes are never recaptured.
+	baselineReq, err := httpmsg.ParseRawRequest(string(baselineRaw))
+	if err != nil {
+		return BodyDifferentialResult{Ran: false, Reason: "baseline request fetch failed", Evidence: selected}
 	}
-	cfg.Evidence.Add("confirm-baseline", string(baselineRaw), baseRaw)
+	if service != nil {
+		baselineReq = baselineReq.WithService(service)
+	}
+	fetched := fetchConfirmationResponse(client, baselineReq, cfg.NoRedirects, true)
+	retain(fetched.exchange, evidence.RoleControl, "confirm-baseline")
+	if !fetched.ok {
+		return BodyDifferentialResult{Ran: false, Reason: "baseline request fetch failed", Evidence: selected}
+	}
+	baseRaw := fetched.full
 
 	// Fold every baseline sample (fresh + cached) into one token set: a token
 	// must be absent from all of them to be considered payload-introduced.
@@ -638,11 +659,12 @@ func ConfirmBodyDifferential(
 	if introduced == 0 {
 		return BodyDifferentialResult{
 			Ran: true, Confirmed: false,
-			Reason: "payload introduced no stable content absent from baseline (no effect, dynamic noise, or marker already in baseline)",
+			Reason:   "payload introduced no stable content absent from baseline (no effect, dynamic noise, or marker already in baseline)",
+			Evidence: selected,
 		}
 	}
 
-	return BodyDifferentialResult{Ran: true, Confirmed: true, Reason: "payload reproducibly introduced content absent from baseline"}
+	return BodyDifferentialResult{Ran: true, Confirmed: true, Reason: "payload reproducibly introduced content absent from baseline", Evidence: selected}
 }
 
 // volatileHeaderLine matches per-request response header lines whose values
@@ -740,20 +762,41 @@ func fetchResponse(client *http.Requester, service *httpmsg.Service, raw []byte,
 // rounds parse the raw once and reuse the parsed request here, instead of
 // re-parsing per round. The request is treated as immutable by Execute.
 func fetchResponseParsed(client *http.Requester, req *httpmsg.HttpRequestResponse, noRedirects bool) (int, string, bool) {
-	// NoClustering bypasses the requester's 500ms response cache. These
-	// confirmation replays run back-to-back (well within the TTL); a cached replay
-	// would return a byte-identical response and collapse the measured run-to-run
-	// variance to zero — making dynamic noise look like stable introduced content
-	// and defeating the very differential this helper exists to compute.
+	fetched := fetchConfirmationResponse(client, req, noRedirects, false)
+	return fetched.status, fetched.full, fetched.ok
+}
+
+// confirmationResponse keeps comparison projections separate from the raw receipt.
+// Neither body normalization nor tokenization can change selected HTTP evidence.
+type confirmationResponse struct {
+	status   int
+	body     string
+	full     string
+	exchange *evidence.Exchange
+	ok       bool
+}
+
+func fetchConfirmationResponse(client *http.Requester, req *httpmsg.HttpRequestResponse, noRedirects, capture bool) confirmationResponse {
+	// NoClustering forces distinct executions, not back-to-back cache replays.
 	resp, _, err := client.Execute(req, http.Options{NoRedirects: noRedirects, NoClustering: true})
-	if err != nil {
-		return 0, "", false
+	var fetched confirmationResponse
+	if resp == nil {
+		return fetched
 	}
 	defer resp.Close()
-	if resp.Response() == nil {
-		return 0, "", false
+	if capture {
+		// A completed response remains useful context even when Execute also
+		// reports an error. Capture the current selected chain BEFORE Close.
+		fetched.exchange = http.CaptureEvidence(resp)
 	}
-	return resp.Response().StatusCode, resp.FullResponseString(), true
+	if err != nil || resp.Response() == nil {
+		return fetched
+	}
+	fetched.status = resp.Response().StatusCode
+	fetched.body = resp.Body().String()
+	fetched.full = resp.FullResponseString()
+	fetched.ok = true
+	return fetched
 }
 
 // ReflectionProbe sends a request carrying the given fresh canary and reports
@@ -885,13 +928,14 @@ func isAuthorityTerminator(c byte) bool {
 //
 // On a wildcard-probe error it fails open (returns true) so a transient probe
 // failure does not suppress a real finding.
-func ConfirmNotSoft404(
+func ConfirmNotSoft404WithEvidence(
 	sc *ScanContext,
 	client *http.Requester,
 	probeReq *httpmsg.HttpRequestResponse,
 	statusCode int,
 	body []byte,
 	location string,
+	sink *EvidenceCollector,
 ) bool {
 	// A 3xx redirect to a login/auth page is not a real exposure. Reuses the
 	// shared login-redirect detector so detection stays consistent with the
@@ -902,7 +946,7 @@ func ConfirmNotSoft404(
 	if sc == nil {
 		return true
 	}
-	entry, err := sc.WildcardProbe(probeReq, client)
+	entry, err := sc.WildcardProbeWithEvidence(probeReq, client, sink)
 	if err != nil || entry == nil {
 		return true // fail open — never suppress on a probe failure
 	}
@@ -926,9 +970,9 @@ type CrossIDConfig struct {
 	// self-refetch. Default false so the refetch mirrors the IDOR modules'
 	// probes, which follow redirects.
 	NoRedirects bool
-	// Evidence, when non-nil, collects the same-id refetch responses used to
-	// measure the endpoint's determinism, so the module can attach the
-	// determinism evidence to its finding. nil-safe: leave unset to skip.
+	// Evidence, when non-nil, collects at most the first two same-id refetch
+	// receipts (full HTTP messages, not comparison bodies), subject to its cap.
+	// SelfRounds still controls all comparison rounds. nil-safe: unset skips capture.
 	Evidence *EvidenceCollector
 }
 
@@ -1011,11 +1055,12 @@ func ConfirmCrossIDDifferential(
 
 	selfRatio := 1.0
 	for i := 0; i < cfg.SelfRounds; i++ {
-		status, body, ok := fetchResponseBodyParsed(client, originalReq, cfg.NoRedirects)
-		if !ok {
+		fetched := fetchConfirmationResponse(client, originalReq, cfg.NoRedirects, cfg.Evidence != nil && i < 2 && cfg.Evidence.Len() < MaxEvidencePairs)
+		cfg.Evidence.AddExchange(fetched.exchange, evidence.RoleConfirmation, fmt.Sprintf("confirm-original round %d", i+1))
+		if !fetched.ok {
 			return CrossIDVerdict{Ran: false, CrossRatio: crossRatio, Reason: "same-id refetch failed"}
 		}
-		cfg.Evidence.Add(fmt.Sprintf("confirm-original round %d", i+1), string(originalRaw), body)
+		status, body := fetched.status, fetched.body
 		// A status flap for an unchanged id means the endpoint is non-deterministic
 		// at the status level — treat it as maximally unstable.
 		if status != baselineStatus {
@@ -1063,6 +1108,10 @@ func rawBodySignature(status int, body string) ResponseSignature {
 // once and replays the parsed request across rounds. The request is immutable to
 // Execute. The bool is false on any HTTP/empty-response error.
 func fetchResponseBodyParsed(client *http.Requester, req *httpmsg.HttpRequestResponse, noRedirects bool) (int, string, bool) {
+	return fetchResponseBodyParsedWithEvidence(client, req, noRedirects, nil, "")
+}
+
+func fetchResponseBodyParsedWithEvidence(client *http.Requester, req *httpmsg.HttpRequestResponse, noRedirects bool, sink *EvidenceCollector, label string) (int, string, bool) {
 	// NoClustering bypasses the 500ms response cache so each same-id refetch is a
 	// genuinely fresh observation. A cached replay would report perfect self-
 	// similarity (selfRatio≈1.0) and make a non-deterministic endpoint look stable,
@@ -1074,6 +1123,9 @@ func fetchResponseBodyParsed(client *http.Requester, req *httpmsg.HttpRequestRes
 	defer resp.Close()
 	if resp.Response() == nil {
 		return 0, "", false
+	}
+	if sink != nil && sink.Len() < MaxEvidencePairs {
+		sink.AddExchange(http.CaptureEvidence(resp), evidence.RoleControl, label)
 	}
 	return resp.Response().StatusCode, resp.Body().String(), true
 }
@@ -1129,18 +1181,19 @@ func MatchWithinSpan(re *regexp.Regexp, body string, maxSpan int) bool {
 // re-fetch is blocked or not an error surface, or the control is blocked: such a
 // page can neither reproduce the leak nor serve as a clean control. A nil re is
 // treated as "nothing to re-confirm" and passes.
-func ConfirmMatchReproduces(
+func ConfirmMatchReproducesWithEvidence(
 	ctx *httpmsg.HttpRequestResponse,
 	ip httpmsg.InsertionPoint,
 	httpClient *http.Requester,
 	payloadRaw []byte,
 	re *regexp.Regexp,
+	sink *EvidenceCollector,
 ) bool {
 	if re == nil {
 		return true
 	}
 	// (1) Reproducible under the payload, on a genuine (non-blocked, error-surface) response.
-	body, blocked, surface, ok := errorSurfaceFetch(ctx, httpClient, payloadRaw)
+	body, blocked, surface, ok := errorSurfaceFetchWithEvidence(ctx, httpClient, payloadRaw, sink, evidence.RoleConfirmation, "error signature payload replay")
 	if !ok {
 		return true
 	}
@@ -1148,7 +1201,7 @@ func ConfirmMatchReproduces(
 		return false
 	}
 	// (2) Absent from a fresh, non-blocked control fetch of the original value.
-	controlBody, controlBlocked, _, ok := errorSurfaceFetch(ctx, httpClient, ip.BuildRequest([]byte(ip.BaseValue())))
+	controlBody, controlBlocked, _, ok := errorSurfaceFetchWithEvidence(ctx, httpClient, ip.BuildRequest([]byte(ip.BaseValue())), sink, evidence.RoleControl, "error signature original-value control")
 	if !ok {
 		return true
 	}
@@ -1166,6 +1219,10 @@ func ConfirmMatchReproduces(
 // captured response, so a coincidental match against a per-request random token
 // would "reproduce" from cache instead of revealing itself as one-off noise.
 func errorSurfaceFetch(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte) (body string, blocked, surface, ok bool) {
+	return errorSurfaceFetchWithEvidence(ctx, httpClient, raw, nil, evidence.RoleUnknown, "")
+}
+
+func errorSurfaceFetchWithEvidence(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte, sink *EvidenceCollector, role evidence.Role, label string) (body string, blocked, surface, ok bool) {
 	req, err := httpmsg.ParseRawRequest(string(raw))
 	if err != nil {
 		return "", false, false, false
@@ -1176,6 +1233,9 @@ func errorSurfaceFetch(ctx *httpmsg.HttpRequestResponse, httpClient *http.Reques
 		return "", false, false, false
 	}
 	defer resp.Close()
+	if sink != nil && sink.Len() < MaxEvidencePairs {
+		sink.AddExchange(http.CaptureEvidence(resp), role, label)
+	}
 	return resp.Body().String(), infra.IsBlockedResponse(resp), infra.IsErrorSurfaceStatus(resp), true
 }
 

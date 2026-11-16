@@ -22,7 +22,7 @@ func expandProjectRecordsFromQuery(ctx context.Context, repo *database.Repositor
 	}
 	qb := database.NewQueryBuilder(repo.DB(), filters)
 	var uuids []string
-	if err := qb.BuildRecordsQuery().Column("uuid").Scan(ctx, &uuids); err != nil {
+	if err := qb.BuildRecordsQuery().ExcludeColumn("*").Column("uuid").Scan(ctx, &uuids); err != nil {
 		return nil, fmt.Errorf("failed to query http records: %w", err)
 	}
 	return uuids, nil

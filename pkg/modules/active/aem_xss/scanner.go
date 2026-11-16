@@ -101,6 +101,7 @@ func (m *Module) probeSink(
 	s sink,
 	baseURL string,
 ) *output.ResultEvent {
+	proof := &aem.Proof{}
 	reflected, err := modkit.ConfirmReflectionWithValue(reflectRounds, modkit.FreshCanary, func(marker string) (bool, error) {
 		res := aem.Get(ctx, httpClient, s.build(marker), nil)
 		if !res.OK || !s.okStatus(res.Status) {
@@ -108,6 +109,12 @@ func (m *Module) probeSink(
 		}
 		if s.requireHTML && !strings.Contains(strings.ToLower(res.ContentType), "html") {
 			return false, nil
+		}
+		if proof.Primary == nil {
+			proof.Primary = res.Exchange
+			proof.Payload = xssPayload(marker)
+		} else {
+			proof.Confirmation(res)
 		}
 		return strings.Contains(res.Body, xssPayload(marker)), nil
 	})
@@ -118,7 +125,7 @@ func (m *Module) probeSink(
 	// Headless confirmation with a fresh marker.
 	marker := modkit.FreshCanary()
 	confirmed, dialogMsg := m.headlessConfirm(baseURL+s.build(marker), marker)
-	return m.build(s, marker, baseURL, dialogMsg, confirmed)
+	return m.build(s, marker, baseURL, dialogMsg, confirmed, proof)
 }
 
 // headlessConfirm navigates the attack URL in a headless browser and reports
@@ -153,7 +160,7 @@ func (m *Module) headlessConfirm(fullURL, marker string) (bool, string) {
 	return false, ""
 }
 
-func (m *Module) build(s sink, marker, baseURL, dialogMsg string, confirmed bool) *output.ResultEvent {
+func (m *Module) build(s sink, marker, baseURL, dialogMsg string, confirmed bool, proof *aem.Proof) *output.ResultEvent {
 	path := s.build(marker)
 	matchedURL := baseURL + path
 
@@ -169,7 +176,7 @@ func (m *Module) build(s sink, marker, baseURL, dialogMsg string, confirmed bool
 	tags := append([]string{"aem", "adobe", "xss"}, s.tags...)
 	desc := fmt.Sprintf("Reflected XSS in the AEM %s sink at %s. %s", s.id, path, label)
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		ModuleID:         ModuleID,
 		Host:             aem.HostFromBase(baseURL),
 		URL:              matchedURL,
@@ -185,4 +192,8 @@ func (m *Module) build(s sink, marker, baseURL, dialogMsg string, confirmed bool
 			Reference:   s.ref,
 		},
 	}
+	// ProbeURL reports dialogs but exposes no HTTP receipt. Keep its fresh-marker
+	// confirmation distinct from the selected transport reflection operation.
+	result.Metadata = map[string]any{"browser_confirmation_capture": "missing", "browser_confirmation_capture_reason": "ProbeURL exposes dialogs, not raw HTTP exchanges"}
+	return proof.Attack(result)
 }

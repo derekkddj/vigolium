@@ -18,11 +18,11 @@ func teeToRuntimeLog(w io.Writer, sessionDir string) (io.Writer, io.Closer) {
 	if sessionDir == "" {
 		return w, nil
 	}
-	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
 		return w, nil
 	}
 	logPath := filepath.Join(sessionDir, config.RuntimeLogFilename)
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return w, nil
 	}

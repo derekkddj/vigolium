@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/grafana/sobek"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	gohttp "github.com/vigolium/vigolium/pkg/http"
 )
 
@@ -23,6 +24,7 @@ type cacheEntry struct {
 	raw       []byte
 	elapsed   int64
 	createdAt time.Time
+	exchange  *evidence.Exchange
 }
 
 func newHTTPCache() *httpCache {
@@ -156,7 +158,9 @@ func httpCacheFuncDefs() []JSFuncDef {
 					key := cacheKey(rawReq)
 
 					if entry, ok := cache.get(key); ok {
-						return buildResponseObject(vm, entry.raw, entry.elapsed)
+						result := buildResponseObject(vm, entry.raw, entry.elapsed, entry.exchange)
+						_ = result.ToObject(vm).Set("cached", true)
+						return result
 					}
 
 					resp := doSimpleRequest(vm, opts.HTTPClient, "GET", urlStr, "", call.Argument(1))
@@ -173,6 +177,7 @@ func httpCacheFuncDefs() []JSFuncDef {
 								raw:       rawBytes,
 								elapsed:   elapsedMs,
 								createdAt: time.Now(),
+								exchange:  exchangeFromValue(vm, respObj.Get("exchange")).Clone(),
 							})
 						}
 					}
@@ -216,7 +221,9 @@ func httpCacheFuncDefs() []JSFuncDef {
 					key := cacheKey(rawReq)
 
 					if entry, ok := cache.get(key); ok {
-						return buildResponseObject(vm, entry.raw, entry.elapsed)
+						result := buildResponseObject(vm, entry.raw, entry.elapsed, entry.exchange)
+						_ = result.ToObject(vm).Set("cached", true)
+						return result
 					}
 
 					resp := doRequestFromOpts(vm, opts.HTTPClient, o)
@@ -233,6 +240,7 @@ func httpCacheFuncDefs() []JSFuncDef {
 								raw:       rawBytes,
 								elapsed:   elapsedMs,
 								createdAt: time.Now(),
+								exchange:  exchangeFromValue(vm, respObj.Get("exchange")).Clone(),
 							})
 						}
 					}

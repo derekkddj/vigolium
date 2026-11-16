@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/vigolium/vigolium/pkg/deparos/jstangle/linkfinder"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/modules/modtest"
@@ -131,6 +132,16 @@ func TestScanPerRequest_ReferencedMapIngestsRoutes(t *testing.T) {
 	assert.Equal(t, output.EvidenceGradeImpact, event.EvidenceGrade)
 	assert.Equal(t, "comment", event.Metadata["reference_origin"])
 	assert.Equal(t, true, event.Metadata["has_source_content"])
+	assert.False(t, event.BaselineEvidence, "a fetched map must not inherit the bundle as proof")
+	assert.Contains(t, event.Request, "GET /static/js/main.abc.js.map HTTP/1.1")
+	assert.Contains(t, event.Response, mapBody, "select the map, not the triggering bundle")
+	require.Len(t, event.Evidence, 1)
+	assert.True(t, event.Evidence[0].Primary)
+	assert.Equal(t, evidence.RoleObservation, event.Evidence[0].Role)
+	require.NotNil(t, event.Evidence[0].Exchange)
+	assert.Equal(t, evidence.ProvenanceCaptured, event.Evidence[0].Exchange.Provenance)
+	assert.Equal(t, srv.URL+"/static/js/main.abc.js.map", event.Evidence[0].Exchange.URL)
+	assert.NoError(t, event.Evidence[0].Exchange.Validate())
 
 	fed := feeder.urls()
 	assert.Contains(t, fed, srv.URL+"/api/v1/accounts")
@@ -196,6 +207,9 @@ func TestScanPerRequest_InlineMapNeedsNoFetch(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.Contains(t, feeder.urls(), srv.URL+"/api/inline/route")
+	require.True(t, results[0].BaselineEvidence, "an inline map is input evidence")
+	require.Empty(t, results[0].Request, "do not pair the credential-stripped working request with the original response")
+	require.Empty(t, results[0].Response)
 
 	mu.Lock()
 	defer mu.Unlock()

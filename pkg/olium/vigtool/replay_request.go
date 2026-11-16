@@ -1,7 +1,6 @@
 package vigtool
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -9,21 +8,20 @@ import (
 	"fmt"
 	gohttp "net/http"
 	"net/http/cookiejar"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/olium/tool"
 	"github.com/vigolium/vigolium/pkg/replay"
 	"golang.org/x/net/publicsuffix"
 )
 
-// replayRecordSource tags http_records created by persisting a replay exchange,
-// so query_records / fsexport can distinguish agent-driven replays from crawled
-// or scanner traffic.
+// replayRecordSource is the fallback for captures without an original record.
+// Versioned replays preserve the original record's source and input lineage.
 const replayRecordSource = "olium-replay"
 
 const (
@@ -51,6 +49,9 @@ func NewReplayRequestTool(ctx *SessionsContext) tool.Tool {
 }
 
 type replayRequestTool struct {
+	tool.HTTPReceiptStore
+	// doReplay is a test seam; production always uses the shared replay engine.
+	doReplay  func(context.Context, replay.Options) (*replay.Result, error)
 	ctx       *SessionsContext
 	totalRun  atomic.Int64
 	perRecMu  sync.Mutex
@@ -76,9 +77,11 @@ func (*replayRequestTool) Description() string {
 		"inspect_record — pull payloads from attack_kit or compose your own. Optionally pass an " +
 		"auth_session name to fold in cookies/headers from list_auth_sessions. Cookies set by one " +
 		"replay persist to the next (multi-step auth flows work). Honours HTTP_PROXY / HTTPS_PROXY " +
-		"env vars so the operator can route replays through Burp. The exact sent request and received " +
-		"response are persisted as a durable http_record — its UUID is returned as 'replay_record_uuid'; " +
-		"pass that to report_finding via record_uuids so the finding links the exchange that proved it. " +
+		"env vars so the operator can route replays through Burp. A complete captured sent exchange " +
+		"is saved as an immutable record version preserving input lineage; its UUID is returned as " +
+		"'replay_record_uuid'. Check persisted/persistence_status before linking it via report_finding " +
+		"record_uuids. Partial/missing captures are reported honestly through execution receipt refs; " +
+		"mutated_request is an intended preview, not proof of bytes sent. " +
 		"Capped at 30 calls per record and 200 per run to prevent runaway loops."
 }
 
@@ -114,7 +117,7 @@ func (*replayRequestTool) Schema() map[string]any {
 			},
 			"raw_request": map[string]any{
 				"type":        "string",
-				"description": "Optional fully-formed raw HTTP request to send verbatim. Mutually exclusive with mutations. Useful for hand-crafted attacks that don't fit the insertion-point model.",
+				"description": "Optional fully-formed raw HTTP request supplied to the replay engine. Mutually exclusive with mutations. Overlays, transport defaults and redirects may change the actual sent request; select its execution receipt for evidence, not this intended input.",
 			},
 			"auth_session": map[string]any{
 				"type":        "string",
@@ -233,6 +236,7 @@ func (r *replayRequestTool) Execute(ctx context.Context, args map[string]any, _ 
 		HeaderOverlay:        overlay,
 		NoRedirects:          argsBool(args, "no_redirects"),
 		Client:               r.getClient(),
+		CaptureExchange:      true,
 	}
 	if rawOverride != "" {
 		opts.RawRequest = []byte(rawOverride)
@@ -241,47 +245,92 @@ func (r *replayRequestTool) Execute(ctx context.Context, args map[string]any, _ 
 	r.incPerRecord(uuid)
 	r.totalRun.Add(1)
 
-	result, err := replay.Do(ctx, opts)
-	if err != nil {
-		return tool.Result{Content: fmt.Sprintf("replay_request: %v", err), IsError: true}, nil
+	doReplay := r.doReplay
+	if doReplay == nil {
+		doReplay = replay.Do
 	}
-
-	// Persist the actual sent request + received response as a durable
-	// http_record so the mutated exchange that confirms a finding survives the
-	// model session. The UUID is returned so report_finding can link it as
-	// evidence via record_uuids. Best-effort: a capture hiccup must not fail
-	// the replay the model already completed.
-	replayRecordUUID := r.persistReplayExchange(ctx, rec.Scheme, rec.Hostname, rec.Port, result)
-
-	// Embedding the engine's Result means future field additions to the
-	// shared schema land in the tool's output automatically, instead of
-	// silently drifting from the autopilot prompts that read it.
+	result, executionErr := doReplay(ctx, opts)
+	var captured, baselineCapture *evidence.Exchange
+	if result != nil {
+		if result.Replay != nil {
+			captured = result.Replay.Exchange
+			if result.Replay.Error != "" {
+				executionErr = errors.Join(executionErr, errors.New(result.Replay.Error))
+			}
+		}
+		if result.Baseline != nil {
+			baselineCapture = result.Baseline.Exchange
+		}
+	}
+	// Retain any partial receipt returned with an error; absence stays missing.
+	// Never use RawMutatedRequest or summary renderings as sent evidence.
+	receipt, receiptErr := r.RetainHTTPReceipt(captured, "http_client_message")
+	baselineReceipt, baselineErr := r.RetainHTTPReceipt(baselineCapture, "http_client_message")
+	replayRecordUUID, persistErr := r.persistReplayExchange(ctx, rec.UUID, result)
+	persistenceStatus := "saved"
+	if persistErr != nil {
+		persistenceStatus = "failed"
+		if captured == nil || captured.RequestState != evidence.StateComplete || captured.ResponseState != evidence.StateComplete {
+			persistenceStatus = "capture_unavailable"
+		}
+	}
+	receipt = r.RefreshHTTPReceiptAvailability(receipt)
+	baselineReceipt = r.RefreshHTTPReceiptAvailability(baselineReceipt)
 	out := struct {
-		RecordUUID       string `json:"record_uuid"`
-		ReplayRecordUUID string `json:"replay_record_uuid,omitempty"`
+		RecordUUID         string                   `json:"record_uuid"`
+		ReplayRecordUUID   string                   `json:"replay_record_uuid,omitempty"`
+		Receipt            tool.HTTPReceiptManifest `json:"receipt"`
+		BaselineReceipt    tool.HTTPReceiptManifest `json:"baseline_receipt"`
+		Persisted          bool                     `json:"persisted"`
+		PersistenceStatus  string                   `json:"persistence_status"`
+		PersistError       string                   `json:"persist_error,omitempty"`
+		ExecutionError     string                   `json:"execution_error,omitempty"`
+		ReceiptError       string                   `json:"receipt_error,omitempty"`
+		MutatedRequestKind string                   `json:"mutated_request_kind"`
 		*replay.Result
-	}{RecordUUID: uuid, ReplayRecordUUID: replayRecordUUID, Result: result}
-	body, _ := json.Marshal(out)
-
-	details := map[string]any{
-		"record_uuid":     uuid,
-		"status":          result.Replay.Status,
-		"length_delta":    result.Diff.LengthDelta,
-		"content_changed": result.Diff.ContentChanged,
+	}{RecordUUID: rec.UUID, ReplayRecordUUID: replayRecordUUID, Receipt: receipt, BaselineReceipt: baselineReceipt,
+		Persisted: persistErr == nil && replayRecordUUID != "", PersistenceStatus: persistenceStatus,
+		MutatedRequestKind: "intended", Result: result}
+	if persistErr != nil {
+		out.PersistError = persistErr.Error()
 	}
+	if executionErr != nil {
+		out.ExecutionError = executionErr.Error()
+	}
+	if err := errors.Join(receiptErr, baselineErr); err != nil {
+		out.ReceiptError = err.Error()
+	}
+	body, _ := json.Marshal(out)
+	details := map[string]any{"record_uuid": rec.UUID, "receipt": receipt, "baseline_receipt": baselineReceipt,
+		"persisted": out.Persisted, "persistence_status": persistenceStatus, "mutated_request_kind": "intended"}
 	if replayRecordUUID != "" {
 		details["replay_record_uuid"] = replayRecordUUID
 	}
-	if len(result.Diff.ReflectsPayload) > 0 {
-		details["reflects_payload"] = true
+	if persistErr != nil {
+		details["persist_error"] = out.PersistError
 	}
-	if result.AdditionalGroups > 0 {
-		details["additional_payload_groups"] = result.AdditionalGroups
+	if executionErr != nil {
+		details["execution_error"] = out.ExecutionError
 	}
-	return tool.Result{
-		Content: string(body),
-		Details: details,
-	}, nil
+	if out.ReceiptError != "" {
+		details["receipt_error"] = out.ReceiptError
+	}
+	if result != nil {
+		if result.Replay != nil {
+			details["status"] = result.Replay.Status
+		}
+		if result.Diff != nil {
+			details["length_delta"] = result.Diff.LengthDelta
+			details["content_changed"] = result.Diff.ContentChanged
+			if len(result.Diff.ReflectsPayload) > 0 {
+				details["reflects_payload"] = true
+			}
+		}
+		if result.AdditionalGroups > 0 {
+			details["additional_payload_groups"] = result.AdditionalGroups
+		}
+	}
+	return tool.Result{Content: string(body), Details: details, IsError: executionErr != nil}, nil
 }
 
 // perRecordCount reads the current attempt count for uuid without
@@ -302,61 +351,31 @@ func (r *replayRequestTool) incPerRecord(uuid string) {
 	r.perRecord[uuid]++
 }
 
-// persistReplayExchange saves the exact request that was sent and the response
-// that came back as a project-scoped http_record, returning its UUID. Best
-// effort: any failure (no repo, network-error replay, empty request bytes,
-// save error) returns "" and is swallowed — the replay already succeeded and
-// the model has the diff, so persistence must never fail the tool call.
-func (r *replayRequestTool) persistReplayExchange(ctx context.Context, scheme, hostname string, port int, result *replay.Result) string {
+// persistReplayExchange uses only the owned sent capture. SaveRecordVersion
+// preserves the original input lineage/project/source without rewriting any
+// historical exchange or finding link. Even on an execution error a complete
+// receipt can be saved; partial receipts remain selectable, not fake records.
+func (r *replayRequestTool) persistReplayExchange(ctx context.Context, previousUUID string, result *replay.Result) (string, error) {
 	repo := r.ctx.repo()
-	if repo == nil || result == nil || result.Replay == nil ||
-		result.Replay.Error != "" || len(result.RawMutatedRequest) == 0 {
-		return ""
+	if repo == nil {
+		return "", fmt.Errorf("replay persistence unavailable: no repository")
 	}
-	svc, err := httpmsg.NewService(hostname, port, scheme)
+	if result == nil || result.Replay == nil || result.Replay.Exchange == nil {
+		return "", fmt.Errorf("replay persistence unavailable: no captured exchange")
+	}
+	x := result.Replay.Exchange
+	if x.RequestState != evidence.StateComplete || x.ResponseState != evidence.StateComplete {
+		return "", fmt.Errorf("replay persistence unavailable: capture is incomplete; receipt is execution-scoped only")
+	}
+	rr, err := httpmsg.FromEvidenceExchange(x)
 	if err != nil {
-		return ""
+		return "", err
 	}
-	rr := httpmsg.NewHttpRequestResponse(
-		httpmsg.NewHttpRequestWithService(svc, result.RawMutatedRequest),
-		httpmsg.NewHttpResponse(rawResponseFromReplaySummary(result.Replay)),
-	)
-	uuid, err := repo.SaveRecord(ctx, rr, replayRecordSource, r.ctx.ProjectUUID)
-	if err != nil {
-		return ""
+	rr = rr.WithResponse(httpmsg.NewHttpResponseWithDuration(rr.Response().Raw(), time.Duration(result.Replay.ResponseTimeMs)*time.Millisecond)).WithEvidence(x)
+	if previousUUID != "" {
+		return repo.SaveRecordVersion(ctx, previousUUID, rr)
 	}
-	return uuid
-}
-
-// rawResponseFromReplaySummary reconstructs wire-format response bytes from a
-// replay Summary so the exchange can be persisted. Status line uses HTTP/1.1
-// (the replay client normalizes protocol); Content-Length is synthesized from
-// the captured body when the origin omitted it (e.g. de-chunked responses),
-// matching the capture path used by web_fetch.
-func rawResponseFromReplaySummary(s *replay.Summary) []byte {
-	var b bytes.Buffer
-	statusText := gohttp.StatusText(s.Status)
-	if statusText == "" {
-		statusText = "Status"
-	}
-	fmt.Fprintf(&b, "HTTP/1.1 %d %s\r\n", s.Status, statusText)
-
-	keys := make([]string, 0, len(s.Headers))
-	for k := range s.Headers {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		for _, v := range s.Headers.Values(k) {
-			fmt.Fprintf(&b, "%s: %s\r\n", k, v)
-		}
-	}
-	if s.Headers.Get("Content-Length") == "" && len(s.RawBody) > 0 {
-		fmt.Fprintf(&b, "Content-Length: %d\r\n", len(s.RawBody))
-	}
-	b.WriteString("\r\n")
-	b.Write(s.RawBody)
-	return b.Bytes()
+	return repo.SaveRecord(ctx, rr, replayRecordSource, r.ctx.ProjectUUID)
 }
 
 func (r *replayRequestTool) lookupAuthHeaders(ctx context.Context, hostname, name string) (map[string]string, error) {

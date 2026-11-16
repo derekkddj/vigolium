@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -102,12 +103,40 @@ func TestDeleteOldAgenticScans(t *testing.T) {
 	// A fresh one that must survive.
 	newAgenticScan(t, repo, DefaultProjectUUID, "query", "")
 
-	deleted, err := repo.DeleteOldAgenticScans(ctx, 24*time.Hour)
-	if err != nil {
-		t.Fatalf("DeleteOldAgenticScans: %v", err)
+	// References must stay attached to their retained catalog, including durable
+	// sections/candidates and children (whose own status can still be running).
+	child := newAgenticScan(t, repo, DefaultProjectUUID, "scan", old.UUID)
+	child.Status = "running"
+	if err := repo.UpdateAgenticScan(ctx, child); err != nil {
+		t.Fatal(err)
 	}
-	if deleted != 1 {
-		t.Errorf("DeleteOldAgenticScans = %d, want 1", deleted)
+	section := &AgentSection{UUID: uuid.NewString(), AgenticScanUUID: old.UUID, ProjectUUID: DefaultProjectUUID}
+	candidate := &AgentFindingCandidate{UUID: uuid.NewString(), AgenticScanUUID: old.UUID, ProjectUUID: DefaultProjectUUID, SectionUUID: section.UUID}
+	finding := &Finding{ProjectUUID: DefaultProjectUUID, AgenticScanUUID: old.UUID, HTTPRecordUUIDs: []string{}, ModuleID: "audit", ModuleName: "audit", Severity: "high"}
+	for _, model := range []any{section, candidate, finding} {
+		if _, err := repo.db.NewInsert().Model(model).Exec(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	otherProject := newAgenticScan(t, repo, uuid.NewString(), "query", "")
+	otherProject.CompletedAt = old.CompletedAt
+	if err := repo.UpdateAgenticScan(ctx, otherProject); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := repo.DeleteOldAgenticScans(ctx, 24*time.Hour)
+	if deleted != 0 || !errors.Is(err, ErrUnsafeAgenticScanRetention) {
+		t.Fatalf("DeleteOldAgenticScans = %d, %v; want disabled", deleted, err)
+	}
+	for _, run := range []*AgenticScan{old, child, otherProject} {
+		if _, err := repo.GetAgenticScan(ctx, run.UUID); err != nil {
+			t.Fatalf("retained catalog missing for %s: %v", run.UUID, err)
+		}
+	}
+	for _, model := range []any{section, candidate, finding} {
+		n, err := repo.db.NewSelect().Model(model).Where("agentic_scan_uuid = ?", old.UUID).Count(ctx)
+		if err != nil || n != 1 {
+			t.Fatalf("retained dependency %T: count=%d, err=%v", model, n, err)
+		}
 	}
 }
 

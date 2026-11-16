@@ -20,6 +20,8 @@ import (
 
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
+	httpRequester "github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/jsext"
 	"github.com/vigolium/vigolium/pkg/modules"
@@ -232,48 +234,152 @@ func TestRun_UnreachableIsInconclusive(t *testing.T) {
 	assert.Equal(t, database.VerdictInconclusive, res.Verdict, res.Reason)
 }
 
-// TestRun_PassiveUsesStoredRecord: a passive verify re-analyzes the stored
-// record and sends nothing; --refetch analyzes a fresh response instead.
+// TestRun_PassiveUsesStoredRecord: a passive verify re-analyzes an explicitly
+// selected stored observation without sending; --refetch assesses a fresh response.
 func TestRun_PassiveUsesStoredRecord(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepo(t)
+	var fixed atomic.Bool
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		if !fixed.Load() {
+			w.Header().Set("Server", "Apache/2.4.41")
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer srv.Close()
+
+	// Capture the original observation through the real HTTP stack before fixing
+	// the server. A linked record alone does not select an observation role.
+	requester := modtest.Requester(t)
+	chain, _, err := requester.Execute(modtest.Request(t, srv.URL+"/item"), httpRequester.Options{NoClustering: true})
+	require.NoError(t, err)
+	x := httpRequester.CaptureEvidence(chain)
+	chain.Close()
+	require.NotNil(t, x)
+	require.Equal(t, evidence.ProvenanceCaptured, x.Provenance)
+	require.Equal(t, evidence.StateComplete, x.RequestState)
+	require.Equal(t, evidence.StateComplete, x.ResponseState)
+	rec, err := httpmsg.FromEvidenceExchange(x)
+	require.NoError(t, err)
+	recUUID := saveRecord(t, repo, rec, "scanner")
+	f := saveFinding(t, repo, &database.Finding{
+		ModuleID: "software-version-header", ModuleName: "Software Version Disclosed in Headers",
+		URL: srv.URL + "/item", HTTPRecordUUIDs: []string{recUUID},
+		EvidenceStatus: "selected",
+		Evidence:       []evidence.Entry{evidence.Select(x, evidence.RoleObservation, true, "Version disclosure observation")},
+	})
+	fixed.Store(true)
+	hits.Store(0) // only requests made by verification count below
+
+	res := Run(ctx, Reconstruct(ctx, repo, database.DefaultProjectUUID, f, nil), RunOptions{})
+	require.Equal(t, database.VerdictConfirmed, res.Verdict, res.Reason)
+	assert.Positive(t, res.Matched)
+	assert.Zero(t, res.UnclassifiedMatched)
+	require.NotNil(t, res.Plan.Baseline)
+	assert.Equal(t, BaselineSelectedExchange, res.Plan.Baseline.Source)
+	assert.Equal(t, x.ID, res.Plan.Baseline.ExchangeID)
+	assert.Equal(t, evidence.RoleObservation, res.Plan.Baseline.Role)
+	assert.False(t, res.Plan.Network)
+	assert.Equal(t, database.ModuleTypePassive, res.Plan.ModuleType)
+	assert.Zero(t, hits.Load(), "a passive verify must not send a request")
+
+	res = Run(ctx, Reconstruct(ctx, repo, database.DefaultProjectUUID, f, nil), RunOptions{Refetch: true, Requester: requester})
+	assert.Equal(t, database.VerdictNotReproduced, res.Verdict, res.Reason)
+	assert.True(t, res.Plan.Network)
+	assert.Zero(t, res.Matched)
+	assert.Equal(t, int64(1), hits.Load(), "--refetch fetches the record once")
+}
+
+func TestRun_PassiveLegacyIsInconclusive(t *testing.T) {
 	ctx := context.Background()
 	repo := newRepo(t)
 	var hits atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits.Add(1)
-		_, _ = io.WriteString(w, "ok") // no version header any more
+		_, _ = io.WriteString(w, "ok")
 	}))
 	defer srv.Close()
-
 	rec := modtest.Request(t, srv.URL+"/item").WithResponse(httpmsg.NewHttpResponse([]byte(
 		"HTTP/1.1 200 OK\r\nServer: Apache/2.4.41\r\nContent-Type: text/html\r\n\r\nbody")))
 	recUUID := saveRecord(t, repo, rec, "scanner")
-	f := saveFinding(t, repo, &database.Finding{
-		ModuleID: "software-version-header", ModuleName: "Software Version Disclosed in Headers",
-		URL: srv.URL + "/item", HTTPRecordUUIDs: []string{recUUID},
-	})
 
-	res := Run(ctx, Reconstruct(ctx, repo, database.DefaultProjectUUID, f, nil), RunOptions{})
-	assert.Equal(t, database.VerdictConfirmed, res.Verdict, res.Reason)
-	assert.False(t, res.Plan.Network)
-	assert.Equal(t, database.ModuleTypePassive, res.Plan.ModuleType)
-	assert.Zero(t, hits.Load(), "a passive verify must not send a request")
-
-	res = Run(ctx, Reconstruct(ctx, repo, database.DefaultProjectUUID, f, nil), RunOptions{Refetch: true, Requester: modtest.Requester(t)})
-	assert.Equal(t, database.VerdictNotReproduced, res.Verdict, res.Reason)
-	assert.Equal(t, int64(1), hits.Load(), "--refetch fetches the record once")
+	for _, tc := range []struct {
+		name   string
+		hash   string
+		source string
+		refs   []string
+	}{
+		{name: "linked record", hash: strings.Repeat("be", 20), source: BaselineLinkedRecord, refs: []string{recUUID}},
+		{name: "inline historical HTTP", hash: strings.Repeat("bf", 20), source: BaselineFindingRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := saveFinding(t, repo, &database.Finding{
+				FindingHash: tc.hash,
+				ModuleID:    "software-version-header", ModuleName: "Software Version Disclosed in Headers",
+				URL: srv.URL + "/item", HTTPRecordUUIDs: tc.refs,
+				Request: string(rec.Request().Raw()), Response: string(rec.Response().Raw()),
+			})
+			// Inline history intentionally has no linked record or typed selection.
+			// Keep both legacy paths unknown rather than claiming captured fidelity.
+			assert.Len(t, f.HTTPRecordUUIDs, len(tc.refs))
+			assert.Empty(t, f.Evidence)
+			res := Run(ctx, Reconstruct(ctx, repo, database.DefaultProjectUUID, f, nil), RunOptions{})
+			assert.Equal(t, database.VerdictInconclusive, res.Verdict, res.Reason)
+			assert.Contains(t, res.Reason, "unknown observation role")
+			assert.Contains(t, res.Reason, "explicit observation")
+			assert.Zero(t, res.Matched)
+			assert.Zero(t, res.UnclassifiedMatched, "legacy stored context is rejected before running the module")
+			assert.Zero(t, res.Results)
+			require.NotNil(t, res.Plan.Baseline)
+			assert.Equal(t, tc.source, res.Plan.Baseline.Source)
+			assert.Equal(t, evidence.RoleUnknown, res.Plan.Baseline.Role)
+			assert.False(t, res.Plan.Network)
+			assert.Zero(t, hits.Load(), "legacy stored context must not trigger a request")
+		})
+	}
 }
 
-// TestRun_ExtensionModule: an ext-* finding verifies through a module loaded
-// from an extension file.
+// TestRun_ExtensionModule: an ext-* finding is confirmed only when its re-run
+// selects the actual HTTP call's invocation-local receipt, not legacy/context data.
 func TestRun_ExtensionModule(t *testing.T) {
-	ctx := context.Background()
-	repo := newRepo(t)
-	var fixed atomic.Bool
-	srv := sqliServer(t, &fixed, nil)
+	for _, tc := range []struct {
+		name      string
+		selection string
+		verdict   string
+	}{
+		{
+			name:      "selected attack receipt",
+			selection: `result.evidence = [{exchange: resp.exchange, role: "attack", primary: true}];`,
+			verdict:   database.VerdictConfirmed,
+		},
+		{
+			name:    "unselected HTTP call",
+			verdict: database.VerdictInconclusive,
+		},
+		{
+			name: "legacy HTTP text",
+			selection: `result.request = resp.request;
+      result.response = resp.raw;
+      result.evidence = [{request: resp.request, response: resp.raw, note: "historical attack"}];`,
+			verdict: database.VerdictInconclusive,
+		},
+		{
+			name:      "baseline context only",
+			selection: `result.evidence = [{exchange: ctx.exchange, role: "baseline"}];`,
+			verdict:   database.VerdictInconclusive,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			repo := newRepo(t)
+			var fixed atomic.Bool
+			srv := sqliServer(t, &fixed, nil)
 
-	dir := t.TempDir()
-	script := filepath.Join(dir, "sqli_probe.js")
-	require.NoError(t, os.WriteFile(script, []byte(`module.exports = {
+			dir := t.TempDir()
+			script := filepath.Join(dir, "sqli_probe.js")
+			require.NoError(t, os.WriteFile(script, []byte(`module.exports = {
   id: "sqli-probe",
   name: "SQLi probe",
   severity: "high",
@@ -283,44 +389,61 @@ func TestRun_ExtensionModule(t *testing.T) {
   scanPerInsertionPoint: function(ctx, insertion) {
     var resp = vigolium.http.send(insertion.buildRequest("1'"));
     if (resp && resp.body && resp.body.indexOf("SQL syntax") >= 0) {
-      return [{ name: "SQLi probe", severity: "high", url: ctx.request.url }];
+      var result = {
+        name: "SQLi probe", severity: "high", url: ctx.request.url,
+        payload: "1'", fuzzingParameter: insertion.name
+      };
+      `+tc.selection+`
+      return [result];
     }
     return null;
   }
 };
 `), 0o600))
-	cfg := config.ExtensionsConfig{Enabled: true, CustomDir: []string{script}}
-	requester := modtest.Requester(t)
-	engine, err := jsext.NewEngine(&cfg, requester, &jsext.EngineOptions{})
-	require.NoError(t, err)
-	var mod modules.Module
-	for _, m := range engine.ActiveModules() {
-		if strings.HasPrefix(m.ID(), "ext-") {
-			mod = m
-		}
-	}
-	if mod == nil {
-		t.Fatal("the extension did not load")
-	}
-	resolve := func(id string) modules.Module {
-		if id == mod.ID() {
-			return mod
-		}
-		return nil
-	}
+			cfg := config.ExtensionsConfig{Enabled: true, CustomDir: []string{script}}
+			requester := modtest.Requester(t)
+			engine, err := jsext.NewEngine(&cfg, requester, &jsext.EngineOptions{})
+			require.NoError(t, err)
+			var mod modules.Module
+			for _, m := range engine.ActiveModules() {
+				if strings.HasPrefix(m.ID(), "ext-") {
+					mod = m
+				}
+			}
+			if mod == nil {
+				t.Fatal("the extension did not load")
+			}
+			resolve := func(id string) modules.Module {
+				if id == mod.ID() {
+					return mod
+				}
+				return nil
+			}
 
-	base := withResponse(modtest.Request(t, srv.URL+"/item?id=1"), "item page")
-	baseUUID := saveRecord(t, repo, base, "scanner")
-	f := saveFinding(t, repo, &database.Finding{
-		ModuleID: mod.ID(), ModuleName: "SQLi probe", URL: srv.URL + "/item?id=1", OriginRecordUUID: baseUUID,
-		FindingSource:  database.FindingSourceExtension,
-		InsertionPoint: &database.FindingInsertionPoint{Type: "URL_PARAM", Name: "id"},
-	})
-	res := Run(ctx, Reconstruct(ctx, repo, database.DefaultProjectUUID, f, resolve), RunOptions{Requester: requester})
-	assert.Equal(t, database.VerdictConfirmed, res.Verdict, res.Reason)
+			base := withResponse(modtest.Request(t, srv.URL+"/item?id=1"), "item page")
+			baseUUID := saveRecord(t, repo, base, "scanner")
+			f := saveFinding(t, repo, &database.Finding{
+				ModuleID: mod.ID(), ModuleName: "SQLi probe", URL: srv.URL + "/item?id=1", OriginRecordUUID: baseUUID,
+				FindingSource:  database.FindingSourceExtension,
+				InsertionPoint: &database.FindingInsertionPoint{Type: "URL_PARAM", Name: "id"},
+			})
+			res := Run(ctx, Reconstruct(ctx, repo, database.DefaultProjectUUID, f, resolve), RunOptions{Requester: requester})
+			require.Equal(t, tc.verdict, res.Verdict, res.Reason)
+			assert.Positive(t, res.Results, "the extension must actually report its SQLi match")
+			if tc.verdict == database.VerdictConfirmed {
+				assert.Positive(t, res.Matched)
+				assert.Zero(t, res.UnclassifiedMatched)
+			} else {
+				assert.Zero(t, res.Matched)
+				assert.Positive(t, res.UnclassifiedMatched)
+				assert.Contains(t, res.Reason, "unclassified / context data")
+				assert.Contains(t, res.Reason, "without explicitly selected evidence")
+			}
 
-	// Without the extension loaded the same finding is unsupported.
-	assert.Equal(t, database.VerdictUnsupported, Reconstruct(ctx, repo, database.DefaultProjectUUID, f, nil).Verdict)
+			// Without the extension loaded the same finding is unsupported.
+			assert.Equal(t, database.VerdictUnsupported, Reconstruct(ctx, repo, database.DefaultProjectUUID, f, nil).Verdict)
+		})
+	}
 }
 
 func TestSingleDifferingPoint(t *testing.T) {

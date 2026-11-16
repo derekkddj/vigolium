@@ -109,24 +109,37 @@ func (s *Service) Mode() string {
 func (s *Service) mintFixed(pctx PayloadContext) string {
 	nonce := mintNonce()
 	pctx.CallbackURL = s.template.render(nonce)
-	s.trackerCache().Add(nonce, pctx)
-	s.queuePayload(&database.OASTPayload{
-		Nonce:       nonce,
-		ProjectUUID: s.projectUUID,
-		ScanUUID:    s.scanUUID,
-		Class:       string(pctx.class()),
-		ModuleID:    pctx.ModuleID,
-		TargetURL:   pctx.TargetURL,
-		Param:       pctx.ParameterName,
-		RequestHash: pctx.RequestHash,
-	})
+	s.trackPayload(nonce, pctx)
 	return pctx.CallbackURL
 }
 
-// recordFixedPayload is RecordPayload for a {nonce} template: it updates the
-// tracker and the persisted row (still queued, or already written).
+// trackPayload persists small nonce context for both live and fixed modes. No
+// request/response bodies are retained at mint time.
+func (s *Service) trackPayload(nonce string, pctx PayloadContext) {
+	s.contextMu.Lock()
+	defer s.contextMu.Unlock()
+	pctx.plantingOwned = true
+	s.trackerCache().Add(nonce, pctx)
+	s.queuePayload(&database.OASTPayload{
+		Nonce:         nonce,
+		ProjectUUID:   s.projectUUID,
+		ScanUUID:      s.scanUUID,
+		Class:         string(pctx.class()),
+		InjectionType: pctx.InjectionType,
+		ModuleID:      pctx.ModuleID,
+		TargetURL:     pctx.TargetURL,
+		Param:         pctx.ParameterName,
+		RequestHash:   pctx.RequestHash,
+		Payload:       pctx.Payload,
+	})
+}
+
+// recordFixedPayload updates intent in the tracker and the persisted row for
+// either correlated mode (still queued, or already written).
 func (s *Service) recordFixedPayload(callbackURL, payload string) {
-	nonce := s.template.nonceOf(callbackURL)
+	s.contextMu.Lock()
+	defer s.contextMu.Unlock()
+	nonce := s.NonceForCallback(callbackURL)
 	if nonce == "" {
 		return
 	}

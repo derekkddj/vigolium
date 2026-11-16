@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -114,8 +115,10 @@ func (m *Module) ScanPerInsertionPoint(
 
 		matched := strings.Contains(resp.Body().String(), m.result)
 		var fullResp string
+		var selectedExchange *evidence.Exchange
 		if matched {
 			fullResp = resp.FullResponseString()
+			selectedExchange = http.CaptureEvidence(resp)
 		}
 		resp.Close()
 		if !matched {
@@ -131,7 +134,8 @@ func (m *Module) ScanPerInsertionPoint(
 		// cannot. The fresh product is also inherently absent from any baseline, so
 		// this doubles as a baseline-exclusion check. Fail OPEN on a transport error
 		// (cerr != nil) so a transient failure never suppresses a real finding.
-		if confirmed, cerr := m.confirmEvaluation(ctx, ip, httpClient, payload); cerr == nil && !confirmed {
+		support := modkit.NewEvidenceCollector()
+		if confirmed, cerr := m.confirmEvaluation(ctx, ip, httpClient, payload, support); cerr == nil && !confirmed {
 			continue
 		}
 
@@ -142,6 +146,8 @@ func (m *Module) ScanPerInsertionPoint(
 			FuzzingParameter: ip.Name(),
 			ExtractedResults: []string{ip.BaseValue()},
 		})
+		modkit.SetPrimaryEvidence(results[len(results)-1], selectedExchange, evidence.RoleAttack, "matched template evaluation probe")
+		modkit.AppendEvidence(results[len(results)-1], support)
 		// A confirmed evaluation is decisive; stop probing further breakout forms for
 		// this insertion point (downstream dedup would collapse them anyway).
 		return results, nil
@@ -168,6 +174,7 @@ func (m *Module) confirmEvaluation(
 	ip httpmsg.InsertionPoint,
 	httpClient *http.Requester,
 	matchedPayload string,
+	collectors ...*modkit.EvidenceCollector,
 ) (bool, error) {
 	const rounds = 2
 	for i := 0; i < rounds; i++ {
@@ -181,7 +188,15 @@ func (m *Module) confirmEvaluation(
 		req := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
 		resp, _, err := httpClient.Execute(req, http.Options{NoClustering: true})
 		if err != nil {
+			x := http.CaptureFailureEvidence(err)
+			for _, proof := range collectors {
+				proof.AddExchange(x, evidence.RoleConfirmation, fmt.Sprintf("fresh-operand evaluation round %d", i+1))
+			}
 			return false, err
+		}
+		x := http.CaptureEvidence(resp)
+		for _, proof := range collectors {
+			proof.AddExchange(x, evidence.RoleConfirmation, fmt.Sprintf("fresh-operand evaluation round %d", i+1))
 		}
 		if resp.Response() == nil {
 			resp.Close()

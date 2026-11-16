@@ -15,9 +15,9 @@ import (
 // along — findingChildTables is the one list those paths read.
 
 // findingChildTables are the tables keyed by findings.id that must not outlive
-// their finding. finding_records is the evidence junction; the other two are
-// the finding's history.
-var findingChildTables = []string{"finding_records", "finding_observations", "finding_status_events", "finding_hash_aliases"}
+// their finding. finding_records and finding_evidence are evidence junctions;
+// the others are the finding's observation, lifecycle and identity history.
+var findingChildTables = []string{"finding_records", "finding_evidence", "finding_observations", "finding_status_events", "finding_hash_aliases"}
 
 // recordFindingObservation notes that scanUUID observed the finding. A repeat
 // within one scan is a no-op (PRIMARY KEY (finding_id, scan_uuid)), and a save

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/uptrace/bun"
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/agent/agenttypes"
 	agentprompt "github.com/vigolium/vigolium/pkg/agent/prompt"
@@ -270,6 +272,102 @@ func (cfg *SwarmConfig) probeConfig() ProbeConfig {
 	}
 }
 
+// initializeSwarmRun is the swarm-local get-or-create/seed path. Unlike the
+// generic partial updater, it validates stored identity before any pipeline
+// writes. A transaction also covers creation collisions and native ownership,
+// so a failed guard cannot leave a new parent or partially seed an existing one.
+func (s *SwarmRunner) initializeSwarmRun(ctx context.Context, cfg *SwarmConfig, run *database.AgenticScan) error {
+	if cfg.ProjectUUID == "" {
+		cfg.ProjectUUID = database.DefaultProjectUUID
+	}
+	run.ProjectUUID = cfg.ProjectUUID
+	cfg.AgenticScanUUID = run.UUID
+	if s.repo == nil {
+		if cfg.ScanUUID == "" {
+			cfg.ScanUUID = uuid.NewString()
+		}
+		run.ScanUUID = cfg.ScanUUID
+		return nil
+	}
+	return s.repo.DB().RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		// Match CreateAgenticScan's get-or-create contract, but keep subsequent
+		// validation and seeding in the same transaction (including conflicts).
+		if _, err := tx.NewInsert().Model(run).On("CONFLICT (uuid) DO NOTHING").Exec(ctx); err != nil {
+			return fmt.Errorf("create agent run: %w", err)
+		}
+		existing := &database.AgenticScan{}
+		q := tx.NewSelect().Model(existing).Where("uuid = ?", run.UUID)
+		if s.repo.DB().Driver() == "postgres" {
+			q = q.For("UPDATE")
+		}
+		if err := q.Scan(ctx); err != nil {
+			return fmt.Errorf("read agent run: %w", err)
+		}
+		if existing.ProjectUUID != cfg.ProjectUUID {
+			return fmt.Errorf("%w: swarm agent run belongs to another project", database.ErrScanProjectMismatch)
+		}
+		if existing.Mode != "swarm" {
+			return fmt.Errorf("agent run UUID already belongs to another mode")
+		}
+		if existing.ScanUUID != "" {
+			if cfg.ScanUUID != "" && cfg.ScanUUID != existing.ScanUUID {
+				return fmt.Errorf("agent run UUID already references another native scan")
+			}
+			cfg.ScanUUID = existing.ScanUUID
+		}
+		if cfg.ScanUUID == "" {
+			cfg.ScanUUID = uuid.NewString()
+		}
+		run.ScanUUID = cfg.ScanUUID
+
+		child := &database.Scan{}
+		childQuery := tx.NewSelect().Model(child).Column("uuid", "project_uuid", "agentic_scan_uuid").Where("uuid = ?", cfg.ScanUUID)
+		if s.repo.DB().Driver() == "postgres" {
+			childQuery = childQuery.For("UPDATE")
+		}
+		if err := childQuery.Scan(ctx); err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("read native scan: %w", err)
+			}
+		} else {
+			if child.ProjectUUID != cfg.ProjectUUID {
+				return fmt.Errorf("%w: swarm native scan belongs to another project", database.ErrScanProjectMismatch)
+			}
+			if child.AgenticScanUUID != "" && child.AgenticScanUUID != run.UUID {
+				return fmt.Errorf("native scan UUID already belongs to another agent run")
+			}
+			// Claim only an unowned (or already matching) child. Later native
+			// callbacks must never run against somebody else's nonempty parent.
+			res, err := tx.NewUpdate().Model((*database.Scan)(nil)).Set("agentic_scan_uuid = ?", run.UUID).
+				Where("uuid = ?", cfg.ScanUUID).Where("project_uuid = ?", cfg.ProjectUUID).
+				Where("(agentic_scan_uuid IS NULL OR agentic_scan_uuid = '' OR agentic_scan_uuid = ?)", run.UUID).Exec(ctx)
+			if err != nil {
+				return fmt.Errorf("claim native scan: %w", err)
+			}
+			if n, err := res.RowsAffected(); err != nil || n != 1 {
+				return fmt.Errorf("native scan ownership changed during initialization")
+			}
+		}
+		// Keep pre-created caller metadata, including a nested run's parent.
+		// Carry immutable identity into subsequent phase/finalization writes.
+		run.ParentAgenticScanUUID = existing.ParentAgenticScanUUID
+		if !existing.StartedAt.IsZero() {
+			run.StartedAt = existing.StartedAt
+		}
+		res, err := tx.NewUpdate().Model(run).OmitZero().
+			ExcludeColumn("id", "uuid", "project_uuid", "parent_run_uuid", "created_at").
+			Where("uuid = ?", run.UUID).Where("project_uuid = ?", cfg.ProjectUUID).
+			Where("(scan_uuid IS NULL OR scan_uuid = '' OR scan_uuid = ?)", cfg.ScanUUID).Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("seed agent run: %w", err)
+		}
+		if n, err := res.RowsAffected(); err != nil || n != 1 {
+			return fmt.Errorf("agent run identity changed during initialization")
+		}
+		return nil
+	})
+}
+
 // Run executes the full agent swarm pipeline.
 func (s *SwarmRunner) Run(ctx context.Context, cfg SwarmConfig) (*SwarmResult, error) {
 	start := time.Now()
@@ -314,14 +412,8 @@ func (s *SwarmRunner) Run(ctx context.Context, cfg SwarmConfig) (*SwarmResult, e
 	if agenticScanUUID == "" {
 		agenticScanUUID = uuid.New().String()
 	}
-	// Ensure a run-unique native scan_uuid. Scan callbacks receive it via
-	// ScanRequest.ScanUUID and tag the native scan's findings with it, so the
-	// pipeline can stamp agentic_scan_uuid onto exactly this run's findings and
-	// scope its finding counts to the run rather than the whole project. Empty
-	// slips through when a caller (e.g. the server) didn't pin one.
-	if cfg.ScanUUID == "" {
-		cfg.ScanUUID = uuid.New().String()
-	}
+	// Initialization resolves the native UUID from the stored run on resume,
+	// or generates a fresh one, before any native/agent callbacks can write.
 	agenticScan := &database.AgenticScan{
 		UUID:        agenticScanUUID,
 		ProjectUUID: cfg.ProjectUUID,
@@ -342,23 +434,12 @@ func (s *SwarmRunner) Run(ctx context.Context, cfg SwarmConfig) (*SwarmResult, e
 		agenticScan.InputRaw = cfg.Inputs[0]
 	}
 
-	if s.repo != nil {
-		// Upsert: when the API handler / CLI pre-inserted a row under our
-		// agenticScanUUID, double-inserting would hit the unique constraint and log
-		// a spurious warning. Probe first; update-with-OmitZero keeps any
-		// caller-set fields (target_url, parent_run_uuid, …) intact.
-		if existing, _ := s.repo.GetAgenticScan(ctx, agenticScanUUID); existing != nil {
-			if err := s.repo.UpdateAgenticScan(ctx, agenticScan); err != nil {
-				zap.L().Warn("Failed to seed existing agent run record", zap.Error(err))
-			}
-		} else {
-			if err := s.repo.CreateAgenticScan(ctx, agenticScan); err != nil {
-				zap.L().Warn("Failed to create agent run record", zap.Error(err))
-			}
-		}
-	}
-
 	result := &SwarmResult{AgenticScanUUID: agenticScanUUID}
+	if err := s.initializeSwarmRun(ctx, &cfg, agenticScan); err != nil {
+		// Do not finalize an unvalidated UUID: even terminal persistence or
+		// attribution would be a write against a run we do not own.
+		return result, fmt.Errorf("swarm initialization failed: %w", err)
+	}
 
 	_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", "run", "run started: "+agenticScanUUID)
 
@@ -396,7 +477,18 @@ func (s *SwarmRunner) Run(ctx context.Context, cfg SwarmConfig) (*SwarmResult, e
 func (s *SwarmRunner) finishRun(ctx context.Context, cfg SwarmConfig, agenticScan *database.AgenticScan, result *SwarmResult, start time.Time, err error) (*SwarmResult, error) {
 	// Finalization must survive the run's cancellation/deadline. Logging below
 	// only observes the context; it never changes err or the existing status rules.
-	finalizeCtx := context.WithoutCancel(ctx)
+	// This is the common exit path, including discovery/planner failures and
+	// cancellations that bypass finalizeSwarmStep. Preserve the original error
+	// and status while reconciling whatever findings were actually persisted.
+	if s.repo != nil || (agenticScan.UUID != "" && (cfg.ScanFunc != nil || cfg.DiscoverFunc != nil)) {
+		ps := &swarmPipelineState{runner: s, cfg: cfg, agenticScan: agenticScan, result: result}
+		ps.attributeRunFindings(ctx)
+		result.TotalFindings, result.SeverityCounts = ps.runFindingCounts(ctx)
+	}
+	// Reconciliation has its own bounded detached calls. Give terminal status
+	// persistence a fresh budget so a slow attribution/count cannot starve it.
+	finalizeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
 	result.Duration = time.Since(start)
 	now := time.Now()
 	agenticScan.CompletedAt = now
@@ -456,13 +548,33 @@ func (s *SwarmRunner) finishRun(ctx context.Context, cfg SwarmConfig, agenticSca
 	}
 
 	if s.repo != nil {
-		if updateErr := s.repo.UpdateAgenticScan(finalizeCtx, agenticScan); updateErr != nil {
+		projectUUID := agenticScan.ProjectUUID
+		if projectUUID == "" {
+			projectUUID = database.DefaultProjectUUID
+		}
+		// Finalization must not reassign a stored run from another project.
+		updateResult, updateErr := s.repo.DB().NewUpdate().Model(agenticScan).OmitZero().
+			Where("uuid = ?", agenticScan.UUID).Where("project_uuid = ?", projectUUID).Exec(finalizeCtx)
+		if updateErr != nil {
 			zap.L().Warn("Failed to update agent run record", zap.Error(updateErr))
+		} else if n, _ := updateResult.RowsAffected(); n != 1 {
+			zap.L().Warn("Agent run finalization refused: missing row or different project", zap.String("agentic_scan_uuid", agenticScan.UUID))
+		} else if result.TotalFindings == 0 {
+			// UpdateAgenticScan omits zero fields. Explicitly persist a known zero
+			// rather than retaining a previous count from a resumed run.
+			if _, updateErr := s.repo.DB().NewUpdate().Model((*database.AgenticScan)(nil)).
+				Set("finding_count = 0").Where("uuid = ?", agenticScan.UUID).
+				Where("project_uuid = ?", projectUUID).Exec(finalizeCtx); updateErr != nil {
+				zap.L().Warn("Failed to persist empty agent finding count", zap.Error(updateErr))
+			}
 		}
 	}
 
 	// Free-form warnings/errors can contain credentials or complete target URLs.
 	// Keep originals in result/DB, but log only safe categories and counts here.
+	if result.TotalFindings < 0 {
+		_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", "run", "warning: persisted finding count unavailable; findings=-1 means unknown")
+	}
 	if len(result.Warnings) > 0 {
 		_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", "run", fmt.Sprintf(
 			"warning: warnings recorded: count=%d; see run details", len(result.Warnings)))

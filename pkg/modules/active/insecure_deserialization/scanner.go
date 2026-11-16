@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -81,6 +82,7 @@ var payloads = []deserPayload{
 }
 
 type probeCapture struct {
+	exchange     *evidence.Exchange
 	body         string
 	request      string
 	response     string
@@ -181,7 +183,11 @@ func (m *Module) ScanPerInsertionPoint(
 			continue
 		}
 
-		return []*output.ResultEvent{{
+		finding := &output.ResultEvent{
+			Evidence: []evidence.Entry{
+				evidence.Select(control.exchange, evidence.RoleControl, false, "benign malformed-value control"),
+				evidence.Select(second.exchange, evidence.RoleConfirmation, false, "serialized probe replay"),
+			},
 			ModuleID:      ModuleID,
 			RecordKind:    output.RecordKindCandidate,
 			EvidenceGrade: output.EvidenceGradeDifferential,
@@ -214,7 +220,9 @@ func (m *Module) ScanPerInsertionPoint(
 				"gadget_execution":      false,
 				"side_effect_confirmed": false,
 			},
-		}}, nil
+		}
+		modkit.SetPrimaryEvidence(finding, first.exchange, evidence.RoleAttack, "payload-specific deserialization probe")
+		return []*output.ResultEvent{finding}, nil
 	}
 
 	return nil, nil
@@ -231,6 +239,7 @@ func (m *Module) executeProbe(ctx *httpmsg.HttpRequestResponse, httpClient *http
 		return probeCapture{}, nil
 	}
 	return probeCapture{
+		exchange:     http.CaptureEvidence(resp),
 		body:         resp.BodyString(),
 		request:      string(raw),
 		response:     resp.FullResponseString(),

@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -46,14 +47,11 @@ type MergeOptions struct {
 	// oast_interactions from the copy. Safe only for a reader that shows no
 	// finding and filters no record by one.
 	//
-	// It is the only option here that bounds the MERGING process's memory rather
-	// than the destination's size. The three tables it drops are the ones that
-	// cannot be copied set-based — findings.id is AUTOINCREMENT and is referenced
-	// by both the junction and the OAST rows, so the id remapping needs every
-	// source row in Go before the write transaction opens. Each finding row
-	// carries its inline request, response, and additional_evidence, so a corpus
-	// with many findings is buffered in full, per source, whether or not anything
-	// will read one.
+	// This also avoids buffering the finding identity/metadata inventory used
+	// to remap AUTOINCREMENT IDs. Inline finding bodies are otherwise hydrated
+	// one finding at a time; selected receipt bytes are validated in bounded
+	// pages and copied set-based. Selected receipts and their associations are
+	// omitted with the findings.
 	SkipFindings bool
 }
 
@@ -74,16 +72,17 @@ var findingBodyColumns = []string{"additional_evidence", "request", "response"}
 
 // MergeStats reports what a SQLite-to-SQLite merge copied into the destination.
 type MergeStats struct {
-	ProjectsMerged       int
-	ScansMerged          int
-	AgenticScansMerged   int
-	RecordsMerged        int
-	FindingsMerged       int
-	FindingsDeduped      int
-	FindingRecordsMerged int
-	OASTMerged           int
-	ObservationsMerged   int
-	StatusEventsMerged   int
+	ProjectsMerged             int
+	ScansMerged                int
+	AgenticScansMerged         int
+	RecordsMerged              int
+	FindingsMerged             int
+	FindingsDeduped            int
+	FindingRecordsMerged       int
+	OASTMerged                 int
+	OASTPlantingReceiptsMerged int
+	ObservationsMerged         int
+	StatusEventsMerged         int
 
 	// rekeyNeeded is set when findings were merged from a source below schema
 	// v6 (identity v2), so the destination must re-key them.
@@ -104,6 +103,7 @@ func (s *MergeStats) Add(o *MergeStats) {
 	s.FindingsDeduped += o.FindingsDeduped
 	s.FindingRecordsMerged += o.FindingRecordsMerged
 	s.OASTMerged += o.OASTMerged
+	s.OASTPlantingReceiptsMerged += o.OASTPlantingReceiptsMerged
 	s.ObservationsMerged += o.ObservationsMerged
 	s.StatusEventsMerged += o.StatusEventsMerged
 }
@@ -230,9 +230,9 @@ func mergeOnce(ctx context.Context, dest *DB, srcPath string, opts MergeOptions)
 	// SQLite connection cannot run new statements while a result-set cursor is
 	// open on it, so these reads must be fully drained first.
 	//
-	// This is where SkipFindings pays: the read below is the whole of a source's
-	// finding corpus, inline evidence included, resident in Go at once. Skipping
-	// leaves all three nil, and every step downstream is a no-op on empty input.
+	// Finding identity/metadata rows are buffered for ID mapping, but their
+	// inline evidence bodies are omitted here and fetched one finding at a time.
+	// Selected receipt bodies are never pre-buffered with this inventory.
 	var (
 		srcFindings       []bufferedRow
 		srcFindingRecords []bufferedRow
@@ -284,6 +284,10 @@ func mergeOnce(ctx context.Context, dest *DB, srcPath string, opts MergeOptions)
 	// deferred rollback cleanly covers every early-return error path.
 	defer func() { _ = tx.Rollback() }()
 
+	if err := validateMergeOASTPayloads(ctx, tx); err != nil {
+		return nil, fmt.Errorf("validate OAST nonce context: %w", err)
+	}
+
 	// Set-based copies for uuid-keyed tables (OR IGNORE dedups by primary key /
 	// unique key). The AUTOINCREMENT "id" column is never copied: tables that
 	// have one (agentic_scans) dedup on their UNIQUE(uuid) instead, and letting
@@ -297,6 +301,11 @@ func mergeOnce(ctx context.Context, dest *DB, srcPath string, opts MergeOptions)
 			return nil, fmt.Errorf("inspect columns for %s: %w", table, err)
 		}
 		cols = dropColumn(cols, "id")
+		if table == "http_records" && len(cols) > 0 {
+			if err := validateMergeRecordCaptureStates(ctx, tx, cols); err != nil {
+				return nil, fmt.Errorf("validate source raw-record fidelity: %w", err)
+			}
+		}
 		if opts.SkipRecordBodies && table == "http_records" {
 			for _, c := range recordBodyColumns {
 				cols = dropColumn(cols, c)
@@ -324,11 +333,21 @@ func mergeOnce(ctx context.Context, dest *DB, srcPath string, opts MergeOptions)
 		}
 	}
 
+	if err := mergeOASTPlantingReceipts(ctx, tx, stats); err != nil {
+		return nil, fmt.Errorf("merge OAST planting receipts: %w", err)
+	}
+
 	// findings: insert without id, dedup on (project_uuid, finding_hash), and
 	// build a src→dst id map so the junction and OAST rows can be relinked.
 	idMap, err := mergeFindings(ctx, tx, srcFindings, findingCols, stats)
 	if err != nil {
 		return nil, fmt.Errorf("merge findings: %w", err)
+	}
+
+	if !opts.SkipFindings {
+		if err := mergeSelectedEvidence(ctx, tx, idMap); err != nil {
+			return nil, fmt.Errorf("merge selected evidence: %w", err)
+		}
 	}
 
 	if err := mergeFindingRecords(ctx, tx, srcFindingRecords, idMap, stats); err != nil {
@@ -361,8 +380,9 @@ func mergeOnce(ctx context.Context, dest *DB, srcPath string, opts MergeOptions)
 // cursor advancing (database/sql may reuse []byte buffers across Next()).
 type bufferedRow []any
 
-// readRows reads every row of src.<table> into memory and returns the rows
-// alongside the table's column names (in physical order).
+// readRows buffers src.<table> and its physical column names. For findings,
+// inline bodies are represented by NULL placeholders and hydrated individually
+// during the write; they must not be retained with the complete row inventory.
 func readRows(ctx context.Context, conn *sql.Conn, table string) ([]bufferedRow, []string, error) {
 	cols, err := tableColumns(ctx, conn, "src", table)
 	if err != nil {
@@ -371,7 +391,17 @@ func readRows(ctx context.Context, conn *sql.Conn, table string) ([]bufferedRow,
 	if len(cols) == 0 {
 		return nil, nil, nil
 	}
-	q := fmt.Sprintf("SELECT %s FROM src.%s", strings.Join(cols, ", "), table)
+	selectCols := slices.Clone(cols)
+	if table == "findings" {
+		// Buffer identities/metadata only. Hydrate one finding's legacy inline
+		// evidence inside mergeFindings rather than retaining the full corpus.
+		for i, col := range selectCols {
+			if slices.Contains(findingBodyColumns, col) {
+				selectCols[i] = "NULL AS " + col
+			}
+		}
+	}
+	q := fmt.Sprintf("SELECT %s FROM src.%s", strings.Join(selectCols, ", "), table)
 	rows, err := conn.QueryContext(ctx, q)
 	if err != nil {
 		return nil, nil, err
@@ -442,10 +472,26 @@ func mergeFindings(ctx context.Context, tx *sql.Tx, rows []bufferedRow, cols []s
 		"INSERT INTO main.findings (%s) VALUES (%s) ON CONFLICT (project_uuid, finding_hash) DO NOTHING RETURNING id",
 		strings.Join(insertCols, ", "), placeholders)
 
-	for _, row := range rows {
-		srcID, ok := toInt64(row[idIdx])
+	for _, metadata := range rows {
+		srcID, ok := toInt64(metadata[idIdx])
 		if !ok {
 			continue
+		}
+		// Never mutate the buffered metadata's backing slice: doing so would
+		// accumulate every hydrated body in rows until the merge completes.
+		row := append(bufferedRow(nil), metadata...)
+		var bodyCols []string
+		var bodyPtrs []any
+		for _, col := range findingBodyColumns {
+			if i := indexOf(cols, col); i >= 0 {
+				bodyCols = append(bodyCols, col)
+				bodyPtrs = append(bodyPtrs, &row[i])
+			}
+		}
+		if len(bodyCols) > 0 {
+			if err := tx.QueryRowContext(ctx, "SELECT "+strings.Join(bodyCols, ", ")+" FROM src.findings WHERE id = ?", srcID).Scan(bodyPtrs...); err != nil {
+				return nil, err
+			}
 		}
 		args := make([]any, 0, len(insertCols))
 		for i := range row {
@@ -469,6 +515,9 @@ func mergeFindings(ctx context.Context, tx *sql.Tx, rows []bufferedRow, cols []s
 			}
 			if existing.Valid {
 				idMap[srcID] = existing.Int64
+				if err := mergeFindingProof(ctx, tx, existing.Int64, row, cols); err != nil {
+					return nil, err
+				}
 			}
 			stats.FindingsDeduped++
 		case err != nil:
@@ -483,13 +532,81 @@ func mergeFindings(ctx context.Context, tx *sql.Tx, rows []bufferedRow, cols []s
 	return idMap, nil
 }
 
+// mergeFindingProof preserves exact source refs and supporting pairs on a hash
+// conflict. Existing proof/status/attribution wins; only an entirely empty primary
+// pair is filled. The ordered supporting-pair sample is capped, identities are not.
+func mergeFindingProof(ctx context.Context, tx *sql.Tx, id int64, row bufferedRow, cols []string) error {
+	text := func(column string) string {
+		i := indexOf(cols, column)
+		if i < 0 || row[i] == nil {
+			return ""
+		}
+		switch v := row[i].(type) {
+		case []byte:
+			return string(v)
+		case string:
+			return v
+		default:
+			return fmt.Sprint(v)
+		}
+	}
+	var refsJSON, evidenceJSON, request, response, evidenceStatus sql.NullString
+	if err := tx.QueryRowContext(ctx, "SELECT http_record_uuids, additional_evidence, request, response, evidence_status FROM main.findings WHERE id = ?", id).
+		Scan(&refsJSON, &evidenceJSON, &request, &response, &evidenceStatus); err != nil {
+		return err
+	}
+	decode := func(raw string) ([]string, error) {
+		if raw == "" {
+			return nil, nil
+		}
+		var values []string
+		err := json.Unmarshal([]byte(raw), &values)
+		return values, err
+	}
+	refs, err := decode(refsJSON.String)
+	if err != nil {
+		return err
+	}
+	sourceRefs, err := decode(text("http_record_uuids"))
+	if err != nil {
+		return err
+	}
+	evidence, err := decode(evidenceJSON.String)
+	if err != nil {
+		return err
+	}
+	support, err := decode(text("additional_evidence"))
+	if err != nil {
+		return err
+	}
+	incoming := buildEvidence(text("request"), text("response"))
+	primary := buildEvidence(request.String, response.String)
+	if primary == "" && incoming != "" {
+		request.String, response.String = text("request"), text("response")
+		primary = incoming
+	}
+	refsBytes, err := json.Marshal(mergeUniqueStrings(refs, sourceRefs))
+	if err != nil {
+		return err
+	}
+	evidenceBytes, err := json.Marshal(appendUniqueEvidence(evidence, primary, append([]string{incoming}, support...)...))
+	if err != nil {
+		return err
+	}
+	// A legacy status stays unknown unless the source explicitly supplies one;
+	// a historic nonempty decision is never replaced by an import.
+	if evidenceStatus.String == "" {
+		evidenceStatus.String = text("evidence_status")
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE main.findings SET http_record_uuids = ?, additional_evidence = ?, request = ?, response = ?, evidence_status = NULLIF(?, '') WHERE id = ?`,
+		string(refsBytes), string(evidenceBytes), request.String, response.String, evidenceStatus.String, id)
+	return err
+}
+
 // mergeFindingRecords copies the finding↔record junction, remapping the source
 // finding id to the destination id. Rows whose finding was not mapped (e.g. a
 // finding that failed to insert) are skipped rather than orphaned.
 func mergeFindingRecords(ctx context.Context, tx *sql.Tx, rows []bufferedRow, idMap map[int64]int64, stats *MergeStats) error {
-	if len(rows) == 0 {
-		return nil
-	}
 	for _, row := range rows {
 		if len(row) < 2 {
 			continue
@@ -510,6 +627,38 @@ func mergeFindingRecords(ctx context.Context, tx *sql.Tx, rows []bufferedRow, id
 		}
 		if n, _ := res.RowsAffected(); n > 0 {
 			stats.FindingRecordsMerged++
+		}
+	}
+	// Synchronize only findings touched by this import, never a broad repair of
+	// the destination. Union both legacy representations, including ghost refs.
+	seen := make(map[int64]bool)
+	for _, id := range idMap {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO main.finding_records (finding_id, record_uuid)
+			SELECT f.id, j.value FROM main.findings f, json_each(f.http_record_uuids) j WHERE f.id = ?`, id); err != nil {
+			return err
+		}
+		// Preserve the existing/source array order. Only junction-only refs are
+		// appended in UUID order; an idempotent import must not change the first
+		// linked exchange selected by replay/export readers.
+		if _, err := tx.ExecContext(ctx, `UPDATE main.findings SET http_record_uuids = (
+			WITH array_refs AS (
+				SELECT value AS record_uuid, MIN(CAST(key AS INTEGER)) AS position
+				FROM json_each(http_record_uuids) GROUP BY value
+			)
+			SELECT json_group_array(record_uuid) FROM (
+				SELECT record_uuid, 0 AS relation, position FROM array_refs
+				UNION ALL
+				SELECT record_uuid, 1, 0 FROM main.finding_records
+				WHERE finding_id = ? AND NOT EXISTS (
+					SELECT 1 FROM array_refs a WHERE a.record_uuid = finding_records.record_uuid
+				)
+				ORDER BY relation, position, record_uuid
+			)) WHERE id = ?`, id, id); err != nil {
+			return err
 		}
 	}
 	return nil

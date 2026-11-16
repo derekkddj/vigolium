@@ -171,7 +171,7 @@ type Handlers struct {
 	projectHeavyMu     sync.Mutex
 	projectHeavyActive map[string]int
 
-	// Background cleanup for completed agent run statuses
+	// Background pruning of completed agent statuses from the in-memory cache only
 	agentCleanupStop chan struct{}
 
 	// runCtx is the server-lifecycle context for background agent runs.
@@ -284,10 +284,10 @@ func NewHandlers(q queue.Queue, db *database.DB, repo *database.Repository, rw *
 	return h
 }
 
-// agentDBCleanupLoop periodically removes old completed/failed agent runs from the
-// database and prunes the in-memory map for completed runs.
+// agentDBCleanupLoop prunes only the in-memory map for completed runs.
+// Evidence and its database catalog are retained: expiry must coordinate project
+// scope, resumed runs, artifacts, findings, and durable sections before deletion.
 func (h *Handlers) agentDBCleanupLoop() {
-	const ttl = 24 * time.Hour
 	ticker := time.NewTicker(15 * time.Minute)
 	defer ticker.Stop()
 
@@ -300,26 +300,15 @@ func (h *Handlers) agentDBCleanupLoop() {
 			now := time.Now()
 			h.agentMu.Lock()
 			for id, status := range h.agenticScanStatus {
-				if status.CompletedAt != nil && now.Sub(*status.CompletedAt) > time.Hour {
+				if status != nil && database.IsTerminalAgenticScanStatus(status.Status) && status.CompletedAt != nil && now.Sub(*status.CompletedAt) > time.Hour {
 					delete(h.agenticScanStatus, id)
 				}
 			}
 			h.agentMu.Unlock()
 
-			// Prune DB (completed/failed runs older than 24h)
-			if h.repo != nil {
-				if n, err := h.repo.DeleteOldAgenticScans(context.Background(), ttl); err == nil && n > 0 {
-					zap.L().Debug("Cleaned up old agent runs", zap.Int("count", n))
-				}
-			}
-
-			// Clean up old agent session directories
-			if h.settings != nil {
-				sessDir := h.settings.Agent.EffectiveSessionsDir()
-				if n, err := agent.CleanupSessionDirs(sessDir, 48*time.Hour); err == nil && n > 0 {
-					zap.L().Debug("Cleaned up old session directories", zap.Int("count", n))
-				}
-			}
+			// No automatic evidence deletion. A directory's top-level mtime does
+			// not reflect descendant writes or an active/resumed run, and deleting
+			// catalog rows first makes retained evidence unreachable.
 		}
 	}
 }

@@ -9,6 +9,7 @@ import (
 	urlutil "github.com/projectdiscovery/utils/url"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -86,7 +87,8 @@ func (m *Module) ScanPerRequest(
 	// noise on SPAs / wildcard reverse proxies that return the same 2xx shell
 	// for every path: their /de../static, /favicon../static, etc. all look
 	// successful but resolve to the same index.html.
-	wildcard, _ := scanCtx.WildcardProbe(ctx, httpClient)
+	gateEvidence := modkit.NewEvidenceCollector()
+	wildcard, _ := scanCtx.WildcardProbeWithEvidence(ctx, httpClient, gateEvidence)
 
 	// For each injection variant, try each suffix
 	for _, injection := range m.injections {
@@ -120,6 +122,7 @@ func (m *Module) ScanPerRequest(
 			// (Same fix as idor_detection.)
 			bodyBytes := append([]byte(nil), resp.Body().Bytes()...)
 			body := string(bodyBytes)
+			primary := http.CaptureEvidence(resp)
 			resp.Close()
 
 			// Must be 200 with a non-trivial body
@@ -154,7 +157,9 @@ func (m *Module) ScanPerRequest(
 			// index.html. Confirm the shell POSITIVELY from independent samples;
 			// when the hit is that shell, no suffix under this request can be a
 			// real escape, so stop probing the whole request.
-			if modkit.ResemblesCatchAllShell(scanCtx, ctx, httpClient, body) {
+			context := modkit.NewEvidenceCollector()
+			context.AddBaseline("Observed input", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
+			if modkit.ResemblesCatchAllShellWithEvidence(scanCtx, ctx, httpClient, body, context) {
 				return results, nil
 			}
 
@@ -162,7 +167,7 @@ func (m *Module) ScanPerRequest(
 			// require it to keep returning a stable, non-wildcard 200. A one-shot
 			// 200 from a transient race / load-balancer flap / caching edge will
 			// not reproduce and is dropped.
-			if !confirmStableOffBySlash(httpClient, ctx.Service(), modifiedRaw, body, wildcard) {
+			if !confirmStableOffBySlash(httpClient, ctx.Service(), modifiedRaw, body, wildcard, context) {
 				continue
 			}
 
@@ -178,7 +183,7 @@ func (m *Module) ScanPerRequest(
 			// suffix-independent generic prefix means no other suffix can be a real
 			// escape either, so stop probing this request entirely.
 			normalizedPath := "/" + segment + "/" + suffix
-			if bodySimilarToControl(httpClient, ctx.Service(), rawHttp, normalizedPath, body) {
+			if bodySimilarToControl(httpClient, ctx.Service(), rawHttp, normalizedPath, body, context) {
 				return results, nil
 			}
 
@@ -189,7 +194,7 @@ func (m *Module) ScanPerRequest(
 			// not a file read). Drop this hit but keep trying other suffixes — a
 			// distinct one may still be a genuine escape under the same parent.
 			randomPath := "/" + segment + injection + "/" + modkit.FreshCanary()
-			if bodySimilarToControl(httpClient, ctx.Service(), rawHttp, randomPath, body) {
+			if bodySimilarToControl(httpClient, ctx.Service(), rawHttp, randomPath, body, context) {
 				continue
 			}
 
@@ -201,11 +206,11 @@ func (m *Module) ScanPerRequest(
 			// to /{suffix}. Drop this suffix (a sibling suffix may still be a real
 			// escape, so keep probing rather than return).
 			cleanCanonical := "/" + suffix
-			if bodySimilarToControl(httpClient, ctx.Service(), rawHttp, cleanCanonical, body) {
+			if bodySimilarToControl(httpClient, ctx.Service(), rawHttp, cleanCanonical, body, context) {
 				continue
 			}
 
-			results = append(results, &output.ResultEvent{
+			result := &output.ResultEvent{
 				URL:              urlx.Scheme + "://" + urlx.Host + newPath,
 				Request:          string(modifiedRaw),
 				Response:         body,
@@ -214,7 +219,11 @@ func (m *Module) ScanPerRequest(
 				Info: output.Info{
 					Description: fmt.Sprintf("Nginx off-by-slash alias traversal via /%s%s/%s", segment, injection, suffix),
 				},
-			})
+			}
+			modkit.SetPrimaryEvidence(result, primary, evidence.RoleAttack, "Alias traversal candidate")
+			modkit.AppendEvidence(result, context)
+			modkit.AppendEvidence(result, gateEvidence)
+			results = append(results, result)
 			// Stop on first match per injection
 			return results, nil
 		}
@@ -234,9 +243,15 @@ func confirmStableOffBySlash(
 	modifiedRaw []byte,
 	firstBody string,
 	wildcard *modkit.WildcardEntry,
+	sinks ...*modkit.EvidenceCollector,
 ) bool {
+	var sink *modkit.EvidenceCollector
+	if len(sinks) > 0 {
+		sink = sinks[0]
+	}
 	for i := 0; i < 2; i++ {
-		status, body, ok := modkit.ExecuteRaw(httpClient, service, modifiedRaw, http.Options{NoRedirects: true, NoClustering: true})
+		status, body, _, receipt, ok := infra.ExecuteRawCapture(httpClient, service, modifiedRaw, http.Options{NoRedirects: true, NoClustering: true})
+		sink.AddExchange(receipt, evidence.RoleConfirmation, fmt.Sprintf("Traversal reproduction %d", i+1))
 		if !ok {
 			return true
 		}
@@ -265,12 +280,18 @@ func bodySimilarToControl(
 	service *httpmsg.Service,
 	rawHttp []byte,
 	controlPath, refBody string,
+	sinks ...*modkit.EvidenceCollector,
 ) bool {
+	var sink *modkit.EvidenceCollector
+	if len(sinks) > 0 {
+		sink = sinks[0]
+	}
 	modified, err := httpmsg.SetPath(rawHttp, controlPath)
 	if err != nil {
 		return false
 	}
-	status, body, ok := modkit.ExecuteRaw(client, service, modified, http.Options{NoRedirects: true, NoClustering: true})
+	status, body, _, receipt, ok := infra.ExecuteRawCapture(client, service, modified, http.Options{NoRedirects: true, NoClustering: true})
+	sink.AddExchange(receipt, evidence.RoleControl, "Differential control: "+controlPath)
 	if !ok || status < 200 || status >= 300 {
 		return false
 	}

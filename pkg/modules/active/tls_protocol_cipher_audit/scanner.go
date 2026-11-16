@@ -247,7 +247,10 @@ func (m *Module) buildResult(ctx *httpmsg.HttpRequestResponse, host, dedupKey st
 	desc.WriteString("Each was confirmed by completing a real TLS handshake at that setting (re-verified with a second handshake), so it is a negotiated fact rather than a heuristic. ")
 	desc.WriteString("Disable deprecated protocols (require TLS 1.2+) and remove RC4/3DES/static-RSA suites in favour of forward-secret AEAD ciphers.")
 
+	// Negotiated handshake artifacts are proof of TLS settings, not captured
+	// HTTP messages. Leave HTTP evidence missing rather than borrow the input.
 	return &output.ResultEvent{
+		EvidenceStatus:   "missing",
 		ModuleID:         ModuleID,
 		Host:             host,
 		URL:              target,

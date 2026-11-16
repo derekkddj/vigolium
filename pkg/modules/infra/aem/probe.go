@@ -15,6 +15,7 @@ package aem
 import (
 	nethttp "net/http"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -25,6 +26,8 @@ import (
 // do() — so every caller's existing `if !res.OK` check both fails open on a flaky
 // probe and drops a block page without a separate guard.
 type ProbeResult struct {
+	// Exchange owns this operation's actual HTTP pair before the chain closes.
+	Exchange    *evidence.Exchange
 	Status      int
 	Body        string
 	ContentType string
@@ -96,13 +99,14 @@ func do(ctx *httpmsg.HttpRequestResponse, client *http.Requester, method, path, 
 	// because callers reason about those statuses (IsProxyBlockedStatus drives the
 	// dispatcher-bypass fallback).
 	if infra.GetBlockDetectionValidator().Validate(resp) != nil {
-		return ProbeResult{}
+		return ProbeResult{Exchange: http.CaptureEvidence(resp)}
 	}
 	return ProbeResult{
 		Status:      r.StatusCode,
 		Body:        resp.BodyString(),
 		ContentType: r.Header.Get("Content-Type"),
-		Header:      r.Header,
+		Header:      r.Header.Clone(),
+		Exchange:    http.CaptureEvidence(resp),
 		OK:          true,
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	sf "github.com/vigolium/vigolium/pkg/modules/infra/salesforce"
@@ -63,7 +64,8 @@ func (m *Module) ScanPerHost(
 
 	// Tech gate: locating a live Aura gateway + harvesting its context IS the
 	// fail-closed presence check (a non-Salesforce host has no gateway).
-	endpoint, auraContext, ok := sf.Prepare(ctx, httpClient, scanCtx)
+	collector := modkit.NewEvidenceCollector()
+	endpoint, auraContext, ok := sf.Prepare(ctx, httpClient, scanCtx, collector)
 	if !ok {
 		return nil, nil
 	}
@@ -71,27 +73,42 @@ func (m *Module) ScanPerHost(
 	// Catch-all negative control (round 1): a bogus class/method must NOT succeed.
 	// If it does, ApexActionController.execute rubber-stamps anything, so any
 	// positive would be a false positive — skip the host.
-	if m.apexSucceeds(ctx, httpClient, endpoint, auraContext, bogusProbePre) {
+	var preControl *evidence.Exchange
+	if m.apexSucceeds(ctx, httpClient, endpoint, auraContext, bogusProbePre, &preControl) {
 		return nil, nil
 	}
+	collector.AddExchange(preControl, evidence.RoleControl, "Bogus Apex before positive rounds")
 
 	// The benign, read-only probe must return SUCCESS across every independent
 	// round. A single ERROR/invalidSession round means the guest cannot (reliably)
 	// invoke Apex and we do not report.
-	for range confirmRounds + 1 {
-		if !m.apexSucceeds(ctx, httpClient, endpoint, auraContext, benignProbe) {
+	var primary *evidence.Exchange
+	for i := range confirmRounds + 1 {
+		var exchange *evidence.Exchange
+		if !m.apexSucceeds(ctx, httpClient, endpoint, auraContext, benignProbe, &exchange) {
 			return nil, nil
+		}
+		if i == 0 {
+			primary = exchange
+		} else {
+			collector.AddExchange(exchange, evidence.RoleConfirmation, fmt.Sprintf("Benign Apex confirmation %d", i))
 		}
 	}
 
 	// Re-check the catch-all with a second, distinct bogus triple after the benign
 	// rounds so a transient endpoint fluke cannot masquerade as a real positive.
-	if m.apexSucceeds(ctx, httpClient, endpoint, auraContext, bogusProbePost) {
+	var postControl *evidence.Exchange
+	if m.apexSucceeds(ctx, httpClient, endpoint, auraContext, bogusProbePost, &postControl) {
 		return nil, nil
 	}
+	collector.AddExchange(postControl, evidence.RoleControl, "Bogus Apex after positive rounds")
 
 	matchedURL := urlx.Scheme + "://" + urlx.Host + endpoint
-	return []*output.ResultEvent{m.build(host, matchedURL, endpoint)}, nil
+	result := m.build(host, matchedURL, endpoint)
+	result.AdditionalEvidence, result.Evidence = collector.Entries(), collector.Evidence()
+	result.EvidenceStatus = "missing"
+	modkit.SetPrimaryEvidence(result, primary, evidence.RoleAttack, "Guest benign Apex execution")
+	return []*output.ResultEvent{result}, nil
 }
 
 // apexSucceeds invokes one ApexActionController.execute probe and reports whether
@@ -102,8 +119,14 @@ func (m *Module) apexSucceeds(
 	httpClient *http.Requester,
 	endpoint, auraContext string,
 	p apexProbe,
+	receipts ...**evidence.Exchange,
 ) bool {
 	resp := sf.InvokeAction(ctx, httpClient, endpoint, sf.BuildApexExecute(p.namespace, p.classname, p.method), auraContext)
+	for _, receipt := range receipts {
+		if receipt != nil {
+			*receipt = resp.Exchange
+		}
+	}
 	parsed, ok := sf.ParseAuraResponse(resp.Body)
 	if !ok {
 		return false

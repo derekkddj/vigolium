@@ -195,9 +195,9 @@ func GenerateHTMLReport(items []any, outputPath string, meta HTMLReportMeta) err
 
 // ReportItemProducer streams export envelopes to emit, one at a time, in the
 // order they should appear in the report. It must return the first error from
-// emit (fatal) and should log-and-skip its own data-source errors. Used by
-// GenerateHTMLReportStreaming so the report renders without ever materializing
-// the whole result set.
+// emit or its data source; silently skipping a failed read would publish an
+// indistinguishably incomplete artifact. Producer renderers consume it without
+// materializing the whole raw result set.
 type ReportItemProducer func(emit func(any) error) error
 
 // GenerateHTMLReportStreaming renders the embedded template.html to outputPath
@@ -221,13 +221,9 @@ func GenerateHTMLReportStreaming(produce ReportItemProducer, outputPath string, 
 	tmplStr := string(tmplBytes)
 	parts := strings.SplitN(tmplStr, marker, 2)
 	if len(parts) != 2 {
-		// Marker missing — fall back to the monolithic path, buffering the
-		// streamed items (rare: only if the bundled template is malformed).
-		var items []any
-		if err := produce(func(item any) error { items = append(items, item); return nil }); err != nil {
-			return err
-		}
-		return generateHTMLReportLegacy(items, outputPath, meta, tmplStr)
+		// A malformed embedded template must not turn a large production export
+		// into a whole-corpus raw collection. The legacy helper is small-input only.
+		return fmt.Errorf("HTML report template missing streaming data marker")
 	}
 
 	generatedAt := meta.GeneratedAt

@@ -6,6 +6,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -116,7 +117,8 @@ func (m *Module) ScanPerRequest(
 				// directory) and probe it.
 				newPath := path + "/" + payload
 
-				rawReq, body, status, ok := m.fetchPathBody(ctx, httpClient, newPath)
+				var receipt *evidence.Exchange
+				rawReq, body, status, ok := m.fetchPathBody(ctx, httpClient, newPath, &receipt)
 				if !ok || !testCase.Matches(body) {
 					// Remember a fronting-proxy block so we know the bypass is worth
 					// trying for this endpoint below.
@@ -130,7 +132,8 @@ func (m *Module) ScanPerRequest(
 				// the host's wildcard shell (a server that 200s every path). Compares
 				// against a cached host-wide random-path fingerprint; fails open on
 				// probe error so a real actuator is never suppressed by a flaky probe.
-				if !modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, 200, []byte(body), "") {
+				guardProof := modkit.NewEvidenceCollector()
+				if !modkit.ConfirmNotSoft404WithEvidence(scanCtx, httpClient, ctx, 200, []byte(body), "", guardProof) {
 					continue
 				}
 
@@ -140,12 +143,12 @@ func (m *Module) ScanPerRequest(
 				// directly and catches catch-all static handlers (e.g. Keycloak's
 				// /auth/resources/.../<path>) that the root-scoped wildcard probe above
 				// cannot — the catch-all only fires under a specific path prefix.
-				if m.siblingIsCatchAll(testCase, path, ctx, httpClient) {
+				if m.siblingIsCatchAll(testCase, path, ctx, httpClient, guardProof) {
 					continue
 				}
 
 				hit = true
-				results = append(results, &output.ResultEvent{
+				result := &output.ResultEvent{
 					URL:              urlx.Scheme + "://" + urlx.Host + newPath,
 					Request:          rawReq,
 					Response:         body,
@@ -154,7 +157,10 @@ func (m *Module) ScanPerRequest(
 					// they report Low; every other actuator endpoint leaves Severity
 					// Undefined and inherits the module's High default.
 					Info: output.Info{Severity: endpointSeverity(testCase.Name)},
-				})
+				}
+				modkit.SetPrimaryEvidence(result, receipt, evidence.RoleObservation, "selected actuator response")
+				modkit.AppendEvidence(result, guardProof)
+				results = append(results, result)
 			}
 
 			// Reverse-proxy path-normalization bypass: when a fronting proxy blocked
@@ -166,18 +172,20 @@ func (m *Module) ScanPerRequest(
 			if path == "" && blocked && !hit && testCase.Name != "" {
 				tc := testCase
 				if res := modkit.ProbePathBypass(urlx.Path, "actuator/"+tc.Name, func(bypassPath string) *output.ResultEvent {
-					rawReq, body, _, ok := m.fetchPathBody(ctx, httpClient, bypassPath)
+					var receipt *evidence.Exchange
+					rawReq, body, _, ok := m.fetchPathBody(ctx, httpClient, bypassPath, &receipt)
 					if !ok || !tc.Matches(body) {
 						return nil
 					}
-					if !modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, 200, []byte(body), "") {
+					guardProof := modkit.NewEvidenceCollector()
+					if !modkit.ConfirmNotSoft404WithEvidence(scanCtx, httpClient, ctx, 200, []byte(body), "", guardProof) {
 						return nil
 					}
 					// Seed Name/Tags from the module so the bypass annotation
 					// (appended by ProbePathBypass) yields a clean finding — this
 					// module otherwise leaves Info empty for the runner to fill, and
 					// assignModuleInfo only fills EMPTY fields.
-					return &output.ResultEvent{
+					result := &output.ResultEvent{
 						URL:              urlx.Scheme + "://" + urlx.Host + bypassPath,
 						Request:          rawReq,
 						Response:         body,
@@ -188,6 +196,9 @@ func (m *Module) ScanPerRequest(
 							Severity: endpointSeverity(tc.Name),
 						},
 					}
+					modkit.SetPrimaryEvidence(result, receipt, evidence.RoleAttack, "actuator proxy-path bypass")
+					modkit.AppendEvidence(result, guardProof)
+					return result
 				}); res != nil {
 					results = append(results, res)
 				}
@@ -206,6 +217,7 @@ func (m *Module) fetchPathBody(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	newPath string,
+	receiptOut ...**evidence.Exchange,
 ) (rawReq, body string, status int, ok bool) {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
@@ -228,6 +240,9 @@ func (m *Module) fetchPathBody(
 
 	if resp.Response() == nil {
 		return "", "", 0, false
+	}
+	if len(receiptOut) > 0 && receiptOut[0] != nil {
+		*receiptOut[0] = http.CaptureEvidence(resp)
 	}
 	status = resp.Response().StatusCode
 	if status != 200 {
@@ -252,9 +267,14 @@ func (m *Module) siblingIsCatchAll(
 	parentPath string,
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
+	sinks ...*modkit.EvidenceCollector,
 ) bool {
 	siblingPath := parentPath + "/" + modkit.FreshCanary()
-	_, body, _, ok := m.fetchPathBody(ctx, httpClient, siblingPath)
+	var receipt *evidence.Exchange
+	_, body, _, ok := m.fetchPathBody(ctx, httpClient, siblingPath, &receipt)
+	if len(sinks) > 0 {
+		sinks[0].AddExchange(receipt, evidence.RoleControl, "nonexistent actuator sibling")
+	}
 	if !ok {
 		return false
 	}

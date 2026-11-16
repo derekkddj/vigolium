@@ -31,6 +31,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/core/ratelimit"
 	"github.com/vigolium/vigolium/pkg/core/services"
 	"github.com/vigolium/vigolium/pkg/deparos/waf"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http/proxyenv"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/proxytarget"
@@ -130,8 +131,9 @@ type Options struct {
 
 // Requester executes HTTP requests with rate limiting and host error tracking
 type Requester struct {
-	client        *retryablehttp.Client
-	clientNoRedir *retryablehttp.Client
+	client         *retryablehttp.Client
+	clientNoRedir  *retryablehttp.Client
+	captureClients *capturedRetryClients // bounded cached wrappers; per-send state stays on context
 	// rawClient never follows redirects: a raw request is exactly one
 	// round trip, so the response belongs to the bytes that were sent and no
 	// header ever travels to a Location host.
@@ -173,6 +175,9 @@ type Requester struct {
 	// WithContext's shallow copy shares one instance. Always non-nil after
 	// NewRequester; inert until SetResponseObserver installs a sink.
 	respObserver *responseObserver
+	// plantingObserver is opt-in and scoped to an executor view. Only selected
+	// noncached underlying sends are captured, before the chain can be closed.
+	plantingObserver *plantingObserver
 	// edgePacer pre-arms the host limiter's pacing the first time a host is seen
 	// behind a CDN/WAF edge, so the active phase paces from its first request
 	// instead of bursting into the edge and arming a rate-based WAF (see
@@ -409,6 +414,11 @@ type ObservedResponse struct {
 	Status      int
 	RequestRaw  []byte
 	Body        []byte
+	// CaptureEvidence lazily owns the actual current exchange. Only call it
+	// synchronously inside the sink, before Execute returns and the chain can
+	// be closed. Matching consumers can retain the returned independent receipt
+	// without copying every 5xx body merely to inspect its error signature.
+	CaptureEvidence func() *evidence.Exchange
 }
 
 // responseObserver forwards 5xx responses to an installed sink. A 5xx is the
@@ -448,13 +458,19 @@ func (o *responseObserver) report(host, urlStr string, reqRaw []byte, resp *http
 	if len(body) == 0 {
 		return
 	}
+	if req := resp.Request(); req != nil && req.URL != nil && req.URL.Host != "" {
+		// Attribute a followed response to the final connection locator, not
+		// the original input or a probe's spoofed Host header.
+		host, urlStr = req.URL.Hostname(), req.URL.String()
+	}
 	(*sink)(ObservedResponse{
-		Host:        host,
-		URL:         urlStr,
-		ContentType: httpResp.Header.Get("Content-Type"),
-		Status:      status,
-		RequestRaw:  reqRaw,
-		Body:        body,
+		Host:            host,
+		URL:             urlStr,
+		ContentType:     httpResp.Header.Get("Content-Type"),
+		Status:          status,
+		RequestRaw:      reqRaw,
+		Body:            body,
+		CaptureEvidence: func() *evidence.Exchange { return CaptureEvidence(resp) },
 	})
 }
 
@@ -968,21 +984,22 @@ func NewRequester(options *types.Options, services *services.Services) (*Request
 	rawClient := rawClients.direct
 
 	r := &Requester{
-		client:        client,
-		clientNoRedir: clientNoRedir,
-		rawClient:     rawClient,
-		rawClients:    rawClients,
-		services:      services,
-		customHeaders: parseHeaders(options.Headers),
-		carried:       &carriedSessionStore{},
-		blockNotifier: &blockNotifier{seen: make(map[string]struct{})},
-		respObserver:  &responseObserver{},
-		edgePacer:     &edgePacer{},
-		poolStats:     poolStats,
-		sent:          sent,
-		gate:          gate,
-		retries:       max(options.Retries, 0),
-		callStats:     &CallStats{},
+		client:         client,
+		clientNoRedir:  clientNoRedir,
+		captureClients: &capturedRetryClients{},
+		rawClient:      rawClient,
+		rawClients:     rawClients,
+		services:       services,
+		customHeaders:  parseHeaders(options.Headers),
+		carried:        &carriedSessionStore{},
+		blockNotifier:  &blockNotifier{seen: make(map[string]struct{})},
+		respObserver:   &responseObserver{},
+		edgePacer:      &edgePacer{},
+		poolStats:      poolStats,
+		sent:           sent,
+		gate:           gate,
+		retries:        max(options.Retries, 0),
+		callStats:      &CallStats{},
 	}
 
 	// Keep the edge-pacer's once-per-host dedup in sync with the limiter's entry
@@ -1224,6 +1241,7 @@ func (r *Requester) cloneSharingTransport() (*Requester, error) {
 	clone := *r
 	clone.client = cloneRetryClientWithJar(r.client, jar, retryOpts)
 	clone.clientNoRedir = cloneRetryClientWithJar(r.clientNoRedir, jar, retryOpts)
+	clone.captureClients = &capturedRetryClients{} // fresh jars require their own cached client views
 	return &clone, nil
 }
 
@@ -1324,6 +1342,19 @@ func (r *Requester) executeContext(ctx context.Context, input *httpmsg.HttpReque
 	if opts.RawRequestTarget != "" {
 		opts.RawRequest = true
 	}
+	// Observe ONLY the underlying send, not the normalized chain returned from
+	// the clusterer. A cache hit or singleflight follower sends nothing. The
+	// predicate prevents copying ordinary traffic or changing cache behavior.
+	send := func(in *httpmsg.HttpRequestResponse, o Options) (*httpUtils.ResponseChain, time.Duration, error) {
+		sink := r.wantsPlantingReceipt(in, o)
+		chain, elapsed, err := r.executeDirectly(ctx, in, o)
+		if err == nil {
+			observePlantingReceipt(sink, chain)
+		} else {
+			observePlantingFailure(sink, err)
+		}
+		return chain, elapsed, err
+	}
 	if r.clusterer != nil && !opts.NoClustering {
 		// Stamp this requester's cache partition onto the options copy the
 		// clusterer keys on. Callers never set this field.
@@ -1331,11 +1362,9 @@ func (r *Requester) executeContext(ctx context.Context, input *httpmsg.HttpReque
 		// bytes (the module's value instead of the session's), so they get
 		// their own cache partition.
 		opts.clusterScope = r.clusterScope + r.preservedScope
-		return r.clusterer.Execute(input, opts, func(in *httpmsg.HttpRequestResponse, o Options) (*httpUtils.ResponseChain, time.Duration, error) {
-			return r.executeDirectly(ctx, in, o)
-		})
+		return r.clusterer.Execute(input, opts, send)
 	}
-	return r.executeDirectly(ctx, input, opts)
+	return send(input, opts)
 }
 
 // CloseIdleConnections returns this requester's idle keep-alive connections to
@@ -1417,9 +1446,10 @@ func (r *Requester) executeDirectly(ctx context.Context, input *httpmsg.HttpRequ
 	}
 
 	var (
-		resp    *httpUtils.ResponseChain
-		elapsed time.Duration
-		creds   *authentication.Credentials
+		resp        *httpUtils.ResponseChain
+		elapsed     time.Duration
+		creds       *authentication.Credentials
+		lastSendErr error
 	)
 	// probeBaseline is the record's own request when it differs from this
 	// one: if the breaker hands this call its recovery probe, the baseline
@@ -1462,6 +1492,7 @@ func (r *Requester) executeDirectly(ctx context.Context, input *httpmsg.HttpRequ
 			}
 			var sendErr error
 			resp, sendErr = r.doRequest(attemptCtx, input, opts, creds)
+			lastSendErr = sendErr // overwrite: never splice an earlier retry into this attempt
 			elapsed = time.Since(start)
 			if sendErr != nil && ctx.Err() == nil {
 				// Feed transport failures (timeout/reset/refused) to the adaptive
@@ -1484,6 +1515,7 @@ func (r *Requester) executeDirectly(ctx context.Context, input *httpmsg.HttpRequ
 			continue
 		}
 		if err != nil {
+			err = retainCaptureFailure(err, lastSendErr)
 			if attempts > 1 && ctx.Err() == nil {
 				// The message retryablehttp gives a retried failure, which logs and
 				// the text fallback of transport-error classification recognise.
@@ -1899,6 +1931,11 @@ func (r *Requester) doRequest(ctx context.Context, input *httpmsg.HttpRequestRes
 	// ctx already carries the attempt's ClientTrace (poolStats.traceContext);
 	// a raw request bypasses net/http and is not traced.
 	start := time.Now()
+	var capture *captureTransport
+	if !opts.RawRequest {
+		capture = &captureTransport{maxBody: MaxBodyRead}
+		ctx = context.WithValue(ctx, requestCaptureKey{}, capture)
+	}
 	req, err := input.BuildRetryableRequestWithContext(ctx)
 	if err != nil {
 		return nil, &requestBuildError{err: err}
@@ -1998,14 +2035,27 @@ func (r *Requester) doRequest(ctx context.Context, input *httpmsg.HttpRequestRes
 		if !opts.PreserveConnection {
 			dropConnectionClose(req.Header)
 		}
+		client := r.client
 		if opts.NoRedirects {
-			resp, err = r.clientNoRedir.Do(req)
-		} else {
-			resp, err = r.client.Do(req)
+			client = r.clientNoRedir
 		}
+		resp, err = r.captureClients.get(client, opts.NoRedirects).Do(req)
+		err = clientTimeoutError(ctx, err)
 	}
 
 	if err != nil {
+		if capture != nil {
+			if resp == nil {
+				last := capture.finalRequest()
+				return nil, ownCaptureFailure(err, requestOnlyFailureEvidence(last), last)
+			}
+			// A redirect-policy failure may return its actual response alongside
+			// the error. Own available bytes, then release every pooled buffer.
+			chain, fillErr := fillCapturedResponse(resp, MaxBodyRead)
+			x := CaptureEvidence(chain)
+			chain.Close()
+			return nil, ownCaptureFailure(joinCaptureErrors(err, fillErr), x, resp.Request)
+		}
 		if resp != nil && resp.Body != nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
@@ -2016,12 +2066,7 @@ func (r *Requester) doRequest(ctx context.Context, input *httpmsg.HttpRequestRes
 	if opts.RawRequest {
 		stripRawhttpDecodedEncoding(resp)
 	}
-
-	if r.services.Options.DumpTraffic {
-		dumpTraffic(req.Request, resp, time.Since(start))
-	}
-
-	respChain := httpUtils.NewResponseChain(resp, MaxBodyRead)
+	stampCapture(resp, req.Request, opts)
 	// Fill ONCE, at the response the chain starts on — the FINAL response, i.e.
 	// the one this request actually ended up at.
 	//
@@ -2033,16 +2078,18 @@ func (r *Requester) doRequest(ctx context.Context, input *httpmsg.HttpRequestRes
 	//
 	// Callers that want the intermediate hops walk them deliberately via
 	// RedirectChainHops, which documents that it consumes the chain.
-	if err := respChain.Fill(); err != nil {
-		// NewResponseChain checks two buffers out of projectdiscovery's
-		// global, fixed-size pool (default 10000). On this error path the
-		// chain is never handed to the caller, so nothing downstream will
-		// Close() it — we must release the buffers here or they leak. Because
-		// the pool's getBuffer() acquires with context.Background() (a
-		// non-cancellable wait), enough accumulated leaks exhaust the pool and
-		// every subsequent request blocks forever, deadlocking the whole scan.
+	respChain, fillErr := fillCapturedResponse(resp, MaxBodyRead)
+	if r.services.Options.DumpTraffic {
+		// Dump only buffered bytes: reading the live body first could discard
+		// a partial body and hide its read failure before capture observes it.
+		dumpTraffic(req.Request, respChain, time.Since(start))
+	}
+	if fillErr != nil {
+		// Native callers ignore chains on error. Copy the receipt BEFORE Close
+		// and return only an error; it owns no pool slots or live body readers.
+		x := CaptureEvidence(respChain)
 		respChain.Close()
-		return nil, errors.Wrap(err, "could not generate response chain")
+		return nil, ownCaptureFailure(errors.Wrap(fillErr, "could not generate response chain"), x, resp.Request)
 	}
 	return respChain, nil
 }
@@ -2100,14 +2147,15 @@ func DumpExchange(method, fullURL string, reqDump []byte, resp *http.Response, e
 }
 
 // dumpTraffic prints an HTTP request/response pair to stderr in a Burp-style format.
-func dumpTraffic(req *http.Request, resp *http.Response, elapsed time.Duration) {
+func dumpTraffic(req *http.Request, chain *httpUtils.ResponseChain, elapsed time.Duration) {
 	var reqDump, respDump []byte
 
 	if req != nil {
 		reqDump, _ = httputil.DumpRequestOut(req, true)
 	}
-	if resp != nil {
-		respDump, _ = httputil.DumpResponse(resp, true)
+	var resp *http.Response
+	if chain != nil {
+		resp, respDump = chain.Response(), chain.FullResponseBytes()
 	}
 
 	method := ""

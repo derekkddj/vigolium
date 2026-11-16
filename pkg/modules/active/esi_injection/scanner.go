@@ -6,6 +6,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -125,7 +126,8 @@ func (m *Module) confirmProcessing(
 ) (finding *output.ResultEvent, reached bool) {
 	left, right := modkit.FreshCanary(), modkit.FreshCanary()
 	probeRaw := ip.BuildRequest([]byte(left + esiElement + right))
-	body, full, ok := renderedBody(ctx, httpClient, probeRaw, left+right)
+	var attack, control *evidence.Exchange
+	body, full, ok := renderedBody(ctx, httpClient, probeRaw, left+right, &attack)
 	if !ok || !strings.Contains(body, left) {
 		return nil, false
 	}
@@ -138,21 +140,22 @@ func (m *Module) confirmProcessing(
 	// real finding) and closed on a match (the stripper this round exists for).
 	cl, cr := modkit.FreshCanary(), modkit.FreshCanary()
 	controlRaw := ip.BuildRequest([]byte(cl + controlElement + cr))
-	controlBody, controlFull, controlOK := renderedBody(ctx, httpClient, controlRaw, "")
+	controlBody, _, controlOK := renderedBody(ctx, httpClient, controlRaw, "", &control)
 	if controlOK && strings.Contains(controlBody, cl+cr) {
 		return nil, true
 	}
 
 	ev := modkit.NewEvidenceCollector()
-	ev.Add("baseline", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
-	ev.Add("control (non-ESI namespace, kept)", string(controlRaw), controlFull)
+	ev.AddBaseline("baseline", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
+	ev.AddExchange(control, evidence.RoleControl, "control (non-ESI namespace, kept)")
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:                urlStr,
 		Matched:            urlStr,
 		Request:            string(probeRaw),
 		Response:           full,
 		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
 		FuzzingParameter:   ip.Name(),
 		RecordKind:         output.RecordKindFinding,
 		EvidenceGrade:      output.EvidenceGradeDifferential,
@@ -167,7 +170,9 @@ func (m *Module) confirmProcessing(
 			Confidence:  ModuleConfidence,
 			Tags:        ModuleTags,
 		},
-	}, true
+	}
+	modkit.SetPrimaryEvidence(result, attack, evidence.RoleAttack, "selected probe")
+	return result, true
 }
 
 // renderedBody sends rawReq and returns its body only when the application
@@ -180,6 +185,7 @@ func renderedBody(
 	httpClient *http.Requester,
 	rawReq []byte,
 	keepIf string,
+	receipts ...**evidence.Exchange,
 ) (body, full string, ok bool) {
 	req := httpmsg.NewRequestResponseRaw(rawReq, ctx.Service())
 	resp, _, err := httpClient.Execute(req, http.Options{NoClustering: true})
@@ -198,6 +204,9 @@ func renderedBody(
 	body = resp.Body().String()
 	if keepIf == "" || strings.Contains(body, keepIf) {
 		full = resp.FullResponseString()
+		if len(receipts) > 0 {
+			*receipts[0] = http.CaptureEvidence(resp)
+		}
 	}
 	return body, full, true
 }

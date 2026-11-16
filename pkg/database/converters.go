@@ -8,12 +8,12 @@ import (
 	"fmt"
 	"net"
 	neturl "net/url"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/output"
@@ -410,21 +410,15 @@ func (r *HTTPRecord) PrepareIdentity(ctx *httpmsg.HttpRequestResponse) error {
 		return fmt.Errorf("failed to parse URL: %w", err)
 	}
 
-	// Host info
-	r.Scheme = u.Scheme
-	r.Hostname = u.Hostname()
-	port := 0
-	if u.Port() != "" {
-		// strconv, not fmt.Sscanf: this runs for every record before the dedup
-		// check, and Sscanf costs ~1us and several allocations (the &port escapes
-		// through an `any`) where Atoi costs ~20ns and none.
-		port, _ = strconv.Atoi(u.Port())
-	} else if u.Scheme == "https" {
-		port = 443
-	} else {
-		port = 80
+	// The service is the destination. An absolute-form URL or a rewritten Host
+	// can name a different authority and must not change direct/batch identity.
+	service := ctx.Service()
+	if service == nil {
+		return fmt.Errorf("HttpRequestResponse has no destination service")
 	}
-	r.Port = port
+	r.Scheme = service.Protocol()
+	r.Hostname = service.Host()
+	r.Port = service.Port()
 
 	// Request fields
 	r.Method = req.Method()
@@ -441,7 +435,7 @@ func (r *HTTPRecord) PrepareIdentity(ctx *httpmsg.HttpRequestResponse) error {
 	hash := sha256.Sum256(req.Raw())
 	r.RequestHash = hex.EncodeToString(hash[:])
 
-	return nil
+	return prepareRecordCaptureStates(r, ctx)
 }
 
 // EnrichFromHttpRequestResponse fills everything PrepareIdentity left out: the
@@ -533,10 +527,13 @@ func (r *HTTPRecord) EnrichFromHttpRequestResponse(ctx *httpmsg.HttpRequestRespo
 		r.Parameters = embeddedParams(params)
 	}
 
-	// Timestamps
-	r.SentAt = time.Now()
+	// Known receipts retain their source time, not their execution identity.
+	// Inputs without receipt metadata keep the original write-time behavior.
+	if r.SentAt.IsZero() {
+		r.SentAt = time.Now()
+	}
 
-	return nil
+	return r.ValidateCaptureStates()
 }
 
 // responseColumns are the http_records columns derived from a stored response.
@@ -625,19 +622,24 @@ func (f *Finding) FromResultEvent(event *output.ResultEvent) error {
 
 	f.Request = event.Request
 	f.Response = event.Response
+	f.AdditionalEvidence = event.AdditionalEvidence
+	f.Evidence = evidence.CloneEntries(event.Evidence)
+	f.EvidenceStatus = event.EvidenceStatus
+	// Preserve original binary producer bytes before windowing/capping legacy
+	// compatibility text. Existing typed receipts remain authoritative and are
+	// never repaired, rehashed or replaced by these display-only projections.
+	prepareFindingLegacyText(f)
 	// Static assets (JS/CSS/source maps) can be megabytes; on a finding we only
 	// need the matched region in context. Store the response head (status line +
 	// headers) verbatim plus a window of the body around the match. event.Response
 	// is left untouched so the linked http_record still carries the full body for
 	// display. Non-static responses are stored whole.
 	if windowed, ok := windowStaticFindingResponse(f.URL, event.Response, event.ExtractedResults); ok {
-		f.Response = windowed
+		f.Response = legacyEvidenceTextProjection(windowed)
 	}
-	// Cap evidence carried straight off the event (modules that collect many
-	// request/response pairs themselves, e.g. OAST/timing collectors) to the same
-	// ceiling the dedup merge paths enforce, so a single finding never persists an
-	// unbounded payload.
-	f.AdditionalEvidence = event.AdditionalEvidence
+	// Cap only the legacy display sample to the same ceiling the dedup merge
+	// paths enforce. Original typed receipts and binary producer bytes preserved
+	// above remain intact independently of this compatibility-text cap.
 	if len(f.AdditionalEvidence) > maxAdditionalEvidence {
 		f.AdditionalEvidence = f.AdditionalEvidence[:maxAdditionalEvidence]
 	}

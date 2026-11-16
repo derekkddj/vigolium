@@ -1,11 +1,12 @@
 'use client';
 
-import React, { useState, useMemo, useRef, useCallback } from 'react';
-import { Copy, Check, Upload, Loader2, Zap, Scale, Layers } from 'lucide-react';
+import React, { Suspense, useState, useMemo, useRef, useCallback } from 'react';
+import { Upload, Loader2, Zap, Scale, Layers } from 'lucide-react';
 import { zipSync } from 'fflate';
-import { useScanURL, useScanRequest, useRunScan, useUploadRepo, useScans, useDeleteScan, useStopScan, usePauseScan, useResumeScan, useScanLogs } from '@/api/hooks';
-import type { ScanURLRequest, ScanRequestRequest, RunScanRequest, ScansQueryParams, Scan, ScanLog } from '@/api/types';
-import { useFollowTail } from '@/lib/useFollowTail';
+import { useScanURL, useScanRequest, useRunScan, useUploadRepo, useScans, useDeleteScan, useStopScan, usePauseScan, useResumeScan } from '@/api/hooks';
+import type { ScanURLRequest, ScanRequestRequest, RunScanRequest, Scan } from '@/api/types';
+import NativeScanDetail, { NativeScanURLSync } from '@/components/shared/NativeScanDetail';
+import { useNativeScanHistory, useNativeScanSelection } from '@/hooks/useNativeScanSelection';
 import { formatDate } from '@/lib/formatters';
 import PageShell from './PageShell';
 import Dropdown from './Dropdown';
@@ -89,102 +90,12 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
-/* ─── ScanDetailPanel (light) ─── */
-
-function ScanDetailPanel({ scan, onClose }: { scan: Scan; onClose: () => void }) {
-  const { data } = useScanLogs(scan.uuid, { limit: 200 }, scan.status === 'running');
-  const logs = data?.logs ?? [];
-  const logText = data?.text;
-  const tail = useFollowTail<HTMLDivElement>(logText ?? logs.length);
-  const [modulesCopied, setModulesCopied] = useState(false);
-
-  const statusColor = (s: string) =>
-    s === 'running' ? '#00b368' :
-    s === 'paused' ? '#b8860b' :
-    s === 'completed' ? '#0078c8' :
-    s === 'failed' || s === 'cancelled' ? '#e34e1c' : '#005661';
-
-  const levelColor = (level: string) => {
-    if (level === 'warn') return '#b8860b';
-    if (level === 'error') return '#e34e1c';
-    return '#708e8e';
-  };
-
-  return (
-    <div className="border-l border-[#bbc3c4] flex flex-col h-full min-h-0">
-      <div className="px-3 py-1.5 border-b border-[#bbc3c4] flex items-center justify-between shrink-0">
-        <span className="text-[#0078c8] text-xs font-bold">SCAN DETAILS</span>
-        <button onClick={onClose} className="text-[10px] text-[#708e8e] hover:text-[#005661]">[close]</button>
-      </div>
-      <div className="px-3 py-2 text-xs border-b border-[#bbc3c4] shrink-0 space-y-1">
-        <div className="text-[#005661] break-all">
-          <span className="text-[#708e8e]">uuid:</span> {scan.uuid}
-        </div>
-        {scan.project_uuid && (
-          <div className="text-[#005661] break-all">
-            <span className="text-[#708e8e]">project_uuid:</span> {scan.project_uuid}
-          </div>
-        )}
-        <div className="flex flex-wrap gap-x-4 gap-y-0.5">
-          <span><span className="text-[#708e8e]">status:</span> <span className="font-bold uppercase" style={{ color: statusColor(scan.status) }}>{scan.status}</span></span>
-          <span><span className="text-[#708e8e]">name:</span> <span className="text-[#005661]">{scan.name || '-'}</span></span>
-          <span><span className="text-[#708e8e]">mode:</span> <span className="text-[#0078c8]">{scan.scan_mode || '-'}</span></span>
-          <span><span className="text-[#708e8e]">source:</span> <span className="text-[#005661] font-semibold">{scan.scan_source || '-'}</span></span>
-          <span><span className="text-[#708e8e]">findings:</span> <span style={{ color: scan.total_findings > 0 ? '#b8860b' : '#708e8e' }}>{scan.total_findings}</span></span>
-          <span><span className="text-[#708e8e]">processed:</span> <span className="text-[#00b368]">{scan.processed_count}</span></span>
-        </div>
-        <div className="flex flex-wrap gap-x-4 gap-y-0.5">
-          <span><span className="text-[#708e8e]">started:</span> <span className="text-[#005661]">{scan.started_at ? formatDate(scan.started_at) : '-'}</span></span>
-          <span><span className="text-[#708e8e]">finished:</span> <span className="text-[#005661]">{scan.finished_at ? formatDate(scan.finished_at) : '-'}</span></span>
-          <span><span className="text-[#708e8e]">created:</span> <span className="text-[#005661]">{scan.created_at ? formatDate(scan.created_at) : '-'}</span></span>
-        </div>
-        {scan.modules && (
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="text-[#708e8e]">modules:</span>
-              <span className="text-[#0078c8] text-[10px]">{scan.modules === 'all' ? 'all' : scan.modules.split(',').length + ' modules'}</span>
-              <button
-                onClick={() => { navigator.clipboard.writeText(scan.modules!); setModulesCopied(true); setTimeout(() => setModulesCopied(false), 1500); }}
-                className="px-1.5 py-0.5 text-[10px] border border-[#bbc3c4] text-[#708e8e] hover:text-[#005661]"
-              >
-                {modulesCopied ? <><Check size={10} className="inline-block mr-0.5 -mt-px" />copied!</> : <><Copy size={10} className="inline-block mr-0.5 -mt-px" />copy</>}
-              </button>
-            </div>
-            <textarea readOnly rows={3} value={scan.modules} className="mt-0.5 w-full bg-[#ede4d1] border border-[#bbc3c4] text-[#005661] text-xs p-1.5 resize-none focus:outline-none" />
-          </div>
-        )}
-      </div>
-      <div className="px-3 py-1.5 border-b border-[#bbc3c4] shrink-0">
-        <span className="text-[#0078c8] text-xs font-bold">LOGS</span>
-        <span className="text-[#bbc3c4] text-[10px] ml-2">{logText !== undefined ? 'runtime.log tail' : `${logs.length} entries`}</span>
-      </div>
-      <div ref={tail.ref} onScroll={tail.onScroll} className="bg-[#ede4d1] overflow-y-auto font-mono text-[11px] leading-relaxed flex-1 min-h-0">
-        {logText ? (
-          <pre className="px-3 py-2 whitespace-pre-wrap break-all text-[#005661]">{logText}</pre>
-        ) : logs.length === 0 ? (
-          <div className="px-3 py-2 text-[#bbc3c4]">no logs</div>
-        ) : (
-          logs.map((log: ScanLog) => (
-            <div key={log.id} className="px-3 py-0.5 hover:bg-[#ede4d1] flex gap-2">
-              <span className="text-[#708e8e] shrink-0">{new Date(log.created_at).toLocaleTimeString()}</span>
-              <span className="shrink-0 uppercase font-bold" style={{ color: levelColor(log.level) }}>{log.level.padEnd(5)}</span>
-              {log.phase && <span className="text-[#00b368] shrink-0">[{log.phase}]</span>}
-              <span className="text-[#005661]">{log.message}</span>
-              {log.metadata && <span className="text-[#708e8e]">{log.metadata}</span>}
-            </div>
-          ))
-        )}
-      </div>
-    </div>
-  );
-}
-
 /* ─── ScanActions (light) ─── */
 
 function ScanActions({ scan, onStop, onDelete, onPause, onResume }: { scan: Scan; onStop: (uuid: string) => void; onDelete: (uuid: string) => void; onPause: (uuid: string) => void; onResume: (uuid: string) => void }) {
   const [confirmDel, setConfirmDel] = useState(false);
   return (
-    <div className="flex items-center gap-1">
+    <div className="flex items-center gap-1" onClick={(event) => event.stopPropagation()}>
       {scan.status === 'running' && (
         <>
           <button onClick={(e) => { e.stopPropagation(); onPause(scan.uuid); }} className="text-[10px] text-[#b8860b] hover:underline">[pause]</button>
@@ -251,15 +162,16 @@ export default function ScanPage() {
   const dragCounter = useRef(0);
 
   // Scan history state
-  const [historyParams, setHistoryParams] = useState<ScansQueryParams>({ limit: HISTORY_PAGE_SIZE, offset: 0 });
-  const [expandedScanUuid, setExpandedScanUuid] = useState<string | null>(null);
+  const { selectedUUID: expandedScanUuid, selectScan, syncFromURL, projectKey } = useNativeScanSelection();
+  const [historyParams, setHistoryParams] = useNativeScanHistory(HISTORY_PAGE_SIZE, projectKey);
 
   /* ── hooks ── */
   const scanURL = useScanURL();
   const scanRequest = useScanRequest();
   const runScan = useRunScan();
   const uploadRepo = useUploadRepo();
-  const { data: scansData, isLoading: scansLoading } = useScans(historyParams);
+  const { data: historyData, isLoading: scansLoading, error: scansError, refetch: refetchScans } = useScans(historyParams);
+  const scansData = historyData?.project_uuid && historyData.project_uuid !== projectKey ? undefined : historyData;
   const deleteScan = useDeleteScan();
   const stopScan = useStopScan();
   const pauseScan = usePauseScan();
@@ -276,7 +188,6 @@ export default function ScanPage() {
 
   const isSubmitting = mutation.isPending;
 
-  const selectedScan = expandedScanUuid ? scansData?.data?.find((s) => s.uuid === expandedScanUuid) ?? null : null;
   const historyPage = Math.floor((historyParams.offset || 0) / HISTORY_PAGE_SIZE) + 1;
   const historyTotalPages = Math.ceil((scansData?.total || 0) / HISTORY_PAGE_SIZE);
 
@@ -478,6 +389,7 @@ export default function ScanPage() {
 
   return (
     <PageShell>
+      <Suspense fallback={null}><NativeScanURLSync onChange={syncFromURL} /></Suspense>
       {/* ════════════════════════════════════════ NEW SCAN ════════════════════════════════════════ */}
       <div className="border border-[#bbc3c4] bg-[#f6edda]">
         <div className="px-3 py-1.5 border-b border-[#bbc3c4]">
@@ -757,8 +669,8 @@ export default function ScanPage() {
         <div className="px-3 py-1.5 border-b border-[#bbc3c4]">
           <span className="text-[#0078c8] text-xs font-bold">SCAN HISTORY</span>
         </div>
-        <div className="flex" style={{ minHeight: selectedScan ? 420 : undefined }}>
-          <div className={`overflow-x-auto ${selectedScan ? 'w-1/2' : 'w-full'}`}>
+        <div className="flex" style={{ minHeight: expandedScanUuid ? 420 : undefined }}>
+          <div className={`overflow-x-auto ${expandedScanUuid ? 'w-1/2' : 'w-full'}`}>
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-[#bbc3c4]">
@@ -773,9 +685,10 @@ export default function ScanPage() {
               </thead>
               <tbody>
                 {scansLoading && <tr><td colSpan={7} className="px-3 py-4 text-center text-[#708e8e]">loading...</td></tr>}
-                {!scansLoading && (!scansData?.data || scansData.data.length === 0) && <tr><td colSpan={7} className="px-3 py-4 text-center text-[#bbc3c4]">no scans</td></tr>}
+                {scansError && <tr><td colSpan={7} className="px-3 py-2 text-[#e34e1c]" role="alert">Scan history unavailable: {scansError.message} <button className="underline" onClick={() => void refetchScans()}>Retry history</button></td></tr>}
+                {!scansLoading && !scansError && (!scansData?.data || scansData.data.length === 0) && <tr><td colSpan={7} className="px-3 py-4 text-center text-[#bbc3c4]">no scans</td></tr>}
                 {scansData?.data?.map((scan) => (
-                  <tr key={scan.uuid} onClick={() => setExpandedScanUuid((prev) => prev === scan.uuid ? null : scan.uuid)} className={`border-b border-[#bbc3c4]/50 hover:bg-[#ede4d1] transition-colors cursor-pointer ${expandedScanUuid === scan.uuid ? 'bg-[#ede4d1]' : ''}`}>
+                  <tr key={scan.uuid} onClick={() => selectScan(expandedScanUuid === scan.uuid ? null : scan.uuid)} className={`border-b border-[#bbc3c4]/50 hover:bg-[#ede4d1] transition-colors cursor-pointer ${expandedScanUuid === scan.uuid ? 'bg-[#ede4d1]' : ''}`}>
                     <td className="px-3 py-1.5"><StatusBadge status={scan.status} /></td>
                     <td className="px-3 py-1.5 text-[#005661]">{scan.name || scan.uuid.slice(0, 8)}</td>
                     <td className="px-3 py-1.5 text-[#708e8e]">{[scan.scan_mode, scan.scan_source].filter(Boolean).join(' / ') || '-'}</td>
@@ -790,7 +703,7 @@ export default function ScanPage() {
               </tbody>
             </table>
           </div>
-          {selectedScan && <div className="w-1/2"><ScanDetailPanel scan={selectedScan} onClose={() => setExpandedScanUuid(null)} /></div>}
+          {expandedScanUuid && <div className="w-1/2 min-w-0"><NativeScanDetail uuid={expandedScanUuid} theme="light" onClose={() => selectScan(null)} /></div>}
         </div>
         {(scansData?.total || 0) > HISTORY_PAGE_SIZE && (
           <div className="flex items-center justify-between px-3 py-1 border-t border-[#bbc3c4] text-xs text-[#708e8e]">

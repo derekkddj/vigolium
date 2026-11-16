@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -111,6 +112,7 @@ func (m *Module) ScanPerRequest(
 			respStatus = resp.Response().StatusCode
 			respBody = resp.FullResponseString()
 		}
+		uploadExchange := http.CaptureEvidence(resp)
 		resp.Close()
 
 		// Early abort on first probe: strict server validation
@@ -129,7 +131,8 @@ func (m *Module) ScanPerRequest(
 		// Only report when the file is independently retrievable AND echoes our
 		// unique marker (upload accepted + file fetchable + marker present), which
 		// is the actual vulnerability. Unverified candidates are dropped.
-		verified, executed, verifyBody := m.verifyUpload(ctx, httpClient, respBody, probe, marker)
+		var retrieval *evidence.Exchange
+		verified, executed, verifyBody := m.verifyUpload(ctx, httpClient, respBody, probe, marker, &retrieval)
 		if !verified {
 			continue
 		}
@@ -151,10 +154,11 @@ func (m *Module) ScanPerRequest(
 			signal = "Verified: executed (arithmetic signature)"
 		}
 
-		results = append(results, &output.ResultEvent{
+		result := &output.ResultEvent{
 			URL:              urlx.String(),
 			Request:          string(modified),
 			Response:         verifyBody,
+			Evidence:         []evidence.Entry{evidence.Select(uploadExchange, evidence.RoleAttack, false, "file upload")},
 			FuzzingParameter: "file",
 			ExtractedResults: []string{
 				fmt.Sprintf("Probe: %s", probe.name),
@@ -167,7 +171,9 @@ func (m *Module) ScanPerRequest(
 				Severity:    sev,
 				Confidence:  severity.Certain,
 			},
-		})
+		}
+		modkit.SetPrimaryEvidence(result, retrieval, evidence.RoleConfirmation, "selected probe")
+		results = append(results, result)
 
 		return results, nil // One confirmed finding is enough
 	}
@@ -187,6 +193,7 @@ func (m *Module) verifyUpload(
 	uploadResponse string,
 	probe uploadProbe,
 	marker string,
+	receipts ...**evidence.Exchange,
 ) (verified, executed bool, body string) {
 	// Try to extract upload path from response
 	uploadPath := extractUploadPath(uploadResponse)
@@ -203,15 +210,22 @@ func (m *Module) verifyUpload(
 
 	execSig := markerExecSignature(marker)
 	for _, path := range pathsToTry {
-		fetched, err := m.fetchPath(ctx, httpClient, path)
+		var exchange *evidence.Exchange
+		fetched, err := m.fetchPath(ctx, httpClient, path, &exchange)
 		if err != nil {
 			continue
 		}
 
 		if strings.Contains(fetched, execSig) {
+			if len(receipts) > 0 {
+				*receipts[0] = exchange
+			}
 			return true, true, fetched // interpreter ran the code -> RCE
 		}
 		if strings.Contains(fetched, marker) {
+			if len(receipts) > 0 {
+				*receipts[0] = exchange
+			}
 			return true, false, fetched // stored + retrievable, execution not observed
 		}
 	}
@@ -224,6 +238,7 @@ func (m *Module) fetchPath(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	path string,
+	receipts ...**evidence.Exchange,
 ) (string, error) {
 	raw := ctx.Request().Raw()
 
@@ -254,5 +269,8 @@ func (m *Module) fetchPath(
 		return "", fmt.Errorf("non-200 response: %d", resp.Response().StatusCode)
 	}
 
+	if len(receipts) > 0 {
+		*receipts[0] = http.CaptureEvidence(resp)
+	}
 	return resp.FullResponseString(), nil
 }

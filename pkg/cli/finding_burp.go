@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/pkg/burpbridge"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/terminal"
 )
 
@@ -138,7 +139,11 @@ func pushOneFinding(
 		if findingSendViaBurp {
 			organizerResp = nil
 		}
-		notes := fmt.Sprintf("%s [%s] finding #%d", findingPushLabel(f), f.Severity, f.ID)
+		role := evidence.RoleUnknown
+		if entry := primaryFindingEntry(f); entry != nil {
+			role = entry.Role
+		}
+		notes := fmt.Sprintf("%s [%s] finding #%d · role=%s · reproduction context, not a vulnerability verdict", findingPushLabel(f), f.Severity, f.ID, role)
 		if _, err := client.SendToOrganizer(ctx, url, "", req, organizerResp, burpbridge.OrganizerOptions{
 			Source:    "vigolium-finding",
 			Notes:     notes,
@@ -161,10 +166,25 @@ func pushOneFinding(
 	return nil
 }
 
-// findingPushEvidence resolves the request/response bytes and URL to push for a
-// finding, preferring its first linked HTTP record and falling back to the
-// inline evidence stored on the finding itself.
+// findingPushEvidence resolves one explicit primary receipt. Missing or ambiguous
+// selections never fall back. Historical findings without a manifest can still
+// hand off legacy traffic, explicitly labelled unknown-role context.
 func findingPushEvidence(f *database.Finding, byUUID map[string]*database.HTTPRecord) (req, resp []byte, url string) {
+	if len(f.Evidence) > 0 {
+		e := primaryFindingEntry(f)
+		if e == nil || e.Exchange == nil || e.Exchange.ID != e.ExchangeID || e.Exchange.Validate() != nil || len(e.Exchange.Request) == 0 || e.Exchange.RequestState != evidence.StateComplete {
+			return nil, nil, ""
+		}
+		target, err := selectedReceiptURL(e.Exchange)
+		if err != nil {
+			return nil, nil, ""
+		}
+		return e.Exchange.Request, e.Exchange.Response, target.String()
+	}
+	// Legacy handoff is unknown-role context, not inferred proof.
+	if f.EvidenceStatus != "" && f.EvidenceStatus != "legacy_unknown" && f.EvidenceStatus != "unclassified" {
+		return nil, nil, ""
+	}
 	records := recordsForFinding(byUUID, f)
 	for _, rec := range records {
 		if len(rec.RawRequest) == 0 {

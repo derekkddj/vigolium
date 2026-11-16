@@ -517,7 +517,7 @@ func (h *Handlers) runBackgroundAutopilot(agenticScanUUID string, req AgentAutop
 	var streamFile *os.File
 	if sessionDir != "" {
 		logPath := filepath.Join(sessionDir, config.RuntimeLogFilename)
-		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
 			cfg.StreamWriter = f
 			streamFile = f
 		} else {

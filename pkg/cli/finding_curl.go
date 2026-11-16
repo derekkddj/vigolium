@@ -9,12 +9,13 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/terminal"
 )
 
-// `finding --curl` renders the request that proves each selected finding as a
-// curl command; `--curl-all` renders every linked record. Nothing is sent.
+// `finding --curl` renders explicitly selected primary requests for reproduction.
+// Legacy requests have unknown roles and are never described as proof. Nothing is sent.
 
 var (
 	findingCurl       bool
@@ -26,8 +27,8 @@ func init() {
 	// Registered here rather than in finding.go's init: findingCmd is a
 	// package-level value, so its flag set exists before any init runs.
 	f := findingCmd.Flags()
-	f.BoolVar(&findingCurl, "curl", false, "Render each selected finding's proving request (its stored evidence, else its first linked record) as a curl command; -j gives {id, finding_hash, record_uuid, curl, argv}")
-	f.BoolVar(&findingCurlAll, "curl-all", false, "Like --curl, but render every HTTP record linked to each finding")
+	f.BoolVar(&findingCurl, "curl", false, "Render the explicitly selected primary request as curl (legacy inline fallback is role unknown, not proof); nothing is sent")
+	f.BoolVar(&findingCurlAll, "curl-all", false, "Render all selected exchanges and linked context requests with their roles; nothing is sent")
 	f.BoolVar(&findingRedactAuth, "redact-auth", false, "With --curl/--curl-all: replace Authorization/Cookie/API-key header values with <redacted>")
 }
 
@@ -58,16 +59,19 @@ func renderFindingCurl(ctx context.Context, cmd *cobra.Command, db *database.DB,
 	for _, f := range findings {
 		var rendered []curlItem
 		if findingCurlAll {
-			rendered = findingRecordCurls(f, byUUID)
-			if len(rendered) == 0 {
+			for _, entry := range f.Evidence {
+				if it, ok := selectedExchangeCurl(entry); ok {
+					rendered = append(rendered, it)
+				}
+			}
+			rendered = append(rendered, findingRecordCurls(f, byUUID)...)
+			if len(f.Evidence) == 0 && len(rendered) == 0 {
 				if it, ok := findingEvidenceCurl(f); ok {
 					rendered = append(rendered, it)
 				}
 			}
 		} else if it, ok := findingEvidenceCurl(f); ok {
 			rendered = append(rendered, it)
-		} else if all := findingRecordCurls(f, byUUID); len(all) > 0 {
-			rendered = all[:1]
 		}
 		if len(rendered) == 0 {
 			skipped = append(skipped, f.ID)
@@ -76,6 +80,7 @@ func renderFindingCurl(ctx context.Context, cmd *cobra.Command, db *database.DB,
 		for i := range rendered {
 			rendered[i].ID = f.ID
 			rendered[i].FindingHash = f.FindingHash
+			rendered[i].EvidenceStatus = f.EvidenceStatus
 		}
 		items = append(items, rendered...)
 	}
@@ -107,14 +112,31 @@ func renderFindingCurl(ctx context.Context, cmd *cobra.Command, db *database.DB,
 		if it.RecordUUID != "" {
 			label += " record " + it.RecordUUID
 		}
+		if it.ExchangeID != "" {
+			label += " exchange " + it.ExchangeID
+		}
+		if it.OccurrenceID != "" {
+			label += " occurrence=" + it.OccurrenceID
+		}
+		label += " role=" + it.EvidenceRole + " (reproduction request, not a vulnerability verdict)"
 		return label
 	})
 	return nil
 }
 
-// findingEvidenceCurl renders the request stored on the finding itself — the
-// one the module sent when it proved the issue.
+// findingEvidenceCurl prefers a single explicitly selected primary entry. An
+// unavailable or ambiguous selection never falls back to legacy/linked traffic.
 func findingEvidenceCurl(f *database.Finding) (curlItem, bool) {
+	if len(f.Evidence) > 0 {
+		entry := primaryFindingEntry(f)
+		if entry == nil {
+			return curlItem{}, false
+		}
+		return selectedExchangeCurl(*entry)
+	}
+	if f.EvidenceStatus != "" && f.EvidenceStatus != "legacy_unknown" && f.EvidenceStatus != "unclassified" {
+		return curlItem{}, false
+	}
 	if strings.TrimSpace(f.Request) == "" {
 		return curlItem{}, false
 	}
@@ -129,7 +151,29 @@ func findingEvidenceCurl(f *database.Finding) (curlItem, bool) {
 		return curlItem{}, false
 	}
 	method, _ := httpmsg.GetMethod(raw)
-	return curlItemFrom(cmd, method, cmd.Argv[len(cmd.Argv)-1]), true
+	it := curlItemFrom(cmd, method, cmd.Argv[len(cmd.Argv)-1])
+	it.EvidenceRole, it.RequestSource = string(evidence.RoleUnknown), "legacy_inline"
+	return it, true
+}
+
+func selectedExchangeCurl(entry evidence.Entry) (curlItem, bool) {
+	x := entry.Exchange
+	if x == nil || x.ID != entry.ExchangeID || x.Validate() != nil || len(x.Request) == 0 || x.RequestState != evidence.StateComplete {
+		return curlItem{}, false
+	}
+	u, err := selectedReceiptURL(x)
+	if err != nil {
+		return curlItem{}, false
+	}
+	cmd, err := httpmsg.ToCurl(x.Request, u.Scheme+"://"+u.Host, httpmsg.CurlOptions{RedactAuth: findingRedactAuth})
+	if err != nil {
+		return curlItem{}, false
+	}
+	method, _ := httpmsg.GetMethod(x.Request)
+	it := curlItemFrom(cmd, method, cmd.Argv[len(cmd.Argv)-1])
+	it.ExchangeID, it.EvidenceRole, it.RequestSource = entry.ExchangeID, string(entry.Role), "selected_exchange"
+	it.OccurrenceID, it.FindingURL, it.ScanUUID, it.EvidenceLabel, it.EvidencePrimary = entry.OccurrenceID, entry.FindingURL, entry.ScanUUID, entry.Label, entry.Primary
+	return it, true
 }
 
 // findingRecordCurls renders every linked record that holds a request.
@@ -144,6 +188,10 @@ func findingRecordCurls(f *database.Finding, byUUID map[string]*database.HTTPRec
 			continue
 		}
 		it.RecordUUID = rec.UUID
+		it.EvidenceRole, it.RequestSource = string(evidence.RoleUnknown), "linked_context"
+		if rec.UUID == f.OriginRecordUUID {
+			it.RequestSource = "origin_replay_context"
+		}
 		out = append(out, it)
 	}
 	return out

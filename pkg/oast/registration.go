@@ -355,13 +355,14 @@ func (s *Service) Enabled() bool {
 // callback URL was minted since the previous Flush: nothing planted, nothing to
 // wait for.
 //
-// It also writes the payload contexts a {nonce} template minted to
-// oast_payloads.
+// It also writes minted payload contexts and drains queued planting receipts
+// for both correlated modes.
 func (s *Service) Flush() {
 	if s == nil {
 		return
 	}
 	s.flushPayloads()
+	s.drainPlantingReceipts(false)
 	if s.client.Load() == nil {
 		return
 	}
@@ -383,6 +384,7 @@ func (s *Service) Close() {
 		return
 	}
 	s.flushPayloads()
+	s.drainPlantingReceipts(true)
 	s.lifeMu.Lock()
 	if s.closed {
 		s.lifeMu.Unlock()

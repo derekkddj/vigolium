@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -32,29 +33,65 @@ func (r *Repository) CreateAgenticScan(ctx context.Context, run *AgenticScan) er
 	return nil
 }
 
-// AttributeScanToAgenticScan links a native scan (and every finding it
-// produced) to the agentic scan that launched it. The run_native_scan tool calls this
-// after a blocking LaunchScan returns, so the child scan's findings show up
-// under `finding --agentic-scan <parent>` — which filters on
-// finding.agentic_scan_uuid directly rather than joining through scans. Both
-// the scan row and its findings are stamped; a no-op when either UUID is empty.
+// AttributeScanToAgenticScan reconciles a native child on success or failure.
+// Both rows must exist in the same project. Ownership cannot be reassigned;
+// only missing finding parents are filled, preserving historical attribution.
+// This does not reconstruct deduplicated occurrences: findings whose original
+// scan_uuid belongs to an older run remain there until an occurrence model exists.
 func (r *Repository) AttributeScanToAgenticScan(ctx context.Context, scanUUID, agenticScanUUID string) error {
 	if scanUUID == "" || agenticScanUUID == "" {
 		return nil
 	}
-	if _, err := r.db.NewUpdate().Model((*Scan)(nil)).
-		Set("agentic_scan_uuid = ?", agenticScanUUID).
-		Where("uuid = ?", scanUUID).
-		Exec(ctx); err != nil {
-		return fmt.Errorf("attribute scan %s to agentic scan %s: %w", scanUUID, agenticScanUUID, err)
-	}
-	if _, err := r.db.NewUpdate().Model((*Finding)(nil)).
-		Set("agentic_scan_uuid = ?", agenticScanUUID).
-		Where("scan_uuid = ?", scanUUID).
-		Exec(ctx); err != nil {
-		return fmt.Errorf("attribute findings of scan %s to agentic scan %s: %w", scanUUID, agenticScanUUID, err)
-	}
-	return nil
+	return r.db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		parent := &AgenticScan{}
+		parentQuery := tx.NewSelect().Model(parent).Column("uuid", "project_uuid").Where("uuid = ?", agenticScanUUID)
+		if r.db.Driver() == "postgres" {
+			parentQuery = parentQuery.For("UPDATE")
+		}
+		if err := parentQuery.Scan(ctx); err != nil {
+			return fmt.Errorf("attribute parent scan: %w", err)
+		}
+		scan := &Scan{}
+		scanQuery := tx.NewSelect().Model(scan).Column("uuid", "project_uuid", "agentic_scan_uuid").Where("uuid = ?", scanUUID)
+		if r.db.Driver() == "postgres" {
+			scanQuery = scanQuery.For("UPDATE")
+		}
+		if err := scanQuery.Scan(ctx); err != nil {
+			return fmt.Errorf("attribute native scan: %w", err)
+		}
+		if scan.ProjectUUID != parent.ProjectUUID {
+			return fmt.Errorf("%w: native scan %s and parent %s belong to different projects", ErrScanProjectMismatch, scanUUID, agenticScanUUID)
+		}
+		if scan.AgenticScanUUID != "" && scan.AgenticScanUUID != agenticScanUUID {
+			return fmt.Errorf("native scan %s already belongs to another agent run", scanUUID)
+		}
+		// Refuse malformed cross-project children rather than partially stamping.
+		foreign, err := tx.NewSelect().Model((*Finding)(nil)).Where("scan_uuid = ?", scanUUID).
+			Where("project_uuid <> ?", scan.ProjectUUID).Exists(ctx)
+		if err != nil {
+			return fmt.Errorf("validate child findings: %w", err)
+		}
+		if foreign {
+			return fmt.Errorf("%w: native scan has findings in another project", ErrScanProjectMismatch)
+		}
+		res, err := tx.NewUpdate().Model((*Scan)(nil)).
+			Set("agentic_scan_uuid = ?", agenticScanUUID).
+			Where("uuid = ?", scanUUID).Where("project_uuid = ?", parent.ProjectUUID).
+			Where("(agentic_scan_uuid = '' OR agentic_scan_uuid IS NULL OR agentic_scan_uuid = ?)", agenticScanUUID).Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("attribute native scan: %w", err)
+		}
+		if n, err := res.RowsAffected(); err != nil || n != 1 {
+			return fmt.Errorf("native scan ownership changed during attribution")
+		}
+		if _, err := tx.NewUpdate().Model((*Finding)(nil)).
+			Set("agentic_scan_uuid = ?", agenticScanUUID).
+			Where("scan_uuid = ?", scanUUID).Where("project_uuid = ?", parent.ProjectUUID).
+			Where("(agentic_scan_uuid = '' OR agentic_scan_uuid IS NULL)").Exec(ctx); err != nil {
+			return fmt.Errorf("attribute child findings: %w", err)
+		}
+		return nil
+	})
 }
 
 // GetAgenticScan retrieves an agent run by UUID.
@@ -203,14 +240,10 @@ func (r *Repository) GetChildAgenticScans(ctx context.Context, parentUUID string
 }
 
 // TerminalAgenticScanStatuses is the authoritative set of agentic_scans.status
-// values meaning the run has finished. Two subsystems must agree on it — the
-// SSE log follower, which tails runtime.log until the run is terminal, and the
-// retention sweep below, which only deletes finished runs — and a status
-// present in one and absent from the other is either a stream that never ends
-// or a row that is never cleaned. Both were true of "completed_with_errors",
-// what a multi-driver audit writes when one leg fails: following its log spun
-// until the two-hour cap and its row outlived every retention window. Add new
-// terminal statuses here, not at either call site.
+// values meaning the run has finished, used by the SSE log follower and other
+// status readers. Add new terminal statuses here, not at call sites. Terminal
+// status alone is not permission to expire evidence: runs can be resumed and
+// the catalog may still have retained artifacts and dependent records.
 var TerminalAgenticScanStatuses = []string{
 	"completed",
 	"completed_with_errors",
@@ -317,18 +350,17 @@ func MultiDriverAgenticScanStatus(failed, total int) string {
 	}
 }
 
-// DeleteOldAgenticScans removes finished agent runs older than the given
-// duration. "Finished" is TerminalAgenticScanStatuses, not a literal list —
-// see that variable.
+// ErrUnsafeAgenticScanRetention means the legacy unscoped sweep would detach
+// artifacts, findings, child runs, or durable sections from their catalog.
+var ErrUnsafeAgenticScanRetention = errors.New("automatic agent catalog deletion is disabled: scoped artifact and dependency retention is required")
+
+// DeleteOldAgenticScans fails closed without deleting catalog rows. Terminal
+// status and age alone do not make a run safe to delete: it can be resumed and
+// retained evidence and dependent rows still refer to its UUID. Keep this API
+// compatible until an opt-in, scoped retention workflow can coordinate artifacts
+// and transactionally handle database dependencies.
+//
+// Deprecated: use an explicitly scoped, dependency-aware retention workflow.
 func (r *Repository) DeleteOldAgenticScans(ctx context.Context, olderThan time.Duration) (int, error) {
-	cutoff := time.Now().Add(-olderThan)
-	res, err := r.db.NewDelete().Model((*AgenticScan)(nil)).
-		Where("status IN (?)", bun.List(TerminalAgenticScanStatuses)).
-		Where("completed_at < ?", cutoff).
-		Exec(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("failed to delete old agent runs: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	return int(n), nil
+	return 0, ErrUnsafeAgenticScanRetention
 }

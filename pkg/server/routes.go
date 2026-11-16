@@ -11,7 +11,6 @@ import (
 	fiberlogger "github.com/gofiber/fiber/v3/middleware/logger"
 	fiberrecover "github.com/gofiber/fiber/v3/middleware/recover"
 	"github.com/gofiber/fiber/v3/middleware/requestid"
-	"github.com/gofiber/fiber/v3/middleware/static"
 
 	"github.com/vigolium/vigolium/pkg/apicontract"
 	"github.com/vigolium/vigolium/public"
@@ -58,7 +57,16 @@ func registerRoutes(app *fiber.App, handlers *Handlers, cfg ServerConfig) {
 				// Version negotiation and opt-in project creation.
 				apicontract.RESTAPIVersionHeader, apicontract.ProjectCreateHeader,
 			},
-			ExposeHeaders: []string{apicontract.RESTAPIVersionHeader},
+			// These are part of the archive/tail contract. Without explicit
+			// exposure cross-origin viewers cannot distinguish a preview from
+			// complete evidence even when the server reports the omission.
+			ExposeHeaders: []string{
+				apicontract.RESTAPIVersionHeader,
+				"X-Log-Size", "X-Log-Truncated",
+				"X-Artifact-Total-Size", "X-Artifact-Truncated",
+				"X-Artifact-Offset", "X-Artifact-Returned-Bytes",
+				"Content-Disposition",
+			},
 		}
 		switch cfg.CORSAllowedOrigins {
 		case "reflect-origin":
@@ -109,10 +117,7 @@ func registerRoutes(app *fiber.App, handlers *Handlers, cfg ServerConfig) {
 	// Fiber's static middleware calls c.Next() for paths with no matching file,
 	// so /api/*, /health, /metrics, /swagger all pass through to their handlers.
 	uiFS, _ := fs.Sub(public.StaticFS, "ui")
-	app.Use("/", static.New("", static.Config{
-		FS:         uiFS,
-		IndexNames: []string{"index.html"},
-	}))
+	app.Use("/", uiStaticMiddleware(uiFS))
 
 	// Bearer auth with user store
 	if !cfg.NoAuth && (len(cfg.APIKeys) > 0 || cfg.UserStore != nil) {
@@ -144,6 +149,7 @@ func registerRoutes(app *fiber.App, handlers *Handlers, cfg ServerConfig) {
 		demo.Get("/http-records/:uuid", handlers.HandleGetRecord)
 		demo.Get("/findings", handlers.findingsHandler().HandleListFindings)
 		demo.Get("/findings/:id", handlers.findingsHandler().HandleGetFinding)
+		demo.Get("/findings/:id/evidence/:exchange_id", handlers.findingsHandler().HandleGetFindingEvidence)
 		demo.Get("/extensions/docs", handlers.HandleListExtensionAPI) // must precede :name
 		demo.Get("/extensions", handlers.HandleListExtensions)
 		demo.Get("/extensions/:name", handlers.HandleGetExtension)
@@ -163,6 +169,7 @@ func registerRoutes(app *fiber.App, handlers *Handlers, cfg ServerConfig) {
 	viewer.Get("/http-records/:uuid", handlers.HandleGetRecord)
 	viewer.Get("/findings", handlers.findingsHandler().HandleListFindings)
 	viewer.Get("/findings/:id", handlers.findingsHandler().HandleGetFinding)
+	viewer.Get("/findings/:id/evidence/:exchange_id", handlers.findingsHandler().HandleGetFindingEvidence)
 	viewer.Get("/stats", handlers.HandleStats)
 	viewer.Get("/scans", handlers.HandleListScans)
 	viewer.Get("/scans/:uuid", handlers.HandleGetScan)

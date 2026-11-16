@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -128,6 +129,7 @@ type takeoverCapture struct {
 	body     string
 	request  string
 	response string
+	receipt  *evidence.Exchange
 }
 
 // Module implements the Subdomain Takeover active scanner.
@@ -277,42 +279,45 @@ func (m *Module) ScanPerHost(
 				} else if matches {
 					description = fmt.Sprintf("The host %s has a CNAME bound to %s and reproducibly returns %q, but that response can also describe an unavailable or ordinary missing site. Claimability was not demonstrated.", host, fp.service, marker)
 				}
-				return []*output.ResultEvent{
-					{
-						ModuleID:      ModuleID,
-						RecordKind:    kind,
-						EvidenceGrade: grade,
-						URL:           target,
-						Matched:       target,
-						Request:       first.request,
-						Response:      first.response,
-						AdditionalEvidence: []string{
-							output.BuildEvidence("credential-free fingerprint replay", second.request, second.response),
-						},
-						ExtractedResults: []string{
-							fmt.Sprintf("Service: %s", fp.service),
-							fmt.Sprintf("Marker: %s", marker),
-							fmt.Sprintf("Host: %s", host),
-						},
-						Info: output.Info{
-							Name:        name,
-							Description: description,
-							Severity:    sev,
-							Confidence:  ModuleConfidence,
-							Tags:        ModuleTags,
-							Reference:   []string{"https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/10-Test_for_Subdomain_Takeover"},
-						},
-						Metadata: map[string]any{
-							"service":               fp.service,
-							"cname_confirmed":       matches,
-							"dns_conclusive":        conclusive,
-							"strong_fingerprint":    fp.strong,
-							"confirmation_rounds":   2,
-							"claimability_tested":   false,
-							"resource_registration": false,
-						},
+				ev := modkit.NewEvidenceCollector()
+				ev.AddExchange(second.receipt, evidence.RoleConfirmation, "credential-free fingerprint replay")
+				result := &output.ResultEvent{
+					Evidence:      ev.Evidence(),
+					ModuleID:      ModuleID,
+					RecordKind:    kind,
+					EvidenceGrade: grade,
+					URL:           target,
+					Matched:       target,
+					Request:       first.request,
+					Response:      first.response,
+					AdditionalEvidence: []string{
+						output.BuildEvidence("credential-free fingerprint replay", second.request, second.response),
 					},
-				}, nil
+					ExtractedResults: []string{
+						fmt.Sprintf("Service: %s", fp.service),
+						fmt.Sprintf("Marker: %s", marker),
+						fmt.Sprintf("Host: %s", host),
+					},
+					Info: output.Info{
+						Name:        name,
+						Description: description,
+						Severity:    sev,
+						Confidence:  ModuleConfidence,
+						Tags:        ModuleTags,
+						Reference:   []string{"https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/10-Test_for_Subdomain_Takeover"},
+					},
+					Metadata: map[string]any{
+						"service":               fp.service,
+						"cname_confirmed":       matches,
+						"dns_conclusive":        conclusive,
+						"strong_fingerprint":    fp.strong,
+						"confirmation_rounds":   2,
+						"claimability_tested":   false,
+						"resource_registration": false,
+					},
+				}
+				modkit.SetPrimaryEvidence(result, first.receipt, evidence.RoleObservation, "deprovisioned-service fingerprint")
+				return []*output.ResultEvent{result}, nil
 			}
 		}
 	}
@@ -335,6 +340,7 @@ func (m *Module) fetch(ctx *httpmsg.HttpRequestResponse, client *http.Requester,
 		body:     resp.BodyString(),
 		request:  string(raw),
 		response: resp.FullResponseString(),
+		receipt:  http.CaptureEvidence(resp),
 	}, nil
 }
 

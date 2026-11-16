@@ -52,6 +52,18 @@ type errorEvt struct {
 	Error     string  `json:"error"`
 }
 
+// streamRetryEvt records a nonterminal attempt boundary. The preceding
+// assistant message is partial; a later attempt may still complete the run.
+// This additive event must not be represented as a terminal errorEvt.
+type streamRetryEvt struct {
+	Type      string  `json:"type"`
+	ID        string  `json:"id"`
+	ParentID  *string `json:"parentId"`
+	Timestamp string  `json:"timestamp"`
+	Attempt   int     `json:"attempt"`
+	Error     string  `json:"error"`
+}
+
 // section_start / section_end / section_interrupted mark the durable-autopilot
 // bounded-section boundaries (an engine Reset() + reconstructed-brief cycle).
 // Not part of the Pi schema — like errorEvt, they follow the additive-event
@@ -109,12 +121,13 @@ type assistantMsg struct {
 }
 
 type toolResultMsg struct {
-	Role       string `json:"role"`
-	ToolCallID string `json:"toolCallId"`
-	ToolName   string `json:"toolName"`
-	Content    []any  `json:"content"`
-	IsError    bool   `json:"isError"`
-	Timestamp  int64  `json:"timestamp"`
+	Role       string         `json:"role"`
+	ToolCallID string         `json:"toolCallId"`
+	ToolName   string         `json:"toolName"`
+	Content    []any          `json:"content"`
+	IsError    bool           `json:"isError"`
+	Details    map[string]any `json:"details,omitempty"` // additive evidence/capture receipts
+	Timestamp  int64          `json:"timestamp"`
 }
 
 // --- content parts ---

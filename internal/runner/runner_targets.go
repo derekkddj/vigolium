@@ -67,11 +67,11 @@ func (r *Runner) resolvedScopeOriginMode() string {
 // keeping that list correct.
 //
 // Best-effort: failing to annotate a scan must not abort it.
-func (r *Runner) persistScopeOriginMode(ctx context.Context, scanUUID string) {
+func (r *Runner) persistScopeOriginMode(ctx context.Context, scanUUID string, scope nativeScanScope) {
 	if r.repository == nil {
 		return
 	}
-	if err := r.repository.UpdateScanPartial(ctx, &database.Scan{
+	if err := scope.updateMetadata(ctx, &database.Scan{
 		UUID:            scanUUID,
 		ScopeOriginMode: r.resolvedScopeOriginMode(),
 	}); err != nil {

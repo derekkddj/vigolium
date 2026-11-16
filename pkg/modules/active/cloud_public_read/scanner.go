@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -106,7 +107,8 @@ func (m *Module) probePath(ctx *httpmsg.HttpRequestResponse, client *http.Reques
 	if scanCtx == nil {
 		return nil, nil
 	}
-	wildcard, wildcardErr := scanCtx.WildcardProbe(ctx, client)
+	guardProof := modkit.NewEvidenceCollector()
+	wildcard, wildcardErr := scanCtx.WildcardProbeWithEvidence(ctx, client, guardProof)
 	if wildcardErr != nil || wildcard == nil || wildcard.MatchesBody(resp.Response().StatusCode, resp.Body().Bytes()) {
 		return nil, nil
 	}
@@ -143,7 +145,7 @@ func (m *Module) probePath(ctx *httpmsg.HttpRequestResponse, client *http.Reques
 		extracted = append(extracted, sensitiveContent...)
 	}
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		ModuleID:         ModuleID,
 		RecordKind:       kind,
 		EvidenceGrade:    grade,
@@ -167,7 +169,10 @@ func (m *Module) probePath(ctx *httpmsg.HttpRequestResponse, client *http.Reques
 			"sensitive_object_names":    len(sensitiveNames),
 			"sensitive_content_anchors": len(sensitiveContent),
 		},
-	}, nil
+	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+	modkit.AppendEvidence(result, guardProof)
+	return result, nil
 }
 
 func stripCredentials(raw []byte) ([]byte, error) {

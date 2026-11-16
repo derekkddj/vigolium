@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	mcpinfra "github.com/vigolium/vigolium/pkg/modules/infra/mcp"
@@ -113,7 +114,7 @@ func (m *Module) ScanPerHost(
 
 	// 2) Bare URI fuzzing (works against servers that read whatever URI you give)
 	for i, p := range payloads {
-		_, body, err := client.ReadResource(8000+i, p.value)
+		_, body, exchange, err := client.ReadResourceEvidence(8000+i, p.value)
 		if err != nil {
 			continue
 		}
@@ -126,7 +127,7 @@ func (m *Module) ScanPerHost(
 		}
 		if p.confirm != nil {
 			if ok, n := p.confirm(body, ""); ok {
-				findings = append(findings, m.makeFinding(urlx.String(), p.value, p, fmt.Sprintf("%d content marker(s) confirmed", n)))
+				findings = append(findings, m.makeFinding(urlx.String(), p.value, p, fmt.Sprintf("%d content marker(s) confirmed", n), mcpinfra.NewProof(exchange)))
 			}
 		}
 	}
@@ -147,13 +148,15 @@ func (m *Module) ScanPerHost(
 		// up baselines[tpl.URITemplate] but that map is keyed by concrete resource
 		// URIs, so the baseline was always empty.
 		var tplBaseline string
-		if _, b, err := client.ReadResource(9500+ti, substituteTemplate(tpl.URITemplate, placeholders, "", "")); err == nil {
+		var baselineExchange *evidence.Exchange
+		if _, b, exchange, err := client.ReadResourceEvidence(9500+ti, substituteTemplate(tpl.URITemplate, placeholders, "", "")); err == nil {
 			tplBaseline = b
+			baselineExchange = exchange
 		}
 		for pi, p := range payloads {
 			for _, ph := range placeholders {
 				uri := substituteTemplate(tpl.URITemplate, placeholders, ph, p.value)
-				_, body, err := client.ReadResource(9000+ti*100+pi, uri)
+				_, body, exchange, err := client.ReadResourceEvidence(9000+ti*100+pi, uri)
 				if err != nil {
 					continue
 				}
@@ -164,7 +167,9 @@ func (m *Module) ScanPerHost(
 				}
 				if p.confirm != nil {
 					if ok, n := p.confirm(body, tplBaseline); ok {
-						findings = append(findings, m.makeFinding(urlx.String(), uri, p, fmt.Sprintf("%d content marker(s) confirmed", n)))
+						proof := mcpinfra.NewProof(exchange)
+						proof.Control(baselineExchange)
+						findings = append(findings, m.makeFinding(urlx.String(), uri, p, fmt.Sprintf("%d content marker(s) confirmed", n), proof))
 					}
 				}
 			}
@@ -174,8 +179,9 @@ func (m *Module) ScanPerHost(
 	return findings, nil
 }
 
-func (m *Module) makeFinding(targetURL, uri string, p uriPayload, evidence string) *output.ResultEvent {
-	return &output.ResultEvent{
+func (m *Module) makeFinding(targetURL, uri string, p uriPayload, evidence string, proof *mcpinfra.Proof) *output.ResultEvent {
+	proof.Payload = p.value
+	return proof.Attack(&output.ResultEvent{
 		URL:              targetURL,
 		Matched:          uri,
 		ExtractedResults: []string{p.value},
@@ -187,7 +193,7 @@ func (m *Module) makeFinding(targetURL, uri string, p uriPayload, evidence strin
 			Tags:        []string{"mcp", p.vulnTag, "injection"},
 			Reference:   []string{"https://modelcontextprotocol.io/specification/2025-11-25/server/resources"},
 		},
-	}
+	})
 }
 
 // helpers -------------------------------------------------------------------

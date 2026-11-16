@@ -1,6 +1,7 @@
 package database
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -15,14 +16,14 @@ import (
 	"github.com/uptrace/bun"
 
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"go.uber.org/zap"
 )
 
-// SaveRecord stores a denormalized HTTP record (request + response + host + parameters).
-// The source identifies the origin of the record (e.g. "scanner", "ingest-cli", "ingest-server", "ingest-proxy").
-// Returns the UUID of the saved record. If a matching record already exists (same method,
-// hostname, path, URL, and request body), the existing UUID is returned without inserting.
+// SaveRecord stores an immutable HTTP exchange (request + response + service).
+// The source identifies its origin, not its identity. Only an exact exchange in
+// the same project can reuse a UUID, including request headers and response absence.
 func (r *Repository) SaveRecord(ctx context.Context, httpRR *httpmsg.HttpRequestResponse, source string, projectUUID string) (string, error) {
 	return r.SaveRecordWithLineage(ctx, httpRR, source, projectUUID, RecordLineage{})
 }
@@ -100,6 +101,7 @@ func (r *Repository) SaveRecordWithLineage(ctx context.Context, httpRR *httpmsg.
 	if err := record.FromHttpRequestResponse(httpRR); err != nil {
 		return "", fmt.Errorf("failed to convert request: %w", err)
 	}
+	prepareRecordServiceIdentity(record, httpRR)
 	record.Source = source
 	record.ProjectUUID = defaultProjectUUID(projectUUID)
 	lineage.applyTo(record)
@@ -137,12 +139,9 @@ func (r *Repository) AdoptRecordParent(ctx context.Context, uuid, parentUUID str
 	r.AdoptRecord(ctx, uuid, RecordLineage{ParentUUID: parentUUID}, "")
 }
 
-// evidenceRecordKinds are the sources that mean "this row reached the database
-// as a finding's evidence" rather than "a phase fetched it". One list, read by
-// recordSourceRequiresExactIdentity on the way in and by AdoptRecord's promote
-// clause on the way out — spelled twice, a fourth kind would be treated as
-// non-promotable in one direction and non-displaceable in the other, leaving
-// rows that can never be relabelled.
+// evidenceRecordKinds are sources that reached storage as finding context,
+// rather than a phase's own traffic. AdoptRecord can promote these labels when
+// a phase later fetches the exact same exchange. Labels never control identity.
 var evidenceRecordKinds = []string{RecordKindFinding, RecordKindCandidate, RecordKindObservation}
 
 // AdoptRecord repairs a row that lost a dedup race, in ONE statement: it
@@ -238,7 +237,7 @@ func adoptRecordOn(ctx context.Context, db bun.IDB, uuid string, lineage RecordL
 		q = q.Set("chain_truncated = ?", true)
 		set = true
 	}
-	if source != "" && !recordSourceRequiresExactIdentity(source) {
+	if source != "" && !recordSourceIsFindingEvidence(source) {
 		q = q.Set("source = CASE WHEN source IN (?) THEN ? ELSE source END", bun.List(evidenceRecordKinds), source)
 		set = true
 	}
@@ -249,10 +248,11 @@ func adoptRecordOn(ctx context.Context, db bun.IDB, uuid string, lineage RecordL
 	return err
 }
 
-// UpsertSnapshotRecord stores a Burp snapshot record idempotently. When an
-// existing request later gains a response, or its response changes, the
-// response-derived columns are refreshed in place while the stable UUID and
-// finding links are preserved. outcome is inserted, updated, or unchanged.
+// UpsertSnapshotRecord stores a snapshot idempotently without changing stored
+// bytes. EVERY changed request, response (including absence), or service creates
+// a new version, even before findings reference it: pending writers and future
+// references must see the exchange their UUID originally identified. outcome is
+// inserted or unchanged; the legacy updated outcome is no longer emitted.
 func (r *Repository) UpsertSnapshotRecord(ctx context.Context, httpRR *httpmsg.HttpRequestResponse, source string, projectUUID string) (uuid, outcome string, err error) {
 	if httpRR == nil || httpRR.Request() == nil {
 		return "", "", fmt.Errorf("invalid HttpRequestResponse")
@@ -261,6 +261,7 @@ func (r *Repository) UpsertSnapshotRecord(ctx context.Context, httpRR *httpmsg.H
 	if err := record.FromHttpRequestResponse(httpRR); err != nil {
 		return "", "", fmt.Errorf("failed to convert request: %w", err)
 	}
+	prepareRecordServiceIdentity(record, httpRR)
 	record.Source = source
 	record.ProjectUUID = defaultProjectUUID(projectUUID)
 
@@ -275,47 +276,11 @@ func (r *Repository) UpsertSnapshotRecord(ctx context.Context, httpRR *httpmsg.H
 		r.emitRecordSaved(record)
 		return record.UUID, "inserted", nil
 	}
-	if !record.HasResponse {
-		return existingUUID, "unchanged", nil
-	}
-
-	existing, err := r.GetRecordByUUID(ctx, existingUUID)
-	if err != nil {
-		return "", "", err
-	}
-	if existing.HasResponse && existing.ResponseHash == record.ResponseHash {
-		return existingUUID, "unchanged", nil
-	}
-	_, err = r.db.NewUpdate().
-		Model((*HTTPRecord)(nil)).
-		Set("status_code = ?", record.StatusCode).
-		Set("status_phrase = ?", record.StatusPhrase).
-		Set("response_http_version = ?", record.ResponseHTTPVersion).
-		Set("response_content_type = ?", record.ResponseContentType).
-		Set("response_content_length = ?", record.ResponseContentLength).
-		Set("raw_response = ?", record.RawResponse).
-		Set("response_decoded_from = NULLIF(?, '')", record.ResponseDecodedFrom).
-		Set("response_hash = ?", record.ResponseHash).
-		Set("response_norm_hash = ?", record.ResponseNormHash).
-		Set("response_words = ?", record.ResponseWords).
-		Set("response_title = ?", record.ResponseTitle).
-		Set("response_location = ?", record.ResponseLocation).
-		Set("content_hash = ?", record.ContentHash).
-		Set("has_response = ?", true).
-		Set("received_at = ?", time.Now()).
-		Where("uuid = ?", existingUUID).
-		Exec(ctx)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to refresh snapshot response: %w", err)
-	}
-	return existingUUID, "updated", nil
+	return existingUUID, "unchanged", nil
 }
 
-// findDuplicateRecord checks whether a record with the same method, hostname,
-// path, and URL already exists. For requests with a body, the request_hash is
-// also compared to distinguish different payloads to the same endpoint. It is a
-// thin wrapper over the batched findDuplicateRecordUUIDs so the duplicate rule
-// lives in exactly one place.
+// findDuplicateRecord uses the same exact exchange identity as the batched
+// writer, independent of source or request body length.
 func (r *Repository) findDuplicateRecord(ctx context.Context, record *HTTPRecord) (string, error) {
 	uuids, err := r.findDuplicateRecordUUIDs(ctx, []*HTTPRecord{record})
 	if err != nil {
@@ -324,53 +289,18 @@ func (r *Repository) findDuplicateRecord(ctx context.Context, record *HTTPRecord
 	return uuids[0], nil
 }
 
-// recordDedupTuple is the (method, hostname, path, url) identity shared by the
-// duplicate lookup for grouping and matching. request_hash is compared
-// separately because it only narrows records that carry a body.
-func recordDedupTuple(method, host, path, url string) string {
-	return method + "\x00" + host + "\x00" + path + "\x00" + url
-}
-
-// recordSourceRequiresExactIdentity reports whether records saved under this
-// source must dedup on the EXACT raw request (its request_hash) even when the
-// request carries no body. Finding-evidence records — saved with the record kind
-// as their source (finding / candidate / observation) — carry the precise
-// exchange a module used to prove a vulnerability. A header-only probe (Origin,
-// Authorization, Cookie, X-Forwarded-*, a method-override or cache/conditional
-// header) leaves method/host/path/url unchanged and carries no body, so the coarse
-// no-body dedup would collapse it onto an unrelated baseline record and mislink the
-// finding to traffic that never carried the attacker header (and to the baseline
-// response). Requiring the request_hash keeps each proving exchange distinct.
-//
-// Crawler/ingest sources (scanner, spidering, discovery, ingest-*) intentionally
-// keep the coarse no-body key so repeated identical fetches still collapse and the
-// record store isn't inflated by every header-varied crawl request.
-func recordSourceRequiresExactIdentity(source string) bool {
+// recordSourceIsFindingEvidence controls source promotion only. Identity is
+// exact for every source, including crawler and ingestion records.
+func recordSourceIsFindingEvidence(source string) bool {
 	return slices.Contains(evidenceRecordKinds, source)
 }
 
-// dedupCandidate is the narrow projection findDuplicateRecordUUIDs scans — only
-// the columns the duplicate rule needs, so candidate rows don't allocate full
-// HTTPRecord structs.
-type dedupCandidate struct {
-	Method      string `bun:"method"`
-	Hostname    string `bun:"hostname"`
-	Path        string `bun:"path"`
-	URL         string `bun:"url"`
-	RequestHash string `bun:"request_hash"`
-	UUID        string `bun:"uuid"`
-}
-
-// findDuplicateRecordUUIDs is the batched duplicate lookup: for each input
-// record it returns the UUID of a pre-existing duplicate (same project, method,
-// hostname, path, url — plus request_hash when the request carries a body) or ""
-// when none exists; the result slice is parallel to records.
-//
-// It runs one SELECT per distinct project (instead of one per record), letting
-// the batched record writer keep the dedup check off the scan worker's hot path.
-// The lookup columns line up with the idx_records_dedup covering index
-// (project_uuid, method, hostname, path, url, request_hash, uuid), so the
-// row-value IN list resolves via the index instead of a table scan.
+// findDuplicateRecordUUIDs returns an exact stored exchange UUID for each input,
+// or "" when none exists. Source is deliberately absent from the duplicate rule.
+// Queries are project-scoped and use the dedup index's request columns, extended
+// with the service, response hash and presence. Only one exact hash candidate
+// per identity loads bytes at a time; bytes are verified without parsing, so
+// compacted/legacy rows with stale hashes cannot masquerade as the original.
 func (r *Repository) findDuplicateRecordUUIDs(ctx context.Context, records []*HTTPRecord) ([]string, error) {
 	out := make([]string, len(records))
 	if len(records) == 0 {
@@ -383,16 +313,17 @@ func (r *Repository) findDuplicateRecordUUIDs(ctx context.Context, records []*HT
 	keys := make([]string, len(records))
 	byProject := make(map[string][]int)
 	for i, rec := range records {
-		keys[i] = recordDedupTuple(rec.Method, rec.Hostname, rec.Path, rec.URL)
+		keys[i] = recordDedupKey(rec)
 		byProject[rec.ProjectUUID] = append(byProject[rec.ProjectUUID], i)
 	}
 
 	for project, idxs := range byProject {
-		// Distinct (method, hostname, path, url) tuples for the IN list.
+		// Exact exchange tuples; COALESCE makes NULL and empty hashes equivalent
+		// only for absent responses (whose presence flag remains part of the key).
 		seen := make(map[string]struct{}, len(idxs))
 		clause := strings.Builder{}
-		clause.WriteString("(method, hostname, path, url) IN (")
-		args := make([]interface{}, 0, len(idxs)*4)
+		clause.WriteString("(method, hostname, path, url, scheme, port, request_hash, has_response, COALESCE(response_hash, ''), " + recordCaptureStateSQL() + ") IN (")
+		args := make([]interface{}, 0, len(idxs)*11)
 		for _, i := range idxs {
 			if _, ok := seen[keys[i]]; ok {
 				continue
@@ -401,54 +332,35 @@ func (r *Repository) findDuplicateRecordUUIDs(ctx context.Context, records []*HT
 			if len(args) > 0 {
 				clause.WriteByte(',')
 			}
-			clause.WriteString("(?,?,?,?)")
+			clause.WriteString("(?,?,?,?,?,?,?,?,?,?,?)")
 			rec := records[i]
-			args = append(args, rec.Method, rec.Hostname, rec.Path, rec.URL)
+			args = append(args, rec.Method, rec.Hostname, rec.Path, rec.URL, rec.Scheme, rec.Port,
+				rec.RequestHash, rec.HasResponse, rec.ResponseHash, rec.CaptureRequestState, rec.CaptureResponseState)
 		}
 		clause.WriteByte(')')
 		if len(args) == 0 {
 			continue
 		}
 
-		var rows []dedupCandidate
+		var rows []*HTTPRecord
 		err := r.db.NewSelect().
 			Model((*HTTPRecord)(nil)).
-			Column("method", "hostname", "path", "url", "request_hash", "uuid").
+			Column(recordExchangeIdentityColumns...).
 			Where("project_uuid = ?", project).
+			Where("body_compaction IS NULL").
 			Where(clause.String(), args...).
+			OrderExpr("uuid").
 			Scan(ctx, &rows)
 		if err != nil {
 			return nil, err
 		}
 
-		// A body record matches the candidate with the same request_hash; a
-		// no-body record matches any candidate (mirroring findDuplicateRecord,
-		// which omits the request_hash filter when there is no body) — UNLESS its
-		// source requires exact identity (finding-evidence records), in which case
-		// it too must match on request_hash so a header-only probe never collapses
-		// onto an unrelated baseline record.
-		byTuple := make(map[string][]dedupCandidate, len(rows))
-		for _, row := range rows {
-			k := recordDedupTuple(row.Method, row.Hostname, row.Path, row.URL)
-			byTuple[k] = append(byTuple[k], row)
+		byIdentity, err := r.validRecordCandidates(ctx, rows)
+		if err != nil {
+			return nil, err
 		}
-
 		for _, i := range idxs {
-			cands := byTuple[keys[i]]
-			if len(cands) == 0 {
-				continue
-			}
-			rec := records[i]
-			if rec.RequestContentLength == 0 && !recordSourceRequiresExactIdentity(rec.Source) {
-				out[i] = cands[0].UUID
-				continue
-			}
-			for _, c := range cands {
-				if c.RequestHash == rec.RequestHash {
-					out[i] = c.UUID
-					break
-				}
-			}
+			out[i] = byIdentity[keys[i]]
 		}
 	}
 
@@ -475,6 +387,7 @@ func (r *Repository) SaveRecordBatch(ctx context.Context, records []*httpmsg.Htt
 			zap.L().Debug("SaveRecordBatch: skipping record", zap.Error(err))
 			continue
 		}
+		prepareRecordServiceIdentity(rec, rr)
 		rec.Source = source
 		rec.ProjectUUID = projectUUID
 		converted[i] = rec
@@ -526,6 +439,9 @@ func (r *Repository) SaveRecordsBatch(ctx context.Context, records []*HTTPRecord
 	}
 
 	for _, rec := range records {
+		if err := rec.ValidateCaptureStates(); err != nil {
+			return nil, err
+		}
 		rec.ProjectUUID = defaultProjectUUID(rec.ProjectUUID)
 	}
 
@@ -564,6 +480,9 @@ func (r *Repository) SaveRecordsBatchSkipExisting(ctx context.Context, records [
 	}
 
 	for _, rec := range records {
+		if err := rec.ValidateCaptureStates(); err != nil {
+			return nil, err
+		}
 		rec.ProjectUUID = defaultProjectUUID(rec.ProjectUUID)
 	}
 
@@ -574,10 +493,16 @@ func (r *Repository) SaveRecordsBatchSkipExisting(ctx context.Context, records [
 		// existing uuids is a second round trip that another writer can invalidate
 		// between the two statements. Supported by the bundled modernc SQLite
 		// (3.35+) and by Postgres.
-		return tx.NewInsert().Model(&records).
+		if err := tx.NewInsert().Model(&records).
 			On("CONFLICT (uuid) DO NOTHING").
 			Returning("uuid").
-			Scan(ctx, &inserted)
+			Scan(ctx, &inserted); err != nil {
+			return err
+		}
+		// Check after INSERT resolves concurrent UUID conflicts, inside the same
+		// transaction. A different known snapshot rolls back instead of silently
+		// counting a partial/complete collision as a harmless skipped import.
+		return validateExistingRecordCaptureStates(ctx, tx, records)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to batch insert %d records: %w", len(records), err)
@@ -600,11 +525,15 @@ func (r *Repository) SaveRecordsBatchSkipExisting(ctx context.Context, records [
 // GetRecordByUUID retrieves a single HTTP record by UUID
 func (r *Repository) GetRecordByUUID(ctx context.Context, uuid string) (*HTTPRecord, error) {
 	record := &HTTPRecord{}
-	err := r.db.NewSelect().
+	q := r.db.NewSelect().
 		Model(record).
-		Where("uuid = ?", uuid).
-		Scan(ctx)
-	if err != nil {
+		Where("uuid = ?", uuid)
+	if r.db.readOnly {
+		// Archived pre-v10 rows lack capture-state columns; read only what is
+		// stored and let absent states remain zero, without migrating the source.
+		q = q.ColumnExpr("r.*")
+	}
+	if err := q.Scan(ctx); err != nil {
 		return nil, err
 	}
 	return record, nil
@@ -824,10 +753,10 @@ func (r *Repository) GetUnprobedRecordsBySource(ctx context.Context, projectUUID
 // scanRecordColumns is the minimal column projection the dynamic-assessment scan
 // feed needs to reconstruct an HttpRequestResponse (via
 // recordToHttpRequestResponse): the UUID, the cursor key (created_at), the
-// stored URL, the raw request/response bytes, and the has_response gate that
-// ParsedResponse() checks. Shared by GetScanRecordsByUUIDs and
-// DBInputSource.fetchNextBatch so the two scan-feed fetches can't drift.
-var scanRecordColumns = []string{"uuid", "created_at", "url", "raw_request", "raw_response", "has_response"}
+// stored URL, destination service, raw request/response bytes, and has_response.
+// The service must stay distinct from an absolute-form request's authority.
+// Shared by GetScanRecordsByUUIDs and DBInputSource.fetchNextBatch.
+var scanRecordColumns = append([]string{"uuid", "created_at", "sent_at", "url", "scheme", "hostname", "port", "raw_request", "raw_response", "has_response", "body_compaction"}, recordCaptureStateColumns...)
 
 // getRecordsByUUIDs fetches HTTP records matching uuids. With no columns it loads
 // the full model; passing columns projects the SELECT to just those.
@@ -847,6 +776,10 @@ func (r *Repository) getRecordsByUUIDs(ctx context.Context, uuids []string, colu
 		q := r.db.NewSelect().Model(&page).Where("uuid IN (?)", bun.List(chunk))
 		if len(columns) > 0 {
 			q = q.Column(columns...)
+		} else if r.db.readOnly {
+			// Read archived rows as stored: pre-v10 readonly sources lack capture
+			// states, which Bun leaves zero when those columns are not returned.
+			q = q.ColumnExpr("r.*")
 		}
 		if err := q.Scan(ctx); err != nil {
 			return nil, fmt.Errorf("failed to get records by UUIDs: %w", err)
@@ -992,51 +925,26 @@ func (r *Repository) UpdateRecordAnnotations(ctx context.Context, uuid string, r
 	return nil
 }
 
-// OverwriteRecordResponseBody replaces the stored raw response of the record
-// with the given UUID and recomputes its derived fields (response_hash,
-// response_norm_hash, response_words, response_content_length), keeping them
-// consistent with dedup/resume/fingerprinting that key off those columns.
-//
-// rawResponse must be a complete HTTP response (status line + headers + body).
-// Used by the passive js-beautify module to overwrite a minified JS body with
-// its beautified form in place. The derivation is deriveResponseColumns, as at
-// ingest, so a rewritten record hashes identically to one ingested with the new body.
-// (Distinct from UpdateRecordResponse, which is the replay feature's full
-// response-field swap.)
+// OverwriteRecordResponseBody is a compatibility guard for the former raw
+// rewrite API. Identical bytes are a no-op; a transformation is rejected even
+// for unreferenced records. Beautified JavaScript belongs in an analysis artifact
+// (SaveAnalysisArtifactForRecord), never in the captured raw exchange.
 func (r *Repository) OverwriteRecordResponseBody(ctx context.Context, uuid string, rawResponse []byte) error {
 	if uuid == "" || len(rawResponse) == 0 {
 		return fmt.Errorf("OverwriteRecordResponseBody: empty uuid or response")
 	}
 
-	// Path + URL are needed for the reflected-URL-robust normalized body hash.
-	recs, err := r.getRecordsByUUIDs(ctx, []string{uuid}, "uuid", "path", "url")
+	recs, err := r.getRecordsByUUIDs(ctx, []string{uuid}, "uuid", "has_response", "raw_response")
 	if err != nil {
 		return fmt.Errorf("OverwriteRecordResponseBody: load record: %w", err)
 	}
 	if len(recs) == 0 {
 		return fmt.Errorf("OverwriteRecordResponseBody: no record found with uuid %s", uuid)
 	}
-	rec := recs[0]
-
-	// No content type: response_title is not one of the columns this rewrites.
-	cols := deriveResponseColumns(httpmsg.NewHttpResponse(rawResponse), "", rec.Path, rec.URL)
-
-	result, err := r.db.NewUpdate().
-		Model((*HTTPRecord)(nil)).
-		Where("uuid = ?", uuid).
-		Set("raw_response = ?", rawResponse).
-		Set("response_hash = ?", cols.Hash).
-		Set("response_norm_hash = ?", cols.NormHash).
-		Set("response_words = ?", cols.Words).
-		Set("response_content_length = ?", cols.ContentLength).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("OverwriteRecordResponseBody: update failed: %w", err)
+	if recs[0].HasResponse && bytes.Equal(recs[0].RawResponse, rawResponse) {
+		return nil
 	}
-	if rows, _ := result.RowsAffected(); rows == 0 {
-		return fmt.Errorf("OverwriteRecordResponseBody: no record found with uuid %s", uuid)
-	}
-	return nil
+	return fmt.Errorf("OverwriteRecordResponseBody: %w; store a derived analysis artifact instead", ErrImmutableRecordExchange)
 }
 
 // HasRecordsFromSources reports whether projectUUID holds any record whose
@@ -1079,7 +987,7 @@ func (r *Repository) GetRecordsWithResponseBodyPage(ctx context.Context, project
 		}
 		return q.OrderExpr("uuid ASC").Limit(int64(limit))
 	}
-	columns := []string{"uuid", "hostname", "url", "has_response", "raw_response", "response_content_type"}
+	columns := append([]string{"uuid", "hostname", "url", "has_response", "raw_response", "response_content_type", "body_compaction"}, recordCaptureStateColumns...)
 	if keep == nil {
 		if err := page(r.db.NewSelect().Model(&records).Column(columns...)).Scan(ctx); err != nil {
 			return nil, "", 0, fmt.Errorf("failed to query records with response body: %w", err)
@@ -1172,14 +1080,17 @@ func (r *Repository) WalkJavaScriptRecords(ctx context.Context, projectUUID, hos
 // targeted re-spider phase. It carries just enough to evaluate rich/SPA content
 // and dedup app shells (source + raw_response) without materializing every column.
 type ReSpiderCandidate struct {
-	UUID                string `bun:"uuid"`
-	URL                 string `bun:"url"`
-	Scheme              string `bun:"scheme"`
-	Hostname            string `bun:"hostname"`
-	Port                int    `bun:"port"`
-	Source              string `bun:"source"`
-	ResponseContentType string `bun:"response_content_type"`
-	RawResponse         []byte `bun:"raw_response"`
+	UUID                 string          `bun:"uuid"`
+	URL                  string          `bun:"url"`
+	Scheme               string          `bun:"scheme"`
+	Hostname             string          `bun:"hostname"`
+	Port                 int             `bun:"port"`
+	Source               string          `bun:"source"`
+	ResponseContentType  string          `bun:"response_content_type"`
+	RawResponse          []byte          `bun:"raw_response"`
+	CaptureRequestState  evidence.State  `bun:"capture_request_state"`
+	CaptureResponseState evidence.State  `bun:"capture_response_state"`
+	BodyCompaction       *BodyCompaction `bun:"body_compaction,type:jsonb"`
 }
 
 // GetReSpiderCandidates returns records that carry a response body, for the
@@ -1194,7 +1105,7 @@ func (r *Repository) GetReSpiderCandidates(ctx context.Context, projectUUID, aft
 	var rows []ReSpiderCandidate
 	q := r.db.NewSelect().
 		TableExpr("http_records").
-		ColumnExpr("uuid, url, scheme, hostname, port, source, response_content_type, raw_response").
+		Column(append([]string{"uuid", "url", "scheme", "hostname", "port", "source", "response_content_type", "raw_response", "body_compaction"}, recordCaptureStateColumns...)...).
 		Where("has_response = ?", true).
 		Where("raw_response IS NOT NULL").
 		Where("length(raw_response) > 0")
@@ -1234,8 +1145,9 @@ type HostTarget struct {
 	Port     int    `bun:"port"`
 }
 
-// dbTimestampString renders t the way `driver` stores created_at/cursor_at, so a
-// keyset comparison matches the very row the value was read back from.
+// dbTimestampString renders legacy non-cursor timestamp filters. Cursor keys
+// use dbCursorTimeExpr/dbCursorTimeValue instead, because SQLite traffic may
+// also contain UTC suffixes and fractional timestamps.
 //
 // The two drivers need different precision and neither tolerates the other's:
 //

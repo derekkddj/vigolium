@@ -2,6 +2,7 @@ package output
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -10,6 +11,13 @@ import (
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
 )
+
+// markdownWriter permits per-finding output to a buffered file without building
+// the full report string. strings.Builder remains supported by small helpers.
+type markdownWriter interface {
+	io.Writer
+	WriteString(string) (int, error)
+}
 
 func GenerateMarkdownReport(items []any, outputPath string, meta HTMLReportMeta) error {
 	f, err := os.Create(outputPath)
@@ -50,7 +58,7 @@ func renderMarkdownSummary(items []any, meta HTMLReportMeta) string {
 	return w.String()
 }
 
-func writeMarkdownHeader(w *strings.Builder, data ReportData) {
+func writeMarkdownHeader(w markdownWriter, data ReportData) {
 	fmt.Fprintf(w, "# %s\n\n", data.Title)
 	generated := data.GeneratedAt
 	if generated == "" {
@@ -69,7 +77,7 @@ func writeMarkdownHeader(w *strings.Builder, data ReportData) {
 	w.WriteString("\n---\n\n")
 }
 
-func writeMarkdownTOC(w *strings.Builder, data ReportData) {
+func writeMarkdownTOC(w markdownWriter, data ReportData) {
 	w.WriteString("## Table of Contents\n\n")
 	w.WriteString("- [Executive Summary](#executive-summary)\n")
 	writeMarkdownTOCGroup(w, "Critical", "critical-findings", data.CriticalFindings)
@@ -80,7 +88,7 @@ func writeMarkdownTOC(w *strings.Builder, data ReportData) {
 	w.WriteString("\n")
 }
 
-func writeMarkdownTOCGroup(w *strings.Builder, severity, anchor string, findings []ReportFinding) {
+func writeMarkdownTOCGroup(w markdownWriter, severity, anchor string, findings []ReportFinding) {
 	if len(findings) == 0 {
 		return
 	}
@@ -90,7 +98,7 @@ func writeMarkdownTOCGroup(w *strings.Builder, severity, anchor string, findings
 	}
 }
 
-func writeMarkdownExecutiveSummary(w *strings.Builder, data ReportData) {
+func writeMarkdownExecutiveSummary(w markdownWriter, data ReportData) {
 	w.WriteString("## Executive Summary\n\n")
 	fmt.Fprintf(w, "A total of **%d findings** were identified during the scan.\n\n", data.TotalFindings)
 
@@ -142,7 +150,7 @@ func newMarkdownFindingOptions(meta HTMLReportMeta) markdownFindingOptions {
 	return o
 }
 
-func writeMarkdownFindings(w *strings.Builder, severity string, findings []ReportFinding, opts markdownFindingOptions) {
+func writeMarkdownFindings(w markdownWriter, severity string, findings []ReportFinding, opts markdownFindingOptions) {
 	if len(findings) == 0 {
 		return
 	}
@@ -150,92 +158,118 @@ func writeMarkdownFindings(w *strings.Builder, severity string, findings []Repor
 	fmt.Fprintf(w, "## %s Findings\n\n", severity)
 
 	for _, f := range findings {
-		fmt.Fprintf(w, "### %d. %s\n\n", f.ID, f.Title)
+		writeMarkdownFinding(w, f, opts)
+	}
+}
 
-		if f.ModuleName != "" {
-			fmt.Fprintf(w, "**Module:** %s", f.ModuleName)
-			if f.ModuleID != "" {
-				fmt.Fprintf(w, " (%s)", MarkdownCodeSpan(f.ModuleID))
-			}
-			w.WriteString("  \n")
+func writeMarkdownFinding(w markdownWriter, f ReportFinding, opts markdownFindingOptions) {
+	fmt.Fprintf(w, "### %d. %s\n\n", f.ID, f.Title)
+
+	if f.ModuleName != "" {
+		fmt.Fprintf(w, "**Module:** %s", f.ModuleName)
+		if f.ModuleID != "" {
+			fmt.Fprintf(w, " (%s)", MarkdownCodeSpan(f.ModuleID))
 		}
-		fmt.Fprintf(w, "**Severity:** %s  \n", cases.Title(language.English).String(f.Severity))
-		if f.Confidence != "" {
-			fmt.Fprintf(w, "**Confidence:** %s  \n", f.Confidence)
-		}
-		if f.CWE != "" {
-			fmt.Fprintf(w, "**CWE:** %s  \n", f.CWE)
-		}
-		if f.CVSSScore > 0 {
-			fmt.Fprintf(w, "**CVSS:** %.1f  \n", f.CVSSScore)
-		}
-		if f.URL != "" {
-			fmt.Fprintf(w, "**URL:** %s  \n", MarkdownCodeSpan(f.URL))
-		}
-		if f.SourceFile != "" {
-			fmt.Fprintf(w, "**Source File:** %s  \n", MarkdownCodeSpan(f.SourceFile))
-		}
-		if f.RepoName != "" {
-			fmt.Fprintf(w, "**Repository:** %s  \n", f.RepoName)
-		}
-		if f.FoundAt != "" {
-			fmt.Fprintf(w, "**Found At:** %s  \n", f.FoundAt)
+		w.WriteString("  \n")
+	}
+	fmt.Fprintf(w, "**Severity:** %s  \n", cases.Title(language.English).String(f.Severity))
+	if f.Confidence != "" {
+		fmt.Fprintf(w, "**Confidence:** %s  \n", f.Confidence)
+	}
+	if f.CWE != "" {
+		fmt.Fprintf(w, "**CWE:** %s  \n", f.CWE)
+	}
+	if f.CVSSScore > 0 {
+		fmt.Fprintf(w, "**CVSS:** %.1f  \n", f.CVSSScore)
+	}
+	if f.URL != "" {
+		fmt.Fprintf(w, "**URL:** %s  \n", MarkdownCodeSpan(f.URL))
+	}
+	if f.SourceFile != "" {
+		fmt.Fprintf(w, "**Source File:** %s  \n", MarkdownCodeSpan(f.SourceFile))
+	}
+	if f.RepoName != "" {
+		fmt.Fprintf(w, "**Repository:** %s  \n", f.RepoName)
+	}
+	if f.FoundAt != "" {
+		fmt.Fprintf(w, "**Found At:** %s  \n", f.FoundAt)
+	}
+	w.WriteString("\n")
+
+	writeMarkdownFindingMetadata(w, f, opts)
+
+	if f.Description != "" {
+		fmt.Fprintf(w, "%s\n\n", normalizeFindingBody(f.Description))
+	}
+
+	if f.Remediation != "" {
+		fmt.Fprintf(w, "**Remediation:** %s\n\n", f.Remediation)
+	}
+
+	if len(f.MatchedAt) > 0 {
+		w.WriteString("**Matched At:**\n")
+		for _, m := range f.MatchedAt {
+			fmt.Fprintf(w, "- %s\n", MarkdownCodeSpan(m))
 		}
 		w.WriteString("\n")
-
-		writeMarkdownFindingMetadata(w, f, opts)
-
-		if f.Description != "" {
-			fmt.Fprintf(w, "%s\n\n", normalizeFindingBody(f.Description))
-		}
-
-		if f.Remediation != "" {
-			fmt.Fprintf(w, "**Remediation:** %s\n\n", f.Remediation)
-		}
-
-		if len(f.MatchedAt) > 0 {
-			w.WriteString("**Matched At:**\n")
-			for _, m := range f.MatchedAt {
-				fmt.Fprintf(w, "- %s\n", MarkdownCodeSpan(m))
-			}
-			w.WriteString("\n")
-		}
-
-		if len(f.ExtractedResults) > 0 {
-			w.WriteString("**Extracted Results:**\n")
-			for _, r := range f.ExtractedResults {
-				fmt.Fprintf(w, "- %s\n", MarkdownCodeSpan(r))
-			}
-			w.WriteString("\n")
-		}
-
-		if len(f.AdditionalEvidence) > 0 {
-			w.WriteString("**Additional Evidence:**\n")
-			for _, e := range f.AdditionalEvidence {
-				fmt.Fprintf(w, "- %s\n", e)
-			}
-			w.WriteString("\n")
-		}
-
-		// Request and response get the same cap: the request carries the
-		// payload, so it is as much evidence as the response and must not be
-		// the one left unbounded.
-		writeMarkdownHTTPDetails(w, "HTTP Request", f.Request, opts.maxBodyBytes, markdownFullCommand(f, opts, true))
-		writeMarkdownHTTPDetails(w, "HTTP Response", f.Response, opts.maxBodyBytes, markdownFullCommand(f, opts, false))
-
-		if len(f.Tags) > 0 {
-			fmt.Fprintf(w, "**Tags:** %s\n\n", strings.Join(f.Tags, ", "))
-		}
-
-		w.WriteString("---\n\n")
 	}
+
+	if len(f.ExtractedResults) > 0 {
+		w.WriteString("**Extracted Results:**\n")
+		for _, r := range f.ExtractedResults {
+			fmt.Fprintf(w, "- %s\n", MarkdownCodeSpan(r))
+		}
+		w.WriteString("\n")
+	}
+
+	if len(f.AdditionalEvidence) > 0 {
+		w.WriteString("**Additional legacy evidence — role unknown (not proof):**\n")
+		for _, e := range f.AdditionalEvidence {
+			fmt.Fprintf(w, "- %s\n", e)
+		}
+		w.WriteString("\n")
+	}
+
+	status := f.EvidenceStatus
+	if status == "" {
+		status = "missing / unclassified"
+	}
+	fmt.Fprintf(w, "**Stored finding evidence status:** %s\n\n", status)
+	w.WriteString("Original finding metadata; each occurrence retains its own role/primary flag. Later selections do not reclassify legacy evidence.\n\n")
+	if len(f.Evidence) == 0 {
+		w.WriteString("Missing / unclassified selected evidence. Legacy inline text and traffic links are not proof.\n\n")
+	}
+	for _, entry := range f.Evidence {
+		fmt.Fprintf(w, "**Selected exchange:** %s · role %s · primary %t · occurrence %s · label %s\n\n", MarkdownCodeSpan(entry.ExchangeID), entry.Role, entry.Primary, MarkdownCodeSpan(entry.OccurrenceID), MarkdownCodeSpan(entry.Label))
+		if entry.Exchange == nil {
+			w.WriteString("Selected bytes unavailable; no fallback substituted.\n\n")
+			continue
+		}
+		x := entry.Exchange
+		fmt.Fprintf(w, "Capture: request=%s response=%s provenance=%s hash=%s\n\n", x.RequestState, x.ResponseState, x.Provenance, MarkdownCodeSpan(x.ContentHash))
+		w.WriteString("Text previews are non-authoritative; JSON/JSONL and filesystem evidence bundles carry exact captured bytes. Baseline/control/unknown roles are not proof.\n\n")
+		writeMarkdownHTTPDetails(w, "Selected request preview", string(x.Request), opts.maxBodyBytes, "")
+		writeMarkdownHTTPDetails(w, "Selected response preview", string(x.Response), opts.maxBodyBytes, "")
+	}
+	w.WriteString("Legacy inline text — role unknown (not proof).\n\n")
+	// Request and response get the same cap: the request carries the
+	// payload, so it is as much evidence as the response and must not be
+	// the one left unbounded.
+	writeMarkdownHTTPDetails(w, "HTTP Request", f.Request, opts.maxBodyBytes, markdownFullCommand(f, opts))
+	writeMarkdownHTTPDetails(w, "HTTP Response", f.Response, opts.maxBodyBytes, markdownFullCommand(f, opts))
+
+	if len(f.Tags) > 0 {
+		fmt.Fprintf(w, "**Tags:** %s\n\n", strings.Join(f.Tags, ", "))
+	}
+
+	w.WriteString("---\n\n")
 }
 
 // writeMarkdownFindingMetadata writes the identifiers that tie a finding back
 // to the store — finding_id, finding_hash, scan_uuid, module_id and the linked
 // record UUIDs — as a two-column table keyed by their machine names, followed
 // by a ready-to-run follow-up command. Empty identifiers are omitted.
-func writeMarkdownFindingMetadata(w *strings.Builder, f ReportFinding, opts markdownFindingOptions) {
+func writeMarkdownFindingMetadata(w markdownWriter, f ReportFinding, opts markdownFindingOptions) {
 	type row struct{ key, val string }
 	var rows []row
 	if f.ID > 0 {
@@ -274,17 +308,9 @@ func writeMarkdownFindingMetadata(w *strings.Builder, f ReportFinding, opts mark
 	}
 }
 
-// markdownFullCommand names the command that prints a truncated message whole:
-// the first linked record's body when the finding has one, else the finding
-// itself rendered with --full-body.
-func markdownFullCommand(f ReportFinding, opts markdownFindingOptions, request bool) string {
-	if len(f.RecordUUIDs) > 0 && f.RecordUUIDs[0] != "" {
-		tail := []string{"traffic", "body", "--uuid", f.RecordUUIDs[0]}
-		if request {
-			tail = append(tail, "--request")
-		}
-		return opts.followUp(tail...)
-	}
+// markdownFullCommand names the finding's full text view. An arbitrary first
+// linked record is not necessarily the receipt that supplied this legacy text.
+func markdownFullCommand(f ReportFinding, opts markdownFindingOptions) string {
 	if f.ID > 0 {
 		return opts.followUp("finding", "--id", strconv.Itoa(f.ID), "--markdown", "--full-body")
 	}
@@ -294,7 +320,7 @@ func markdownFullCommand(f ReportFinding, opts markdownFindingOptions, request b
 // writeMarkdownHTTPDetails writes one raw HTTP message inside a collapsible
 // <details> block, fenced with a backtick run longer than any inside the
 // message and capped at maxBytes with an explicit truncation note.
-func writeMarkdownHTTPDetails(w *strings.Builder, summary, raw string, maxBytes int, fullCmd string) {
+func writeMarkdownHTTPDetails(w markdownWriter, summary, raw string, maxBytes int, fullCmd string) {
 	if raw == "" {
 		return
 	}

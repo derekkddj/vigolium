@@ -110,12 +110,14 @@ func (m *Module) phaseConsole(
 			continue
 		}
 
+		proof := &gqlProof{primary: first.Exchange}
 		// Confirm: the same console signature must reproduce on further rounds.
 		confirmed := confirmRounds(defaultConfirmRounds-1, func() (bool, error) {
 			r, err := m.send(ctx, httpClient, "GET", path, "", "")
 			if err != nil {
 				return false, err
 			}
+			proof.confirm(r)
 			return matchConsole(r) == name, nil
 		})
 		if !confirmed {
@@ -124,7 +126,7 @@ func (m *Module) phaseConsole(
 
 		reportedType[name] = true
 		consoleURL := target + path
-		results = append(results, &output.ResultEvent{
+		results = append(results, proof.observation(&output.ResultEvent{
 			ModuleID:      ModuleID,
 			RecordKind:    output.RecordKindObservation,
 			EvidenceGrade: output.EvidenceGradeObservation,
@@ -149,7 +151,7 @@ func (m *Module) phaseConsole(
 				"console":       name,
 				"impact_proven": false,
 			},
-		})
+		}))
 	}
 	return results
 }

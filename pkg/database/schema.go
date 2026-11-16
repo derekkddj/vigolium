@@ -5,7 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
+
+	"github.com/uptrace/bun"
 )
 
 // Sentinel errors returned by the generic table API. Callers (notably the REST
@@ -25,7 +28,42 @@ var (
 	ErrCompositePKUnsupported = errors.New("single-value operation not supported for composite primary key table")
 	// ErrImmutablePrimaryKey indicates an attempt to update a primary-key column.
 	ErrImmutablePrimaryKey = errors.New("cannot update primary key column")
+	// ErrGenericTableAccessDenied reserves evidence storage for its scoped,
+	// association-aware repository APIs. Schema metadata remains discoverable.
+	ErrGenericTableAccessDenied = errors.New("generic access to evidence storage is forbidden")
+	// ErrGenericInsertUnsupported requires HTTP ingestion to establish a validated
+	// exchange identity rather than accepting arbitrary generic column values.
+	ErrGenericInsertUnsupported = errors.New("generic HTTP record insertion is unsupported; use traffic ingestion")
 )
+
+// ValidateGenericTableAccess applies to record reads and writes, not discovery.
+// Evidence bytes and associations must only be exposed by exact finding selection.
+func ValidateGenericTableAccess(tableName string) error {
+	switch strings.ToLower(tableName) {
+	case "evidence_exchanges", "finding_evidence", "oast_planting_receipts":
+		return fmt.Errorf("%w: %q", ErrGenericTableAccessDenied, tableName)
+	default:
+		return nil
+	}
+}
+
+// isGenericRecordMetadataColumn is deliberately an allowlist: new captured
+// exchange fields must not become mutable merely by being added to the schema.
+func isGenericRecordMetadataColumn(column string) bool {
+	// Fidelity is immutable with its bytes, even if a future metadata allowlist
+	// expands. Share the capture-column definition with reload and dedup.
+	if slices.Contains(recordCaptureStateColumns, column) {
+		return false
+	}
+	switch column {
+	case "scan_uuid", "source", "parameters", "technology", "content_hash", "is_authenticated",
+		"parent_uuid", "root_uuid", "target", "chain_truncated", "remarks",
+		"risk_score", "surface_score", "response_norm_hash":
+		return true
+	default:
+		return false
+	}
+}
 
 // GenericQueryOptions holds options for filtered, sorted, paginated generic queries.
 type GenericQueryOptions struct {
@@ -172,6 +210,9 @@ func listColumnsPostgres(ctx context.Context, db *DB, tableName string) ([]Colum
 // Returns rows as ordered maps, column names, and total row count.
 // The tableName must be validated against ListTables before calling.
 func QueryGenericTable(ctx context.Context, db *DB, tableName string, limit, offset int) ([]map[string]interface{}, []string, int64, error) {
+	if err := ValidateGenericTableAccess(tableName); err != nil {
+		return nil, nil, 0, err
+	}
 	// Count total rows
 	var total int64
 	countRow := db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s", quoteIdent(db.Driver(), tableName)))
@@ -337,6 +378,9 @@ func isValidColumn(name string, columns []ColumnInfo) bool {
 // QueryGenericTableFiltered runs a filtered, sorted, paginated SELECT on the given table.
 // The tableName and all column references are validated before use.
 func QueryGenericTableFiltered(ctx context.Context, db *DB, tableName string, opts GenericQueryOptions) ([]map[string]interface{}, []string, int64, error) {
+	if err := ValidateGenericTableAccess(tableName); err != nil {
+		return nil, nil, 0, err
+	}
 	if err := ValidateTableName(ctx, db, tableName); err != nil {
 		return nil, nil, 0, err
 	}
@@ -423,6 +467,9 @@ func QueryGenericTableFiltered(ctx context.Context, db *DB, tableName string, op
 
 // GetGenericRecord fetches a single record by primary key.
 func GetGenericRecord(ctx context.Context, db *DB, tableName, pkValue string) (map[string]interface{}, error) {
+	if err := ValidateGenericTableAccess(tableName); err != nil {
+		return nil, err
+	}
 	if err := ValidateTableName(ctx, db, tableName); err != nil {
 		return nil, err
 	}
@@ -466,6 +513,12 @@ func GetGenericRecord(ctx context.Context, db *DB, tableName, pkValue string) (m
 // InsertGenericRecord inserts a record into the given table.
 // fields is a map of column_name -> value. Column names are validated.
 func InsertGenericRecord(ctx context.Context, db *DB, tableName string, fields map[string]interface{}) error {
+	if err := ValidateGenericTableAccess(tableName); err != nil {
+		return err
+	}
+	if strings.EqualFold(tableName, "http_records") {
+		return ErrGenericInsertUnsupported
+	}
 	if err := ValidateTableName(ctx, db, tableName); err != nil {
 		return err
 	}
@@ -506,6 +559,9 @@ func InsertGenericRecord(ctx context.Context, db *DB, tableName string, fields m
 // UpdateGenericRecord updates a record by primary key.
 // fields is a map of column_name -> new_value. PK columns cannot be updated.
 func UpdateGenericRecord(ctx context.Context, db *DB, tableName, pkValue string, fields map[string]interface{}) error {
+	if err := ValidateGenericTableAccess(tableName); err != nil {
+		return err
+	}
 	if err := ValidateTableName(ctx, db, tableName); err != nil {
 		return err
 	}
@@ -535,6 +591,9 @@ func UpdateGenericRecord(ctx context.Context, db *DB, tableName, pkValue string,
 		}
 		if !isValidColumn(col, allColumns) {
 			return fmt.Errorf("%w %q for table %q", ErrInvalidColumn, col, tableName)
+		}
+		if tableName == "http_records" && !isGenericRecordMetadataColumn(col) {
+			return fmt.Errorf("%w: %q; use SaveRecordVersion for changed exchanges", ErrImmutableRecordExchange, col)
 		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = %s", quoteIdent(driver, col), makePlaceholder(driver, i)))
 		args = append(args, val)
@@ -569,6 +628,9 @@ func UpdateGenericRecord(ctx context.Context, db *DB, tableName, pkValue string,
 
 // DeleteGenericRecord deletes a record by primary key.
 func DeleteGenericRecord(ctx context.Context, db *DB, tableName, pkValue string) error {
+	if err := ValidateGenericTableAccess(tableName); err != nil {
+		return err
+	}
 	if err := ValidateTableName(ctx, db, tableName); err != nil {
 		return err
 	}
@@ -579,6 +641,17 @@ func DeleteGenericRecord(ctx context.Context, db *DB, tableName, pkValue string)
 	}
 	if len(pk.Columns) != 1 {
 		return fmt.Errorf("%w: %q (delete)", ErrCompositePKUnsupported, tableName)
+	}
+
+	if tableName == "findings" {
+		// Deleting a finding drops its associations, not its retained raw receipts.
+		return db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+			var id int64
+			if err := tx.NewRaw("SELECT id FROM findings WHERE id = ?", pkValue).Scan(ctx, &id); err != nil {
+				return err
+			}
+			return deleteFindingsByIDsTx(ctx, tx, []int64{id})
+		})
 	}
 
 	driver := db.Driver()

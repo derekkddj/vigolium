@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules"
 )
@@ -35,6 +36,9 @@ const (
 	// BaselineFindingRequest: the request stored on the finding itself (a
 	// passive finding without a loadable record).
 	BaselineFindingRequest = "finding_request"
+	// SelectedExchange is explicitly classified replay context / observation,
+	// not inferred from a URL or first linked record.
+	BaselineSelectedExchange = "selected_exchange"
 )
 
 // Insertion-point sources, reported in Plan.InsertionPointSource.
@@ -45,10 +49,11 @@ const (
 
 // Plan is a reconstructed finding: what verify will run, or why it will not.
 type Plan struct {
-	FindingID   int64  `json:"id"`
-	FindingHash string `json:"finding_hash"`
-	ModuleID    string `json:"module_id"`
-	ModuleType  string `json:"module_type,omitempty"` // active | passive
+	FindingID      int64  `json:"id"`
+	FindingHash    string `json:"finding_hash"`
+	ModuleID       string `json:"module_id"`
+	ModuleType     string `json:"module_type,omitempty"` // active | passive
+	EvidenceStatus string `json:"evidence_status,omitempty"`
 
 	Baseline             *Baseline                       `json:"baseline,omitempty"`
 	InsertionPoint       *database.FindingInsertionPoint `json:"insertion_point,omitempty"`
@@ -70,10 +75,12 @@ type Plan struct {
 
 // Baseline describes the request the module will be run against.
 type Baseline struct {
-	Source     string `json:"source"`
-	RecordUUID string `json:"record_uuid,omitempty"`
-	Method     string `json:"method,omitempty"`
-	URL        string `json:"url,omitempty"`
+	Source     string        `json:"source"`
+	RecordUUID string        `json:"record_uuid,omitempty"`
+	ExchangeID string        `json:"exchange_id,omitempty"`
+	Role       evidence.Role `json:"role,omitempty"`
+	Method     string        `json:"method,omitempty"`
+	URL        string        `json:"url,omitempty"`
 	// Request is the raw baseline request, filled for --dry-run output.
 	Request string `json:"request,omitempty"`
 }
@@ -106,7 +113,16 @@ var unsupportedSources = map[string]string{
 // Reconstruct rebuilds the plan for one finding. repo may be nil, in which
 // case only the request stored on the finding is available.
 func Reconstruct(ctx context.Context, repo *database.Repository, projectUUID string, f *database.Finding, resolve ModuleResolver) *Plan {
-	p := &Plan{FindingID: f.ID, FindingHash: f.FindingHash, ModuleID: f.ModuleID, finding: f, Payload: f.Payload}
+	p := &Plan{FindingID: f.ID, FindingHash: f.FindingHash, ModuleID: f.ModuleID, finding: f, Payload: f.Payload, EvidenceStatus: f.EvidenceStatus}
+	owner := f.ProjectUUID
+	if owner == "" {
+		owner = database.DefaultProjectUUID
+	}
+	if projectUUID != "" && projectUUID != owner {
+		return p.decide(database.VerdictInconclusive, "finding is outside the selected project")
+	}
+	// Even stateless verification is constrained to the finding's own project.
+	projectUUID = owner
 	if reason, ok := unsupportedSources[f.FindingSource]; ok {
 		return p.decide(database.VerdictUnsupported, reason)
 	}
@@ -162,19 +178,59 @@ func (p *Plan) fail(verdict, reason string) bool {
 // findBaseline sets p.item and p.Baseline; false when the plan was decided.
 func (p *Plan) findBaseline(ctx context.Context, repo *database.Repository, projectUUID string, passive bool) bool {
 	f := p.finding
+	if repo != nil && f.ID != 0 {
+		stored, err := repo.GetFindingByID(ctx, f.ID)
+		if err != nil {
+			return p.fail(database.VerdictInconclusive, "could not load finding evidence manifest: "+err.Error())
+		}
+		if stored.ProjectUUID != f.ProjectUUID {
+			return p.fail(database.VerdictInconclusive, "finding is outside the selected project")
+		}
+		f.Evidence, f.EvidenceStatus = stored.Evidence, stored.EvidenceStatus
+		p.EvidenceStatus = f.EvidenceStatus
+	}
+	// Positive selection intent with no associations is a broken manifest,
+	// not a legacy finding. Do not conceal it with origin, links or inline text.
+	if len(f.Evidence) == 0 && f.EvidenceStatus != "" && f.EvidenceStatus != "unclassified" && f.EvidenceStatus != "legacy_unknown" {
+		return p.fail(database.VerdictInconclusive, "selected evidence manifest is empty or unavailable; no legacy replay substituted")
+	}
+	if ambiguousPrimaryOccurrence(f.Evidence) {
+		return p.fail(database.VerdictInconclusive, "multiple primary declarations within one occurrence; no replay or proof chosen")
+	}
+	// Explicit observation/baseline associations are authoritative for replay.
+	// A missing selected replay receipt never falls back to origin/linked traffic.
+	if passive && len(f.Evidence) > 0 {
+		return p.useSelectedExchange(ctx, repo, projectUUID, true)
+	}
+	for _, entry := range f.Evidence {
+		if entry.Role == evidence.RoleBaseline {
+			return p.useSelectedExchange(ctx, repo, projectUUID, false)
+		}
+	}
 
+	if repo != nil {
+		if err := repo.HydrateFindingRecordRefs(ctx, []*database.Finding{f}); err != nil {
+			return p.fail(database.VerdictInconclusive, "could not load finding record references: "+err.Error())
+		}
+	}
 	if f.OriginRecordUUID != "" && repo != nil {
-		if item, rec := loadRecord(ctx, repo, f.OriginRecordUUID); item != nil {
+		if item, rec := loadRecord(ctx, repo, projectUUID, f.OriginRecordUUID); item != nil {
 			p.item = item
-			p.Baseline = &Baseline{Source: BaselineOriginRecord, RecordUUID: rec.UUID}
+			p.Baseline = &Baseline{Source: BaselineOriginRecord, RecordUUID: rec.UUID, Role: evidence.RoleUnknown}
 			return true
 		}
 	}
 
-	var evidence *database.HTTPRecord
+	if len(f.Evidence) > 0 {
+		// An exact origin is independent replay context, not replacement proof.
+		// Without it or a selected baseline, do not guess from links or URLs.
+		return p.useSelectedExchange(ctx, repo, projectUUID, false)
+	}
+
+	var legacyRecord *database.HTTPRecord
 	if repo != nil {
 		for _, uuid := range f.HTTPRecordUUIDs {
-			item, rec := loadRecord(ctx, repo, uuid)
+			item, rec := loadRecord(ctx, repo, projectUUID, uuid)
 			if item == nil {
 				continue
 			}
@@ -183,17 +239,21 @@ func (p *Plan) findBaseline(ctx context.Context, repo *database.Repository, proj
 			// finding's own evidence row.
 			if passive || !database.IsEvidenceRecordSource(rec.Source) {
 				p.item = item
-				p.Baseline = &Baseline{Source: BaselineLinkedRecord, RecordUUID: rec.UUID}
+				p.Baseline = &Baseline{Source: BaselineLinkedRecord, RecordUUID: rec.UUID, Role: evidence.RoleUnknown}
 				return true
 			}
-			evidence = rec
-			break
+			// Keep legacy request context for replay matching, not proof, but keep looking:
+			// a later exact link may be the scanned baseline, regardless of UUID
+			// ordering or how legacy array/junction refs were combined.
+			if legacyRecord == nil {
+				legacyRecord = rec
+			}
 		}
 	}
 
 	findingRaw := []byte(f.Request)
-	if len(findingRaw) == 0 && evidence != nil {
-		findingRaw = evidence.RawRequest
+	if len(findingRaw) == 0 && legacyRecord != nil {
+		findingRaw = legacyRecord.RawRequest
 	}
 	if len(findingRaw) == 0 {
 		return p.fail(database.VerdictInconclusive, "no baseline: the finding has no loadable record and no stored request")
@@ -208,7 +268,7 @@ func (p *Plan) findBaseline(ctx context.Context, repo *database.Repository, proj
 			item = item.WithResponse(httpmsg.NewHttpResponse([]byte(f.Response)))
 		}
 		p.item = item
-		p.Baseline = &Baseline{Source: BaselineFindingRequest}
+		p.Baseline = &Baseline{Source: BaselineFindingRequest, Role: evidence.RoleUnknown}
 		return true
 	}
 
@@ -217,7 +277,7 @@ func (p *Plan) findBaseline(ctx context.Context, repo *database.Repository, proj
 	if repo != nil {
 		if item, rec, ip := matchBaselineRecord(ctx, repo, projectUUID, f, findingRaw); item != nil {
 			p.item = item
-			p.Baseline = &Baseline{Source: BaselineMatchedRecord, RecordUUID: rec.UUID}
+			p.Baseline = &Baseline{Source: BaselineMatchedRecord, RecordUUID: rec.UUID, Role: evidence.RoleUnknown}
 			if p.InsertionPoint == nil && f.InsertionPoint == nil && ip != nil {
 				p.InsertionPoint = &database.FindingInsertionPoint{Type: ip.Type().String(), Name: ip.Name()}
 				p.InsertionPointSource = PointDiffering
@@ -262,11 +322,12 @@ func (p *Plan) findInsertionPoint(passive bool) {
 }
 
 // loadRecord loads a record and converts it to an item; nil when either fails.
-func loadRecord(ctx context.Context, repo *database.Repository, uuid string) (*httpmsg.HttpRequestResponse, *database.HTTPRecord) {
-	rec, err := repo.GetRecordByUUID(ctx, uuid)
-	if err != nil || rec == nil || len(rec.RawRequest) == 0 {
+func loadRecord(ctx context.Context, repo *database.Repository, projectUUID, uuid string) (*httpmsg.HttpRequestResponse, *database.HTTPRecord) {
+	records, err := repo.GetFindingRecordsScoped(ctx, projectUUID, []string{uuid})
+	if err != nil || len(records) == 0 || len(records[0].RawRequest) == 0 {
 		return nil, nil
 	}
+	rec := records[0]
 	item, err := database.RecordToHttpRequestResponse(rec)
 	if err != nil || item == nil {
 		return nil, nil

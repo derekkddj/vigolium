@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/vigolium/vigolium/pkg/olium/provider"
 	"github.com/vigolium/vigolium/pkg/olium/skill"
 	"github.com/vigolium/vigolium/pkg/olium/stream"
@@ -64,6 +65,12 @@ type Config struct {
 	Skills *skill.Registry
 	// MaxTurns caps how many LLM→tool cycles a single Run may do. 0 = default 32.
 	MaxTurns int
+	// DisableTools is an execution boundary, not just an empty advertised tool
+	// list. Even hallucinated tool calls cannot dispatch. Opt-in for planners.
+	DisableTools bool
+	// RequireFinalAnswer rejects empty or length-truncated text-only output.
+	// General chat/autopilot keep their existing completion semantics.
+	RequireFinalAnswer bool
 	// ToolTimeout bounds each tool invocation. 0 = DefaultToolTimeout.
 	// Negative = disabled (tools run without an imposed deadline, honoring
 	// only the parent ctx).
@@ -229,6 +236,10 @@ type Engine struct {
 	failedCalls map[string]int
 }
 
+// ToolArchiveDir returns the immutable session root for operator log hydration.
+// An empty root means no per-invocation archive is configured.
+func (e *Engine) ToolArchiveDir() string { return e.cfg.SpillDir }
+
 // New constructs an Engine. Skills (if any) are baked into the system
 // prompt at construction time — the registry itself is stable for the
 // session, so there's no reason to re-render on every turn.
@@ -383,6 +394,15 @@ func (e *Engine) run(ctx context.Context, userPrompt string, out chan<- Event) {
 	e.mu.Unlock()
 
 	tools := e.toolDefs()
+	if e.cfg.DisableTools {
+		tools = nil
+		// Built-in CLI/SDK providers own hidden tools and ignore req.Tools.
+		// Reject before calling Stream rather than claiming false isolation.
+		if provider.HasInternalToolLoop(e.cfg.Provider) {
+			out <- Event{Type: EventError, Err: "provider cannot enforce disabled tool execution"}
+			return
+		}
+	}
 
 	emptyStreak := 0
 	for turn := 0; turn < e.maxT; turn++ {
@@ -415,7 +435,7 @@ func (e *Engine) run(ctx context.Context, userPrompt string, out chan<- Event) {
 		}
 		stopReason, usage, toolCalls, assistantText, err := e.streamOnceWithRetry(ctx, req, out)
 		if err != nil {
-			out <- Event{Type: EventError, Err: err.Error()}
+			out <- Event{Type: EventError, Err: err.Error(), Usage: usage}
 			return
 		}
 
@@ -439,7 +459,15 @@ func (e *Engine) run(ctx context.Context, userPrompt string, out chan<- Event) {
 
 		out <- Event{Type: EventTurnDone, StopReason: stopReason, Usage: usage, ToolCalls: toStreamToolCalls(toolCalls)}
 
+		if e.cfg.DisableTools && len(toolCalls) > 0 {
+			out <- Event{Type: EventError, Err: "tool execution is disabled for this session; final answer required"}
+			return // do not dispatch even if Tools was accidentally populated
+		}
 		if len(toolCalls) == 0 {
+			if e.cfg.RequireFinalAnswer && (strings.TrimSpace(assistantText) == "" || stopReason == stream.StopReasonLength) {
+				out <- Event{Type: EventError, Err: "final answer is empty or truncated; no complete deliverable"}
+				return
+			}
 			// Text-only turn. Small open-weight models routinely lose the
 			// tool-calling loop here and silently wrap up after 0-record
 			// queries; legacy behavior was to treat the first empty turn as
@@ -734,10 +762,10 @@ func (e *Engine) streamOnce(
 // streamOnceWithRetry wraps streamOnce so a transient upstream stream
 // failure (HTTP/2 INTERNAL_ERROR, REFUSED_STREAM, GOAWAY, idle reset, or a
 // content-less codex `error` frame) retries instead of tearing down the
-// whole multi-turn loop. Text, thinking, AND tool-call-start deltas are all
-// safe to dup on retry: they're cosmetic only (the operator sees a notice
-// line followed by the fresh attempt's output), the assistant message is
-// only committed to history from the successful attempt (see run loop), and
+// whole multi-turn loop. Failed-attempt deltas remain visible to live viewers,
+// but EventStreamRetry separates them from the next attempt for recorders and
+// consumers that parse the final response. The assistant message is only
+// committed to history from the successful attempt (see run loop), and
 // no consumer commits a tool card until EventToolExecEnd — which a failed
 // attempt never reaches. We deliberately retry even when a tool-call-start
 // was already forwarded: in agentic mode a turn almost always ends in a
@@ -771,7 +799,14 @@ func (e *Engine) streamOnceWithRetry(
 			return stopReason, usage, toolCalls, text, err
 		}
 		if attempt == maxStreamAttempts-1 {
-			break
+			return stopReason, usage, toolCalls, text, lastErr
+		}
+		out <- Event{
+			Type:      EventStreamRetry,
+			Attempt:   attempt + 1,
+			Err:       err.Error(),
+			Usage:     usage,
+			ToolCalls: toStreamToolCalls(toolCalls),
 		}
 		out <- Event{
 			Type:  EventInfo,
@@ -784,7 +819,9 @@ func (e *Engine) streamOnceWithRetry(
 		}
 		select {
 		case <-ctx.Done():
-			return stopReason, usage, toolCalls, text, ctx.Err()
+			// Usage was already emitted on EventStreamRetry for this abandoned
+			// attempt; do not charge it again as terminal-attempt usage.
+			return stopReason, nil, toolCalls, text, ctx.Err()
 		case <-time.After(backoff):
 		}
 		if backoff *= 2; backoff > maxStreamBackoff {
@@ -801,11 +838,14 @@ func (e *Engine) streamOnceWithRetry(
 // engine loop continues so the model can recover or halt.
 func (e *Engine) dispatchTool(ctx context.Context, tc provider.ToolCall, out chan<- Event) tool.Result {
 	return e.runTool(ctx, tc, func(partial tool.Result) {
-		out <- Event{
+		select {
+		case out <- Event{
 			Type:       EventToolExecProgress,
 			ToolCallID: tc.ID,
 			ToolName:   tc.Name,
 			ToolResult: partial.Content,
+		}:
+		case <-ctx.Done():
 		}
 	})
 }
@@ -817,6 +857,19 @@ func (e *Engine) dispatchTool(ctx context.Context, tc provider.ToolCall, out cha
 // onUpdate may be nil (the parallel path passes nil so concurrent tools
 // don't interleave progress events).
 func (e *Engine) runTool(ctx context.Context, tc provider.ToolCall, onUpdate tool.UpdateFn) tool.Result {
+	return tool.ArchiveExecution(ctx, e.cfg.SpillDir, tc.ID, tc.Name, tc.Args,
+		func(archivedCtx context.Context) tool.Result {
+			return e.runToolWithoutArchive(archivedCtx, tc, onUpdate)
+		})
+}
+
+func (e *Engine) runToolWithoutArchive(ctx context.Context, tc provider.ToolCall, onUpdate tool.UpdateFn) tool.Result {
+	if err := ctx.Err(); err != nil {
+		return tool.Result{Content: "not run: cancelled before tool dispatch: " + err.Error(), IsError: true}
+	}
+	if e.cfg.DisableTools {
+		return tool.Result{Content: "not run: tool execution is disabled for this session", IsError: true}
+	}
 	// A tools-less engine (e.g. a single-turn classifier built with no Tools
 	// registry) advertises no tools, but a model can still hallucinate a tool
 	// call. Return a recoverable error result instead of dereferencing a nil
@@ -851,10 +904,14 @@ func (e *Engine) runTool(ctx context.Context, tc provider.ToolCall, onUpdate too
 	}
 	res, runErr := t.Execute(toolCtx, tc.Args, onUpdate)
 	if runErr != nil {
-		return tool.Result{
-			Content: fmt.Sprintf("tool panic: %v", runErr),
-			IsError: true,
+		// A tool can return useful partial bytes/details together with an
+		// error. Never discard them before the archive/recorder sees them.
+		prefix := fmt.Sprintf("tool panic: %v", runErr)
+		if res.Content != "" {
+			prefix += "\n\n" + res.Content
 		}
+		res.Content = prefix
+		res.IsError = true
 	}
 	return e.noteToolOutcome(t, tc, annotateCutShort(res, ctx, toolCtx, timeout))
 }
@@ -955,7 +1012,10 @@ func (e *Engine) dispatchToolsParallel(ctx context.Context, calls []provider.Too
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
 			case <-ctx.Done():
-				results[i] = tool.Result{Content: ctx.Err().Error(), IsError: true}
+				results[i] = tool.ArchiveExecution(ctx, e.cfg.SpillDir, tc.ID, tc.Name, tc.Args,
+					func(context.Context) tool.Result {
+						return tool.Result{Content: "not run: cancelled before tool dispatch: " + ctx.Err().Error(), IsError: true}
+					})
 				return
 			}
 			// nil onUpdate: concurrent tools would interleave progress
@@ -985,6 +1045,7 @@ func (e *Engine) dispatchToolsParallel(ctx context.Context, calls []provider.Too
 			ToolCategory: e.categoryFor(tc.Name),
 			ToolResult:   res.Content,
 			ToolIsErr:    res.IsError,
+			ToolDetails:  res.Details,
 		}
 	}
 }
@@ -1017,6 +1078,7 @@ func (e *Engine) dispatchAndRecord(ctx context.Context, tc provider.ToolCall, ou
 		ToolCategory: category,
 		ToolResult:   result.Content,
 		ToolIsErr:    result.IsError,
+		ToolDetails:  result.Details,
 	}
 }
 
@@ -1025,7 +1087,15 @@ func (e *Engine) dispatchAndRecord(ctx context.Context, tc provider.ToolCall, ou
 // state that must outlive the per-tool budget. Both dispatch paths use it
 // to keep the shrink→hook ordering identical.
 func (e *Engine) prepareHistoryContent(tc provider.ToolCall, res tool.Result) string {
-	content := e.shrinkToolResult(tc, res.Content)
+	var content string
+	pointer := e.toolArchivePointer(res)
+	if _, archived := res.Details[tool.ArchiveDetailsKey]; archived && pointer != "" {
+		// The authoritative archive already contains the result/raw streams.
+		// Avoid a second disk copy of a potentially capped bash preview.
+		content = truncateToolResult(res.Content, e.maxToolResultLen) + pointer
+	} else {
+		content = e.shrinkToolResult(tc, res.Content)
+	}
 	if e.cfg.OnToolResult != nil {
 		content = e.cfg.OnToolResult(tc.Name, content, res.IsError)
 	}
@@ -1052,12 +1122,13 @@ func (e *Engine) shrinkToolResult(tc provider.ToolCall, content string) string {
 	return truncateToolResult(content, e.maxToolResultLen)
 }
 
-// spillToolResult writes the full payload to <dir>/tool-results/<id>.txt
-// and returns a short excerpt + pointer the model can act on. ok=false
+// spillToolResult writes the full payload to an exclusively created file under
+// <dir>/tool-results/ and returns a short excerpt + pointer. Reused or sanitized
+// provider call IDs must never overwrite an earlier receipt. ok=false
 // means we couldn't write — caller should fall back to truncation.
 func spillToolResult(dir string, tc provider.ToolCall, content string, max int) (string, bool) {
 	spillBase := filepath.Join(dir, "tool-results")
-	if err := os.MkdirAll(spillBase, 0o755); err != nil {
+	if err := os.MkdirAll(spillBase, 0o700); err != nil {
 		return "", false
 	}
 	// Filename: <toolName>-<callID>.txt. Sanitize the call ID since some
@@ -1071,7 +1142,26 @@ func spillToolResult(dir string, tc provider.ToolCall, content string, max int) 
 	filename := fmt.Sprintf("%s-%s.txt", name, id)
 	path := filepath.Join(spillBase, filename)
 
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	var f *os.File
+	for attempt := 0; attempt < 8; attempt++ {
+		var err error
+		f, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			break
+		}
+		if !os.IsExist(err) {
+			return "", false
+		}
+		path = filepath.Join(spillBase, fmt.Sprintf("%s-%s-%s.txt", name, id, uuid.NewString()))
+	}
+	if f == nil {
+		return "", false
+	}
+	n, writeErr := io.WriteString(f, content)
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if writeErr != nil || n != len(content) || syncErr != nil || closeErr != nil {
+		_ = os.Remove(path) // no pointer may refer to an incomplete spill
 		return "", false
 	}
 
@@ -1087,6 +1177,7 @@ func spillToolResult(dir string, tc provider.ToolCall, content string, max int) 
 		return fmt.Sprintf("Tool output spilled to disk (%d bytes). Read with `read_file path=%q`.",
 			len(content), path), true
 	}
+	headLen = min(headLen, len(content))
 	return content[:headLen] + fmt.Sprintf(pointerTpl, len(content), headLen, path, path), true
 }
 
@@ -1370,10 +1461,17 @@ const spillPointerMarker = "read_file path="
 // preserving a spill pointer when the result had one - that line is how the
 // model can still read the full output back.
 func elideToolResult(content string) string {
-	stub := fmt.Sprintf("[%d bytes of earlier tool output elided to fit the context window; re-run the tool if you need it]", len(content))
-	// spillToolResult always appends its pointer as the trailing line.
-	if last := content[strings.LastIndexByte(content, '\n')+1:]; strings.Contains(last, spillPointerMarker) {
-		return stub + "\n" + last
+	stub := fmt.Sprintf("[%d bytes of earlier tool output elided to fit the context window; consult saved output when available, do not repeat side-effecting commands to recover logs]", len(content))
+	// Hooks may append a scratchpad digest after the archive/spill pointer.
+	// Preserve the actual hydration line even when it is not the last line.
+	var pointer string
+	for line := range strings.SplitSeq(content, "\n") {
+		if strings.Contains(line, spillPointerMarker) {
+			pointer = line
+		}
+	}
+	if pointer != "" {
+		return stub + "\n" + pointer
 	}
 	return stub
 }

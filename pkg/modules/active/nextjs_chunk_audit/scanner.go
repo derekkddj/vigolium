@@ -9,6 +9,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/samber/lo"
 	"github.com/vigolium/vigolium/pkg/deparos/jstangle/linkfinder"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -92,6 +93,7 @@ type chunkCtx struct {
 	scheme    string
 	sourceURL string
 	fromMap   bool
+	exchange  *evidence.Exchange
 }
 
 func (m *Module) ScanPerRequest(
@@ -146,25 +148,27 @@ func (m *Module) ScanPerRequest(
 	var results []*output.ResultEvent
 	for _, chunkPath := range newChunks {
 		chunkURL := baseOrigin + chunkPath
-		chunkBody, ok := m.fetchBytes(anonymousCtx, anonymousClient, chunkPath, MaxChunkBytes)
+		var chunkExchange *evidence.Exchange
+		chunkBody, ok := m.fetchBytes(anonymousCtx, anonymousClient, chunkPath, MaxChunkBytes, &chunkExchange)
 		if !ok {
 			continue
 		}
 		results = append(results, m.analyzeBody(chunkBody, chunkCtx{
-			scanCtx: scanCtx, state: state, host: host, scheme: scheme, sourceURL: chunkURL,
+			scanCtx: scanCtx, state: state, host: host, scheme: scheme, sourceURL: chunkURL, exchange: chunkExchange,
 		})...)
 		// Re-emit the chunk URL through the feeder so the passive pipeline
 		// (notably secret_detect's secret scan) gets coverage.
 		m.feedURL(scanCtx, chunkURL)
 
 		mapPath := chunkPath + ".map"
-		mapBody, ok := m.fetchBytes(anonymousCtx, anonymousClient, mapPath, MaxMapBytes)
+		var mapExchange *evidence.Exchange
+		mapBody, ok := m.fetchBytes(anonymousCtx, anonymousClient, mapPath, MaxMapBytes, &mapExchange)
 		if !ok {
 			continue
 		}
 		results = append(results, m.analyzeBody(mapBody, chunkCtx{
 			scanCtx: scanCtx, state: state, host: host, scheme: scheme,
-			sourceURL: baseOrigin + mapPath, fromMap: true,
+			sourceURL: baseOrigin + mapPath, fromMap: true, exchange: mapExchange,
 		})...)
 	}
 
@@ -196,8 +200,18 @@ func (m *Module) fetchBytes(
 	httpClient *http.Requester,
 	path string,
 	maxBytes int64,
+	exchanges ...**evidence.Exchange,
 ) ([]byte, bool) {
-	return modkit.FetchAssetBytes(ctx, httpClient, path, maxBytes)
+	if len(exchanges) == 0 {
+		return modkit.FetchAssetBytes(ctx, httpClient, path, maxBytes)
+	}
+	body, exchange, ok := modkit.FetchAssetBytesCapture(ctx, httpClient, path, maxBytes)
+	for _, selected := range exchanges {
+		if selected != nil {
+			*selected = exchange.Clone()
+		}
+	}
+	return body, ok
 }
 
 func (m *Module) analyzeBody(body []byte, cc chunkCtx) []*output.ResultEvent {
@@ -285,7 +299,10 @@ func classifyExtractions(cc chunkCtx, relativeRoutes, absoluteURLs []string) (fe
 	return feedTargets, crossOrigin
 }
 
-func buildSecretEvent(cc chunkCtx, secrets []SecretMatch) *output.ResultEvent {
+func buildSecretEvent(cc chunkCtx, secrets []SecretMatch) (finding *output.ResultEvent) {
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, cc.exchange, evidence.RoleObservation, "anonymous credential-bearing asset")
+	}()
 	conf := severity.Tentative
 	sev := severity.Medium
 	patterns := make([]string, 0, len(secrets))
@@ -328,7 +345,10 @@ func buildSecretEvent(cc chunkCtx, secrets []SecretMatch) *output.ResultEvent {
 	}
 }
 
-func buildPublicIdentifierEvent(cc chunkCtx, identifiers []SecretMatch) *output.ResultEvent {
+func buildPublicIdentifierEvent(cc chunkCtx, identifiers []SecretMatch) (finding *output.ResultEvent) {
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, cc.exchange, evidence.RoleObservation, "anonymous identifier-bearing asset")
+	}()
 	patterns := make([]string, 0, len(identifiers))
 	extracted := make([]string, 0, len(identifiers))
 	for _, identifier := range identifiers {
@@ -359,7 +379,10 @@ func buildPublicIdentifierEvent(cc chunkCtx, identifiers []SecretMatch) *output.
 	}
 }
 
-func buildSummaryEvent(cc chunkCtx, routes, urls int, crossOrigin []string) *output.ResultEvent {
+func buildSummaryEvent(cc chunkCtx, routes, urls int, crossOrigin []string) (finding *output.ResultEvent) {
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, cc.exchange, evidence.RoleObservation, "analyzed anonymous asset")
+	}()
 	return &output.ResultEvent{
 		ModuleID:         ModuleID,
 		RecordKind:       output.RecordKindObservation,

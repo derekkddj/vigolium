@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -257,7 +258,7 @@ func (m *Module) runTest(
 	test pathInfoTest,
 	fp *notFoundFingerprint,
 	catchAll *catchAllProbe,
-) *output.ResultEvent {
+) (finding *output.ResultEvent) {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
@@ -335,8 +336,10 @@ func (m *Module) runTest(
 	// /index.php/anything alike). This is a no-op for the non-existent-script
 	// test, whose bare base script 404s, and for a genuine misconfig where the
 	// PATH_INFO response diverges from the base script.
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(finding, guardProof) }()
 	if base := baseScriptPath(test.path); base != "" && base != test.path {
-		if bStatus, bBody, ok := modkit.FetchPath(ctx, httpClient, base); ok && bStatus == 200 && modkit.BodiesSimilar(bBody, body) {
+		if bStatus, bBody, ok := modkit.FetchPathWithEvidence(ctx, httpClient, base, guardProof); ok && bStatus == 200 && modkit.BodiesSimilar(bBody, body) {
 			return nil
 		}
 	}
@@ -344,6 +347,10 @@ func (m *Module) runTest(
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + test.path
 
+	selectedExchange := http.CaptureEvidence(resp)
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, selectedExchange, evidence.RoleAttack, "selected PATH_INFO probe")
+	}()
 	return &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,

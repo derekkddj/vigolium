@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -54,6 +55,7 @@ type Module struct {
 }
 
 type rtdbExchange struct {
+	exchange     *evidence.Exchange
 	status       int
 	body         string
 	rawRequest   string
@@ -257,7 +259,7 @@ func (m *Module) probeRTDB(
 		responseStr = responseStr[:4096] + "\n... (truncated)"
 	}
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		ModuleID:      ModuleID,
 		RecordKind:    kind,
 		EvidenceGrade: grade,
@@ -265,6 +267,7 @@ func (m *Module) probeRTDB(
 		Matched:       targetURL,
 		Request:       first.rawRequest,
 		Response:      responseStr,
+		Evidence:      []evidence.Entry{evidence.Select(replay.exchange, evidence.RoleConfirmation, false, "RTDB replay")},
 		AdditionalEvidence: []string{
 			output.BuildEvidence("credential-free RTDB replay", replay.rawRequest, replay.fullResponse),
 		},
@@ -285,6 +288,8 @@ func (m *Module) probeRTDB(
 			"write_access_tested":      false,
 		},
 	}
+	modkit.SetPrimaryEvidence(result, first.exchange, evidence.RoleObservation, "selected observation")
+	return result
 }
 
 func fetchRTDB(httpClient *http.Requester, targetURL, dbURL string) (rtdbExchange, bool) {
@@ -307,6 +312,7 @@ func fetchRTDB(httpClient *http.Requester, targetURL, dbURL string) (rtdbExchang
 		body:         resp.BodyString(),
 		rawRequest:   rawReq,
 		fullResponse: resp.FullResponseString(),
+		exchange:     http.CaptureEvidence(resp),
 	}, true
 }
 

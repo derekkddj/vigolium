@@ -126,12 +126,14 @@ func (m *Module) probeWritableNodes(
 		if qbTotal(neg) > 0 {
 			continue
 		}
+		proof := aem.NewProof(res)
+		proof.Control(neg)
 		if !aem.ReproduceMarker(ctx, httpClient, path, reproduceRounds, func(r aem.ProbeResult) bool {
 			return qbTotal(r) > 0
-		}) {
+		}, proof) {
 			continue
 		}
-		return m.buildWritable(form, perm, extractPaths(res.Body), path, baseURL)
+		return m.buildWritable(form, perm, extractPaths(res.Body), path, baseURL, proof)
 	}
 	return nil
 }
@@ -153,12 +155,14 @@ func (m *Module) probePackages(
 	if qbTotal(neg) > 0 {
 		return nil
 	}
+	proof := aem.NewProof(res)
+	proof.Control(neg)
 	if !aem.ReproduceMarker(ctx, httpClient, path, reproduceRounds, func(r aem.ProbeResult) bool {
 		return qbTotal(r) > 0 && strings.Contains(r.Body, ".zip")
-	}) {
+	}, proof) {
 		return nil
 	}
-	return m.buildPackages(form, extractPaths(res.Body), path, baseURL)
+	return m.buildPackages(form, extractPaths(res.Body), path, baseURL, proof)
 }
 
 var jcrPathRe = regexp.MustCompile(`"jcr:path"\s*:\s*"([^"]+)"`)
@@ -173,7 +177,7 @@ func extractPaths(body string) []string {
 	return out
 }
 
-func (m *Module) buildWritable(form qbForm, perm string, paths []string, reqPath, baseURL string) *output.ResultEvent {
+func (m *Module) buildWritable(form qbForm, perm string, paths []string, reqPath, baseURL string, proof *aem.Proof) *output.ResultEvent {
 	matchedURL := baseURL + reqPath
 	evidence := []string{
 		"privilege: " + perm,
@@ -205,10 +209,10 @@ func (m *Module) buildWritable(form qbForm, perm string, paths []string, reqPath
 	if form.isBypass() {
 		modkit.AnnotatePathBypassFinding(res, reqPath)
 	}
-	return res
+	return proof.Observation(res)
 }
 
-func (m *Module) buildPackages(form qbForm, paths []string, reqPath, baseURL string) *output.ResultEvent {
+func (m *Module) buildPackages(form qbForm, paths []string, reqPath, baseURL string, proof *aem.Proof) *output.ResultEvent {
 	matchedURL := baseURL + reqPath
 	evidence := []string{"discovered via QueryBuilder type=nt:file nodename=*.zip" + qbBypassNote(form)}
 	if len(paths) > 0 {
@@ -234,7 +238,7 @@ func (m *Module) buildPackages(form qbForm, paths []string, reqPath, baseURL str
 	if form.isBypass() {
 		modkit.AnnotatePathBypassFinding(res, reqPath)
 	}
-	return res
+	return proof.Observation(res)
 }
 
 func qbBypassNote(form qbForm) string {

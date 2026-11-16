@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/maphash"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,8 +53,8 @@ type RecordWriterConfig struct {
 	OperationTimeout time.Duration
 
 	// DedupCacheSize bounds the in-memory dedup cache (LRU) that maps a record's
-	// dedup key to its UUID. A cache hit lets Write skip the per-record SELECT and
-	// the redundant insert for a key already seen by this writer (common in
+	// dedup key to its UUID. A hit validates that one row, then skips the batched
+	// candidate lookup and redundant enrichment/insert (common in
 	// discovery/spidering, which re-encounter the same URLs). Zero means "unset"
 	// and selects the default of 50000; pass a NEGATIVE size to disable the cache.
 	DedupCacheSize int
@@ -199,7 +200,7 @@ type RecordWriter struct {
 	admitWG sync.WaitGroup
 
 	// dedupCache maps a record's dedup key → UUID so a key already seen by this
-	// writer skips the per-record SELECT and the redundant insert. nil disables it.
+	// writer validates that UUID directly and skips enrichment/insert. nil disables it.
 	dedupCache *lru.Cache[string, string]
 }
 
@@ -298,8 +299,8 @@ func (w *RecordWriter) admit(ctx context.Context, rr *httpmsg.HttpRequestRespons
 	}
 	// Identity first, enrichment only if this record survives the dedup cache.
 	// The expensive half of conversion — normalized body hash, HTML title parse,
-	// word count, response hashing, owning the raw bytes — is pure waste for a key
-	// the cache is about to resolve from memory. See HTTPRecord.PrepareIdentity.
+	// word count and owning the input bytes — is pure waste for a key the cache
+	// can resolve to a validated stored row. Raw hashes remain exact for all sources.
 	record := &HTTPRecord{}
 	if err := record.PrepareIdentity(rr); err != nil {
 		return pendingWrite{err: fmt.Errorf("failed to convert request: %w", err), resolved: true}
@@ -316,21 +317,30 @@ func (w *RecordWriter) admit(ctx context.Context, rr *httpmsg.HttpRequestRespons
 	// filter on project_uuid="" while inserts land under DefaultProjectUUID, and
 	// duplicates slip through.
 	record.ProjectUUID = defaultProjectUUID(projectUUID)
+	prepareRecordExchangeIdentity(record, rr)
 
 	// Fast path: a key already seen by this writer (cross-request repeat, common in
-	// discovery/spidering) skips both the dedup SELECT and the redundant insert. On
-	// a miss the flush goroutine runs the duplicate check in one batched query.
+	// discovery/spidering) validates only its cached row and skips enrichment and
+	// insertion. On a miss the shard looks up and verifies exact candidates in batches.
 	dedupKey := recordDedupKey(record)
 	if w.dedupCache != nil {
 		if existingUUID, ok := w.dedupCache.Get(dedupKey); ok {
-			// The in-memory fast path skips the SELECT and the insert, so it must
-			// also carry the lineage the flush path would have applied —
-			// otherwise whether a redirect chain links up, and whether the row
-			// is labelled with the phase that fetched it, would depend on cache
-			// residency. One statement, and a no-op costs nothing (AdoptRecord
-			// returns before issuing anything when there is nothing to set).
-			w.repo.AdoptRecord(ctx, existingUUID, lineage, record.Source)
-			return pendingWrite{uuid: existingUUID, resolved: true}
+			matches, err := w.repo.cachedRecordMatches(ctx, existingUUID, dedupKey)
+			if err != nil {
+				return pendingWrite{err: fmt.Errorf("validate cached record: %w", err), resolved: true}
+			}
+			if !matches {
+				w.dedupCache.Remove(dedupKey)
+			} else {
+				// The in-memory fast path skips the batched lookup and the insert, so it must
+				// also carry the lineage the flush path would have applied —
+				// otherwise whether a redirect chain links up, and whether the row
+				// is labelled with the phase that fetched it, would depend on cache
+				// residency. One statement, and a no-op costs nothing (AdoptRecord
+				// returns before issuing anything when there is nothing to set).
+				w.repo.AdoptRecord(ctx, existingUUID, lineage, record.Source)
+				return pendingWrite{uuid: existingUUID, resolved: true}
+			}
 		}
 	}
 
@@ -412,22 +422,21 @@ func (w *RecordWriter) WriteWithLineage(ctx context.Context, rr *httpmsg.HttpReq
 }
 
 // cacheDedup records a dedup key → UUID mapping so a later Write of the same key
-// short-circuits the SELECT and insert. No-op for an empty UUID or disabled cache.
+// can validate the one cached row and skip enrichment/insert. No-op for an empty
+// UUID or disabled cache.
 func (w *RecordWriter) cacheDedup(key, uuid string) {
 	if w.dedupCache != nil && uuid != "" {
 		w.dedupCache.Add(key, uuid)
 	}
 }
 
-// recordDedupKey builds the in-memory dedup key. It MUST mirror the columns
-// findDuplicateRecordUUIDs matches on: (project_uuid, method, hostname, path, url),
-// plus request_hash when the request carries a body OR its source requires exact
-// identity (finding-evidence records) — otherwise the cache/batch grouping would
-// collapse distinct payloads (or a header-only finding probe) to the same endpoint
-// into one entry, diverging from the DB dedup and mislinking evidence.
+// recordDedupKey mirrors the exact SQL duplicate identity for EVERY source:
+// project, destination service, request bytes, response bytes and absence. Header-
+// only crawl mutations and different answers cannot alias finding evidence.
 func recordDedupKey(r *HTTPRecord) string {
 	var b strings.Builder
-	b.Grow(len(r.ProjectUUID) + len(r.Method) + len(r.Hostname) + len(r.Path) + len(r.URL) + len(r.RequestHash) + 6)
+	b.Grow(len(r.ProjectUUID) + len(r.Method) + len(r.Hostname) + len(r.Path) + len(r.URL) +
+		len(r.Scheme) + len(r.RequestHash) + len(r.ResponseHash) + 24)
 	b.WriteString(r.ProjectUUID)
 	b.WriteByte('\x00')
 	b.WriteString(r.Method)
@@ -437,9 +446,27 @@ func recordDedupKey(r *HTTPRecord) string {
 	b.WriteString(r.Path)
 	b.WriteByte('\x00')
 	b.WriteString(r.URL)
-	if r.RequestContentLength > 0 || recordSourceRequiresExactIdentity(r.Source) {
+	b.WriteByte('\x00')
+	b.WriteString(r.Scheme)
+	b.WriteByte('\x00')
+	b.WriteString(strconv.Itoa(r.Port))
+	b.WriteByte('\x00')
+	b.WriteString(r.RequestHash)
+	b.WriteByte('\x00')
+	if r.HasResponse {
+		b.WriteByte('1')
+	} else {
+		b.WriteByte('0')
+	}
+	b.WriteByte('\x00')
+	b.WriteString(r.ResponseHash)
+	// Keep the legacy key unchanged when both states are absent. Known unknown,
+	// truncated and complete snapshots of identical bytes are distinct rows.
+	if r.hasCaptureStates() {
 		b.WriteByte('\x00')
-		b.WriteString(r.RequestHash)
+		b.WriteString(string(r.CaptureRequestState))
+		b.WriteByte('\x00')
+		b.WriteString(string(r.CaptureResponseState))
 	}
 	return b.String()
 }
@@ -823,24 +850,33 @@ func (w *RecordWriter) flush(ctx context.Context, batch []writeRequest) {
 	// unmutated below, so there is nothing to copy out.
 	var adoptions []int
 
+	for i := range batch {
+		switch {
+		case existing[i] != "":
+			// A deduped record may contribute promote-only lineage/source after
+			// results are delivered, independently of its terminal persistence.
+			adoptions = append(adoptions, i)
+			okCount++
+		case insErr != nil:
+			failCount++
+		default:
+			okCount++
+		}
+	}
+
+	// Publish terminal accounting before waking ANY caller. Receiving the final
+	// Write result must not race a still-pending counter update or an adoption
+	// round trip, even when every database write has already committed.
+	w.flushed.Add(okCount)
+	w.flushFailed.Add(failCount)
 	for i, req := range batch {
 		switch {
 		case existing[i] != "":
-			// A record that deduped onto an earlier row can still contribute its
-			// lineage AND its source: the earlier row may have been written as
-			// finding evidence, before the chain that contains it existed and
-			// before anything knew which phase's traffic it was. AdoptRecord
-			// decides whether there is anything to apply, so the gate here is
-			// just "it deduped".
-			adoptions = append(adoptions, i)
-			okCount++
 			req.result <- WriteResult{UUID: existing[i]}
 		case insErr != nil:
-			failCount++
 			req.result <- WriteResult{Err: fmt.Errorf("batch insert failed: %w", insErr)}
 		default:
 			// The representative record carries the freshly assigned UUID.
-			okCount++
 			req.result <- WriteResult{UUID: records[rep[i]].UUID}
 		}
 	}
@@ -868,7 +904,4 @@ func (w *RecordWriter) flush(ctx context.Context, batch []writeRequest) {
 		})
 	}
 	w.repo.AdoptRecords(ctx, batchAdoptions)
-
-	w.flushed.Add(okCount)
-	w.flushFailed.Add(failCount)
 }

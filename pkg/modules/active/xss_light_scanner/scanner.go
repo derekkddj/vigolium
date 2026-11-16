@@ -6,6 +6,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -153,7 +154,7 @@ func (m *Module) scanWithPrefix(
 	primaryPayload := GeneratePrimaryWithPrefix(prefix)
 	result.PrimaryPayload = primaryPayload
 
-	primaryBody, err := sendAndValidatePayload(ctx, ip, primaryPayload, httpClient)
+	primaryBody, err := sendAndValidatePayload(ctx, ip, primaryPayload, httpClient, &result.PrimaryReceipt)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +197,7 @@ func (m *Module) scanWithPrefix(
 
 	result.SecondaryPayload = secondaryPayload
 
-	secondaryBody, err := sendAndValidatePayload(ctx, ip, secondaryPayload, httpClient)
+	secondaryBody, err := sendAndValidatePayload(ctx, ip, secondaryPayload, httpClient, &result.SecondaryReceipt)
 	if err != nil {
 		return nil, err
 	}
@@ -358,16 +359,28 @@ func buildResultEvent(
 		description += " [bypass: " + result.UsedPrefix + "]"
 	}
 
-	return &output.ResultEvent{
-		URL:              urlx.String(),
-		Request:          string(ip.BuildRequest([]byte(result.PrimaryPayload.FullPayload))),
-		Response:         string(result.PrimaryResponse),
-		FuzzingParameter: ip.Name(),
-		ExtractedResults: []string{ip.BaseValue()},
+	ev := modkit.NewEvidenceCollector()
+	ev.AddBaseline("input baseline", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
+	selected := result.PrimaryReceipt
+	if result.SecondaryReceipt != nil {
+		// Phase 2 runs only after phase 1 failed to establish exploitability.
+		ev.AddExchange(result.PrimaryReceipt, evidence.RoleAttack, "initial canary reflection")
+		selected = result.SecondaryReceipt
+	}
+	event := &output.ResultEvent{
+		Evidence:           ev.Evidence(),
+		AdditionalEvidence: ev.Entries(),
+		URL:                urlx.String(),
+		Request:            string(ip.BuildRequest([]byte(result.PrimaryPayload.FullPayload))),
+		Response:           string(result.PrimaryResponse),
+		FuzzingParameter:   ip.Name(),
+		ExtractedResults:   []string{ip.BaseValue()},
 		Info: output.Info{
 			Description: description,
 		},
 	}
+	modkit.SetPrimaryEvidence(event, selected, evidence.RoleAttack, "matched canary payload")
+	return event
 }
 
 // filterXSSRelevantPoints removes insertion points not relevant for XSS detection.

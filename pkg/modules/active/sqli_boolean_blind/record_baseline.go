@@ -3,6 +3,7 @@ package sqli_boolean_blind
 import (
 	"time"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -27,6 +28,8 @@ type rawBaseline struct {
 	body    string
 	status  int
 	blocked bool
+	// receipt owns the captured baseline exchange; nil when none was captured.
+	receipt *evidence.Exchange
 }
 
 // recordBaseline fetches the record's unmodified response once per record
@@ -44,7 +47,7 @@ func (m *Module) recordBaseline(ctx *httpmsg.HttpRequestResponse, httpClient *ht
 			return rawBaseline{}, false
 		}
 		defer resp.Close()
-		rb := rawBaseline{blocked: infra.IsBlockedResponse(resp)}
+		rb := rawBaseline{blocked: infra.IsBlockedResponse(resp), receipt: http.CaptureEvidence(resp)}
 		if r := resp.Response(); r != nil {
 			rb.full = resp.FullResponseString()
 			rb.body = resp.Body().String()
