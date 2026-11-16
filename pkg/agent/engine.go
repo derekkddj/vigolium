@@ -270,6 +270,26 @@ func (e *Engine) runOnSession(ctx context.Context, opts Options, sess AgentSessi
 			}
 			out, runErr = e.rt().RunOnSession(ctx, oliumCfg, offSess, runPrompt, opts.StreamWriter, thinkingSink.writer(), opts.Verbose)
 			closeAgentSessionWithWarning(offSess, opts.StreamWriter)
+		case opts.MaxTurns > 0:
+			// Fresh-per-call path with an explicit turn budget. RunPrompt builds
+			// its session with the config's default cap (agent.max_turns, 32) and
+			// never saw Options.MaxTurns, so a caller that documented-overrides it
+			// — e.g. the browser auth phase, which must navigate and try several
+			// login surfaces before it can capture a session — was silently
+			// capped at 32 and failed with "exceeded max turns". Build the session
+			// explicitly so the requested cap applies, mirroring the offline path.
+			rec := RecordSpec{SessionDir: opts.SessionDir, Template: opts.PromptTemplate}
+			turnSess, sErr := e.rt().NewSessionWithSpec(oliumCfg, SessionSpec{
+				SourcePath:   opts.SourcePath,
+				IncludeTools: true,
+				MaxTurns:     opts.MaxTurns,
+				Record:       rec,
+			})
+			if sErr != nil {
+				return oliumRunOutput{}, sErr
+			}
+			out, runErr = e.rt().RunOnSession(ctx, oliumCfg, turnSess, runPrompt, opts.StreamWriter, thinkingSink.writer(), opts.Verbose)
+			closeAgentSessionWithWarning(turnSess, opts.StreamWriter)
 		default:
 			// Fresh-per-call path: record a per-phase transcript when a session
 			// dir is wired, named by template so concurrent phases don't clash.
