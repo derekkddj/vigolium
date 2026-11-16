@@ -98,11 +98,12 @@ test.describe('AuthGate — auth required', () => {
       timeout: 5_000,
     });
 
-    // The login mock returns token='e2e-issued-token'.
-    const stored = await page.evaluate(() =>
+    // The button also loses its "Sign in" name while showing the spinner, so
+    // its disappearance is not evidence that the login response has settled.
+    await expect.poll(() => page.evaluate(() =>
       window.localStorage.getItem('vigolium_api_token'),
-    );
-    expect(stored).toBe('e2e-issued-token');
+    )).toBe('e2e-issued-token');
+    await expect(page.getByPlaceholder('username')).toHaveCount(0);
   });
 
   test('credentials login surfaces backend error message', async ({ page }) => {
