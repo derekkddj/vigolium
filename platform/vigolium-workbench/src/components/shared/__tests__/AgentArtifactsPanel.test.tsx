@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { setBaseUrl, setProjectUUID, setToken } from '@/api/client';
 import { ARTIFACT_BLOB_LIMIT, ARTIFACT_PREVIEW_BYTES } from '@/lib/runArtifacts';
 import AgentArtifactsPanel from '../AgentArtifactsPanel';
+import { scrollOwners } from './scrollContract';
 
 const context = vi.hoisted(() => ({ projectUUID: 'project-a' as string | null }));
 vi.mock('@/contexts/ProjectContext', () => ({ useProjectContext: () => context }));
@@ -76,6 +77,53 @@ for (const theme of ['dark', 'light'] as const) {
       expect(screen.getByRole('dialog', { name: 'Run artifacts workspace' }).textContent).toContain('${VIGOLIUM_TOKEN:?Set token locally}');
       expect(screen.getByRole('dialog', { name: 'Run artifacts workspace' }).textContent).toContain('${VIGOLIUM_PROJECT_UUID:?Set active project UUID}');
       expect(screen.getByRole('dialog', { name: 'Run artifacts workspace' }).textContent).not.toContain('test-secret');
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
+  });
+}
+
+for (const theme of ['dark', 'light'] as const) {
+  describe(`${theme} compact inline artifact list`, () => {
+    const many = Array.from({ length: 30 }, (_, i) => ({ name: `file-${i}.TXT`, kind: 'text', size: 4 }));
+    it('shows 12 files initially, expands to 30 and collapses without an inline scroll owner', async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(list(many, true));
+      render(view('run-a', theme));
+      const table = await screen.findByRole('table', { name: 'Artifact files' });
+      expect(within(table).getAllByRole('button')).toHaveLength(12);
+      expect(scrollOwners(table)).toEqual([]);
+      expect(screen.getByText(/Artifact listing truncated at 500/)).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: 'Show all 30 files' }));
+      expect(within(table).getAllByRole('button')).toHaveLength(30);
+      fireEvent.click(screen.getByRole('button', { name: 'Show fewer files' }));
+      expect(within(table).getAllByRole('button')).toHaveLength(12);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+    it.each([1, 12])('omits the filter and expansion controls for %s files', async (count) => {
+      vi.mocked(fetch).mockResolvedValueOnce(list(many.slice(0, count)));
+      render(view('run-a', theme));
+      const table = await screen.findByRole('table', { name: 'Artifact files' });
+      expect(within(table).getAllByRole('button')).toHaveLength(count);
+      expect(scrollOwners(table)).toEqual([]);
+      expect(screen.queryByRole('searchbox', { name: 'Filter artifact files' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /Show all|Show fewer/ })).not.toBeInTheDocument();
+    });
+    it('filters the entire listing case-insensitively and reuses the filter in the workspace', async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(list(many)).mockResolvedValueOnce(page('head'));
+      render(view('run-a', theme));
+      await screen.findByRole('table', { name: 'Artifact files' });
+      const filter = screen.getByRole('searchbox', { name: 'Filter artifact files' });
+      fireEvent.change(filter, { target: { value: 'FILE-29.txt' } });
+      fireEvent.click(screen.getByRole('button', { name: 'file-29.TXT' }));
+      const dialog = screen.getByRole('dialog', { name: 'Run artifacts workspace' });
+      await within(dialog).findByText('head', { exact: true });
+      fireEvent.change(within(dialog).getByRole('searchbox', { name: 'Filter workspace artifact files' }), { target: { value: 'FiLe-28.TxT' } });
+      const sidebar = within(dialog).getByRole('navigation', { name: 'Workspace artifact files' });
+      expect(within(sidebar).getAllByRole('button')).toHaveLength(1);
+      expect(within(sidebar).getByRole('button', { name: 'file-28.TXT' })).toBeInTheDocument();
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Close artifacts workspace' }));
+      fireEvent.change(filter, { target: { value: 'does-not-exist' } });
+      expect(screen.getByText('No artifact files match this filter.')).toBeInTheDocument();
+      expect(within(screen.getByRole('table', { name: 'Artifact files' })).queryAllByRole('button')).toHaveLength(0);
       expect(fetch).toHaveBeenCalledTimes(2);
     });
   });

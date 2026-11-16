@@ -5,6 +5,9 @@ import { useProjectContext } from '@/contexts/ProjectContext';
 import { listRunArtifacts, type RunArtifactList, type RunArtifactScope } from '@/lib/runArtifacts';
 import { evidencePalette, type EvidenceTheme } from './HttpMessage';
 import AgentArtifactWorkspace from './AgentArtifactWorkspace';
+import { filterArtifacts } from '@/lib/artifactFilter';
+
+const ARTIFACT_INLINE_ROWS = 12;
 
 export interface AgentArtifactsPanelProps { runUUID: string; theme: 'dark' | 'light' }
 const errorText = (error: unknown) => error instanceof Error ? error.message : 'Artifact request failed.';
@@ -28,6 +31,8 @@ function ArtifactsContent({ scope, theme }: { scope: RunArtifactScope; theme: Ev
   const [loading, setLoading] = useState(true);
   const [reload, setReload] = useState(0);
   const [selection, setSelection] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [filter, setFilter] = useState('');
   const { projectUUID, runUUID } = scope;
 
   useEffect(() => {
@@ -40,6 +45,8 @@ function ArtifactsContent({ scope, theme }: { scope: RunArtifactScope; theme: Ev
     return () => controller.abort();
   }, [projectUUID, runUUID, reload]);
 
+  const filtered = filterArtifacts(listing?.artifacts ?? [], filter);
+  const visible = expanded ? filtered : filtered.slice(0, ARTIFACT_INLINE_ROWS);
   const selected = listing?.artifacts.find((artifact) => artifact.name === selection);
   const buttonStyle = { borderColor: colors.border, color: colors.accent };
   return <section aria-label="Run artifacts" className="border p-3 space-y-3 text-xs" style={{ borderColor: colors.border, background: colors.background, color: colors.text }}>
@@ -53,15 +60,18 @@ function ArtifactsContent({ scope, theme }: { scope: RunArtifactScope; theme: Ev
     {listing?.truncated && <p role="status" style={{ color: colors.warning }}>Artifact listing truncated at 500 files; this is not a complete inventory. Listing pagination is not available on this endpoint.</p>}
     {listing && listing.artifacts.length === 0 && <p style={{ color: colors.muted }}>No artifact files stored for this run.</p>}
     {!!listing?.artifacts.length && <>
-      <div className="max-h-64 overflow-auto border" style={{ borderColor: colors.border }}>
+      {listing.artifacts.length > ARTIFACT_INLINE_ROWS && <label className="block">Filter artifact files<input type="search" className="block border p-2 w-full" style={{ borderColor: colors.border, background: colors.background }} value={filter} onChange={event => setFilter(event.target.value)} /></label>}
+      <div className="border" style={{ borderColor: colors.border }}>
         <table className="w-full text-left" aria-label="Artifact files">
           <thead style={{ color: colors.muted }}><tr><th className="p-2">Filename</th><th className="p-2">Kind</th><th className="p-2">Size</th></tr></thead>
-          <tbody>{listing.artifacts.map((artifact) => <tr key={artifact.name}>
+          <tbody>{visible.map((artifact) => <tr key={artifact.name}>
             <td className="p-2"><button className="underline text-left break-all" style={{ color: colors.accent, fontWeight: artifact.name === selection ? 'bold' : 'normal' }} aria-pressed={artifact.name === selection} onClick={() => setSelection(artifact.name)}>{artifact.name}</button></td>
             <td className="p-2">{artifact.kind}</td><td className="p-2 whitespace-nowrap">{formatSize(artifact.size)}</td>
           </tr>)}</tbody>
         </table>
       </div>
+      {!filtered.length && <p role="status">No artifact files match this filter.</p>}
+      {filtered.length > ARTIFACT_INLINE_ROWS && <button className="border px-2 py-1" style={buttonStyle} onClick={() => setExpanded(value => !value)}>{expanded ? 'Show fewer files' : `Show all ${filtered.length} files`}</button>}
       {!selected && <p style={{ color: colors.muted }}>Select one file to preview or download its exact bytes.</p>}
     </>}
     {selected && listing && <AgentArtifactWorkspace scope={scope} artifacts={listing.artifacts} truncated={listing.truncated} selected={selected.name} onSelect={setSelection} onClose={() => setSelection(null)} theme={theme} />}
