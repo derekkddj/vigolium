@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useAgentsLogic } from '../useAgentsLogic';
 import DarkAgentsPage from '@/designs/dark/AgentsPage';
 import LightAgentsPage from '@/designs/light/AgentsPage';
+import { scrollOwners } from '@/components/shared/__tests__/scrollContract';
 
 const mocks = vi.hoisted(() => ({
   project: { projectUUID: 'project-a' as string | null },
@@ -214,6 +215,26 @@ describe('agent runtime failure scoping', () => {
 });
 
 describe.each([['dark', DarkAgentsPage], ['light', LightAgentsPage]] as const)('%s agent observability views', (_theme, Page) => {
+  it.each([false, true])('keeps full-width session history and a single detail scroll owner (selected: %s)', (selected) => {
+    mocks.sessions.data = { data: sessions(1) };
+    if (selected) {
+      window.history.replaceState({}, '', '/agentic-scan?session=session-0');
+      mocks.detail.data = sessions(1)[0];
+    }
+    render(<Page />);
+    const table = screen.getByRole('columnheader', { name: 'DURATION' }).closest('table')!;
+    for (let el: Element | null = table; el; el = el.parentElement) {
+      expect(el.className).not.toMatch(/w-1\/2|max-h-\[300px\]/);
+    }
+    if (selected) {
+      const panel = screen.getByText('SESSION DETAILS');
+      const owners = scrollOwners(panel);
+      expect(owners).toHaveLength(1);
+      expect(owners[0].className).toBe('flex-1 min-h-0 flex flex-col overflow-auto');
+      expect(table.compareDocumentPosition(panel) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+  });
+
   it('shows 20-row pagination with unknown totals and supports previous/next', () => {
     mocks.sessions.data = { data: sessions(20), has_more: true };
     const { rerender } = render(<Page />);
