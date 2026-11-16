@@ -444,7 +444,7 @@ func runAgentAudit(cmd *cobra.Command, args []string) error {
 		if gcsErr != nil {
 			return fmt.Errorf("resolve gs:// source: %w", gcsErr)
 		}
-		defer cleanup()
+		defer func() { agent.CleanupAuditSource(extractedPath, cleanup, os.Stderr) }()
 		resolveSource = extractedPath
 	}
 	absTarget, _, _, err := agent.ResolveSourceAndDiff(

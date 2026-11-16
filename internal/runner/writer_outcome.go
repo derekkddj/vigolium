@@ -46,6 +46,7 @@ func (r *Runner) reportWriterOutcome(phase string, o database.PersistenceOutcome
 		zap.Int64("accepted", o.Accepted),
 		zap.Int64("committed", o.Committed),
 		zap.Int64("failed", o.Failed),
+		zap.Int64("rejected", o.Rejected),
 		zap.Int64("unknown", o.Unknown),
 		zap.Bool("timed_out", o.TimedOut))
 
@@ -53,8 +54,8 @@ func (r *Runner) reportWriterOutcome(phase string, o database.PersistenceOutcome
 		return
 	}
 	msg := fmt.Sprintf(
-		"persistence incomplete (%s): accepted=%d committed=%d failed=%d unknown=%d",
-		o.Writer, o.Accepted, o.Committed, o.Failed, o.Unknown)
+		"persistence incomplete (%s): accepted=%d committed=%d failed=%d rejected=%d unknown=%d",
+		o.Writer, o.Accepted, o.Committed, o.Failed, o.Rejected, o.Unknown)
 	if o.TimedOut {
 		msg += "; the writer's flush deadline expired"
 	}

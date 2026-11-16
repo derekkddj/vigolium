@@ -27,6 +27,7 @@ func (m *Module) phaseOperations(
 	endpointPath string,
 	schema *graphqlx.Schema,
 	target string,
+	introspection ...*gqlResp,
 ) *output.ResultEvent {
 	if scanCtx == nil {
 		return nil
@@ -74,7 +75,11 @@ func (m *Module) phaseOperations(
 		fmt.Sprintf("GraphQL endpoint: %s", endpointPath),
 		fmt.Sprintf("Operations exercised: %d (%d queries, %d mutations)", fed, queries, mutations),
 	}
-	return &output.ResultEvent{
+	proof := &gqlProof{}
+	if len(introspection) > 0 && introspection[0] != nil {
+		proof.primary = introspection[0].Exchange
+	}
+	return proof.observation(&output.ResultEvent{
 		ModuleID:         ModuleID,
 		RecordKind:       output.RecordKindObservation,
 		EvidenceGrade:    output.EvidenceGradeObservation,
@@ -98,5 +103,5 @@ func (m *Module) phaseOperations(
 			"mutations_queued":  mutations,
 			"impact_proven":     false,
 		},
-	}
+	})
 }

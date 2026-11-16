@@ -141,8 +141,8 @@ func httpGraphQLFuncDefs() []JSFuncDef {
 			Effect:      EffectNetwork,
 			Category:    CatHTTP,
 			Signature:   ".graphqlSchema(url: string, opts?: {headers?, session?})",
-			Returns:     "object | null",
-			Description: "Fetch a GraphQL schema via introspection query.",
+			Returns:     "GraphQLSchema | null",
+			Description: "Fetch a GraphQL schema via introspection query; raw and exchange retain its response and selectable receipt.",
 			Example:     "",
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
 				return func(call sobek.FunctionCall) sobek.Value {
@@ -255,5 +255,28 @@ func parseGraphQLSchemaResponse(vm *sobek.Runtime, resp sobek.Value) sobek.Value
 		return sobek.Null()
 	}
 
-	return vm.ToValue(schema)
+	value := vm.ToValue(schema)
+	if sobek.IsNull(value) || sobek.IsUndefined(value) {
+		return sobek.Null()
+	}
+	if fields, ok := schema.(map[string]interface{}); ok {
+		// A native JS object supports non-enumerable properties, unlike the
+		// Go-map wrapper created by ToValue.
+		obj := vm.NewObject()
+		for key, field := range fields {
+			_ = obj.Set(key, vm.ToValue(field))
+		}
+		value = obj
+	}
+	// Preserve direct schema fields (types, queryType, etc.). The additive
+	// properties retain the original response and its invocation-owned handle;
+	// parsing JSON or copying receipt display fields must not mint a new handle.
+	// Non-enumerable properties also keep JSON serialization of the schema stable.
+	if obj, ok := value.(*sobek.Object); ok {
+		_ = obj.DefineDataProperty("raw", resp, sobek.FLAG_FALSE, sobek.FLAG_FALSE, sobek.FLAG_FALSE)
+		if exchange := respObj.Get("exchange"); isSet(exchange) {
+			_ = obj.DefineDataProperty("exchange", exchange, sobek.FLAG_FALSE, sobek.FLAG_FALSE, sobek.FLAG_FALSE)
+		}
+	}
+	return value
 }

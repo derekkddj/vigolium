@@ -11,7 +11,13 @@ func (r *Repository) SaveOASTInteraction(ctx context.Context, interaction *OASTI
 		return fmt.Errorf("invalid OASTInteraction")
 	}
 	interaction.ProjectUUID = defaultProjectUUID(interaction.ProjectUUID)
-	if _, err := r.db.NewInsert().Model(interaction).Exec(ctx); err != nil {
+	insert := r.db.NewInsert().Model(interaction)
+	if !interaction.InteractedAt.IsZero() {
+		// Collector timestamps participate in exact repeated-ingest identity.
+		// Never round supplied nanoseconds through a backend time formatter.
+		insert.Value("interacted_at", "?", evidenceCaptureTime(interaction.InteractedAt))
+	}
+	if _, err := insert.Exec(ctx); err != nil {
 		return fmt.Errorf("failed to insert OAST interaction: %w", err)
 	}
 	return nil

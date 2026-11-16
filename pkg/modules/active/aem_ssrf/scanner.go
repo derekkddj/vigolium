@@ -151,21 +151,22 @@ func (m *Module) probe(
 	}
 	// A random sibling under the same directory must 404 — otherwise this is a
 	// wildcard/catch-all mount, not the specific servlet.
-	if !aem.SiblingIs404(ctx, client, s.path) {
+	proof := aem.NewProof(res)
+	if !aem.SiblingIs404(ctx, client, s.path, proof) {
 		return nil
 	}
 	// Reproduce the servlet's specific response.
 	if !aem.ReproduceMarker(ctx, client, s.path, reproduceRounds, func(r aem.ProbeResult) bool {
 		return aem.ServletResponded(r.Status)
-	}) {
+	}, proof) {
 		return nil
 	}
-	return m.build(s, res.Status, baseURL)
+	return m.build(s, res.Status, baseURL, proof)
 }
 
-func (m *Module) build(s ssrfServlet, status int, baseURL string) *output.ResultEvent {
+func (m *Module) build(s ssrfServlet, status int, baseURL string, proof *aem.Proof) *output.ResultEvent {
 	matchedURL := baseURL + s.path
-	return &output.ResultEvent{
+	return proof.Observation(&output.ResultEvent{
 		ModuleID:      ModuleID,
 		Host:          aem.HostFromBase(baseURL),
 		URL:           matchedURL,
@@ -187,5 +188,5 @@ func (m *Module) build(s ssrfServlet, status int, baseURL string) *output.Result
 			Tags:       []string{"aem", "adobe", "ssrf", "exposure"},
 			Reference:  s.ref,
 		},
-	}
+	})
 }

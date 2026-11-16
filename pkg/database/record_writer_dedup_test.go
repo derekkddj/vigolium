@@ -208,12 +208,9 @@ func makeTestGet(t *testing.T, path, headerLine string) *httpmsg.HttpRequestResp
 	return rr
 }
 
-// TestFindDuplicateRecordUUIDs_ExactIdentityForFindingSource is the Claim-1
-// regression: a no-body, header-only mutation (e.g. an Origin probe) that leaves
-// method/host/path/url unchanged must NOT collapse onto the baseline record when
-// its source is finding-evidence (finding/candidate/observation), but the coarse
-// no-body dedup is preserved for crawler/ingest sources.
-func TestFindDuplicateRecordUUIDs_ExactIdentityForFindingSource(t *testing.T) {
+// Header-only mutations must not collapse onto a baseline regardless of source.
+// Crawler rows are possible future finding context, not disposable endpoint keys.
+func TestFindDuplicateRecordUUIDs_ExactIdentityForEverySource(t *testing.T) {
 	db := newTestDB(t)
 	repo := NewRepository(db)
 	ctx := context.Background()
@@ -241,8 +238,8 @@ func TestFindDuplicateRecordUUIDs_ExactIdentityForFindingSource(t *testing.T) {
 	if got[0] != "" {
 		t.Errorf("finding-source header-mutated probe must not collapse onto baseline, got %q", got[0])
 	}
-	if got[1] != baselineUUID {
-		t.Errorf("crawler-source no-body probe should keep coarse dedup onto baseline, got %q want %q", got[1], baselineUUID)
+	if got[1] != "" {
+		t.Errorf("crawler-source header-mutated probe must preserve its own exchange, got %q", got[1])
 	}
 	if got[2] != baselineUUID {
 		t.Errorf("finding-source probe with identical bytes should link to the same exchange, got %q want %q", got[2], baselineUUID)

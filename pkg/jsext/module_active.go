@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/grafana/sobek"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -368,6 +370,32 @@ func buildRequestContext(vm *sobek.Runtime, ctx *httpmsg.HttpRequestResponse) so
 		_ = respObj.Set("headers", newHeadersObject(vm, ctx.Response().Headers()))
 	}
 	_ = obj.Set("response", respObj)
+	if x := ctx.Evidence(); x != nil {
+		_ = obj.Set("exchange", registerContextExchange(vm, x))
+	} else {
+		// Historical producer bytes are useful context, not a claim of complete
+		// post-auth capture. Their role remains explicitly selected by the script.
+		var reqRaw, respRaw []byte
+		if ctx.Request() != nil {
+			reqRaw = ctx.Request().Raw()
+		}
+		if ctx.Response() != nil {
+			respRaw = ctx.Response().Raw()
+		}
+		service := ""
+		if svc := ctx.Service(); svc != nil {
+			service = svc.Protocol() + "://" + net.JoinHostPort(svc.Host(), strconv.Itoa(svc.Port()))
+		}
+		x := evidence.NewExchange(service, ctx.Target(), reqRaw, respRaw, evidence.ProvenanceLegacy)
+		if len(reqRaw) > 0 {
+			x.RequestState = evidence.StateUnknown
+		}
+		if len(respRaw) > 0 {
+			x.ResponseState = evidence.StateUnknown
+		}
+		x.ContentHash = x.Hash()
+		_ = obj.Set("exchange", registerContextExchange(vm, x))
+	}
 
 	return obj
 }
@@ -463,8 +491,26 @@ func parseSingleJSResult(vm *sobek.Runtime, obj *sobek.Object, ctx *httpmsg.Http
 	} else if v := obj.Get("param"); isSet(v) {
 		result.FuzzingParameter = v.String()
 	}
-	if v := obj.Get("evidence"); isSet(v) {
-		result.AdditionalEvidence = jsEvidence(vm, v)
+	if v := obj.Get("record_kind"); isSet(v) {
+		result.RecordKind = output.RecordKind(v.String())
+	}
+	if v := obj.Get("evidence_grade"); isSet(v) {
+		result.EvidenceGrade = output.EvidenceGrade(v.String())
+	}
+	if v := obj.Get("payload"); isSet(v) {
+		result.Payload = v.String()
+	}
+	if v := obj.Get("baseline_evidence"); isSet(v) {
+		result.BaselineEvidence = v.ToBoolean()
+	}
+	parseSelectedEvidence(vm, obj.Get("evidence"), result)
+	if v := obj.Get("additional_evidence"); isSet(v) {
+		result.AdditionalEvidence = append(result.AdditionalEvidence, jsEvidence(vm, v)...)
+	}
+	if evidence.HasSelectedEvidence(result.Evidence) {
+		result.EvidenceStatus = "selected"
+	} else {
+		result.EvidenceStatus = "missing"
 	}
 
 	// Fill defaults from context

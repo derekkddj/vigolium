@@ -68,7 +68,7 @@ func writeCheckpoint(sessionDir string, cp *SwarmCheckpoint) error {
 	// never leaves a corrupt checkpoint that breaks resume.
 	target := filepath.Join(sessionDir, "checkpoint.json")
 	tmp := target + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return fmt.Errorf("failed to write checkpoint temp file: %w", err)
 	}
 	if err := os.Rename(tmp, target); err != nil {
@@ -101,7 +101,7 @@ func EnsureSessionDir(baseDir, agenticScanUUID string) (string, error) {
 		}
 	}
 	dir := filepath.Join(baseDir, agenticScanUUID)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("failed to create session dir: %w", err)
 	}
 	return dir, nil
@@ -113,8 +113,8 @@ func EnsureSessionDir(baseDir, agenticScanUUID string) (string, error) {
 // flow. Centralizes the justification for the dropped write errors at the call
 // sites across the agent pipeline.
 func writeSessionArtifact(path string, data []byte) {
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		zap.L().Debug("failed to write session artifact", zap.String("path", path), zap.Error(err))
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		zap.L().Warn("failed to write session artifact", zap.String("artifact", filepath.Base(path)), zap.Error(err))
 	}
 }
 
@@ -122,13 +122,13 @@ func writeSessionArtifact(path string, data []byte) {
 // and returns the extensions subdirectory path.
 func WriteExtensionsToSessionDir(extensions []GeneratedExtension, sessionDir string) (string, error) {
 	extDir := filepath.Join(sessionDir, "extensions")
-	if err := os.MkdirAll(extDir, 0755); err != nil {
+	if err := os.MkdirAll(extDir, 0o700); err != nil {
 		return "", fmt.Errorf("failed to create extensions dir: %w", err)
 	}
 	for i, ext := range extensions {
 		filename := sanitizeExtensionFilename(ext.Filename, i)
 		path := filepath.Join(extDir, filename)
-		if writeErr := os.WriteFile(path, []byte(ext.Code), 0644); writeErr != nil {
+		if writeErr := os.WriteFile(path, []byte(ext.Code), 0o600); writeErr != nil {
 			zap.L().Warn("Failed to write extension",
 				zap.String("filename", ext.Filename), zap.Error(writeErr))
 			continue
@@ -179,7 +179,7 @@ func WriteExtensionsToTempDir(extensions []GeneratedExtension, prefix string) (s
 	for i, ext := range extensions {
 		filename := sanitizeExtensionFilename(ext.Filename, i)
 		path := filepath.Join(dir, filename)
-		if writeErr := os.WriteFile(path, []byte(ext.Code), 0644); writeErr != nil {
+		if writeErr := os.WriteFile(path, []byte(ext.Code), 0o600); writeErr != nil {
 			zap.L().Warn("Failed to write extension",
 				zap.String("filename", ext.Filename),
 				zap.Error(writeErr))

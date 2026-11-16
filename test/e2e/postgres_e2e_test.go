@@ -683,7 +683,7 @@ func TestPg_AgenticScanCRUD(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), totalFiltered)
 
-	// DeleteOldAgenticScans: mark parent as old + completed, then delete.
+	// Age-only retention is disabled; the old parent and its child stay linked.
 	_, err = repo.DB().NewUpdate().Model((*database.AgenticScan)(nil)).
 		Set("completed_at = ?", time.Now().Add(-48*time.Hour)).
 		Where("uuid = ?", parentUUID).
@@ -691,8 +691,14 @@ func TestPg_AgenticScanCRUD(t *testing.T) {
 	require.NoError(t, err)
 
 	deleted, err := repo.DeleteOldAgenticScans(ctx, 24*time.Hour)
+	require.ErrorIs(t, err, database.ErrUnsafeAgenticScanRetention)
+	assert.Zero(t, deleted)
+	_, err = repo.GetAgenticScan(ctx, parentUUID)
 	require.NoError(t, err)
-	assert.GreaterOrEqual(t, deleted, 1)
+	retainedChildren, err := repo.GetChildAgenticScans(ctx, parentUUID)
+	require.NoError(t, err)
+	require.Len(t, retainedChildren, 1)
+	assert.Equal(t, child.UUID, retainedChildren[0].UUID)
 }
 
 // ============================================================

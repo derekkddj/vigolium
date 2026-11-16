@@ -81,12 +81,13 @@ func (m *Module) ScanPerHost(
 	// cache can't hide a mutating server. Each snapshot is a name -> Tool map so
 	// tool ORDER is irrelevant (map iteration order is not drift).
 	var fetches []map[string]mcpinfra.Tool
+	var receipts []*mcpinfra.Reply
 	for _, id := range toolsListIDs {
-		body, _, err := client.PostRaw(mcpinfra.MarshalRequest(id, "tools/list", nil))
-		if err != nil || body == "" {
+		op, err := client.PostRawEvidence(mcpinfra.MarshalRequest(id, "tools/list", nil))
+		if err != nil || op.Body == "" {
 			continue
 		}
-		res, err := mcpinfra.ParseToolsListResponse(body)
+		res, err := mcpinfra.ParseToolsListResponse(op.Body)
 		if err != nil || res == nil || len(res.Tools) == 0 {
 			continue
 		}
@@ -95,6 +96,7 @@ func (m *Module) ScanPerHost(
 			byName[t.Name] = t
 		}
 		fetches = append(fetches, byName)
+		receipts = append(receipts, op)
 	}
 
 	// Need at least two comparable snapshots to conclude anything.
@@ -182,7 +184,11 @@ func (m *Module) ScanPerHost(
 		description = fmt.Sprintf("MCP server at %s returned different descriptions or input schemas for the same tool across repeated calls. This is a rug-pull candidate; client approval state and post-approval replacement were not observed.", urlx.Host)
 	}
 
-	return []*output.ResultEvent{{
+	proof := mcpinfra.NewProof(receipts[0].Exchange)
+	for _, op := range receipts[1:] {
+		proof.Confirmation(op.Exchange)
+	}
+	return []*output.ResultEvent{proof.Observation(&output.ResultEvent{
 		ModuleID:         ModuleID,
 		RecordKind:       kind,
 		EvidenceGrade:    grade,
@@ -201,7 +207,7 @@ func (m *Module) ScanPerHost(
 			Reference:   []string{"https://modelcontextprotocol.io/specification/2025-11-25/server/tools"},
 		},
 		Metadata: map[string]any{"snapshot_count": len(fetches), "definition_changes": definitionChanges, "availability_changes": availabilityChanges, "client_approval_observed": false, "rug_pull_confirmed": false},
-	}}, nil
+	})}, nil
 }
 
 // fingerprint canonicalises a tool's mutable surface: its description and raw

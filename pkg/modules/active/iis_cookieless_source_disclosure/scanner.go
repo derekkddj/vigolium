@@ -5,9 +5,11 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	proof "github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/iisgate"
+	"github.com/vigolium/vigolium/pkg/modules/infra"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/utils"
@@ -68,7 +70,8 @@ func (m *Module) ScanPerHost(
 
 	// Gate: passive detection AND active behavioral confirmation (a spoofed
 	// Server header alone never passes). Cached per host across IIS modules.
-	if !iisgate.IsIIS(ctx, scanCtx, host, httpClient) {
+	gateEvidence := modkit.NewEvidenceCollector()
+	if !iisgate.IsIISWithEvidence(ctx, scanCtx, host, httpClient, gateEvidence) {
 		return nil, nil
 	}
 
@@ -89,6 +92,7 @@ func (m *Module) ScanPerHost(
 			break
 		}
 		if r := m.probeTarget(ctx, httpClient, &budget, baseURL, t); r != nil {
+			modkit.AppendEvidence(r, gateEvidence)
 			results = append(results, r)
 		}
 	}
@@ -103,14 +107,19 @@ func (m *Module) probeTarget(
 	budget *int,
 	baseURL string,
 	t target,
-) *output.ResultEvent {
+) (result *output.ResultEvent) {
+	context := modkit.NewEvidenceCollector()
+	context.AddBaseline("Observed input", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
+	defer func() { modkit.AppendEvidence(result, context) }()
+	var direct *proof.Exchange
 	// Round 0: direct request. If the file is already served, that is itself a
 	// disclosure (no bypass needed).
-	if body, ok := m.get(ctx, httpClient, budget, "/"+t.rel); ok {
+	if body, ok := m.get(ctx, httpClient, budget, "/"+t.rel, &direct); ok {
 		if confirmed, ev := confirmArtifact(t.kind, body); confirmed && !modkit.ResemblesObservedPage(ctx, body) {
-			return buildFinding(baseURL, t, "/"+t.rel, "direct request (no bypass required)", ev, body)
+			return buildFinding(baseURL, t, "/"+t.rel, "direct request (no bypass required)", ev, body, direct)
 		}
 	}
+	context.AddExchange(direct, proof.RoleControl, "Direct protected-file request")
 
 	for shape := 0; shape < numVectorShapes; shape++ {
 		if *budget >= maxRequestsPerHost {
@@ -123,7 +132,8 @@ func (m *Module) probeTarget(
 		}
 
 		// Round 1: bypass attempt must return the real artifact.
-		body, ok := m.get(ctx, httpClient, budget, path)
+		var attack, decoy, confirmation *proof.Exchange
+		body, ok := m.get(ctx, httpClient, budget, path, &attack)
 		if !ok {
 			continue
 		}
@@ -137,7 +147,7 @@ func (m *Module) probeTarget(
 		// echoes config for any path).
 		decoyRel := "vigolium-" + strings.ToLower(utils.RandomString(10)) + extOfRel(t.rel)
 		if decoyPath, dok := buildVector(decoyRel, shape, token); dok {
-			if decoyBody, dok2 := m.get(ctx, httpClient, budget, decoyPath); dok2 {
+			if decoyBody, dok2 := m.get(ctx, httpClient, budget, decoyPath, &decoy); dok2 {
 				if dConfirmed, _ := confirmArtifact(t.kind, decoyBody); dConfirmed {
 					return nil // catch-all: abandon this target entirely
 				}
@@ -145,7 +155,7 @@ func (m *Module) probeTarget(
 		}
 
 		// Round 3: re-confirm determinism.
-		again, ok := m.get(ctx, httpClient, budget, path)
+		again, ok := m.get(ctx, httpClient, budget, path, &confirmation)
 		if !ok {
 			continue
 		}
@@ -153,7 +163,9 @@ func (m *Module) probeTarget(
 			continue
 		}
 
-		return buildFinding(baseURL, t, path, fmt.Sprintf("cookieless (S(X)) bypass shape #%d", shape), ev, body)
+		context.AddExchange(decoy, proof.RoleControl, "Same-shape nonexistent file")
+		context.AddExchange(confirmation, proof.RoleConfirmation, "Bypass reproduction")
+		return buildFinding(baseURL, t, path, fmt.Sprintf("cookieless (S(X)) bypass shape #%d", shape), ev, body, attack)
 	}
 
 	return nil
@@ -167,6 +179,7 @@ func (m *Module) get(
 	httpClient *http.Requester,
 	budget *int,
 	path string,
+	receiptOut ...**proof.Exchange,
 ) (string, bool) {
 	*budget++
 
@@ -179,7 +192,10 @@ func (m *Module) get(
 		return "", false
 	}
 
-	_, body, ok := modkit.ExecuteRaw(httpClient, ctx.Service(), raw, http.Options{NoRedirects: true, NoClustering: true})
+	_, body, _, receipt, ok := infra.ExecuteRawCapture(httpClient, ctx.Service(), raw, http.Options{NoRedirects: true, NoClustering: true})
+	if len(receiptOut) > 0 && receiptOut[0] != nil {
+		*receiptOut[0] = receipt
+	}
 	if !ok {
 		return "", false
 	}
@@ -190,7 +206,12 @@ func (m *Module) get(
 }
 
 // buildFinding assembles a High-severity disclosure finding.
-func buildFinding(baseURL string, t target, path, method string, evidence []string, body string) *output.ResultEvent {
+func buildFinding(baseURL string, t target, path, method string, evidence []string, body string, receipt ...*proof.Exchange) (result *output.ResultEvent) {
+	defer func() {
+		if len(receipt) > 0 {
+			modkit.SetPrimaryEvidence(result, receipt[0], proof.RoleAttack, "Protected artifact response")
+		}
+	}()
 	fullURL := baseURL + path
 	snippet := body
 	if len(snippet) > 400 {

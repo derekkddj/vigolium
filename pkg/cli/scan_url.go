@@ -779,33 +779,6 @@ func executeDirectScan(ctx context.Context, sess *directScanSession, rr *httpmsg
 		return nil, err
 	}
 
-	// Set up HTTP stack
-	var sendScope services.SendScope
-	if m := sess.admission.scopeMatcher(); m != nil {
-		sendScope = m
-	}
-	stack, err := setupScanHTTPStack(sess.budget, sendScope)
-	if err != nil {
-		return nil, err
-	}
-	defer stack.Close()
-	httpRequester, svc := stack.Requester, stack.Services
-	defer sess.installProbeDefaults()()
-	// One local host (a development server): paced from the first request.
-	if svc.HostLimiter.PreArmLocalTarget([]string{target}) != "" && !globalSilent && !globalJSON {
-		fmt.Fprintf(os.Stderr, "  %s %s\n", terminal.InfoSymbol(),
-			terminal.Gray("local target: per-host concurrency starts low and ramps up on clean answers (--no-waf-pacing turns this off)"))
-	}
-
-	// Warn once per host when the edge WAF/CDN starts filtering scan traffic.
-	// The Runner-backed path wires this in RunNativeScan; this direct path builds
-	// its own requester, so it needs the same hook to not silently miss it.
-	if !globalSilent {
-		httpRequester.SetBlockNotifier(func(n http.BlockNotice) {
-			fmt.Fprint(os.Stderr, runner.FormatBlockNoticeLine(n))
-		})
-	}
-
 	// Get modules
 	active, passive := getFilteredModules(resolvedModules, scanURLNoPassive)
 	// A broad selection withholds risk:high modules below the opt-in, as the
@@ -845,7 +818,36 @@ func executeDirectScan(ctx context.Context, sess *directScanSession, rr *httpmsg
 		// handle is process-cached and later inputs of the batch reuse it.
 		sess.noteStore()
 	}
-	sess.begin(ctx, repo, scanProjectUUID, scanUUID, target, method, len(active), len(passive))
+	if err := sess.begin(ctx, repo, scanProjectUUID, scanUUID, target, method, len(active), len(passive)); err != nil {
+		return nil, err
+	}
+
+	// Build the HTTP stack only after the store and scan identity are valid.
+	var sendScope services.SendScope
+	if m := sess.admission.scopeMatcher(); m != nil {
+		sendScope = m
+	}
+	stack, err := setupScanHTTPStack(sess.budget, sendScope)
+	if err != nil {
+		return nil, err
+	}
+	defer stack.Close()
+	httpRequester, svc := stack.Requester, stack.Services
+	defer sess.installProbeDefaults()()
+	// One local host (a development server): paced from the first request.
+	if svc.HostLimiter.PreArmLocalTarget([]string{target}) != "" && !globalSilent && !globalJSON {
+		fmt.Fprintf(os.Stderr, "  %s %s\n", terminal.InfoSymbol(),
+			terminal.Gray("local target: per-host concurrency starts low and ramps up on clean answers (--no-waf-pacing turns this off)"))
+	}
+
+	// Warn once per host when the edge WAF/CDN starts filtering scan traffic.
+	// The Runner-backed path wires this in RunNativeScan; this direct path builds
+	// its own requester, so it needs the same hook to not silently miss it.
+	if !globalSilent {
+		httpRequester.SetBlockNotifier(func(n http.BlockNotice) {
+			fmt.Fprint(os.Stderr, runner.FormatBlockNoticeLine(n))
+		})
+	}
 
 	// Create source
 	src := source.NewSingleSource(rr, resolvedModules)
@@ -989,7 +991,9 @@ func executeDirectScan(ctx context.Context, sess *directScanSession, rr *httpmsg
 	mu.Lock()
 	findingCount := len(findings)
 	mu.Unlock()
-	sess.end(ctx, repo, scanUUID, target, executor, interrupted, execErr, findingCount)
+	if finalizeErr := sess.end(ctx, repo, scanUUID, target, executor, interrupted, execErr, findingCount); finalizeErr != nil {
+		execErr = errors.Join(execErr, finalizeErr)
+	}
 
 	duration := time.Since(startTime)
 

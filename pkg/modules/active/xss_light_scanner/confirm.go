@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -73,6 +74,7 @@ type confirmOutcome struct {
 	bodySnippet      string              // window of the response body around the surviving signature
 	proof            *output.ProofRecipe // the surviving breakout as a recipe; nil when it cannot be one
 
+	receipt   *evidence.Exchange           // HTTP executable-candidate receipt, not browser traffic
 	fuzzedReq *httpmsg.HttpRequestResponse // parsed request, reused for browser confirm
 }
 
@@ -343,6 +345,7 @@ func sendExec(
 		status = r.StatusCode
 	}
 	body := resp.Body().String()
+	out.receipt = http.CaptureEvidence(resp)
 	resp.Close()
 
 	// Skip only 3xx redirects — 4xx/5xx pages ARE rendered and their scripts run
@@ -493,8 +496,12 @@ func gradeConfirmedEvent(base *output.ResultEvent, outcome confirmOutcome) *outp
 		return nil
 	}
 
-	base.Request = outcome.request
 	base.Proof = outcome.proof
+	// The selected receipt is the HTTP executable candidate, not the browser
+	// navigation. ProbeResult currently supplies dialogs but no HTTP receipt.
+	if !modkit.SetPrimaryEvidence(base, outcome.receipt, evidence.RoleConfirmation, "executable payload HTTP response") {
+		base.Request = outcome.request
+	}
 
 	evidenceLabel := "reflection-only payload"
 	if outcome.browserConfirmed {
@@ -519,7 +526,11 @@ func gradeConfirmedEvent(base *output.ResultEvent, outcome confirmOutcome) *outp
 		base.Info.Description += note
 	}
 
-	if ev := output.BuildEvidence(evidenceLabel, outcome.request, outcome.bodySnippet); ev != "" {
+	if outcome.receipt != nil {
+		ev := modkit.NewEvidenceCollector()
+		ev.AddExchange(outcome.receipt, evidence.RoleConfirmation, "executable payload HTTP response")
+		base.AdditionalEvidence = append(base.AdditionalEvidence, ev.Entries()...)
+	} else if ev := output.BuildEvidence(evidenceLabel, outcome.request, outcome.bodySnippet); ev != "" {
 		base.AdditionalEvidence = append(base.AdditionalEvidence, ev)
 	}
 	return base

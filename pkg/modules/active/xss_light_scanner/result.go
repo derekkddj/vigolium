@@ -1,6 +1,10 @@
 package xss_light_scanner
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/vigolium/vigolium/pkg/evidence"
+)
 
 // XSSScanResult contains the results of an XSS scan
 type XSSScanResult struct {
@@ -8,11 +12,13 @@ type XSSScanResult struct {
 	UsedPrefix          string            // Which bypass prefix worked (if any)
 
 	// Payload and response tracking
-	PrimaryPayload    *CanaryPayload // Primary payload used
-	SecondaryPayload  *CanaryPayload // Secondary payload used (if any)
-	PrimaryResponse   []byte         // Response from primary payload
-	SecondaryResponse []byte         // Response from secondary payload (if any)
-	InsertionPoint    string         // Description of insertion point
+	PrimaryPayload    *CanaryPayload     // Primary payload used
+	SecondaryPayload  *CanaryPayload     // Secondary payload used (if any)
+	PrimaryResponse   []byte             // Response from primary payload
+	SecondaryResponse []byte             // Response from secondary payload (if any)
+	InsertionPoint    string             // Description of insertion point
+	PrimaryReceipt    *evidence.Exchange // Actual phase-1 send, including encoding/redirects
+	SecondaryReceipt  *evidence.Exchange // Actual phase-2 send, when it established exploitability
 }
 
 // NewXSSScanResult creates a new scan result

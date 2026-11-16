@@ -79,6 +79,24 @@ func TestGenerateQuickCheckPerRequest(t *testing.T) {
 	}
 }
 
+func TestGeneratedQuickChecksExplicitlySelectReceipts(t *testing.T) {
+	for _, scan := range []string{"per_request", "per_host", "per_insertion_point"} {
+		qc := agenttypes.QuickCheck{ID: "receipt", Scan: scan, Payloads: []string{"attack"},
+			Requests: []agenttypes.QuickCheckRequest{{Method: "POST", Path: "/probe", Body: "attack"}},
+			Match:    agenttypes.QuickCheckMatch{Status: 200}}
+		code := GenerateQuickCheckExtensions([]agenttypes.QuickCheck{qc})[0].Code
+		if !strings.Contains(code, "exchange: resp.exchange") || !strings.Contains(code, "primary: true") {
+			t.Errorf("%s does not select its receipt: %s", scan, code)
+		}
+		if !strings.Contains(code, "request: resp.request") || strings.Contains(code, `request: opts.method + " " + opts.url`) {
+			t.Errorf("%s fabricated request proof", scan)
+		}
+		if scan == "per_insertion_point" && (!strings.Contains(code, "payload: payloads[i]") || !strings.Contains(code, `role: "attack"`)) {
+			t.Errorf("missing insertion-point payload/attack role")
+		}
+	}
+}
+
 func TestGenerateQuickCheckPerHost(t *testing.T) {
 	qc := agenttypes.QuickCheck{
 		ID:   "actuator-check",

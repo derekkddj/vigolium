@@ -45,7 +45,7 @@ func probeHeaders(
 			if confirmChange(ctx, httpClient, baseline, raw, change) {
 				results = append(results, buildProbeResult(
 					urlStr, raw, resp.FullResponseString(),
-					header, "header", value, change,
+					header, "header", value, change, http.CaptureEvidence(resp),
 				))
 			}
 			resp.Close()
@@ -74,7 +74,7 @@ func probeHeaders(
 		if confirmChange(ctx, httpClient, baseline, raw, change) {
 			results = append(results, buildProbeResult(
 				urlStr, raw, resp.FullResponseString(),
-				name, "weird_header", "127.0.0.1", change,
+				name, "weird_header", "127.0.0.1", change, http.CaptureEvidence(resp),
 			))
 		}
 		resp.Close()

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -139,16 +140,25 @@ func (m *Module) ScanPerRequest(
 	// profile. Whatever candidate it produces is the site's generic page for an
 	// unknown user; any real probe matching it is reading that same page, not a
 	// leak.
-	baseline := m.probeUserPath(anonymousCtx, anonymousClient, fmt.Sprintf("/user/%d", baselineProbeUID), strconv.Itoa(baselineProbeUID))
+	var baselineExchange, first *evidence.Exchange
+	ev := modkit.NewEvidenceCollector()
+	baseline := m.probeUserPath(anonymousCtx, anonymousClient, fmt.Sprintf("/user/%d", baselineProbeUID), strconv.Itoa(baselineProbeUID), &baselineExchange)
+	ev.AddExchange(baselineExchange, evidence.RoleControl, "nonexistent user")
 
 	var rawMatches []string
 	seen := map[string]bool{}
 	var usernames []string
 	for i := 1; i <= 5; i++ {
 		path := fmt.Sprintf("/user/%d", i)
-		username := m.probeUserPath(anonymousCtx, anonymousClient, path, strconv.Itoa(i))
+		var exchange *evidence.Exchange
+		username := m.probeUserPath(anonymousCtx, anonymousClient, path, strconv.Itoa(i), &exchange)
 		if username == "" || username == baseline {
 			continue
+		}
+		if first == nil {
+			first = exchange
+		} else {
+			ev.AddExchange(exchange, evidence.RoleObservation, "additional profile")
 		}
 		rawMatches = append(rawMatches, username)
 		if !seen[username] {
@@ -167,13 +177,15 @@ func (m *Module) ScanPerRequest(
 
 	if len(usernames) > 0 {
 		urlx, _ := anonymousCtx.URL()
-		results = append(results, &output.ResultEvent{
-			ModuleID:         ModuleID,
-			RecordKind:       output.RecordKindObservation,
-			EvidenceGrade:    output.EvidenceGradeObservation,
-			URL:              urlx.Scheme + "://" + urlx.Host + "/user/1",
-			Matched:          urlx.Scheme + "://" + urlx.Host + "/user/1",
-			ExtractedResults: usernames,
+		result := &output.ResultEvent{
+			ModuleID:           ModuleID,
+			RecordKind:         output.RecordKindObservation,
+			EvidenceGrade:      output.EvidenceGradeObservation,
+			URL:                urlx.Scheme + "://" + urlx.Host + "/user/1",
+			Matched:            urlx.Scheme + "://" + urlx.Host + "/user/1",
+			ExtractedResults:   usernames,
+			Evidence:           ev.Evidence(),
+			AdditionalEvidence: ev.Entries(),
 			Info: output.Info{
 				Name:        "Drupal Public Profile Names Observed",
 				Description: fmt.Sprintf("Observed %d distinct Drupal profile name(s) through public numeric profile routes: %s. Public profiles are normal site behavior; no login-name mapping or authentication weakness was proven.", len(usernames), strings.Join(usernames, ", ")),
@@ -188,7 +200,9 @@ func (m *Module) ScanPerRequest(
 				"credential_free":          true,
 				"login_identity_confirmed": false,
 			},
-		})
+		}
+		modkit.SetPrimaryEvidence(result, first, evidence.RoleObservation, "selected observation")
+		results = append(results, result)
 	}
 
 	// Vector 2: JSON:API user listing
@@ -207,7 +221,7 @@ func (m *Module) ScanPerRequest(
 // is not a generic error/auth title. uid is the numeric id requested in path; a
 // redirect whose captured segment is just that id echoed back (bare or with an
 // appended extension/selectors) is self-canonicalisation, not a leaked username.
-func (m *Module) probeUserPath(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, path, uid string) string {
+func (m *Module) probeUserPath(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, path, uid string, receipts ...**evidence.Exchange) string {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return ""
@@ -247,6 +261,9 @@ func (m *Module) probeUserPath(ctx *httpmsg.HttpRequestResponse, httpClient *htt
 			// appended extension/selectors like AEM's /user/1 -> /user/1.html),
 			// Drupal's own auth routes, and any error/status-shaped segment.
 			if !isNumeric(username) && !isUIDEcho(username, uid) && !isReservedUserRoute(username) && looksLikeUsername(username) {
+				if len(receipts) > 0 {
+					*receipts[0] = http.CaptureEvidence(resp)
+				}
 				return username
 			}
 		}
@@ -263,6 +280,9 @@ func (m *Module) probeUserPath(ctx *httpmsg.HttpRequestResponse, httpClient *htt
 		}
 		candidate := extractTitleUsername(body)
 		if candidate != "" && !isNumeric(candidate) && looksLikeUsername(candidate) {
+			if len(receipts) > 0 {
+				*receipts[0] = http.CaptureEvidence(resp)
+			}
 			return candidate
 		}
 	}
@@ -309,7 +329,7 @@ func (m *Module) probeJsonAPI(ctx *httpmsg.HttpRequestResponse, httpClient *http
 	}
 
 	urlx, _ := ctx.URL()
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		ModuleID:         ModuleID,
 		RecordKind:       output.RecordKindObservation,
 		EvidenceGrade:    output.EvidenceGradeObservation,
@@ -333,6 +353,8 @@ func (m *Module) probeJsonAPI(ctx *httpmsg.HttpRequestResponse, httpClient *http
 			"private_accounts_proven": false,
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+	return result
 }
 
 func parseDrupalJSONAPIUsers(body string) (int, []string, bool) {

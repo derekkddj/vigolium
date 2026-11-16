@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
+	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/modules/shared/diffscan"
 )
 
@@ -108,10 +110,16 @@ func extractAttackPairs(attacks []*diffscan.Attack) []attackPair {
 		}
 
 		if breakAttack.FirstSnapshot != nil {
+			if breakAttack.FirstSnapshot.Payload != "" {
+				pair.BreakPayload = breakAttack.FirstSnapshot.Payload
+			}
 			pair.BreakStatus = breakAttack.FirstSnapshot.StatusCode
 			pair.BreakLength = breakAttack.FirstSnapshot.ContentLength
 		}
 		if escapeAttack.FirstSnapshot != nil {
+			if escapeAttack.FirstSnapshot.Payload != "" {
+				pair.EscapePayload = escapeAttack.FirstSnapshot.Payload
+			}
 			pair.EscapeStatus = escapeAttack.FirstSnapshot.StatusCode
 			pair.EscapeLength = escapeAttack.FirstSnapshot.ContentLength
 		}
@@ -142,6 +150,73 @@ func diffSignal(breakAttack, escapeAttack *diffscan.Attack) string {
 	}
 	sort.Strings(names)
 	return strings.Join(names, ", ")
+}
+
+// selectAttackEvidence keeps bounded, whole reported break/control pairs and
+// their final confirmations, not intermediate scan traffic. A caller may reserve
+// supporting slots for its deciding guards. The first selected break stays the
+// primary; the baseline is reserved but can never stand in for a missing control.
+func selectAttackEvidence(attacks []*diffscan.Attack, baseline *diffscan.Attack, budgets ...int) []evidence.Entry {
+	budget := modkit.MaxEvidencePairs
+	if len(budgets) > 0 {
+		budget = max(0, min(budget, budgets[0]))
+	}
+	var baselineEntry []evidence.Entry
+	if baseline != nil && baseline.FirstSnapshot != nil && baseline.FirstSnapshot.Exchange != nil && budget > 0 {
+		baselineEntry = append(baselineEntry, evidence.Select(baseline.FirstSnapshot.Exchange, evidence.RoleBaseline, false, "soft baseline"))
+		budget--
+	}
+	var entries []evidence.Entry
+	primarySelected := false
+	contextCount := 0
+	for i := 0; i+1 < len(attacks); i += 2 {
+		attack, control := attacks[i], attacks[i+1]
+		if attack == nil || control == nil {
+			continue
+		}
+		if attack.FirstSnapshot != nil && attack.FirstSnapshot.WafBlocked() {
+			continue
+		}
+		if control.FirstSnapshot != nil && control.FirstSnapshot.WafBlocked() {
+			continue
+		}
+		// Sparse earlier pairs must not consume the slots needed by the same
+		// first available break that the producer selected before bounding.
+		if !primarySelected && (attack.FirstSnapshot == nil || attack.FirstSnapshot.Exchange == nil) {
+			continue
+		}
+		name := "probe"
+		if attack.Probe != nil {
+			name = attack.Probe.Name
+		}
+		var pair []evidence.Entry
+		pairHasPrimary := false
+		for index, probe := range []*diffscan.Attack{attack, control} {
+			role, label := evidence.RoleAttack, name+" break"
+			if index == 1 {
+				role, label = evidence.RoleControl, name+" escape"
+			}
+			if first := probe.FirstSnapshot; first != nil && first.Exchange != nil {
+				primary := index == 0 && !primarySelected
+				pair = append(pair, evidence.Select(first.Exchange, role, primary, label))
+				pairHasPrimary = pairHasPrimary || primary
+			}
+			if last := probe.LastSnapshot; last != nil && last.Exchange != nil && last != probe.FirstSnapshot {
+				pair = append(pair, evidence.Select(last.Exchange, evidence.RoleConfirmation, false, label+" final confirmation"))
+			}
+		}
+		pairContext := len(pair)
+		if pairHasPrimary {
+			pairContext--
+		}
+		if contextCount+pairContext > budget {
+			continue
+		}
+		entries = append(entries, pair...)
+		contextCount += pairContext
+		primarySelected = primarySelected || pairHasPrimary
+	}
+	return append(entries, baselineEntry...)
 }
 
 // groupByProbeName groups attack pairs by probe name.

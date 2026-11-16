@@ -3,10 +3,12 @@ package database
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/output"
 	"go.uber.org/zap"
 )
@@ -14,8 +16,15 @@ import (
 // FindingWriterConfig configures the batching behavior of FindingWriter.
 type FindingWriterConfig struct {
 	// BufferSize is the channel capacity. When full, Save persists inline rather
-	// than blocking the scan worker. Default: 1024.
+	// than waiting for count-buffer room; byte admission can still wait. Default: 1024.
 	BufferSize int
+
+	// MaxPendingBytes bounds estimated retained snapshot bytes across the queue,
+	// current flush and all concurrent inline writes. Save waits cancellably for
+	// this budget BEFORE cloning evidence, even when the count buffer is full.
+	// An individual finding larger than the budget returns an admission error.
+	// Non-positive values use the default: 64 MiB.
+	MaxPendingBytes int64
 
 	// BatchSize is the maximum number of findings coalesced into one transaction.
 	// Default: 64.
@@ -51,6 +60,9 @@ func (c *FindingWriterConfig) withDefaults() FindingWriterConfig {
 	if out.BufferSize <= 0 {
 		out.BufferSize = 1024
 	}
+	if out.MaxPendingBytes <= 0 {
+		out.MaxPendingBytes = 64 << 20
+	}
 	if out.BatchSize <= 0 {
 		out.BatchSize = 64
 	}
@@ -68,10 +80,11 @@ func (c *FindingWriterConfig) withDefaults() FindingWriterConfig {
 
 // findingWrite is a single queued finding.
 type findingWrite struct {
-	event       *output.ResultEvent
-	recordUUIDs []string
-	scanUUID    string
-	projectUUID string
+	event        *output.ResultEvent
+	recordUUIDs  []string
+	scanUUID     string
+	projectUUID  string
+	pendingBytes int64 // byte lease transfers with the snapshot until persistence finishes
 }
 
 // FindingWriterMetrics exposes counters for monitoring.
@@ -81,11 +94,14 @@ type findingWrite struct {
 // on any batch error, so one unconvertible finding reported the whole batch as
 // dropped and Written+Errors could exceed Enqueued.
 type FindingWriterMetrics struct {
-	Enqueued     int64 // findings handed to the background writer
-	Written      int64 // findings the background writer persisted (or deduped onto an existing row)
-	Inline       int64 // findings persisted synchronously (buffer full / shutting down)
-	InlineFailed int64 // inline saves that returned an error
-	Errors       int64 // findings that individually failed to persist in a flush
+	Enqueued         int64 // findings handed to the background writer
+	Written          int64 // findings the background writer persisted (or deduped onto an existing row)
+	Inline           int64 // accepted synchronous persistence attempts (buffer full / shutting down)
+	InlineFailed     int64 // inline saves that returned an error
+	Errors           int64 // findings that individually failed to persist in a flush
+	AdmissionFailed  int64 // rejected before acceptance (invalid, oversize, cancellation or shutdown while waiting)
+	PendingBytes     int64 // estimated retained bytes leased by queued, flushing and inline findings
+	PeakPendingBytes int64 // maximum PendingBytes observed; never exceeds MaxPendingBytes
 }
 
 // FindingWriter decouples finding persistence from scan workers. SaveFinding is
@@ -98,7 +114,8 @@ type FindingWriterMetrics struct {
 // keeps up while also eliminating write contention between concurrent finding
 // transactions. This mirrors RecordWriter's lifecycle (buffered channel,
 // background flush, bounded shutdown drain) but is fire-and-forget: the result
-// UUID is never needed by the caller, so Save does not block on persistence.
+// UUID is never needed by the caller, so an enqueued Save does not wait for its
+// persistence. Byte admission and the inline fallback can still block Save.
 type FindingWriter struct {
 	repo *Repository
 	cfg  FindingWriterConfig
@@ -108,6 +125,14 @@ type FindingWriter struct {
 	// guarantee no send is in flight when it stops accepting new findings.
 	mu     sync.RWMutex
 	closed bool
+
+	// Byte admission has its own short-held lock. A waiter must NEVER hold mu:
+	// Shutdown needs mu to stop channel sends before waking the drain. Closing
+	// bytesChanged broadcasts a release without parking a releasing goroutine.
+	bytesMu          sync.Mutex
+	bytesChanged     chan struct{}
+	pendingBytes     int64
+	peakPendingBytes int64
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -127,11 +152,13 @@ type FindingWriter struct {
 	// Called from the writer goroutine (or the inline saver).
 	onInserted atomic.Pointer[func(*output.ResultEvent)]
 
-	enqueued     atomic.Int64
-	written      atomic.Int64
-	inline       atomic.Int64
-	inlineFailed atomic.Int64
-	errors       atomic.Int64
+	enqueued        atomic.Int64
+	written         atomic.Int64
+	inline          atomic.Int64
+	inlineWritten   atomic.Int64 // completed inline saves; in-flight attempts remain Unknown
+	inlineFailed    atomic.Int64
+	errors          atomic.Int64
+	admissionFailed atomic.Int64
 }
 
 // NewFindingWriter creates and starts a FindingWriter. Call Close() to flush
@@ -141,11 +168,12 @@ func NewFindingWriter(repo *Repository, cfg FindingWriterConfig) *FindingWriter 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	w := &FindingWriter{
-		repo:   repo,
-		cfg:    cfg,
-		ch:     make(chan findingWrite, cfg.BufferSize),
-		ctx:    ctx,
-		cancel: cancel,
+		repo:         repo,
+		cfg:          cfg,
+		ch:           make(chan findingWrite, cfg.BufferSize),
+		ctx:          ctx,
+		cancel:       cancel,
+		bytesChanged: make(chan struct{}),
 	}
 	if w.saveBatch = cfg.saveBatch; w.saveBatch == nil {
 		w.saveBatch = func(ctx context.Context, writes []FindingWrite) []FindingSaveResult {
@@ -159,14 +187,43 @@ func NewFindingWriter(repo *Repository, cfg FindingWriterConfig) *FindingWriter 
 	return w
 }
 
-// Save enqueues a finding for batched persistence. It does not block on the
-// database: if the buffer is full or the writer is shutting down, the finding is
-// persisted synchronously so nothing is dropped. Safe for concurrent callers.
+// Save enqueues a finding for batched persistence. Byte admission may wait until
+// ctx is cancelled or retained snapshots are released. Once admitted, a full
+// count buffer (or closed writer) still persists inline; an enqueued finding is
+// still fire-and-forget. A rejected admission is NOT accepted or persisted and
+// returns an error to the caller. Safe for concurrent callers; the producer must
+// not mutate the input until Save returns (as with the snapshot contract).
 func (w *FindingWriter) Save(ctx context.Context, event *output.ResultEvent, recordUUIDs []string, scanUUID, projectUUID string) error {
 	if event == nil {
+		w.admissionFailed.Add(1)
 		return fmt.Errorf("invalid ResultEvent")
 	}
-	fw := findingWrite{event: event, recordUUIDs: recordUUIDs, scanUUID: scanUUID, projectUUID: projectUUID}
+	if err := ctx.Err(); err != nil {
+		w.admissionFailed.Add(1)
+		return err
+	}
+	pendingBytes := estimateFindingBytes(event, recordUUIDs, scanUUID, projectUUID)
+	if err := w.acquireBytes(ctx, pendingBytes); err != nil {
+		w.admissionFailed.Add(1)
+		return err
+	}
+
+	// Reserve BEFORE any owned allocation, especially evidence.CloneEntries.
+	// The caller keeps the lease for cloning and inline persistence; only a
+	// successful channel send transfers it to the background writer.
+	transferred := false
+	var fw findingWrite
+	defer func() {
+		if !transferred {
+			fw = findingWrite{}
+			event = nil
+			recordUUIDs = nil
+			w.releaseBytes(pendingBytes)
+		}
+	}()
+	event = snapshotFindingEvent(event)
+	recordUUIDs = append([]string(nil), recordUUIDs...)
+	fw = findingWrite{event: event, recordUUIDs: recordUUIDs, scanUUID: scanUUID, projectUUID: projectUUID, pendingBytes: pendingBytes}
 
 	w.mu.RLock()
 	if w.closed {
@@ -177,15 +234,197 @@ func (w *FindingWriter) Save(ctx context.Context, event *output.ResultEvent, rec
 	// lock before cancelling) can never race a send against the drain shutdown.
 	select {
 	case w.ch <- fw:
-		w.mu.RUnlock()
+		transferred = true
+		fw = findingWrite{}
+		event = nil
+		recordUUIDs = nil
 		w.enqueued.Add(1)
+		w.mu.RUnlock()
 		return nil
 	default:
 		w.mu.RUnlock()
-		// Buffer full — persist inline rather than blocking the worker or
-		// dropping the finding. Rare for low-volume findings.
 		return w.saveInline(ctx, event, recordUUIDs, scanUUID, projectUUID)
 	}
+}
+
+// snapshotFindingEvent preserves the producer ownership contract. Metadata is
+// deliberately not marshalled/unmarshalled: typed values keep their identity and
+// the same shallow-copy contract as before byte admission was added.
+func snapshotFindingEvent(event *output.ResultEvent) *output.ResultEvent {
+	snapshot := *event
+	snapshot.Info.Tags = append([]string(nil), event.Info.Tags...)
+	snapshot.ExtractedResults = append([]string(nil), event.ExtractedResults...)
+	snapshot.AdditionalEvidence = append([]string(nil), event.AdditionalEvidence...)
+	snapshot.Evidence = evidence.CloneEntries(event.Evidence)
+	if event.Metadata != nil {
+		snapshot.Metadata = make(map[string]interface{}, len(event.Metadata))
+		for key, value := range event.Metadata {
+			if values, ok := value.([]string); ok {
+				value = append([]string(nil), values...)
+			}
+			if values, ok := value.([]interface{}); ok {
+				value = append([]interface{}(nil), values...)
+			}
+			snapshot.Metadata[key] = value
+		}
+	}
+	return &snapshot
+}
+
+// acquireBytes does not hold the channel lifecycle lock while waiting. Shutdown
+// interrupts a blocked admission explicitly, without pretending it was accepted.
+// Saves starting after Close can still acquire available bytes and persist inline,
+// but cannot bypass the budget if an earlier write remains wedged.
+func (w *FindingWriter) acquireBytes(ctx context.Context, size int64) error {
+	if size == maxFindingBytes {
+		return fmt.Errorf("finding byte admission: retained size saturated; finding cannot fit MaxPendingBytes %d", w.cfg.MaxPendingBytes)
+	}
+	if size > w.cfg.MaxPendingBytes {
+		return fmt.Errorf("finding byte admission: estimated %d bytes exceeds MaxPendingBytes %d", size, w.cfg.MaxPendingBytes)
+	}
+	waited := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if waited && w.ctx.Err() != nil {
+			return fmt.Errorf("finding byte admission: writer shut down while waiting for retained bytes")
+		}
+		w.bytesMu.Lock()
+		if err := ctx.Err(); err != nil {
+			w.bytesMu.Unlock()
+			return err
+		}
+		if size <= w.cfg.MaxPendingBytes-w.pendingBytes {
+			w.pendingBytes += size
+			if w.pendingBytes > w.peakPendingBytes {
+				w.peakPendingBytes = w.pendingBytes
+			}
+			w.bytesMu.Unlock()
+			return nil
+		}
+		changed := w.bytesChanged
+		w.bytesMu.Unlock()
+		waited = true
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-w.ctx.Done():
+			return fmt.Errorf("finding byte admission: writer shut down while waiting for retained bytes")
+		case <-changed:
+		}
+	}
+}
+
+func (w *FindingWriter) releaseBytes(size int64) {
+	if size == 0 {
+		return
+	}
+	w.bytesMu.Lock()
+	w.pendingBytes -= size
+	close(w.bytesChanged)
+	w.bytesChanged = make(chan struct{})
+	w.bytesMu.Unlock()
+}
+
+const maxFindingBytes int64 = 1<<63 - 1
+
+// estimateFindingBytes measures the graph retained by a snapshot without JSON
+// serialization (which would itself allocate another full copy of the evidence).
+// Count immutable strings too: although not cloned, the writer pins their data.
+// Reflection keeps typed metadata intact and covers future ResultEvent fields.
+// Shared values are deliberately counted more than once; slices use capacity,
+// plus padding for clone allocation rounding, and maps have a per-entry floor.
+// This is a conservative admission estimate, not an allocator/RSS measurement:
+// it cannot discover a substring's larger backing allocation or external state.
+func estimateFindingBytes(event *output.ResultEvent, recordUUIDs []string, scanUUID, projectUUID string) int64 {
+	size := findingRetainedBytes(reflect.ValueOf(event), 0)
+	size = addFindingBytes(size, findingRetainedBytes(reflect.ValueOf(recordUUIDs), 0))
+	size = addFindingBytes(size, int64(len(scanUUID)))
+	size = addFindingBytes(size, int64(len(projectUUID)))
+	// Queue slot, lease, batch and temporary FindingWrite headers, including
+	// allocation padding. Even an otherwise empty finding has a real byte cost.
+	return addFindingBytes(size, 512)
+}
+
+func addFindingBytes(a, b int64) int64 {
+	if a >= maxFindingBytes-b {
+		return maxFindingBytes
+	}
+	return a + b
+}
+
+func multiplyFindingBytes(a, b int64) int64 {
+	if a == 0 || b == 0 {
+		return 0
+	}
+	if a > maxFindingBytes/b {
+		return maxFindingBytes
+	}
+	return a * b
+}
+
+func findingRetainedBytes(value reflect.Value, depth int) int64 {
+	if !value.IsValid() {
+		return 0
+	}
+	// Cyclic or excessively deep metadata cannot be safely sized with bounded
+	// work. Saturation makes it an explicit oversize admission error, not a hang.
+	if depth >= 32 {
+		return maxFindingBytes
+	}
+	size := addFindingBytes(int64(value.Type().Size()), 32)
+	if value.Type() == reflect.TypeOf(time.Time{}) {
+		// Do not walk time.Location's private cache/recursive timezone graph.
+		return addFindingBytes(size, 256)
+	}
+	switch value.Kind() {
+	case reflect.String:
+		return addFindingBytes(size, int64(value.Len()))
+	case reflect.Interface, reflect.Pointer:
+		if !value.IsNil() {
+			size = addFindingBytes(size, findingRetainedBytes(value.Elem(), depth+1))
+		}
+	case reflect.Slice, reflect.Array:
+		capacity := value.Len()
+		if value.Kind() == reflect.Slice {
+			capacity = value.Cap()
+		}
+		elementSize := int64(value.Type().Elem().Size())
+		if elementSize == 0 {
+			elementSize = 16
+		}
+		// Twice capacity covers allocation size-class rounding of owned clones.
+		size = addFindingBytes(size, multiplyFindingBytes(int64(capacity), multiplyFindingBytes(elementSize, 2)))
+		kind := value.Type().Elem().Kind()
+		if kind != reflect.String && kind != reflect.Interface && kind != reflect.Pointer && kind != reflect.Slice && kind != reflect.Array && kind != reflect.Map && kind != reflect.Struct {
+			return size
+		}
+		for i := 0; i < value.Len() && size < maxFindingBytes; i++ {
+			size = addFindingBytes(size, findingRetainedBytes(value.Index(i), depth+1))
+		}
+	case reflect.Map:
+		// A one-byte key/value still needs bucket/control/header storage. This
+		// floor prevents many tiny metadata entries from evading backpressure.
+		size = addFindingBytes(size, 128)
+		size = addFindingBytes(size, multiplyFindingBytes(int64(value.Len()), 128))
+		entries := value.MapRange()
+		for size < maxFindingBytes && entries.Next() {
+			size = addFindingBytes(size, findingRetainedBytes(entries.Key(), depth+1))
+			size = addFindingBytes(size, findingRetainedBytes(entries.Value(), depth+1))
+		}
+	case reflect.Struct:
+		for i := 0; i < value.NumField() && size < maxFindingBytes; i++ {
+			size = addFindingBytes(size, findingRetainedBytes(value.Field(i), depth+1))
+		}
+	case reflect.Chan, reflect.Func, reflect.UnsafePointer:
+		if !value.IsNil() {
+			// Opaque objects can pin arbitrary data and cannot be inspected without
+			// changing producer state. JSON persistence cannot encode them either.
+			return maxFindingBytes
+		}
+	}
+	return size
 }
 
 // saveInline persists a finding synchronously and counts the attempt. The failure
@@ -194,11 +433,30 @@ func (w *FindingWriter) Save(ctx context.Context, event *output.ResultEvent, rec
 // though the finding is just as lost as one dropped by a flush.
 func (w *FindingWriter) saveInline(ctx context.Context, event *output.ResultEvent, recordUUIDs []string, scanUUID, projectUUID string) error {
 	w.inline.Add(1)
-	inserted, err := w.repo.SaveFindingInserted(ctx, event, recordUUIDs, scanUUID, projectUUID)
+	var (
+		inserted bool
+		err      error
+	)
+	if w.cfg.saveBatch != nil {
+		// The configured test seam also controls inline writes. Production keeps
+		// the existing single-finding repository path and its callbacks.
+		writes := []FindingWrite{{Event: event, HTTPRecordUUIDs: recordUUIDs, ScanUUID: scanUUID, ProjectUUID: projectUUID}}
+		defer clear(writes)
+		results := w.saveBatch(ctx, writes)
+		if len(results) == 0 {
+			err = fmt.Errorf("finding inline save returned no outcome")
+		} else {
+			err = results[0].Err
+			inserted = results[0].Inserted
+		}
+	} else {
+		inserted, err = w.repo.SaveFindingInserted(ctx, event, recordUUIDs, scanUUID, projectUUID)
+	}
 	if err != nil {
 		w.inlineFailed.Add(1)
 		return err
 	}
+	w.inlineWritten.Add(1)
 	if inserted {
 		w.notifyInserted(event)
 	}
@@ -226,22 +484,30 @@ func (w *FindingWriter) notifyInserted(event *output.ResultEvent) {
 
 // Metrics returns a snapshot of the writer's counters.
 func (w *FindingWriter) Metrics() FindingWriterMetrics {
+	w.bytesMu.Lock()
+	pending, peak := w.pendingBytes, w.peakPendingBytes
+	w.bytesMu.Unlock()
 	return FindingWriterMetrics{
-		Enqueued:     w.enqueued.Load(),
-		Written:      w.written.Load(),
-		Inline:       w.inline.Load(),
-		InlineFailed: w.inlineFailed.Load(),
-		Errors:       w.errors.Load(),
+		Enqueued:         w.enqueued.Load(),
+		Written:          w.written.Load(),
+		Inline:           w.inline.Load(),
+		InlineFailed:     w.inlineFailed.Load(),
+		Errors:           w.errors.Load(),
+		AdmissionFailed:  w.admissionFailed.Load(),
+		PendingBytes:     pending,
+		PeakPendingBytes: peak,
 	}
 }
 
 // Close stops accepting new findings, flushes the buffer, and returns. After
-// Close, Save persists synchronously. Prefer Shutdown when the caller can report
-// what happened; Close is the fire-and-forget form kept for existing call sites.
+// Close, admitted Saves persist synchronously (without bypassing the byte budget).
+// Prefer Shutdown when the caller can report what happened; Close is the
+// fire-and-forget form kept for existing call sites.
 func (w *FindingWriter) Close() { _ = w.Shutdown() }
 
-// Shutdown stops accepting new findings, drains the buffer, and reports what
-// became of everything it accepted.
+// Shutdown stops accepting new queued findings, drains the buffer, and reports
+// accepted writes and pre-acceptance rejections observed before the snapshot.
+// Saves after the once-only snapshot do not change the returned outcome.
 //
 // One absolute deadline (now+FlushTimeout) governs the whole shutdown and is
 // published before the drain is woken, so the drain's flushes and the wait for the
@@ -273,18 +539,23 @@ func (w *FindingWriter) Shutdown() PersistenceOutcome {
 		enqueued := w.enqueued.Load()
 		written := w.written.Load()
 		errCount := w.errors.Load()
-		inline := w.inline.Load()
+		inlineWritten := w.inlineWritten.Load()
 		inlineFailed := w.inlineFailed.Load()
+		// Read attempts AFTER completions so even concurrent inline saves cannot
+		// make known outcomes exceed Accepted. In-flight attempts are Unknown,
+		// not optimistically counted as committed just because Save started.
+		inline := w.inline.Load()
 
 		w.shutdown.outcome = PersistenceOutcome{
 			Writer:    PersistenceWriterFindings,
 			Accepted:  enqueued + inline,
-			Committed: written + inline - inlineFailed,
+			Committed: written + inlineWritten,
 			Failed:    errCount + inlineFailed,
-			// Whatever was enqueued and has neither been written nor failed was
-			// still queued or mid-flush when the deadline passed. It may yet land;
-			// calling it lost would be as wrong as calling it stored.
-			Unknown:  nonNegative(enqueued - written - errCount),
+			Rejected:  w.admissionFailed.Load(),
+			// Queued, mid-flush and in-flight inline writes may yet land; calling
+			// them lost would be as wrong as calling them stored. Rejected writes
+			// never entered Accepted and must not inflate Failed or Unknown.
+			Unknown:  nonNegative(enqueued - written - errCount + inline - inlineWritten - inlineFailed),
 			TimedOut: timedOut,
 		}
 
@@ -295,6 +566,7 @@ func (w *FindingWriter) Shutdown() PersistenceOutcome {
 		if o := w.shutdown.outcome; !o.Clean() {
 			zap.L().Warn("FindingWriter: some findings may not have been persisted",
 				zap.Int64("failed", o.Failed),
+				zap.Int64("rejected", o.Rejected),
 				zap.Int64("unknown", o.Unknown),
 				zap.Int64("committed", o.Committed),
 				zap.Int64("accepted", o.Accepted),
@@ -322,6 +594,7 @@ func (w *FindingWriter) flushLoop() {
 		select {
 		case fw := <-w.ch:
 			batch = append(batch, fw)
+			fw = findingWrite{}
 			if len(batch) >= w.cfg.BatchSize {
 				w.flushBounded(batch)
 				batch = resetFindingBatch(batch)
@@ -341,6 +614,7 @@ func (w *FindingWriter) flushLoop() {
 				select {
 				case fw := <-w.ch:
 					batch = append(batch, fw)
+					fw = findingWrite{}
 					if len(batch) >= w.cfg.BatchSize {
 						w.flush(drainCtx, batch)
 						batch = resetFindingBatch(batch)
@@ -386,6 +660,18 @@ func resetFindingBatch(batch []findingWrite) []findingWrite {
 // BatchSize per incident.
 func (w *FindingWriter) flush(ctx context.Context, batch []findingWrite) {
 	writes := make([]FindingWrite, len(batch))
+	// Both backing arrays must stop retaining snapshots BEFORE waking byte
+	// waiters. This runs on normal success, aligned per-item failure and panic;
+	// panic propagation and persistence outcome handling otherwise stay unchanged.
+	defer func() {
+		clear(writes)
+		var released int64
+		for i := range batch {
+			released += batch[i].pendingBytes
+			batch[i] = findingWrite{}
+		}
+		w.releaseBytes(released)
+	}()
 	for i, b := range batch {
 		writes[i] = FindingWrite{
 			Event:           b.event,

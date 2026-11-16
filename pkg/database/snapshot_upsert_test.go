@@ -7,7 +7,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 )
 
-func TestUpsertSnapshotRecordRefreshesChangedResponse(t *testing.T) {
+func TestUpsertSnapshotRecordVersionsChangedResponse(t *testing.T) {
 	db := newTestDB(t)
 	repo := NewRepository(db)
 	ctx := context.Background()
@@ -19,15 +19,24 @@ func TestUpsertSnapshotRecordRefreshesChangedResponse(t *testing.T) {
 	}
 	second := snapshotPair(t, 403, "changed")
 	uuid2, outcome, err := repo.UpsertSnapshotRecord(ctx, second, "burp-sitemap", "")
-	if err != nil || outcome != "updated" || uuid2 != uuid {
+	// Unreferenced rows are immutable too: a pending finding can link the first
+	// UUID after this call, so reference-check-then-update is never safe.
+	if err != nil || outcome != "inserted" || uuid2 == uuid {
 		t.Fatalf("second upsert uuid=%q outcome=%q err=%v", uuid2, outcome, err)
 	}
 	record, err := repo.GetRecordByUUID(ctx, uuid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.StatusCode != 403 || string(record.RawResponse) == "" {
-		t.Fatalf("record response was not refreshed: %+v", record)
+	if record.StatusCode != 200 || string(record.RawResponse) != string(first.Response().Raw()) {
+		t.Fatalf("original exchange was rewritten: %+v", record)
+	}
+	version, err := repo.GetRecordByUUID(ctx, uuid2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version.StatusCode != 403 || string(version.RawResponse) != string(second.Response().Raw()) {
+		t.Fatalf("new exchange was not stored exactly: %+v", version)
 	}
 	_, outcome, err = repo.UpsertSnapshotRecord(ctx, second, "burp-sitemap", "")
 	if err != nil || outcome != "unchanged" {

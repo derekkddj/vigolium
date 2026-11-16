@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -98,7 +99,7 @@ func (m *Module) ScanPerRequest(
 // fetches a random nonexistent .php path; if that ALSO returns a 200 with an
 // empty/whitespace body, the empty-200 signal is meaningless and wp-cron must
 // not be reported. Fails OPEN on an inconclusive transient error.
-func (m *Module) wpCronEmptyIsSpecific(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) bool {
+func (m *Module) wpCronEmptyIsSpecific(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, sinks ...*modkit.EvidenceCollector) bool {
 	randomPath := "/vigolium-wpcron-" + utils.RandomString(8) + ".php"
 	raw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
@@ -118,6 +119,9 @@ func (m *Module) wpCronEmptyIsSpecific(ctx *httpmsg.HttpRequestResponse, httpCli
 	defer resp.Close()
 	if resp.Response() == nil {
 		return true
+	}
+	if len(sinks) > 0 {
+		sinks[0].AddExchange(http.CaptureEvidence(resp), evidence.RoleControl, "nonexistent PHP cron comparison")
 	}
 	if resp.Response().StatusCode == 200 && len(strings.TrimSpace(resp.Body().String())) == 0 {
 		return false // blanket empty-200 for any .php path → not specific to wp-cron
@@ -232,10 +236,11 @@ func (m *Module) probeFile(
 	// wp-cron.php (a random .php path does not also return an empty 200), so a
 	// host that blanket-returns blank 200s for any .php path is not flagged.
 	if probe.path == "/wp-cron.php" {
-		if len(strings.TrimSpace(body)) == 0 && m.wpCronEmptyIsSpecific(ctx, httpClient) {
+		guardProof := modkit.NewEvidenceCollector()
+		if len(strings.TrimSpace(body)) == 0 && m.wpCronEmptyIsSpecific(ctx, httpClient, guardProof) {
 			urlx, _ := ctx.URL()
 			targetURL := urlx.Scheme + "://" + urlx.Host + probePath
-			return &output.ResultEvent{
+			result := &output.ResultEvent{
 				URL:     targetURL,
 				Matched: targetURL,
 				Request: string(modifiedRaw),
@@ -251,6 +256,9 @@ func (m *Module) probeFile(
 					Tags:        []string{"wordpress", "misconfiguration"},
 				},
 			}
+			modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "wp-cron empty response")
+			modkit.AppendEvidence(result, guardProof)
+			return result
 		}
 		return nil
 	}
@@ -273,7 +281,8 @@ func (m *Module) probeFile(
 	// Soft-404 / SPA-shell gate: reject a marker match that is just the host's
 	// wildcard shell (same 200 body served for a random path).
 	location := resp.Response().Header.Get("Location")
-	if !modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, status, []byte(body), location) {
+	guardProof := modkit.NewEvidenceCollector()
+	if !modkit.ConfirmNotSoft404WithEvidence(scanCtx, httpClient, ctx, status, []byte(body), location, guardProof) {
 		return nil
 	}
 
@@ -281,7 +290,7 @@ func (m *Module) probeFile(
 	// host-wide random path, which cannot see a catch-all scoped to a sub-directory
 	// prefix (now that we probe under context paths). Drop the finding if a
 	// nonexistent sibling under the same parent returns the same markers.
-	if modkit.SiblingServesAnyMarker(scanCtx, ctx, httpClient, probePath, probe.markers) {
+	if modkit.SiblingServesAnyMarkerWithEvidence(scanCtx, ctx, httpClient, probePath, probe.markers, guardProof) {
 		return nil
 	}
 
@@ -293,14 +302,14 @@ func (m *Module) probeFile(
 	// That is how a parked pool earned a Critical WordPress-installer finding off a
 	// marker in an Apache default page. Memoized per record, so the probe sweep
 	// above is unaffected.
-	if modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+	if modkit.EndpointVolatileWithEvidence(scanCtx, ctx, httpClient, guardProof) {
 		return nil
 	}
 
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,
 		Request:          string(modifiedRaw),
@@ -314,4 +323,7 @@ func (m *Module) probeFile(
 			Tags:        []string{"wordpress", "misconfiguration"},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected WordPress file response")
+	modkit.AppendEvidence(result, guardProof)
+	return result
 }

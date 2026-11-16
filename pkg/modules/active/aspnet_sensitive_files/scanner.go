@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -159,7 +160,9 @@ func (m *Module) probeFile(
 	httpClient *http.Requester,
 	sf sensitiveFile,
 	fp *notFoundFingerprint,
-) *output.ResultEvent {
+) (guardResult *output.ResultEvent) {
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(guardResult, guardProof) }()
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
@@ -249,10 +252,10 @@ func (m *Module) probeFile(
 	// genuinely exposed file has no such sibling (the decoy 404s), so this costs no
 	// true positives, and it is robust to the body-truncation quirk because the
 	// decoy is run through the same predicate rather than a body-similarity compare.
-	if modkit.MultiRoundExtDecoyCatchAll(ctx, httpClient, sf.path, body, status, decoyRounds, func(b string) bool {
+	if modkit.MultiRoundExtDecoyCatchAllWithEvidence(ctx, httpClient, sf.path, body, status, decoyRounds, func(b string) bool {
 		_, sibOK := sf.accepts(b)
 		return sibOK
-	}) {
+	}, guardProof) {
 		return nil
 	}
 
@@ -264,7 +267,7 @@ func (m *Module) probeFile(
 		findingName = fmt.Sprintf("ASP.NET Sensitive File: %s", sf.name)
 	}
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,
 		Request:          string(modifiedRaw),
@@ -279,4 +282,6 @@ func (m *Module) probeFile(
 			Reference:   []string{"https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information"},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+	return result
 }

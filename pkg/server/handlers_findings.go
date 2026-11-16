@@ -166,6 +166,9 @@ func (h *findingsHandlers) HandleListFindings(c fiber.Ctx) error {
 		return respondQueryError(c, err)
 	}
 
+	if err := h.repo.HydrateFindingEvidenceManifest(ctx, findings); err != nil {
+		return respondQueryError(c, err)
+	}
 	return respondList(c, PaginatedResponse{
 		ProjectUUID: projectUUID,
 		Data:        findings,
@@ -287,5 +290,30 @@ func (h *findingsHandlers) HandleGetFinding(c fiber.Ctx) error {
 		return respondError(c, fiber.StatusNotFound, ErrFindingNotFound)
 	}
 
-	return c.JSON(finding)
+	// Detail-only hydration. Do not infer proof from a matching URL: the exact
+	// refs may point at a different exchange, or be unavailable legacy ghosts.
+	if err := h.repo.HydrateFindingRecordRefs(c.Context(), []*database.Finding{finding}); err != nil {
+		return respondQueryError(c, err)
+	}
+	// Ordinary detail returns the reference inventory, not the uncapped linked
+	// traffic corpus. Bodies are loaded lazily via /http-records/:uuid.
+	available, err := h.repo.GetFindingRecordUUIDsScoped(c.Context(), finding.ProjectUUID, finding.HTTPRecordUUIDs)
+	if err != nil {
+		return respondQueryError(c, err)
+	}
+	loaded := make(map[string]bool, len(available))
+	for _, ref := range available {
+		loaded[ref] = true
+	}
+	var unavailable []string
+	for _, ref := range finding.HTTPRecordUUIDs {
+		if !loaded[ref] {
+			unavailable = append(unavailable, ref)
+		}
+	}
+	return c.JSON(struct {
+		*database.Finding
+		RecordsTotal int      `json:"records_total"`
+		Unavailable  []string `json:"records_unavailable,omitempty"`
+	}{finding, len(finding.HTTPRecordUUIDs), unavailable})
 }

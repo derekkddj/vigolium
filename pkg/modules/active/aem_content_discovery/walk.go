@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	aem "github.com/vigolium/vigolium/pkg/modules/infra/aem"
@@ -80,7 +81,7 @@ func (m *Module) runTreeWalk(
 		if !aem.ReproduceMarker(ctx, httpClient, hit.reqPath, reproduceRounds, func(r aem.ProbeResult) bool {
 			_, mok := matchSecret(r.Body)
 			return mok
-		}) {
+		}, hit.proof) {
 			continue
 		}
 		results = append(results, m.buildSecret(form, w, hit, baseURL))
@@ -91,14 +92,14 @@ func (m *Module) runTreeWalk(
 	if w.userEnumReq != "" && aem.ReproduceMarker(ctx, httpClient, w.userEnumReq, reproduceRounds, func(r aem.ProbeResult) bool {
 		_, uok := matchUserEnum(w.userEnumPath, r.Body)
 		return uok
-	}) {
+	}, w.userProof) {
 		results = append(results, m.buildUserEnum(form, w, baseURL))
 	}
 
 	// The tree enumeration itself — Medium (repository structure disclosure). Emit
 	// only if the read primitive re-confirms independently at report time, so a
 	// transiently-readable endpoint cannot produce a structure-disclosure finding.
-	if aem.ReproduceMarker(ctx, httpClient, form.sample, reproduceRounds, isJCRJSON) {
+	if aem.ReproduceMarker(ctx, httpClient, form.sample, reproduceRounds, isJCRJSON, w.treeProof) {
 		results = append(results, m.buildTreeWalk(form, w, baseURL))
 	}
 	return results
@@ -133,12 +134,15 @@ func (m *Module) findReadPrimitive(ctx *httpmsg.HttpRequestResponse, httpClient 
 }
 
 type secretHit struct {
+	proof   *aem.Proof
 	path    string // JCR node path
 	reqPath string // rendered request path used to read it
 	marker  string
 }
 
 type walkState struct {
+	treeProof    *aem.Proof
+	userProof    *aem.Proof
 	reached      []string
 	maxDepth     int
 	secretHits   []secretHit
@@ -148,14 +152,17 @@ type walkState struct {
 }
 
 type walkItem struct {
-	path  string
-	depth int
+	path      string
+	depth     int
+	ancestors []*evidence.Exchange // actual responses that supplied this child path
 }
 
 // walk performs a bounded breadth-first traversal of the JCR tree using the locked
 // read form, harvesting secret and user-enumeration markers as it goes.
 func (m *Module) walk(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, form readForm) walkState {
 	var st walkState
+	var treePrimary aem.ProbeResult
+	var treeAncestors, samples []*evidence.Exchange
 	visited := map[string]bool{}
 	queue := make([]walkItem, 0, len(seeds))
 	for _, s := range seeds {
@@ -181,30 +188,58 @@ func (m *Module) walk(ctx *httpmsg.HttpRequestResponse, httpClient *http.Request
 			continue
 		}
 
+		// Keep the deepest reached child and the actual ancestors that supplied
+		// its path. Two early nodes support the reached-node floor; do not fill
+		// the context cap with the whole walk and lose report-time confirmations.
+		if st.treeProof == nil || item.depth > st.maxDepth {
+			treePrimary, treeAncestors = res, item.ancestors
+		}
+		if len(samples) < minNodesForFinding-1 {
+			samples = append(samples, res.Exchange)
+		}
+		st.treeProof = treeWalkProof(treePrimary, treeAncestors, samples)
 		st.reached = append(st.reached, item.path)
 		if item.depth > st.maxDepth {
 			st.maxDepth = item.depth
 		}
 
 		if marker, ok := matchSecret(res.Body); ok {
-			st.secretHits = append(st.secretHits, secretHit{path: item.path, reqPath: reqPath, marker: marker})
+			st.secretHits = append(st.secretHits, secretHit{path: item.path, reqPath: reqPath, marker: marker, proof: aem.NewProof(res)})
 		}
 		if id, ok := matchUserEnum(item.path, res.Body); ok && st.userEnumReq == "" {
 			st.userEnumPath = item.path
 			st.userEnumReq = reqPath
 			st.userEnumID = id
+			st.userProof = aem.NewProof(res)
 		}
 
 		if item.depth < maxDepth {
 			for _, name := range childNames(res.Body) {
 				cp := childPath(item.path, name)
 				if !visited[cp] {
-					queue = append(queue, walkItem{path: cp, depth: item.depth + 1})
+					ancestors := append([]*evidence.Exchange(nil), item.ancestors...)
+					ancestors = append(ancestors, res.Exchange)
+					queue = append(queue, walkItem{path: cp, depth: item.depth + 1, ancestors: ancestors})
 				}
 			}
 		}
 	}
 	return st
+}
+
+// treeWalkProof retains a bounded recursion chain, not a URL-indexed traffic store.
+func treeWalkProof(primary aem.ProbeResult, ancestors, samples []*evidence.Exchange) *aem.Proof {
+	proof := aem.NewProof(primary)
+	seen := map[*evidence.Exchange]bool{primary.Exchange: true}
+	for _, group := range [][]*evidence.Exchange{ancestors, samples} {
+		for _, exchange := range group {
+			if exchange != nil && !seen[exchange] {
+				proof.Observe(aem.ProbeResult{Exchange: exchange})
+				seen[exchange] = true
+			}
+		}
+	}
+	return proof
 }
 
 // isJCRJSON reports whether a probe response is a genuine JCR node rendering: a 200
@@ -345,7 +380,7 @@ func (m *Module) buildTreeWalk(form readForm, w walkState, baseURL string) *outp
 	if form.isBypass() {
 		modkit.AnnotatePathBypassFinding(res, form.sample)
 	}
-	return res
+	return w.treeProof.Observation(res)
 }
 
 func (m *Module) buildSecret(form readForm, w walkState, hit secretHit, baseURL string) *output.ResultEvent {
@@ -381,7 +416,7 @@ func (m *Module) buildSecret(form readForm, w walkState, hit secretHit, baseURL 
 	if form.isBypass() {
 		modkit.AnnotatePathBypassFinding(res, hit.reqPath)
 	}
-	return res
+	return hit.proof.Observation(res)
 }
 
 func (m *Module) buildUserEnum(form readForm, w walkState, baseURL string) *output.ResultEvent {
@@ -416,7 +451,7 @@ func (m *Module) buildUserEnum(form readForm, w walkState, baseURL string) *outp
 	if form.isBypass() {
 		modkit.AnnotatePathBypassFinding(res, w.userEnumReq)
 	}
-	return res
+	return w.userProof.Observation(res)
 }
 
 func primitiveLabel(form readForm) string {

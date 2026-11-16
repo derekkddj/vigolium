@@ -149,6 +149,7 @@ var projectOwnedTables = []string{
 	"scans",
 	"http_records",
 	"analysis_artifacts",
+	"evidence_exchanges",
 	"findings",
 	"scopes",
 	"oast_interactions",
@@ -173,6 +174,7 @@ var projectOwnedTables = []string{
 	"scan_record_progress",
 	// Traffic the browser crawl observed beside its HTTP records.
 	"websocket_frames",
+	"oast_planting_receipts",
 }
 
 // ReassignProjectData moves all data owned by sourceUUID to targetUUID.
@@ -211,11 +213,13 @@ func (r *Repository) DeleteProject(ctx context.Context, uuid string) error {
 // transaction so a partial failure leaves the project intact.
 func (r *Repository) PurgeProjectData(ctx context.Context, projectUUID string) error {
 	return r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
-		if _, err := tx.NewDelete().
-			TableExpr("finding_records").
-			Where("finding_id IN (SELECT id FROM findings WHERE project_uuid = ?)", projectUUID).
-			Exec(ctx); err != nil {
-			return fmt.Errorf("failed to delete finding_records: %w", err)
+		for _, table := range findingChildTables {
+			if _, err := tx.NewDelete().
+				TableExpr(table).
+				Where("finding_id IN (SELECT id FROM findings WHERE project_uuid = ?)", projectUUID).
+				Exec(ctx); err != nil {
+				return fmt.Errorf("failed to delete %s: %w", table, err)
+			}
 		}
 		// Same central table list as reassignment, so the two can't drift.
 		for _, table := range projectOwnedTables {

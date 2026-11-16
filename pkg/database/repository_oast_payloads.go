@@ -2,15 +2,18 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/uptrace/bun"
 )
 
-// SaveOASTPayloads stores the payload contexts of planted OAST payloads in one
-// insert. A nonce that is already stored is left as it is: nonces are minted
-// unique, so a conflict can only be the same payload written twice.
+// SaveOASTPayloads stores small mint contexts in one transaction, preserving
+// each timestamp's nanoseconds rather than using a backend time formatter.
+// Already-stored minted nonces are left as-is; imports use the stricter context
+// validator instead of silently accepting a changed ownership/intent tuple.
 func (r *Repository) SaveOASTPayloads(ctx context.Context, payloads []*OASTPayload) error {
 	rows := make([]*OASTPayload, 0, len(payloads))
 	for _, p := range payloads {
@@ -23,10 +26,18 @@ func (r *Repository) SaveOASTPayloads(ctx context.Context, payloads []*OASTPaylo
 	if len(rows) == 0 {
 		return nil
 	}
-	if _, err := r.db.NewInsert().Model(&rows).On("CONFLICT (nonce) DO NOTHING").Exec(ctx); err != nil {
-		return fmt.Errorf("failed to insert OAST payloads: %w", err)
-	}
-	return nil
+	return r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+		for _, p := range rows {
+			if p.CreatedAt.IsZero() {
+				p.CreatedAt = time.Now().UTC()
+			}
+			if _, err := tx.NewInsert().Model(p).On("CONFLICT (nonce) DO NOTHING").
+				Value("created_at", "?", evidenceCaptureTime(p.CreatedAt)).Exec(ctx); err != nil {
+				return fmt.Errorf("failed to insert OAST payloads: %w", err)
+			}
+		}
+		return nil
+	})
 }
 
 // SetOASTPayloadValues records the literal values planted (see

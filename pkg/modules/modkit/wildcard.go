@@ -6,6 +6,7 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/utils"
@@ -23,6 +24,8 @@ const (
 // return the same 2xx shell for every URL, which would otherwise make any
 // "2xx body" signal meaningless.
 type WildcardEntry struct {
+	// Receipt owns the execution that produced this fingerprint, not just its head.
+	Receipt    *evidence.Exchange
 	Probed     bool
 	StatusCode int
 	BodyLen    int
@@ -87,7 +90,7 @@ func (sc *ScanContext) WildcardProbe(
 
 	cache := sc.getWildcardCache()
 	if entry, ok := cache.Get(host); ok && !entry.Expired() {
-		return entry, nil
+		return cloneWildcardEntry(entry), nil
 	}
 
 	result, err, _ := sc.wildcardFlight.Do(host, func() (interface{}, error) {
@@ -127,6 +130,7 @@ func (sc *ScanContext) WildcardProbe(
 		if resp.Response() != nil {
 			status = resp.Response().StatusCode
 		}
+		entry.Receipt = http.CaptureEvidence(resp)
 		body := resp.Body().Bytes()
 		bodyCopy := make([]byte, len(body))
 		copy(bodyCopy, body)
@@ -147,7 +151,16 @@ func (sc *ScanContext) WildcardProbe(
 	if err != nil {
 		return nil, err
 	}
-	return result.(*WildcardEntry), nil
+	return cloneWildcardEntry(result.(*WildcardEntry)), nil
+}
+
+func cloneWildcardEntry(entry *WildcardEntry) *WildcardEntry {
+	if entry == nil {
+		return nil
+	}
+	copy := *entry
+	copy.Receipt = entry.Receipt.Clone()
+	return &copy
 }
 
 func (sc *ScanContext) getWildcardCache() *lru.Cache[string, *WildcardEntry] {

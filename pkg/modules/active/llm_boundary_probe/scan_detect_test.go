@@ -55,7 +55,8 @@ func TestScanPerRequest_PositiveSecretDisclosure(t *testing.T) {
 	assert.Equal(t, "messages", f.FuzzingParameter)
 	assert.Equal(t, "aws-access-key-id", f.Metadata["rule"])
 	assert.Contains(t, f.ExtractedResults, "secret="+testSecret)
-	assert.Len(t, f.AdditionalEvidence, 2, "both crafted request/response pairs must be attached")
+	assert.Len(t, f.AdditionalEvidence, 1, "the second prompt supports the explicitly selected first prompt")
+	assert.Len(t, f.Evidence, 2, "both actual exchanges must be attached")
 }
 
 // TestScanPerRequest_RefusalNoFinding: the endpoint refuses every prompt with no

@@ -298,7 +298,7 @@ func fetchResponseForIngest(rr *httpmsg.HttpRequestResponse, httpClient *http.Re
 		return rr
 	}
 
-	respChain, elapsed, err := httpClient.Execute(rr, http.Options{})
+	respChain, elapsed, err := httpClient.Execute(rr, http.Options{NoClustering: true})
 	if err != nil {
 		zap.L().Debug("Failed to fetch response during extension ingest",
 			zap.String("url", rr.Target()), zap.Error(err))
@@ -308,11 +308,18 @@ func fetchResponseForIngest(rr *httpmsg.HttpRequestResponse, httpClient *http.Re
 	fullResp := respChain.FullResponseBytes()
 	raw := make([]byte, len(fullResp))
 	copy(raw, fullResp)
+	x := http.CaptureEvidence(respChain)
+	response := httpmsg.NewHttpResponseWithDuration(raw, elapsed)
+	paired := http.FinalRequestOf(respChain, response)
 	respChain.Close()
-
-	// This record is persisted, and this send is the only chance to record its
-	// timing — the converter cannot recover it from the bytes.
-	return rr.WithResponse(httpmsg.NewHttpResponseWithDuration(raw, elapsed))
+	if paired == nil {
+		return rr
+	} // Never persist an original request with a relocated response.
+	if x == nil || len(x.Request) == 0 {
+		return rr // No definitive request bytes: preserve the missing response pair.
+	}
+	paired = httpmsg.NewHttpRequestResponse(httpmsg.NewHttpRequestWithService(paired.Service(), x.Request), response)
+	return paired.WithEvidence(x)
 }
 
 // isExtIngestInScope checks whether a request/response pair should be saved:

@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -234,7 +235,7 @@ func (m *Module) ScanPerRequest(
 
 		body := resp.Body().String()
 		if marker := checkXXEMarkers(body, origBody, p); marker != "" {
-			results = append(results, &output.ResultEvent{
+			result := &output.ResultEvent{
 				URL:              urlx.String(),
 				Request:          string(modifiedRaw),
 				Response:         resp.FullResponseString(),
@@ -244,7 +245,9 @@ func (m *Module) ScanPerRequest(
 					Description: fmt.Sprintf("XXE entity expanded — marker %q found in response", marker),
 				},
 				Metadata: map[string]any{output.MetaSignal: output.SignalInband},
-			})
+			}
+			modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleAttack, "XXE entity payload")
+			results = append(results, result)
 			resp.Close()
 			return results, nil
 		}

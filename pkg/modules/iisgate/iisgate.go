@@ -11,8 +11,10 @@ import (
 	"sync"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
+	"github.com/vigolium/vigolium/pkg/modules/infra"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 )
 
@@ -20,12 +22,17 @@ const cacheSize = 4096
 
 var (
 	cacheOnce sync.Once
-	cache     *lru.Cache[string, bool]
+	cache     *lru.Cache[string, cachedVerdict]
 )
 
-func getCache() *lru.Cache[string, bool] {
+type cachedVerdict struct {
+	ok      bool
+	context *modkit.EvidenceCollector
+}
+
+func getCache() *lru.Cache[string, cachedVerdict] {
 	cacheOnce.Do(func() {
-		c, _ := lru.New[string, bool](cacheSize)
+		c, _ := lru.New[string, cachedVerdict](cacheSize)
 		cache = c
 	})
 	return cache
@@ -39,15 +46,22 @@ func getCache() *lru.Cache[string, bool] {
 // catch-all that echoes one page for everything). A spoofed Server header cannot
 // fake this, so a positive result means the target really is running ASP.NET.
 func ConfirmIISBehavior(host string, ctx *httpmsg.HttpRequestResponse, client *http.Requester) bool {
+	return ConfirmIISBehaviorWithEvidence(host, ctx, client, nil)
+}
+
+func ConfirmIISBehaviorWithEvidence(host string, ctx *httpmsg.HttpRequestResponse, client *http.Requester, sink *modkit.EvidenceCollector) bool {
 	if ctx == nil || ctx.Request() == nil || client == nil {
 		return false
 	}
 	c := getCache()
 	if v, ok := c.Get(host); ok {
-		return v
+		copyContext(sink, v.context)
+		return v.ok
 	}
-	v := probeIIS(ctx, client)
-	c.Add(host, v)
+	context := modkit.NewEvidenceCollector()
+	v := probeIISWithEvidence(ctx, client, context)
+	c.Add(host, cachedVerdict{ok: v, context: context})
+	copyContext(sink, context)
 	return v
 }
 
@@ -84,7 +98,17 @@ func LooksLikeIIS(ctx *httpmsg.HttpRequestResponse, scanCtx *modkit.ScanContext,
 // (LooksLikeIIS) AND active behavioral confirmation (ConfirmIISBehavior, cached
 // per host). A spoofed Server header alone therefore never passes.
 func IsIIS(ctx *httpmsg.HttpRequestResponse, scanCtx *modkit.ScanContext, host string, client *http.Requester) bool {
-	return LooksLikeIIS(ctx, scanCtx, host) && ConfirmIISBehavior(host, ctx, client)
+	return IsIISWithEvidence(ctx, scanCtx, host, client, nil)
+}
+
+func IsIISWithEvidence(ctx *httpmsg.HttpRequestResponse, scanCtx *modkit.ScanContext, host string, client *http.Requester, sink *modkit.EvidenceCollector) bool {
+	return LooksLikeIIS(ctx, scanCtx, host) && ConfirmIISBehaviorWithEvidence(host, ctx, client, sink)
+}
+
+func copyContext(sink, source *modkit.EvidenceCollector) {
+	for _, entry := range source.Evidence() {
+		sink.AddExchange(entry.Exchange, entry.Role, entry.Label)
+	}
 }
 
 type resp struct {
@@ -93,7 +117,7 @@ type resp struct {
 	ok     bool
 }
 
-func fetch(ctx *httpmsg.HttpRequestResponse, client *http.Requester, path string) resp {
+func fetch(ctx *httpmsg.HttpRequestResponse, client *http.Requester, path string, receiptOut ...**evidence.Exchange) resp {
 	raw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return resp{}
@@ -102,7 +126,10 @@ func fetch(ctx *httpmsg.HttpRequestResponse, client *http.Requester, path string
 	if err != nil {
 		return resp{}
 	}
-	st, body, ok := modkit.ExecuteRaw(client, ctx.Service(), raw, http.Options{NoRedirects: true, NoClustering: true})
+	st, body, _, receipt, ok := infra.ExecuteRawCapture(client, ctx.Service(), raw, http.Options{NoRedirects: true, NoClustering: true})
+	if len(receiptOut) > 0 && receiptOut[0] != nil {
+		*receiptOut[0] = receipt
+	}
 	return resp{status: st, body: body, ok: ok}
 }
 
@@ -116,13 +143,21 @@ func anchorable(status int) bool {
 }
 
 func probeIIS(ctx *httpmsg.HttpRequestResponse, client *http.Requester) bool {
-	base := fetch(ctx, client, "/")
+	return probeIISWithEvidence(ctx, client, nil)
+}
+
+func probeIISWithEvidence(ctx *httpmsg.HttpRequestResponse, client *http.Requester, sink *modkit.EvidenceCollector) bool {
+	var baseReceipt, tokReceipt, rndReceipt *evidence.Exchange
+	base := fetch(ctx, client, "/", &baseReceipt)
+	sink.AddExchange(baseReceipt, evidence.RoleControl, "IIS root anchor")
 	if !base.ok || !anchorable(base.status) {
 		return false
 	}
 	token := "(S(" + strings.ToLower(modkit.FreshCanary()) + "))"
-	tok := fetch(ctx, client, "/"+token+"/")
-	rnd := fetch(ctx, client, "/"+modkit.FreshCanary()+"-vigolium404/")
+	tok := fetch(ctx, client, "/"+token+"/", &tokReceipt)
+	rnd := fetch(ctx, client, "/"+modkit.FreshCanary()+"-vigolium404/", &rndReceipt)
+	sink.AddExchange(tokReceipt, evidence.RoleObservation, "IIS cookieless normalization")
+	sink.AddExchange(rndReceipt, evidence.RoleControl, "IIS random-path disproof")
 	return decideIIS(base, tok, rnd)
 }
 

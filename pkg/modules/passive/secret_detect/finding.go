@@ -1,6 +1,8 @@
 package secret_detect
 
 import (
+	"github.com/vigolium/vigolium/pkg/evidence"
+	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/secretscan"
 	"github.com/vigolium/vigolium/pkg/types/severity"
@@ -18,6 +20,9 @@ type EvidenceContext struct {
 	StatusCode   int
 	ContentType  string
 	HeaderValues string
+	// Exchange is the owned input observation, independent of the decoded scan
+	// body and its display window. Nil preserves unclassified legacy context.
+	Exchange *evidence.Exchange
 }
 
 // GradeMatch applies the structural false-positive guard, severity grading, and
@@ -83,6 +88,16 @@ func GradeMatch(mt secretscan.Match, ev EvidenceContext) (*output.ResultEvent, b
 	// offset, as a fallback) so it centers on the exact occurrence that fired.
 	response := BuildEvidenceResponse(ev.RespHead, ev.Body, mt.Secret, mt.Start, mt.End, MatchLine(ev.Body, mt.Start))
 	event := NewSecretFinding(mt.RuleID, mt.RuleName, mt.Secret, mt.Pattern, sev, conf, ev.Host, ev.URL, ev.Request, response)
+	if ev.Exchange != nil {
+		if !modkit.SetPrimaryEvidence(event, ev.Exchange, evidence.RoleObservation, "Secret detected in input observation") {
+			return nil, false // malformed owned metadata must not become an inferred legacy pair
+		}
+		if response != string(ev.Exchange.Response) {
+			// A decoded/windowed detector view is presentation context, not a
+			// second captured response or a replacement for the authoritative bytes.
+			event.AdditionalEvidence = append(event.AdditionalEvidence, output.BuildEvidence("Decoded secret display window (non-authoritative)", "", response))
+		}
+	}
 	return event, true
 }
 

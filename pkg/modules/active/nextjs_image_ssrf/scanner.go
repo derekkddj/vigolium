@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -162,28 +163,33 @@ func (m *Module) ScanPerHost(
 	// catch-all/SPA that echoes the app's own page for ANY url= returns the same
 	// markers in the baseline, so a marker also present there is not evidence.
 	var baselineBody string
+	var baselineExchange *evidence.Exchange
 	baselineFetched := false
 
 	for _, probe := range inBandProbes {
-		probeRaw, status, body, fullResp, ok := m.optimizerProbe(ctx, httpClient, probe.url)
+		probeRaw, status, body, fullResp, primary, ok := m.optimizerProbeEvidence(ctx, httpClient, probe.url)
 		if !ok || status != 200 {
 			continue
 		}
 		if !baselineFetched {
-			_, _, baselineBody, _, _ = m.optimizerProbe(ctx, httpClient, "http://192.0.2.1/")
+			_, _, baselineBody, _, baselineExchange, _ = m.optimizerProbeEvidence(ctx, httpClient, "http://192.0.2.1/")
 			baselineFetched = true
 		}
 		markers := confirmReached(body, baselineBody, probe)
 		if len(markers) == 0 {
 			continue
 		}
-		return []*output.ResultEvent{{
-			ModuleID: ModuleID,
-			Host:     host,
-			URL:      target,
-			Matched:  target,
-			Request:  probeRaw,
-			Response: fullResp,
+		collector := modkit.NewEvidenceCollector()
+		collector.AddExchange(baselineExchange, evidence.RoleControl, "TEST-NET optimizer control")
+		finding := &output.ResultEvent{
+			Evidence:           collector.Evidence(),
+			AdditionalEvidence: collector.Entries(),
+			ModuleID:           ModuleID,
+			Host:               host,
+			URL:                target,
+			Matched:            target,
+			Request:            probeRaw,
+			Response:           fullResp,
 			ExtractedResults: []string{
 				fmt.Sprintf("SSRF URL: %s", probe.url),
 				"Markers: " + strings.Join(markers, ", "),
@@ -199,7 +205,9 @@ func (m *Module) ScanPerHost(
 					"https://patchtheplanet.org/brotli",
 				},
 			},
-		}}, nil
+		}
+		modkit.SetPrimaryEvidence(finding, primary, evidence.RoleAttack, "selected optimizer SSRF probe")
+		return []*output.ResultEvent{finding}, nil
 	}
 
 	return nil, nil
@@ -208,15 +216,15 @@ func (m *Module) ScanPerHost(
 // optimizerProbe fires /_next/image with the given url= target on the host under
 // test and returns the raw probe request plus the response status, body, and full
 // serialization. ok is false on any build or transport error.
-func (m *Module) optimizerProbe(
+func (m *Module) optimizerProbeEvidence(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	internalURL string,
-) (probeRaw string, status int, body, fullResp string, ok bool) {
+) (probeRaw string, status int, body, fullResp string, exchange *evidence.Exchange, ok bool) {
 	path := fmt.Sprintf("/_next/image?url=%s&w=256&q=75", internalURL)
 	raw, err := httpmsg.SetPath(ctx.Request().Raw(), path)
 	if err != nil {
-		return "", 0, "", "", false
+		return "", 0, "", "", nil, false
 	}
 	raw, _ = httpmsg.SetMethod(raw, "GET")
 	// raw is internally built (well-formed), so wrap directly instead of
@@ -224,11 +232,11 @@ func (m *Module) optimizerProbe(
 	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
 	resp, _, err := httpClient.Execute(req, http.Options{})
 	if err != nil {
-		return string(raw), 0, "", "", false
+		return string(raw), 0, "", "", nil, false
 	}
 	defer resp.Close()
 	if resp.Response() == nil {
-		return string(raw), 0, "", "", false
+		return string(raw), 0, "", "", nil, false
 	}
-	return string(raw), resp.Response().StatusCode, resp.Body().String(), resp.FullResponseString(), true
+	return string(raw), resp.Response().StatusCode, resp.Body().String(), resp.FullResponseString(), http.CaptureEvidence(resp), true
 }

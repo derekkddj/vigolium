@@ -1,6 +1,7 @@
 package yamlext
 
 import (
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -85,7 +86,11 @@ func (m *YAMLActiveModule) ScanPerInsertionPoint(
 		}
 
 		// Build response context from ResponseChain
+		probeEvidence := http.CaptureEvidence(resp)
 		respBytes := resp.FullResponseBytes()
+		if probeEvidence != nil {
+			respBytes = probeEvidence.Response // owned bytes survive chain/pool cleanup
+		}
 		resp.Close()
 		httpResp := httpmsg.NewHttpResponse(respBytes)
 
@@ -96,7 +101,11 @@ func (m *YAMLActiveModule) ScanPerInsertionPoint(
 		matched, value := EvalMatchers(m.def.Matchers, m.def.MatchersCondition, httpResp, baseCtx)
 		if matched {
 			baseCtx.Matched = value
-			return m.buildFinding(baseCtx, ctx, string(rawReq), string(respBytes)), nil
+			results := m.buildFinding(baseCtx, ctx, string(rawReq), string(respBytes))
+			for _, result := range results {
+				modkit.SetPrimaryEvidence(result, probeEvidence, evidence.RoleAttack, "YAML payload probe")
+			}
+			return results, nil
 		}
 	}
 
@@ -143,7 +152,7 @@ func (m *YAMLActiveModule) scanExistingResponse(ctx *httpmsg.HttpRequestResponse
 
 	// Rules mode
 	if len(m.def.Rules) > 0 {
-		return m.evalRules(ctx.Response(), baseCtx, ctx, reqStr, respStr), nil
+		return selectYAMLInputEvidence(m.evalRules(ctx.Response(), baseCtx, ctx, reqStr, respStr), ctx), nil
 	}
 
 	// Flat matchers mode
@@ -151,11 +160,22 @@ func (m *YAMLActiveModule) scanExistingResponse(ctx *httpmsg.HttpRequestResponse
 		matched, value := EvalMatchers(m.def.Matchers, m.def.MatchersCondition, ctx.Response(), baseCtx)
 		if matched {
 			baseCtx.Matched = value
-			return m.buildFinding(baseCtx, ctx, reqStr, respStr), nil
+			return selectYAMLInputEvidence(m.buildFinding(baseCtx, ctx, reqStr, respStr), ctx), nil
 		}
 	}
 
 	return nil, nil
+}
+
+// selectYAMLInputEvidence is used only by read-only response-analysis branches.
+// Probe findings never opt into input inheritance to repair absent attack proof.
+func selectYAMLInputEvidence(results []*output.ResultEvent, ctx *httpmsg.HttpRequestResponse) []*output.ResultEvent {
+	input := ctx.Evidence()
+	for _, result := range results {
+		result.BaselineEvidence = true
+		modkit.SetPrimaryEvidence(result, input, evidence.RoleObservation, "YAML input analysis")
+	}
+	return results
 }
 
 func (m *YAMLActiveModule) evalRules(

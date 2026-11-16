@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -357,14 +358,15 @@ func (m *Module) probeFile(
 	// drop the finding if a nonexistent sibling under the same parent returns the
 	// same markers (a handler that 200s every child path). Root-level probes are
 	// already covered by the random-path 404 fingerprint above.
-	if modkit.SiblingServesAnyMarker(scanCtx, ctx, httpClient, probePath, p.markers) {
+	guardProof := modkit.NewEvidenceCollector()
+	if modkit.SiblingServesAnyMarkerWithEvidence(scanCtx, ctx, httpClient, probePath, p.markers, guardProof) {
 		return nil
 	}
 
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,
 		Request:          string(modifiedRaw),
@@ -379,4 +381,7 @@ func (m *Module) probeFile(
 			Reference:   []string{"https://symfony.com/doc/current/reference/configuration/framework.html"},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected file response")
+	modkit.AppendEvidence(result, guardProof)
+	return result
 }

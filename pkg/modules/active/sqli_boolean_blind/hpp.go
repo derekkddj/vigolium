@@ -92,7 +92,7 @@ func (m *Module) tryHPPFallback(
 	// pollution shape it is delivered through.
 	for i := range variantIPs {
 		vip := variantIPs[i]
-		vBaseFull, vBaseSig, vBaseBlocked, err := m.sendPayload(ctx, httpClient, vip, baseValue)
+		vBaseFull, vBaseSig, vBaseBlocked, vBaseReceipt, err := m.sendPayloadReceipt(ctx, httpClient, vip, baseValue)
 		if err != nil {
 			return nil, err
 		}
@@ -102,7 +102,7 @@ func (m *Module) tryHPPFallback(
 			continue
 		}
 		for _, pair := range candidates {
-			result, err := m.testPayloadPair(ctx, httpClient, vip, baseValue, pair, vBaseSig, vBaseFull)
+			result, err := m.testPayloadPair(ctx, httpClient, vip, baseValue, pair, vBaseSig, vBaseFull, vBaseReceipt)
 			if err != nil {
 				return nil, err
 			}

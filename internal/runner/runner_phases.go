@@ -3,6 +3,8 @@ package runner
 import (
 	"cmp"
 	"context"
+	"database/sql"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/core"
@@ -61,6 +64,20 @@ func (r *Runner) RunNativeScan() (err error) {
 	r.scanOutcome.reset()
 	r.moduleErrors.Store(newModuleErrorLedger())
 	r.preflight = nil
+	r.resetHarvestProbeState("", "")
+	r.finalized.Store(false)
+
+	// Identity precedes callbacks and every infrastructure producer (including
+	// auth and OAST). No finalizer, log, heartbeat or metadata write is armed
+	// until the selected store's row belongs to this invocation's project.
+	scope, scopeErr := r.initializeNativeScan(ctx)
+	if scopeErr != nil {
+		r.eventEmitMu.Lock()
+		r.eventCallbackClosed = true
+		r.eventEmitMu.Unlock()
+		return scopeErr
+	}
+	r.resetHarvestProbeState(scope.scanUUID, scope.projectUUID)
 
 	// Total scan budget: when --scanning-max-duration is set, bound the WHOLE scan
 	// (all phases combined). Each phase wraps this ctx with its own per-phase
@@ -119,11 +136,21 @@ func (r *Runner) RunNativeScan() (err error) {
 		defer func() { r.finishCallbackScan(ctx, callbackStartedAt, err) }()
 	}
 
-	infra, err := r.buildInfrastructure(ctx, plan)
-	if err != nil {
+	if err := scope.validate(ctx, r); err != nil {
 		return err
 	}
+	infra, err := r.buildInfrastructure(ctx, plan)
+	if err != nil {
+		// Failed setup must not give callers permission to reconcile a row
+		// reassigned while auth/extension infrastructure was being built.
+		return stderrors.Join(err, scope.validate(ctx, r))
+	}
 	defer infra.Close()
+	// Revalidate after setup, before metadata/liveness/finalizers. Never adopt
+	// a stored foreign project merely to make its logger work.
+	if err := scope.validate(ctx, r); err != nil {
+		return err
+	}
 
 	// Warn the operator (once per host) when the edge WAF/CDN starts filtering
 	// scan traffic, across all phases that share this requester.
@@ -144,71 +171,42 @@ func (r *Runner) RunNativeScan() (err error) {
 	// seam rather than one per OnResult callback; see attachEventObserver.
 	r.attachEventObserver()
 
-	// Initialize scan logger (must happen before printScanConfig so the tee captures it)
-	r.scanLogger = database.NewScanLogger(r.repository, infra.scanUUID)
+	r.scanLogger = database.NewScanLogger(scope.repo, scope.scanUUID, scope.projectUUID)
 	r.scanLogger.StartBatcher()
-	defer r.scanLogger.Close()
+	defer func() {
+		if err := r.scanLogger.Close(); err != nil {
+			outcome := r.scanLogger.Outcome()
+			zap.L().Warn("Scan log shutdown incomplete", zap.Error(err),
+				zap.Uint64("failed_entries", outcome.FailedEntries), zap.Uint64("dropped_entries", outcome.DroppedEntries))
+		}
+	}()
 
-	// Create scan record in the database so every scan is tracked with its lifecycle.
-	// Skip when ScanOnReceive or ManagedScanRecord — the server already created the
-	// scan record and owns its pending/queued/running transitions.
-	if r.repository != nil && r.options.ResumeScanUUID != "" {
-		// --resume-scan: the row exists; mark it running again rather than
-		// creating a new one.
-		if err := r.resumeScanRow(ctx, infra.scanUUID); err != nil {
-			return err
-		}
-	} else if r.repository != nil && !r.options.ScanOnReceive && !r.options.ManagedScanRecord {
-		target := strings.Join(r.options.Targets, ", ")
-		scan := &database.Scan{
-			UUID:            infra.scanUUID,
-			ProjectUUID:     r.options.ProjectUUID,
-			Name:            "cli-scan",
-			Status:          "running",
-			Target:          target,
-			Threads:         r.options.Concurrency,
-			ScopeOriginMode: r.resolvedScopeOriginMode(),
-			ScanSource:      "cli",
-			ScanMode:        "full",
-			StartedAt:       time.Now(),
-			// --caller-tag / VIGOLIUM_CALLER_TAG: the row every record this
-			// scan stores joins to carries the caller's labels.
-			Tags: r.options.CallerTags,
-		}
-		// --only-new-since: the scan starts at a cursor, the incremental mode
-		// scan-on-receive already runs in; the assessment rewinds to it.
-		if !r.options.OnlyNewSinceAt.IsZero() {
-			scan.ScanMode = "incremental"
-			scan.StartCursorAt = r.options.OnlyNewSinceAt
-			scan.CursorAt = r.options.OnlyNewSinceAt
-		}
-		if err := r.repository.CreateScan(ctx, scan); err != nil {
-			zap.L().Warn("Failed to create scan record", zap.Error(err))
-		}
-	}
 	// Stamp the resolved scope mode on the row, whoever created it — there are ten
 	// scan-creation sites and only the runner knows the settings the matcher will
 	// actually be built from.
-	r.persistScopeOriginMode(ctx, infra.scanUUID)
-	r.persistExtensionFailures(ctx, infra)
+	r.persistScopeOriginMode(ctx, infra.scanUUID, scope)
+	r.persistExtensionFailures(ctx, infra, scope)
 	// The resolved plan: scan.plan on the event stream (right after the CLI's
 	// scan.started, before any phase or the preflight sends a request) and
 	// scans.plan on the row. After the infrastructure, so the loaded
 	// extensions' selection is known; after the row exists, so it can be
 	// stored. A scope that refused every target still gets its plan, every
 	// phase disabled_by scope.
-	r.announcePlan(ctx, infra, admission)
+	r.announcePlan(ctx, infra, admission, scope)
+	if err := scope.validate(ctx, r); err != nil {
+		return err
+	}
 	// Liveness heartbeat, always on (status.json + the row's heartbeat
 	// columns). Finish is registered BEFORE the finalizer so it runs AFTER it
 	// (defers are LIFO): status.json only states a terminal status once the
 	// row does. The finalizer itself calls Stop first, which writes the final
 	// total_requests before the row is completed.
-	liveness := r.startLiveness(infra, plan)
+	liveness := r.startLiveness(infra, plan, scope)
 	defer func() {
 		liveness.Finish(r.terminalSessionStatus(err))
 		r.liveness.Store(nil)
 	}()
-	if r.repository != nil {
+	if scope.repo != nil {
 		defer func() {
 			// Terminal status, most-truthful first: a returned error (including a
 			// recovered panic — the recovery defer below sets err, and runs before
@@ -230,12 +228,18 @@ func (r *Runner) RunNativeScan() (err error) {
 			finalCtx, finalCancel := context.WithTimeout(context.WithoutCancel(r.ctx), 30*time.Second)
 			defer finalCancel()
 			liveness.Stop(finalCtx)
-			r.persistModuleErrors(finalCtx, infra.scanUUID)
+			if scopeErr := scope.validate(finalCtx, r); scopeErr != nil {
+				err = stderrors.Join(err, scopeErr)
+				return
+			}
+			r.persistModuleErrors(finalCtx, infra.scanUUID, scope)
 			// WithOutcome, not CompleteScan: the runner is the only component that
 			// saw every phase, so it is the only one that can say whether the run
 			// actually covered its input. Everything else writes "unknown".
-			if completeErr := r.repository.CompleteScanWithOutcome(finalCtx, infra.scanUUID, errMsg, r.Completion()); completeErr != nil {
+			if completeErr := scope.repo.CompleteScanWithOutcomeForProject(finalCtx, scope.projectUUID, scope.scanUUID, errMsg, r.Completion()); completeErr != nil {
 				zap.L().Warn("Failed to complete scan record", zap.Error(completeErr))
+				err = stderrors.Join(err, scope.identityError(completeErr))
+				return
 			}
 			r.finalized.Store(true)
 		}()
@@ -363,7 +367,10 @@ func (r *Runner) RunNativeScan() (err error) {
 			// already cancelled, and a read on it fails and drops the count.
 			finalCtx, finalCancel := context.WithTimeout(context.WithoutCancel(r.ctx), 10*time.Second)
 			defer finalCancel()
-			r.printFinishedBanner(finalCtx, os.Stderr, infra.scanUUID, time.Since(scanStartedAt))
+			if scopeErr := scope.validate(finalCtx, r); scopeErr != nil {
+				return
+			}
+			r.printFinishedBanner(finalCtx, os.Stderr, infra.scanUUID, time.Since(scanStartedAt), scope.projectUUID)
 			r.printModuleErrorSummary(os.Stderr, infra.scanUUID)
 			r.printCoverageCaveats(os.Stderr)
 			r.printSafeSkipped(finalCtx, os.Stderr)
@@ -400,7 +407,13 @@ func (r *Runner) RunNativeScan() (err error) {
 	// among the teardown defers: while stderr is still tee'd to the run log and before
 	// the finished-banner reads the finding count. Idempotent when prior passes already
 	// covered everything; see finalizeFindingGrouping.
-	defer r.finalizeFindingGrouping()
+	defer func() {
+		if scopeErr := scope.validate(r.ctx, r); scopeErr != nil {
+			err = stderrors.Join(err, scopeErr)
+			return
+		}
+		r.finalizeFindingGrouping()
+	}()
 
 	// External harvest sends nothing to the target, so its archive queries
 	// start now and overlap preflight, heuristics and the port sweep; the
@@ -507,11 +520,135 @@ func (r *Runner) RunNativeScan() (err error) {
 	return nil
 }
 
+// NativeScanIdentityError identifies a rejected selected-store scan without
+// treating its UUID as an initialized scan. Unwrap preserves typed database
+// errors (including ErrScanProjectMismatch and sql.ErrNoRows) for callers.
+type NativeScanIdentityError struct {
+	ScanUUID, ProjectUUID string
+	Err                   error
+}
+
+func (e *NativeScanIdentityError) Error() string {
+	return fmt.Sprintf("native scan %q project %q identity unavailable: %v", e.ScanUUID, e.ProjectUUID, e.Err)
+}
+
+func (e *NativeScanIdentityError) Unwrap() error { return e.Err }
+
+type nativeScanScope struct {
+	repo                  *database.Repository
+	scanUUID, projectUUID string
+}
+
+func (s nativeScanScope) identityError(err error) error {
+	return &NativeScanIdentityError{ScanUUID: s.scanUUID, ProjectUUID: s.projectUUID, Err: err}
+}
+
+// initializeNativeScan runs before callback/infrastructure setup. Existing rows
+// are read before any INSERT; managed rows must exist. Empty project always
+// means default, never permission to adopt the project's value from the row.
+func (r *Runner) initializeNativeScan(ctx context.Context) (nativeScanScope, error) {
+	project := r.options.ProjectUUID
+	if project == "" {
+		project = database.DefaultProjectUUID
+	}
+	r.options.ProjectUUID = project
+	s := nativeScanScope{repo: r.repository, scanUUID: r.options.ScanUUID, projectUUID: project}
+	managed := r.options.ManagedScanRecord || r.options.ScanOnReceive
+	if managed && (s.repo == nil || s.scanUUID == "") {
+		return s, s.identityError(sql.ErrNoRows)
+	}
+	if s.scanUUID == "" {
+		s.scanUUID = uuid.NewString()
+		r.options.ScanUUID = s.scanUUID
+	}
+	// Without a selected repository this is memory-only: a UUID is only a
+	// correlation key, never a claim of persisted row ownership.
+	if s.repo == nil {
+		return s, nil
+	}
+	rowCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	scan, err := s.repo.GetScanByUUID(rowCtx, s.scanUUID)
+	switch {
+	case err == nil:
+		if scan.ProjectUUID != s.projectUUID {
+			return s, s.identityError(database.ErrScanProjectMismatch)
+		}
+		if r.options.ResumeScanUUID != "" {
+			// --resume-scan: the row exists; mark it running again rather than
+			// creating a new one.
+			if err := r.resumeScanRow(rowCtx, s.scanUUID); err != nil {
+				return s, err
+			}
+		}
+	case errors.Is(err, sql.ErrNoRows) && !managed:
+		row := &database.Scan{
+			UUID: s.scanUUID, ProjectUUID: s.projectUUID, Name: "cli-scan", Status: "running",
+			Target: strings.Join(r.options.Targets, ", "), Threads: r.options.Concurrency,
+			ScopeOriginMode: r.resolvedScopeOriginMode(), ScanSource: "cli", ScanMode: "full", StartedAt: time.Now(),
+			// --caller-tag / VIGOLIUM_CALLER_TAG: the row every record this
+			// scan stores joins to carries the caller's labels.
+			Tags: r.options.CallerTags,
+		}
+		// --only-new-since: the scan starts at a cursor, the incremental mode
+		// scan-on-receive already runs in; the assessment rewinds to it.
+		if !r.options.OnlyNewSinceAt.IsZero() {
+			row.ScanMode = "incremental"
+			row.StartCursorAt = r.options.OnlyNewSinceAt
+			row.CursorAt = r.options.OnlyNewSinceAt
+		}
+		if err := s.repo.CreateScan(rowCtx, row); err != nil {
+			return s, s.identityError(err)
+		}
+	default:
+		return s, s.identityError(err)
+	}
+	return s, s.validate(rowCtx, r)
+}
+
+func (s nativeScanScope) validate(ctx context.Context, r *Runner) error {
+	if r.options.ScanUUID != s.scanUUID || r.options.ProjectUUID != s.projectUUID ||
+		(s.repo == nil) != (r.repository == nil) ||
+		(s.repo != nil && s.repo.DB() != r.repository.DB()) {
+		return s.identityError(fmt.Errorf("scan store or invocation identity changed"))
+	}
+	if s.repo == nil {
+		return nil
+	}
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	scan, err := s.repo.GetScanByUUID(readCtx, s.scanUUID)
+	if err != nil {
+		return s.identityError(err)
+	}
+	if scan.ProjectUUID != s.projectUUID {
+		return s.identityError(database.ErrScanProjectMismatch)
+	}
+	return nil
+}
+
+// updateMetadata scopes startup/finalizer annotations without ever assigning a
+// project or falling back to another store. The terminal update is scoped too.
+func (s nativeScanScope) updateMetadata(ctx context.Context, scan *database.Scan) error {
+	if s.repo == nil {
+		return nil
+	}
+	res, err := s.repo.DB().NewUpdate().Model(scan).OmitZero().ExcludeColumn("uuid", "project_uuid").
+		Where("uuid = ?", s.scanUUID).Where("project_uuid = ?", s.projectUUID).Exec(ctx)
+	if err != nil {
+		return s.identityError(err)
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return s.identityError(database.ErrScanProjectMismatch)
+	}
+	return nil
+}
+
 // printFinishedBanner writes the "Scan finished" line: the scan id, wall-clock
 // duration, the scan's finding count, and the partial-coverage suffix.
 //
-// The count comes from repository.ScanFindingTotal — the findings table, not the
-// scan row — which is the same helper the CLI's completion summary prints. The
+// The count comes from repository.ScanFindingTotalForProject — the findings
+// table, not the scan row — scoped like the CLI's completion summary. The
 // row was the bug: this banner runs before the completion defer finalizes it
 // (defers are LIFO, and this one is registered later so it stays inside the
 // stderr capture), so total_findings still held its pre-finalize 0 and the
@@ -521,10 +658,17 @@ func (r *Runner) RunNativeScan() (err error) {
 //
 // With no repository the line carries the duration only; on a failed count it
 // omits the count rather than print a zero it does not know to be true.
-func (r *Runner) printFinishedBanner(ctx context.Context, w io.Writer, scanUUID string, duration time.Duration) {
+func (r *Runner) printFinishedBanner(ctx context.Context, w io.Writer, scanUUID string, duration time.Duration, expectedProject ...string) {
+	project := database.DefaultProjectUUID
+	if r.options != nil && r.options.ProjectUUID != "" {
+		project = r.options.ProjectUUID
+	}
+	if len(expectedProject) > 0 {
+		project = expectedProject[0]
+	}
 	findingSummary := ""
 	if r.repository != nil {
-		if total, _, err := r.repository.ScanFindingTotal(ctx, scanUUID); err == nil {
+		if total, _, err := r.repository.ScanFindingTotalForProject(ctx, project, scanUUID); err == nil {
 			findingSummary = fmt.Sprintf(", findings: %d", total)
 		} else {
 			zap.L().Debug("Scan finished banner: finding count unavailable", zap.Error(err))

@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -128,8 +129,10 @@ func (m *Module) ScanPerInsertionPoint(
 		// baseline response for a mutated request, so a module that has the real
 		// proving response must set it (otherwise the finding carries none).
 		provingResp := ""
+		var exchange *evidence.Exchange
 		if matches != nil {
 			provingResp = resp.FullResponseString()
+			exchange = http.CaptureEvidence(resp)
 		}
 		resp.Close()
 		if matches == nil {
@@ -142,7 +145,8 @@ func (m *Module) ScanPerInsertionPoint(
 		// coincidental pattern (or a server that ignores the payload) will not
 		// track the changing canary. Drops the candidate if it can't be
 		// reproduced with a controllable value.
-		confirmed, cerr := m.confirmCRLF(ctx, ip, httpClient, i)
+		ev := modkit.NewEvidenceCollector()
+		confirmed, cerr := m.confirmCRLF(ctx, ip, httpClient, i, ev)
 		if cerr != nil {
 			if errors.Is(cerr, hosterrors.ErrUnresponsiveHost) {
 				return results, nil
@@ -153,16 +157,20 @@ func (m *Module) ScanPerInsertionPoint(
 			continue
 		}
 
-		results = append(results, &output.ResultEvent{
-			URL:              urlx.String(),
-			Request:          string(fuzzedRaw),
-			Response:         provingResp,
-			FuzzingParameter: ip.Name(),
-			ExtractedResults: []string{payload.value},
+		result := &output.ResultEvent{
+			Evidence:           ev.Evidence(),
+			AdditionalEvidence: ev.Entries(),
+			URL:                urlx.String(),
+			Request:            string(fuzzedRaw),
+			Response:           provingResp,
+			FuzzingParameter:   ip.Name(),
+			ExtractedResults:   []string{payload.value},
 			Info: output.Info{
 				Description: fmt.Sprintf("CRLF header injection confirmed: %q reflected as an injected response header across multiple fresh-canary rounds", matches),
 			},
-		})
+		}
+		modkit.SetPrimaryEvidence(result, exchange, evidence.RoleAttack, "selected probe")
+		results = append(results, result)
 		return results, nil
 	}
 
@@ -177,6 +185,7 @@ func (m *Module) confirmCRLF(
 	ip httpmsg.InsertionPoint,
 	httpClient *http.Requester,
 	techniqueIdx int,
+	collectors ...*modkit.EvidenceCollector,
 ) (bool, error) {
 	return modkit.ConfirmReflection(2, func(canary string) (bool, error) {
 		cookieVal := "Tamper=" + canary
@@ -192,6 +201,9 @@ func (m *Module) confirmCRLF(
 			return false, rerr
 		}
 		headers := resp.Headers().String()
+		if len(collectors) > 0 {
+			collectors[0].AddExchange(http.CaptureEvidence(resp), evidence.RoleConfirmation, "fresh cookie canary")
+		}
 		resp.Close()
 
 		// The fresh canary must appear as an injected Set-Cookie header line.

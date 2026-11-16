@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -272,6 +273,7 @@ func (m *Module) ScanPerRequest(
 
 		if matched {
 			fullResp := resp.FullResponseString()
+			attackReceipt := http.CaptureEvidence(resp)
 			resp.Close()
 			// Confirm the signal tracks a FRESH probe before reporting a Critical
 			// finding: the arithmetic variant re-derives the product from fresh
@@ -304,6 +306,7 @@ func (m *Module) ScanPerRequest(
 					Description: description,
 				},
 			}
+			modkit.SetPrimaryEvidence(result, attackReceipt, evidence.RoleAttack, "OGNL evaluation payload")
 			return []*output.ResultEvent{result}, nil
 		}
 		resp.Close()
@@ -352,6 +355,7 @@ func (m *Module) ScanPerInsertionPoint(
 		body := resp.Body().String()
 		if strings.Contains(body, ognlResult) {
 			fullResp := resp.FullResponseString()
+			attackReceipt := http.CaptureEvidence(resp)
 			resp.Close()
 			// Confirm the result tracks fresh operands before reporting a Critical
 			// finding (the fixed product appearing in the page by coincidence must
@@ -373,6 +377,7 @@ func (m *Module) ScanPerInsertionPoint(
 					Description: fmt.Sprintf("OGNL expression evaluated in parameter %q — result %q found in response", ip.Name(), ognlResult),
 				},
 			}
+			modkit.SetPrimaryEvidence(result, attackReceipt, evidence.RoleAttack, "OGNL evaluation payload")
 			return []*output.ResultEvent{result}, nil
 		}
 		resp.Close()

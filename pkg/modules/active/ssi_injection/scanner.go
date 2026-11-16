@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -174,10 +175,11 @@ func (m *Module) confirmEvaluation(
 	var value string
 	var parsed bool
 	probeRaw := ip.BuildRequest([]byte(left + ssiEchoDirective + right))
+	var probeReceipt, controlReceipt *evidence.Exchange
 	body, full, ok := m.renderedHTMLBody(ctx, httpClient, probeRaw, func(b string) bool {
 		value, parsed = ssiEchoValue(b, left, right)
 		return parsed
-	})
+	}, &probeReceipt)
 	if !ok || !strings.Contains(body, left) {
 		return nil, false
 	}
@@ -186,18 +188,22 @@ func (m *Module) confirmEvaluation(
 	}
 
 	controlRaw := ip.BuildRequest([]byte(left + ssiControlComment + right))
-	if controlBody, _, controlOK := m.renderedHTMLBody(ctx, httpClient, controlRaw, nil); controlOK {
+	if controlBody, _, controlOK := m.renderedHTMLBody(ctx, httpClient, controlRaw, nil, &controlReceipt); controlOK {
 		if _, stripped := ssiEchoValue(controlBody, left, right); stripped {
 			return nil, true
 		}
 	}
 
-	return &output.ResultEvent{
-		URL:              urlStr,
-		Matched:          urlStr,
-		Request:          string(probeRaw),
-		Response:         full,
-		FuzzingParameter: param,
+	ev := modkit.NewEvidenceCollector()
+	ev.AddExchange(controlReceipt, evidence.RoleControl, "ordinary HTML comment control")
+	result := &output.ResultEvent{
+		Evidence:           ev.Evidence(),
+		AdditionalEvidence: ev.Entries(),
+		URL:                urlStr,
+		Matched:            urlStr,
+		Request:            string(probeRaw),
+		Response:           full,
+		FuzzingParameter:   param,
 		// The observed values, not the method — ModuleConfirmation states how the check
 		// works, and a triager needs what to grep the response for. The value is
 		// server-owned: the target's own DATE_GMT expansion.
@@ -210,7 +216,9 @@ func (m *Module) confirmEvaluation(
 			Tags:        ModuleTags,
 		},
 		Metadata: map[string]any{output.MetaSignal: output.SignalInband},
-	}, true
+	}
+	modkit.SetPrimaryEvidence(result, probeReceipt, evidence.RoleAttack, "SSI echo directive")
+	return result, true
 }
 
 // renderedHTMLBody sends rawReq and returns its body only when the response is one the
@@ -228,6 +236,7 @@ func (m *Module) renderedHTMLBody(
 	httpClient *http.Requester,
 	rawReq []byte,
 	keepFull func(body string) bool,
+	receiptOut ...**evidence.Exchange,
 ) (body, full string, ok bool) {
 	req := httpmsg.NewRequestResponseRaw(rawReq, ctx.Service())
 	resp, _, err := httpClient.Execute(req, http.Options{NoClustering: true})
@@ -252,6 +261,9 @@ func (m *Module) renderedHTMLBody(
 	body = resp.Body().String()
 	if keepFull != nil && keepFull(body) {
 		full = resp.FullResponseString()
+	}
+	if len(receiptOut) > 0 && receiptOut[0] != nil {
+		*receiptOut[0] = http.CaptureEvidence(resp)
 	}
 	return body, full, true
 }

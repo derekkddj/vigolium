@@ -6,6 +6,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -156,33 +157,35 @@ func (m *Module) ScanPerRequest(
 	// not be a blind 200-everything catch-all (a CDN or error boundary that answers
 	// every path with the same pageProps body). Either gate failing means the route
 	// responds the same with or without a real path — not an auth leak.
-	if !m.confirmDataRouteLeak(ctx, httpClient, dataPath, buildID) {
+	support := modkit.NewEvidenceCollector()
+	if !m.confirmDataRouteLeak(ctx, httpClient, dataPath, buildID, support) {
 		return nil, nil
 	}
 
-	return []*output.ResultEvent{
-		{
-			ModuleID: ModuleID,
-			Host:     host,
-			URL:      urlx.String(),
-			Matched:  urlx.Scheme + "://" + host + dataPath,
-			Request:  string(modifiedRaw),
-			Response: resp.FullResponseString(),
-			ExtractedResults: []string{
-				fmt.Sprintf("Data route: %s", dataPath),
-				fmt.Sprintf("BuildID: %s", buildID),
-				fmt.Sprintf("Original status: %d", statusCode),
-			},
-			Info: output.Info{
-				Name:        "Next.js Data Route Leakage",
-				Description: fmt.Sprintf("Auth-protected page %s leaks data via Next.js data route %s (original status: %d, data route: 200)", urlx.Path, dataPath, statusCode),
-				Severity:    ModuleSeverity,
-				Confidence:  ModuleConfidence,
-				Tags:        []string{"nextjs", "data-leakage", "authorization"},
-				Reference:   []string{"https://nextjs.org/docs/pages/building-your-application/data-fetching"},
-			},
+	finding := &output.ResultEvent{
+		ModuleID: ModuleID,
+		Host:     host,
+		URL:      urlx.String(),
+		Matched:  urlx.Scheme + "://" + host + dataPath,
+		Request:  string(modifiedRaw),
+		Response: resp.FullResponseString(),
+		ExtractedResults: []string{
+			fmt.Sprintf("Data route: %s", dataPath),
+			fmt.Sprintf("BuildID: %s", buildID),
+			fmt.Sprintf("Original status: %d", statusCode),
 		},
-	}, nil
+		Info: output.Info{
+			Name:        "Next.js Data Route Leakage",
+			Description: fmt.Sprintf("Auth-protected page %s leaks data via Next.js data route %s (original status: %d, data route: 200)", urlx.Path, dataPath, statusCode),
+			Severity:    ModuleSeverity,
+			Confidence:  ModuleConfidence,
+			Tags:        []string{"nextjs", "data-leakage", "authorization"},
+			Reference:   []string{"https://nextjs.org/docs/pages/building-your-application/data-fetching"},
+		},
+	}
+	modkit.SetPrimaryEvidence(finding, http.CaptureEvidence(resp), evidence.RoleAttack, "unauthorized data-route probe")
+	modkit.AppendEvidence(finding, support)
+	return []*output.ResultEvent{finding}, nil
 }
 
 // isLeakBody reports whether a data-route body carries real protected-page data
@@ -205,15 +208,16 @@ func isLeakBody(body string) bool {
 // stripped, no redirects) for a data path and returns its body when the response
 // is a 200 application/json. NoClustering bypasses the response cache so each call
 // is a genuinely fresh observation. ok is false on any transport/parse error or a
-// non-200 / non-JSON response.
+// non-200 / non-JSON response. A completed response returns its actual receipt
+// even when ok is false; native failures return only their actually captured bytes.
 func (m *Module) fetchUnauthDataRouteBody(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	dataPath string,
-) (string, bool) {
+) (string, bool, *evidence.Exchange) {
 	raw, err := httpmsg.SetPath(ctx.Request().Raw(), dataPath)
 	if err != nil {
-		return "", false
+		return "", false, nil
 	}
 	raw, _ = httpmsg.RemoveHeader(raw, "Cookie")
 	raw, _ = httpmsg.RemoveHeader(raw, "Authorization")
@@ -224,16 +228,18 @@ func (m *Module) fetchUnauthDataRouteBody(
 
 	resp, _, err := httpClient.Execute(req, http.Options{NoRedirects: true, NoClustering: true})
 	if err != nil {
-		return "", false
+		return "", false, http.CaptureFailureEvidence(err)
 	}
 	defer resp.Close()
+	// Completed rejected controls (notably a 404 decoy) still own receipts.
+	x := http.CaptureEvidence(resp)
 	if resp.Response() == nil || resp.Response().StatusCode != 200 {
-		return "", false
+		return "", false, x
 	}
 	if !strings.Contains(resp.Response().Header.Get("Content-Type"), "application/json") {
-		return "", false
+		return "", false, x
 	}
-	return resp.Body().String(), true
+	return resp.Body().String(), true, x
 }
 
 // confirmDataRouteLeak validates a candidate leak with two fresh requests.
@@ -248,14 +254,22 @@ func (m *Module) confirmDataRouteLeak(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	dataPath, buildID string,
+	collectors ...*modkit.EvidenceCollector,
 ) bool {
-	body, ok := m.fetchUnauthDataRouteBody(ctx, httpClient, dataPath)
+	body, ok, repro := m.fetchUnauthDataRouteBody(ctx, httpClient, dataPath)
+	for _, proof := range collectors {
+		proof.AddExchange(repro, evidence.RoleConfirmation, "fresh unauthorized data-route reproduction")
+	}
 	if !ok || !isLeakBody(body) {
 		return false
 	}
 
 	decoyPath := fmt.Sprintf("/_next/data/%s/%s.json", buildID, catchAllProbeSlug)
-	if decoy, ok := m.fetchUnauthDataRouteBody(ctx, httpClient, decoyPath); ok && isLeakBody(decoy) &&
+	decoy, decoyOK, control := m.fetchUnauthDataRouteBody(ctx, httpClient, decoyPath)
+	for _, proof := range collectors {
+		proof.AddExchange(control, evidence.RoleControl, "improbable data-route catch-all control")
+	}
+	if decoyOK && isLeakBody(decoy) &&
 		modkit.RatioSimilar(
 			modkit.NewResponseSignature(200, body, ""),
 			modkit.NewResponseSignature(200, decoy, ""),

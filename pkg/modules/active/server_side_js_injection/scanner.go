@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -169,9 +170,13 @@ func (m *Module) testTiming(
 
 	slowTimes := make([]time.Duration, 0, confirmSlowRounds)
 	fastTimes := make([]time.Duration, 0, confirmFastRounds)
+	var primary *evidence.Exchange
+	ev := modkit.NewEvidenceCollector()
+	ev.AddBaseline("input baseline", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
 
 	for i := 0; i < confirmSlowRounds; i++ {
-		elapsed, err := m.sendTimed(ctx, httpClient, ip, slowPayload)
+		slow, err := m.sendTimed(ctx, httpClient, ip, slowPayload)
+		elapsed := slow.elapsed
 		if err != nil {
 			return nil, err
 		}
@@ -179,9 +184,15 @@ func (m *Module) testTiming(
 			return nil, nil
 		}
 		slowTimes = append(slowTimes, elapsed)
+		if i == 0 {
+			primary = slow.receipt
+		} else {
+			ev.AddExchange(slow.receipt, evidence.RoleConfirmation, "busy-wait replay")
+		}
 
 		if i < confirmFastRounds {
-			fastElapsed, err := m.sendTimed(ctx, httpClient, ip, fastPayload)
+			fast, err := m.sendTimed(ctx, httpClient, ip, fastPayload)
+			fastElapsed := fast.elapsed
 			if err != nil {
 				return nil, err
 			}
@@ -189,6 +200,7 @@ func (m *Module) testTiming(
 				return nil, nil // server is just slow today
 			}
 			fastTimes = append(fastTimes, fastElapsed)
+			ev.AddExchange(fast.receipt, evidence.RoleControl, "zero-duration busy-wait payload")
 		}
 	}
 
@@ -200,10 +212,11 @@ func (m *Module) testTiming(
 		return nil, nil
 	}
 
-	return &output.ResultEvent{
-		Request:          string(ip.BuildRequest([]byte(slowPayload))),
-		FuzzingParameter: ip.Name(),
-		ExtractedResults: []string{slowPayload, fastPayload, p.context},
+	result := &output.ResultEvent{
+		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
+		FuzzingParameter:   ip.Name(),
+		ExtractedResults:   []string{slowPayload, fastPayload, p.context},
 		Info: output.Info{
 			Name: ModuleName,
 			Description: fmt.Sprintf(
@@ -213,7 +226,14 @@ func (m *Module) testTiming(
 			),
 		},
 		Metadata: map[string]any{output.MetaSignal: output.SignalTiming},
-	}, nil
+	}
+	modkit.SetPrimaryEvidence(result, primary, evidence.RoleAttack, "slow busy-wait payload")
+	return result, nil
+}
+
+type timedProbe struct {
+	elapsed time.Duration
+	receipt *evidence.Exchange
 }
 
 // sendTimed sends one payload and returns the elapsed wall-clock. NoClustering makes
@@ -224,13 +244,14 @@ func (m *Module) sendTimed(
 	httpClient *http.Requester,
 	ip httpmsg.InsertionPoint,
 	payload string,
-) (time.Duration, error) {
+) (timedProbe, error) {
 	req := httpmsg.NewRequestResponseRaw(ip.BuildRequest([]byte(payload)), ctx.Service())
 	// SendTimed: requester-measured latency, not the queue.
 	resp, elapsed, err := modkit.SendTimed(httpClient, req, http.Options{})
 	if err != nil {
-		return 0, err
+		return timedProbe{}, err
 	}
+	receipt := http.CaptureEvidence(resp)
 	resp.Close()
-	return elapsed, nil
+	return timedProbe{elapsed: elapsed, receipt: receipt}, nil
 }

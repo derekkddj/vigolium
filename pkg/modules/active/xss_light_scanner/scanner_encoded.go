@@ -4,6 +4,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -132,7 +133,8 @@ func (m *EncodedModule) scanInsertionPointEncoded(
 			continue
 		}
 
-		body, err := sendAndValidateRawPayload(ctx, ip, encoded, httpClient)
+		var receipt *evidence.Exchange
+		body, err := sendAndValidateRawPayload(ctx, ip, encoded, httpClient, &receipt)
 		if err != nil {
 			return nil, err
 		}
@@ -155,6 +157,7 @@ func (m *EncodedModule) scanInsertionPointEncoded(
 		result.InsertionPoint = ip.Name()
 		result.PrimaryPayload = payload
 		result.PrimaryResponse = body
+		result.PrimaryReceipt = receipt
 		result.ExploitableAnalyses = exploitable
 
 		// Confirm with the SAME pre-encoding that detected the reflection — a raw

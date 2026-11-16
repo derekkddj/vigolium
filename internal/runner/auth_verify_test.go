@@ -15,7 +15,7 @@ import (
 // reauth.on_failure: abort it stops the scan.
 func TestNoteLoginVerification(t *testing.T) {
 	r, infra := preflightRunner(t)
-	r.scanLogger = database.NewScanLogger(nil, "")
+	r.scanLogger = database.NewScanLogger(nil, "", "")
 	results := []authentication.LoginResult{
 		{Session: "ok", OK: true, Verified: true},
 		{Session: "soft", OK: true, Verified: false, Reason: authentication.LoginReasonUnverified, Message: "no expect block"},

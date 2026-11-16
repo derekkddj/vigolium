@@ -131,7 +131,7 @@ func renderFindingMarkdown(f *database.Finding, records []*database.HTTPRecord, 
 	// response windowed like the primary) and free-form prose renders as text —
 	// instead of dumping raw "req\n---------\nresp" blobs comma-joined.
 	if len(f.AdditionalEvidence) > 0 {
-		ew.println("**Additional evidence:**")
+		ew.println("**Additional legacy evidence — role unknown (not proof):**")
 		ew.println()
 		for i, entry := range f.AdditionalEvidence {
 			p := output.ParseEvidence(entry)
@@ -152,11 +152,39 @@ func renderFindingMarkdown(f *database.Finding, records []*database.HTTPRecord, 
 		ew.printf("**Tags:** %s\n\n", strings.Join(f.Tags, ", "))
 	}
 
-	req, resp := findingRequestResponse(f, records)
-	// The request carries the payload — always show it whole. The response is
-	// what compact windows around the match.
-	writeHTTPSection(ew, "Request", req, false, nil, 0)
-	writeHTTPSection(ew, "Response", resp, compact, needles, agentRespBodyPreviewMax)
+	status := f.EvidenceStatus
+	if status == "" {
+		status = "missing / unclassified"
+	}
+	ew.printf("**Stored finding evidence status:** %s\n\n", status)
+	ew.println("Original finding metadata; each occurrence retains its own role/primary flag. Later selections do not reclassify legacy evidence.")
+	ew.println()
+	if primaryFindingEntry(f) == nil {
+		ew.println("No single explicitly selected primary proof / observation. No proof inferred from URL or linked order.")
+		ew.println()
+	}
+	for _, entry := range f.Evidence {
+		ew.printf("### Exchange %s — role %s, primary %t\n\n", entry.ExchangeID, entry.Role, entry.Primary)
+		ew.printf("Occurrence: %s · label: %s · finding URL: %s · scan: %s\n\n", entry.OccurrenceID, entry.Label, entry.FindingURL, entry.ScanUUID)
+		if entry.Exchange == nil {
+			ew.println("Selected bytes unavailable; no fallback substituted.")
+			ew.println()
+			continue
+		}
+		x := entry.Exchange
+		ew.printf("URL: %s · capture: %s/%s · provenance: %s · hash: %s\n\n", x.URL, x.RequestState, x.ResponseState, x.Provenance, x.ContentHash)
+		ew.println("Text preview is non-authoritative; JSON/export carries exact captured bytes.")
+		ew.println()
+		writeHTTPSection(ew, "Selected request", string(x.Request), compact, nil, agentReqBodyPreviewMax)
+		writeHTTPSection(ew, "Selected response", string(x.Response), compact, needles, agentRespBodyPreviewMax)
+	}
+	writeHTTPSection(ew, "Legacy inline request — role unknown (not proof)", f.Request, compact, nil, agentReqBodyPreviewMax)
+	writeHTTPSection(ew, "Legacy inline response — role unknown (not proof)", f.Response, compact, needles, agentRespBodyPreviewMax)
+	for _, rec := range records {
+		ew.printf("### Linked context %s — role unknown (not proof)\n\n", rec.UUID)
+		writeHTTPSection(ew, "Linked request", string(rec.RawRequest), compact, nil, agentReqBodyPreviewMax)
+		writeHTTPSection(ew, "Linked response", string(rec.RawResponse), compact, needles, agentRespBodyPreviewMax)
+	}
 }
 
 // renderRecordMarkdown writes one HTTP record as Markdown. requestOnly omits the

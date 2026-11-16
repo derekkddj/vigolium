@@ -8,10 +8,12 @@
 // A Recorder implements engine.EventRecorder: the engine tees every event
 // (plus each initiating user prompt) through it at a single chokepoint. The
 // recorder coalesces the engine's delta-level events into message records —
-// thinking/text deltas accumulate across a turn and flush as one assistant
-// message on EventTurnDone (carrying that turn's tool calls + usage +
-// stopReason), and each EventToolExecEnd becomes a toolResult message with
-// the full, untruncated tool output.
+// thinking/text deltas accumulate within a provider attempt and flush as an
+// assistant message on EventTurnDone or a partial message on EventStreamRetry.
+// Each EventToolExecEnd becomes a toolResult message with
+// the complete tool-returned output and its structured receipt details. Tools
+// may already have clipped/omitted content; recording cannot recover that or
+// provider-opaque reasoning. Only surfaced events are persisted.
 //
 // Fidelity note: the transcript is structurally Pi-compatible and readable,
 // but a few provider-opaque fields Pi persists for *resume* — per-message
@@ -24,7 +26,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,15 +65,22 @@ type Meta struct {
 	Cwd           string // working directory for the run
 }
 
+type transcriptFile interface {
+	io.Writer
+	Sync() error
+	Close() error
+}
+
 // Recorder writes a Pi-compatible JSONL transcript for one engine session.
 // It implements engine.EventRecorder and io.Closer. Safe for the engine's
 // sequential calls; an internal mutex also guards against an accidental
 // concurrent Close.
 type Recorder struct {
 	mu     sync.Mutex
-	f      *os.File
+	f      transcriptFile
 	meta   Meta
 	closed bool
+	err    error  // sticky: after a failed line, appending could corrupt the JSONL chain
 	lastID string // parent-chain head; "" => next parentId is null
 
 	// Per-turn accumulators for the deltas that make up one assistant
@@ -87,14 +98,19 @@ func New(path string, meta Meta) (*Recorder, error) {
 		return nil, fmt.Errorf("sessionlog: empty path")
 	}
 	if dir := filepath.Dir(path); dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("sessionlog: mkdir %s: %w", dir, err)
 		}
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("sessionlog: open %s: %w", path, err)
 	}
+	return newWithFile(f, meta)
+}
+
+// newWithFile also provides deterministic fault injection for recorder tests.
+func newWithFile(f transcriptFile, meta Meta) (*Recorder, error) {
 	if strings.TrimSpace(meta.SessionID) == "" {
 		meta.SessionID = uuid.NewString()
 	}
@@ -105,7 +121,18 @@ func New(path string, meta Meta) (*Recorder, error) {
 	r.mu.Lock()
 	r.writeHeaderLocked()
 	r.mu.Unlock()
+	if r.Err() != nil {
+		return nil, r.Close()
+	}
 	return r, nil
+}
+
+// Err reports recording health without interrupting the observed run. Once a
+// marshal/write fails, recording stops; Close also reports this error.
+func (r *Recorder) Err() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.err
 }
 
 // UserPrompt records the user message that seeds a Run. Any unflushed
@@ -114,9 +141,12 @@ func New(path string, meta Meta) (*Recorder, error) {
 func (r *Recorder) UserPrompt(prompt string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.flushAssistantLocked(nil, "", nil)
+	if r.closed || r.err != nil {
+		return
+	}
+	r.flushAssistantLocked(nil, "interrupted", nil)
 	id := newID()
-	r.writeLocked(messageEvt{
+	r.writeChainedLocked(id, messageEvt{
 		Type:      "message",
 		ID:        id,
 		ParentID:  r.parentPtr(),
@@ -127,18 +157,21 @@ func (r *Recorder) UserPrompt(prompt string) {
 			Timestamp: nowMillis(),
 		},
 	})
-	r.lastID = id
 }
 
 // Record consumes one engine event. Thinking/text deltas accumulate;
 // EventTurnDone flushes the assistant message; EventToolExecEnd emits a
-// toolResult message; EventError records a terminal error line. Every other
+// toolResult message; EventStreamRetry flushes a partial attempt and records
+// its nonterminal boundary; EventError records a terminal error line. Every other
 // event type (tool-exec start/progress, toolcall_start, run_done, info) is
 // intentionally ignored — the data the transcript needs is already captured
 // by the events above.
 func (r *Recorder) Record(ev engine.Event) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closed || r.err != nil {
+		return
+	}
 	switch ev.Type {
 	case engine.EventThinkingDelta:
 		r.think.WriteString(ev.Delta)
@@ -146,9 +179,20 @@ func (r *Recorder) Record(ev engine.Event) {
 		r.text.WriteString(ev.Delta)
 	case engine.EventTurnDone:
 		r.flushAssistantLocked(ev.ToolCalls, string(ev.StopReason), ev.Usage)
+	case engine.EventStreamRetry:
+		r.flushAssistantLocked(ev.ToolCalls, "interrupted", ev.Usage)
+		id := newID()
+		r.writeChainedLocked(id, streamRetryEvt{
+			Type:      "stream_retry",
+			ID:        id,
+			ParentID:  r.parentPtr(),
+			Timestamp: nowISO(),
+			Attempt:   ev.Attempt,
+			Error:     ev.Err,
+		})
 	case engine.EventToolExecEnd:
 		id := newID()
-		r.writeLocked(messageEvt{
+		r.writeChainedLocked(id, messageEvt{
 			Type:      "message",
 			ID:        id,
 			ParentID:  r.parentPtr(),
@@ -159,22 +203,22 @@ func (r *Recorder) Record(ev engine.Event) {
 				ToolName:   ev.ToolName,
 				Content:    []any{textPart{Type: "text", Text: ev.ToolResult}},
 				IsError:    ev.ToolIsErr,
+				Details:    ev.ToolDetails,
 				Timestamp:  nowMillis(),
 			},
 		})
-		r.lastID = id
 	case engine.EventError:
 		// Non-Pi but useful for debugging: record a terminal engine error as
 		// a standalone line. Pi viewers ignore unknown event types.
 		id := newID()
-		r.writeLocked(errorEvt{
+		r.flushAssistantLocked(nil, "error", nil)
+		r.writeChainedLocked(id, errorEvt{
 			Type:      "error",
 			ID:        id,
 			ParentID:  r.parentPtr(),
 			Timestamp: nowISO(),
 			Error:     ev.Err,
 		})
-		r.lastID = id
 	}
 }
 
@@ -185,9 +229,12 @@ func (r *Recorder) Record(ev engine.Event) {
 func (r *Recorder) SectionStart(id string, seq int, kind, task string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.flushAssistantLocked(nil, "", nil)
+	if r.closed || r.err != nil {
+		return
+	}
+	r.flushAssistantLocked(nil, "interrupted", nil)
 	evtID := newID()
-	r.writeLocked(sectionStartEvt{
+	r.writeChainedLocked(evtID, sectionStartEvt{
 		Type:      "section_start",
 		ID:        evtID,
 		ParentID:  r.parentPtr(),
@@ -197,7 +244,6 @@ func (r *Recorder) SectionStart(id string, seq int, kind, task string) {
 		Kind:      kind,
 		Task:      task,
 	})
-	r.lastID = evtID
 }
 
 // SectionEnd records the close of a durable-autopilot bounded section along
@@ -205,9 +251,12 @@ func (r *Recorder) SectionStart(id string, seq int, kind, task string) {
 func (r *Recorder) SectionEnd(id, status, rotationReason, summary string, durationMs int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.flushAssistantLocked(nil, "", nil)
+	if r.closed || r.err != nil {
+		return
+	}
+	r.flushAssistantLocked(nil, "interrupted", nil)
 	evtID := newID()
-	r.writeLocked(sectionEndEvt{
+	r.writeChainedLocked(evtID, sectionEndEvt{
 		Type:           "section_end",
 		ID:             evtID,
 		ParentID:       r.parentPtr(),
@@ -218,7 +267,6 @@ func (r *Recorder) SectionEnd(id, status, rotationReason, summary string, durati
 		Summary:        summary,
 		DurationMs:     durationMs,
 	})
-	r.lastID = evtID
 }
 
 // SectionInterrupted records a section that was interrupted (e.g. a run
@@ -226,16 +274,18 @@ func (r *Recorder) SectionEnd(id, status, rotationReason, summary string, durati
 func (r *Recorder) SectionInterrupted(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.flushAssistantLocked(nil, "", nil)
+	if r.closed || r.err != nil {
+		return
+	}
+	r.flushAssistantLocked(nil, "interrupted", nil)
 	evtID := newID()
-	r.writeLocked(sectionInterruptedEvt{
+	r.writeChainedLocked(evtID, sectionInterruptedEvt{
 		Type:      "section_interrupted",
 		ID:        evtID,
 		ParentID:  r.parentPtr(),
 		Timestamp: nowISO(),
 		SectionID: id,
 	})
-	r.lastID = evtID
 }
 
 // Close flushes any assistant turn that never reached its turn_done (e.g. a
@@ -244,16 +294,20 @@ func (r *Recorder) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
-		return nil
+		return r.err
 	}
-	r.flushAssistantLocked(nil, "", nil)
+	r.flushAssistantLocked(nil, "interrupted", nil)
 	r.closed = true
-	if r.f == nil {
-		return nil
+	if r.f != nil {
+		if err := r.f.Sync(); err != nil {
+			r.err = errors.Join(r.err, fmt.Errorf("sessionlog: sync: %w", err))
+		}
+		if err := r.f.Close(); err != nil {
+			r.err = errors.Join(r.err, fmt.Errorf("sessionlog: close: %w", err))
+		}
+		r.f = nil
 	}
-	err := r.f.Close()
-	r.f = nil
-	return err
+	return r.err
 }
 
 // writeHeaderLocked writes the session header (session + model_change +
@@ -271,7 +325,7 @@ func (r *Recorder) writeHeaderLocked() {
 	})
 
 	mcID := newID()
-	r.writeLocked(modelChangeEvt{
+	r.writeChainedLocked(mcID, modelChangeEvt{
 		Type:      "model_change",
 		ID:        mcID,
 		ParentID:  r.parentPtr(), // nil here -> "parentId": null
@@ -279,17 +333,15 @@ func (r *Recorder) writeHeaderLocked() {
 		Provider:  r.meta.Provider,
 		ModelID:   r.meta.Model,
 	})
-	r.lastID = mcID
 
 	tlID := newID()
-	r.writeLocked(thinkingLevelEvt{
+	r.writeChainedLocked(tlID, thinkingLevelEvt{
 		Type:          "thinking_level_change",
 		ID:            tlID,
 		ParentID:      r.parentPtr(),
 		Timestamp:     nowISO(),
 		ThinkingLevel: r.meta.ThinkingLevel,
 	})
-	r.lastID = tlID
 }
 
 // flushAssistantLocked writes the accumulated thinking/text plus the turn's
@@ -297,10 +349,11 @@ func (r *Recorder) writeHeaderLocked() {
 // with nothing to show (no thinking, no text, no tool calls — e.g. a nudged
 // empty turn) writes nothing. Caller must hold r.mu.
 func (r *Recorder) flushAssistantLocked(toolCalls []stream.ToolCall, stopReason string, usage *stream.Usage) {
+	if r.closed || r.err != nil {
+		return
+	}
 	think := r.think.String()
 	text := r.text.String()
-	r.think.Reset()
-	r.text.Reset()
 	if think == "" && text == "" && len(toolCalls) == 0 {
 		return
 	}
@@ -324,7 +377,7 @@ func (r *Recorder) flushAssistantLocked(toolCalls []stream.ToolCall, stopReason 
 		})
 	}
 	id := newID()
-	r.writeLocked(messageEvt{
+	r.writeChainedLocked(id, messageEvt{
 		Type:      "message",
 		ID:        id,
 		ParentID:  r.parentPtr(),
@@ -339,22 +392,41 @@ func (r *Recorder) flushAssistantLocked(toolCalls []stream.ToolCall, stopReason 
 			Timestamp:  nowMillis(),
 		},
 	})
-	r.lastID = id
+	if r.err == nil {
+		r.think.Reset()
+		r.text.Reset()
+	}
 }
 
-// writeLocked marshals v to one JSON line and appends it to the file. Marshal
-// or write errors are dropped: a best-effort debug transcript must never take
-// down the run it is observing. Caller must hold r.mu.
-func (r *Recorder) writeLocked(v any) {
-	if r.f == nil || r.closed {
-		return
+// writeChainedLocked commits the chain head only after a complete line write.
+func (r *Recorder) writeChainedLocked(id string, v any) {
+	if r.writeLocked(v) {
+		r.lastID = id
+	}
+}
+
+// writeLocked stops at the first marshal/write failure. A short write may have
+// left an incomplete JSON line, so continuing would produce misleading evidence.
+// Errors are observable through Err/Close without taking down the agent run.
+func (r *Recorder) writeLocked(v any) bool {
+	if r.f == nil || r.closed || r.err != nil {
+		return false
 	}
 	b, err := json.Marshal(v)
 	if err != nil {
-		return
+		r.err = fmt.Errorf("sessionlog: marshal: %w", err)
+		return false
 	}
 	b = append(b, '\n')
-	_, _ = r.f.Write(b)
+	n, err := r.f.Write(b)
+	if n != len(b) {
+		err = errors.Join(err, io.ErrShortWrite)
+	}
+	if err != nil {
+		r.err = fmt.Errorf("sessionlog: write: %w", err)
+		return false
+	}
+	return true
 }
 
 // parentPtr returns the current chain head as a pointer, or nil when the

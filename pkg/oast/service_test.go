@@ -10,6 +10,7 @@ import (
 	"github.com/projectdiscovery/interactsh/pkg/server"
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/oast/oastclass"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
@@ -105,9 +106,9 @@ func extractedValue(results []string, prefix string) (string, bool) {
 	return "", false
 }
 
-// TestEnrichOASTResult verifies an out-of-band finding is made self-tracing: the
-// planting request/response are embedded and human-readable anchors (origin
-// request, http_record UUID, planted callback URL, callback evidence) are added.
+// TestEnrichOASTResult verifies integrity: the original input is context only,
+// replay intent is explicitly non-captured, and the collaborator's bytes are a
+// separate observation. No reconstructed request receives the crawl response.
 func TestEnrichOASTResult(t *testing.T) {
 	interaction := &server.Interaction{
 		Protocol:      "http",
@@ -147,17 +148,28 @@ func TestEnrichOASTResult(t *testing.T) {
 
 	enrichOASTResult(result, interaction, pctx, origin)
 
-	// The planting request is embedded with the request-line payload re-applied,
-	// so the panel shows where the callback URL was planted — not the bare
-	// original. The original Host header (the victim) is preserved.
-	if !strings.Contains(result.Request, "GET http://nonce123.oast.pro/ HTTP/1.1") {
-		t.Errorf("Request missing reconstructed request-line payload: got %q", result.Request)
+	if result.Request != "" || result.Response != "" || result.EvidenceStatus != "missing" {
+		t.Fatalf("missing planting receipt fabricated a primary pair: %+v", result)
 	}
-	if !strings.Contains(result.Request, "Host: victim.example") {
-		t.Errorf("Request dropped the victim Host header: got %q", result.Request)
+	if len(result.Evidence) != 2 {
+		t.Fatalf("expected separate baseline and callback receipts, got %+v", result.Evidence)
 	}
-	if result.Response != string(origin.RawResponse) {
-		t.Errorf("Response not embedded: got %q", result.Response)
+	baseline, callback := result.Evidence[0], result.Evidence[1]
+	if baseline.Role != evidence.RoleBaseline || baseline.Primary || string(baseline.Exchange.Request) != string(origin.RawRequest) || string(baseline.Exchange.Response) != string(origin.RawResponse) {
+		t.Fatalf("baseline changed or selected as planting proof: %+v", baseline)
+	}
+	if callback.Role != evidence.RoleObservation || callback.Primary || string(callback.Exchange.Request) != interaction.RawRequest || string(callback.Exchange.Response) != interaction.RawResponse || callback.Exchange.Service != "http://nonce123.oast.pro" {
+		t.Fatalf("callback did not retain its own collaborator pair: %+v", callback)
+	}
+	if callback.Exchange.Provenance != evidence.ProvenanceSupplied || !callback.Exchange.CapturedAt.Equal(interaction.Timestamp) {
+		t.Fatalf("callback provenance/time changed: %+v", callback.Exchange)
+	}
+	if evidence.HasSelectedEvidence(result.Evidence) {
+		t.Fatal("callback without planting receipt must not claim selected target proof")
+	}
+	hint := output.ParseEvidence(result.AdditionalEvidence[0])
+	if hint.IsPair() || !strings.Contains(hint.Prose, "NOT captured") || !strings.Contains(hint.Prose, "GET http://nonce123.oast.pro/ HTTP/1.1") || strings.Contains(hint.Prose, string(origin.RawResponse)) {
+		t.Fatalf("replay hint became an exchange or omitted integrity label: %+v", hint)
 	}
 
 	// The planted payload + injection point are stated explicitly.
@@ -185,16 +197,14 @@ func TestEnrichOASTResult(t *testing.T) {
 		t.Errorf("description missing origin anchors: %q", result.Info.Description)
 	}
 
-	// The out-of-band callback request is retained as evidence.
-	if len(result.AdditionalEvidence) == 0 ||
-		!strings.Contains(result.AdditionalEvidence[0], "nonce123.oast.pro") {
-		t.Errorf("callback evidence missing: %v", result.AdditionalEvidence)
+	// A compatibility callback pair contains ONLY the collaborator's messages.
+	if len(result.AdditionalEvidence) != 2 || output.ParseEvidence(result.AdditionalEvidence[1]).Request != interaction.RawRequest || output.ParseEvidence(result.AdditionalEvidence[1]).Response != interaction.RawResponse {
+		t.Errorf("callback evidence missing or mixed: %v", result.AdditionalEvidence)
 	}
 }
 
-// TestPayloadRequest verifies the payload is re-applied at the right injection
-// point so the Request panel is never a bare original. Covers the real-world
-// bare-host callback (no scheme), header injection, and the parameter fallback.
+// TestPayloadRequest tests replay INTENT reconstruction only. These strings are
+// not captured requests and must never be promoted to selected evidence.
 func TestPayloadRequest(t *testing.T) {
 	raw := []byte("GET /foo?a=1 HTTP/1.1\r\nHost: victim.example\r\nAccept: */*\r\n\r\n")
 
@@ -234,9 +244,9 @@ func TestPayloadRequest(t *testing.T) {
 	}
 
 	// Parameter injection WITH a recorded payload → the value is re-applied at the
-	// named query parameter using the real builder, so the Request panel shows the
-	// exact wire form (the smuggle payload's literal CR/LF query-encoded, the benign
-	// crawl value replaced) instead of the untouched original request.
+	// named query parameter using the normal builder in the non-captured replay
+	// hint (literal CR/LF query-encoded, benign crawl value replaced). This does
+	// not certify the encoding or bytes of the actual planting execution.
 	smuggleReq := []byte("GET /login?refURL=https%3A%2F%2Fvictim.example%2Fhome HTTP/1.1\r\nHost: victim.example\r\n\r\n")
 	rebuilt := payloadRequest(smuggleReq, PayloadContext{
 		ParameterName: "refURL",

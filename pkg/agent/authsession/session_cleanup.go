@@ -1,44 +1,22 @@
 package authsession
 
 import (
-	"os"
-	"path/filepath"
+	"errors"
 	"time"
-
-	"go.uber.org/zap"
 )
 
-// CleanupSessionDirs removes session directories under sessionsDir that are
-// older than maxAge. It returns the number of directories deleted.
+// ErrUnsafeSessionRetention means age-only cleanup cannot establish that evidence
+// is safe to delete. Directory mtime misses descendant writes and resumed runs.
+var ErrUnsafeSessionRetention = errors.New("automatic session evidence deletion is disabled: age alone cannot establish run inactivity or catalog dependencies")
+
+// CleanupSessionDirs no longer removes evidence based on directory age. The
+// signature is retained for compatibility, but it fails closed without touching
+// the filesystem. A future opt-in retention policy must coordinate authoritative
+// run status, project scope, the catalog, findings, and durable sections.
+// This does not reclaim retained temporary audit sources: those require recovery
+// and guarded owner cleanup (see docs/agentic-scan/evidence-retention.md).
+//
+// Deprecated: use an explicitly scoped, dependency-aware retention workflow.
 func CleanupSessionDirs(sessionsDir string, maxAge time.Duration) (int, error) {
-	entries, err := os.ReadDir(sessionsDir)
-	if err != nil {
-		return 0, err
-	}
-
-	cutoff := time.Now().Add(-maxAge)
-	deleted := 0
-
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			zap.L().Debug("Failed to stat session dir entry", zap.String("name", entry.Name()), zap.Error(err))
-			continue
-		}
-
-		if info.ModTime().Before(cutoff) {
-			path := filepath.Join(sessionsDir, entry.Name())
-			if err := os.RemoveAll(path); err != nil {
-				zap.L().Debug("Failed to remove old session dir", zap.String("path", path), zap.Error(err))
-				continue
-			}
-			deleted++
-		}
-	}
-
-	return deleted, nil
+	return 0, ErrUnsafeSessionRetention
 }

@@ -1,11 +1,11 @@
 'use client';
 
-import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
+import { useState, useRef, useCallback, useEffect, useMemo, type SetStateAction } from 'react';
 import { useFollowTail } from '@/lib/useFollowTail';
-import { useSearchParamsClient } from '@/lib/useSearchParamsClient';
 import { zipSync } from 'fflate';
 import { useAgentSessions, useAgentSessionDetail, useUploadRepo, useStartAutopilotRun, useStartAgentRun, useCancelAgentRun, useAgentRunStatus } from '@/api/hooks';
-import { withDemoKey } from '@/api/client';
+import { useProjectContext } from '@/contexts/ProjectContext';
+import { getProjectUUID } from '@/api/client';
 import { isTerminalAgentStatus } from '@/api/types';
 import { fetchSSE } from '@/lib/sse';
 import { useAgentSessionLogs } from '@/lib/useAgentSessionLogs';
@@ -75,8 +75,31 @@ export function detectInputType(value: string): DetectedInputType {
   return 'url';
 }
 
+const SESSION_PAGE_SIZE = 20;
+
+function writeSessionURL(uuid: string | null, replace = false) {
+  const url = new URL(window.location.href);
+  if (uuid) url.searchParams.set('session', uuid);
+  else url.searchParams.delete('session');
+  const href = url.pathname + url.search + url.hash;
+  if (href !== window.location.pathname + window.location.search + window.location.hash) {
+    if (replace) window.history.replaceState(window.history.state, '', href);
+    else window.history.pushState(window.history.state, '', href);
+  }
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error ? (error instanceof Error ? error.message : fallback) : '';
+}
+
 export function useAgentsLogic() {
-  const searchParams = useSearchParamsClient();
+  const { projectUUID: contextProjectUUID } = useProjectContext();
+  // Match the API scope while ProjectProvider hydrates its persisted selection.
+  const projectUUID = getProjectUUID() ?? contextProjectUUID;
+  const lastProjectRef = useRef(projectUUID);
+  const currentProjectRef = useRef(projectUUID);
+  currentProjectRef.current = projectUUID;
+  const projectGenerationRef = useRef(0);
 
   // Hero state
   const [targetUrl, setTargetUrl] = useState('');
@@ -190,12 +213,19 @@ export function useAgentsLogic() {
   // runtime.log through the watched session (expandedSessionUuid), and Stop hits
   // the cancel endpoint. No client-held SSE drives the run, so closing the tab
   // or navigating away no longer interrupts it.
-  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [activeRun, setActiveRun] = useState<{ projectUUID: typeof projectUUID; uuid: string | null }>({ projectUUID, uuid: null });
+  const activeRunId = activeRun.projectUUID === projectUUID ? activeRun.uuid : null;
+  const activeRunRef = useRef(activeRunId);
+  activeRunRef.current = activeRunId;
   const [scanError, setScanError] = useState('');
+  const [cancelFailure, setCancelFailure] = useState<{ projectUUID: typeof projectUUID; uuid: string; message: string } | null>(null);
+  const cancelError = cancelFailure?.projectUUID === projectUUID && cancelFailure.uuid === activeRunId ? cancelFailure.message : '';
   const [streamingOpen, setStreamingOpen] = useState(false);
   const startAgentRun = useStartAgentRun();
   const cancelAgentRun = useCancelAgentRun();
-  const { data: activeRunStatus } = useAgentRunStatus(activeRunId);
+  const activeRunQuery = useAgentRunStatus(activeRunId);
+  const activeRunStatus = activeRunId ? activeRunQuery.data : undefined;
+  const activeRunStatusError = activeRunId ? errorMessage(activeRunQuery.error, 'Failed to load run status') : '';
   const activeRunTerminal = isTerminalAgentStatus(activeRunStatus?.status);
   // The Start/Stop toggle and the spinner treat a run as "streaming" while we're
   // submitting or while the active run hasn't reached a terminal status
@@ -221,21 +251,72 @@ export function useAgentsLogic() {
   const uploadFileInputRef = useRef<HTMLInputElement>(null);
   const uploadRepo = useUploadRepo();
 
-  // Sessions
-  const [expandedSessionUuid, setExpandedSessionUuid] = useState<string | null>(null);
-  const { data: sessionsData } = useAgentSessions({ limit: 20 });
-  const { data: sessionDetail } = useAgentSessionDetail(expandedSessionUuid);
-  const { logs: sessionLogs, isStreaming: isSessionLogStreaming, error: sessionLogError } =
-    useAgentSessionLogs(expandedSessionUuid, sessionDetail?.status);
+  // Selection starts empty for static HTML/hydration. Scope it before querying,
+  // so a project switch never requests the old UUID against the new project.
+  const [selection, setSelection] = useState<{ projectUUID: typeof projectUUID; uuid: string | null }>({ projectUUID, uuid: null });
+  const expandedSessionUuid = selection.projectUUID === projectUUID ? selection.uuid : null;
+  const selectedSessionRef = useRef(expandedSessionUuid);
+  selectedSessionRef.current = expandedSessionUuid;
+  const setExpandedSessionUuid = useCallback((value: SetStateAction<string | null>) => {
+    if (currentProjectRef.current !== projectUUID) return;
+    const uuid = typeof value === 'function' ? value(selectedSessionRef.current) : value;
+    selectedSessionRef.current = uuid;
+    writeSessionURL(uuid);
+    setSelection({ projectUUID, uuid });
+  }, [projectUUID]);
 
-  // Auto-expand a linked session if the URL contains ?session=...
+  const [history, setHistory] = useState({ projectUUID, offset: 0 });
+  const sessionsOffset = history.projectUUID === projectUUID ? history.offset : 0;
+  const sessionsQuery = useAgentSessions({ limit: SESSION_PAGE_SIZE, offset: sessionsOffset });
+  // keepPreviousData is not the requested page; don't show its rows/range as new.
+  const sessionsData = sessionsQuery.isPlaceholderData ? undefined : sessionsQuery.data;
+  const sessionsLoading = !!(sessionsQuery.isPending || sessionsQuery.isPlaceholderData);
+  const sessionsError = errorMessage(sessionsQuery.error, 'Failed to load agent sessions');
+  const sessionsCount = sessionsData?.data?.length ?? 0;
+  const sessionsTotal = typeof sessionsData?.total === 'number' && Number.isFinite(sessionsData.total) && sessionsData.total >= 0 ? sessionsData.total : null;
+  const sessionsHasNext = !!sessionsData && (typeof sessionsData.has_more === 'boolean'
+    ? sessionsData.has_more
+    : sessionsTotal !== null ? sessionsOffset + sessionsCount < sessionsTotal : sessionsCount === SESSION_PAGE_SIZE);
+  const sessionsBusy = sessionsLoading || !!sessionsQuery.isFetching;
+  const sessionsPrevious = () => setHistory({ projectUUID, offset: Math.max(0, sessionsOffset - SESSION_PAGE_SIZE) });
+  const sessionsNext = () => {
+    if (sessionsHasNext && !sessionsBusy) setHistory({ projectUUID, offset: sessionsOffset + SESSION_PAGE_SIZE });
+  };
+  // A different project/run always opens the full byte-paged log, never a retained tail.
+  const sessionSelectionKey = JSON.stringify([projectUUID, expandedSessionUuid]);
+  const [tailSelectionKey, setTailSelectionKey] = useState<string | null>(null);
+  const consoleMode = tailSelectionKey === sessionSelectionKey ? 'tail' : 'full';
+  useEffect(() => { setTailSelectionKey(null); }, [sessionSelectionKey]);
+  const setConsoleMode = (mode: 'full' | 'tail') => setTailSelectionKey(mode === 'tail' ? sessionSelectionKey : null);
+  const sessionDetailQuery = useAgentSessionDetail(expandedSessionUuid);
+  const sessionDetail = expandedSessionUuid ? sessionDetailQuery.data : undefined;
+  const sessionDetailError = expandedSessionUuid ? errorMessage(sessionDetailQuery.error, 'Failed to load session details') : '';
+  const sessionLog = useAgentSessionLogs(consoleMode === 'tail' && contextProjectUUID ? expandedSessionUuid : null, sessionDetail?.status);
+  const sessionLogs = sessionLog.logs;
+
   useEffect(() => {
-    const session = searchParams.get('session');
-    if (!session) return;
-    setExpandedSessionUuid(session);
-    window.history.replaceState({}, '', withDemoKey('/agentic-scan'));
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    const syncFromURL = () => {
+      const uuid = new URLSearchParams(window.location.search).get('session')?.trim() || null;
+      selectedSessionRef.current = uuid;
+      setSelection({ projectUUID, uuid });
+    };
+    if (lastProjectRef.current !== projectUUID) {
+      lastProjectRef.current = projectUUID;
+      projectGenerationRef.current++;
+      writeSessionURL(null, true);
+      selectedSessionRef.current = null;
+      setSelection({ projectUUID, uuid: null });
+      setHistory({ projectUUID, offset: 0 });
+      setActiveRun({ projectUUID, uuid: null });
+      setCancelFailure(null);
+      setScanError('');
+      setStreamingOpen(false);
+    } else {
+      syncFromURL();
+    }
+    window.addEventListener('popstate', syncFromURL);
+    return () => window.removeEventListener('popstate', syncFromURL);
+  }, [projectUUID]);
 
   // Sync advancedMode with scanProfile so the correct advanced section renders
   useEffect(() => {
@@ -253,7 +334,7 @@ export function useAgentsLogic() {
     if (isScanStreaming || expandedSessionUuid) setStreamingOpen(true);
   }, [isScanStreaming, expandedSessionUuid]);
 
-  const scanOutputTail = useFollowTail<HTMLPreElement>(sessionLogs, expandedSessionUuid);
+  const scanOutputTail = useFollowTail<HTMLPreElement>(sessionLogs, JSON.stringify([projectUUID, expandedSessionUuid]));
 
   const scrollChatToBottom = useCallback(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -265,23 +346,42 @@ export function useAgentsLogic() {
   // / scanResult) and tail its runtime.log by pointing the watched session at
   // the new run UUID. Replaces the old client-held SSE consumption.
   const startScan = useCallback((endpoint: string, body: Record<string, unknown>) => {
+    const projectGeneration = projectGenerationRef.current;
     setScanError('');
-    setActiveRunId(null);
+    setCancelFailure(null);
+    setActiveRun({ projectUUID, uuid: null });
+    activeRunRef.current = null;
     setStreamingOpen(true);
     startAgentRun.mutate({ endpoint, body }, {
       onSuccess: (data) => {
-        setActiveRunId(data.agentic_scan_uuid);
+        if (currentProjectRef.current !== projectUUID || projectGenerationRef.current !== projectGeneration) return;
+        activeRunRef.current = data.agentic_scan_uuid;
+        setActiveRun({ projectUUID, uuid: data.agentic_scan_uuid });
         setExpandedSessionUuid(data.agentic_scan_uuid);
       },
       onError: (err) => {
+        if (currentProjectRef.current !== projectUUID || projectGenerationRef.current !== projectGeneration) return;
         setScanError(err instanceof Error ? err.message : 'Failed to start run');
       },
     });
-  }, [startAgentRun]);
+  }, [startAgentRun, projectUUID, setExpandedSessionUuid]);
 
   const handleScanCancel = useCallback(() => {
-    if (activeRunId) cancelAgentRun.mutate(activeRunId);
-  }, [activeRunId, cancelAgentRun]);
+    if (!activeRunId || cancelAgentRun.isPending || currentProjectRef.current !== projectUUID || activeRunRef.current !== activeRunId) return;
+    const uuid = activeRunId;
+    const projectGeneration = projectGenerationRef.current;
+    const stillCurrent = () => currentProjectRef.current === projectUUID
+      && projectGenerationRef.current === projectGeneration && activeRunRef.current === uuid;
+    setCancelFailure(null);
+    cancelAgentRun.mutate(uuid, {
+      onSuccess: () => {
+        if (stillCurrent()) setCancelFailure(null);
+      },
+      onError: (error) => {
+        if (stillCurrent()) setCancelFailure({ projectUUID, uuid, message: errorMessage(error, 'Failed to cancel run') });
+      },
+    });
+  }, [activeRunId, cancelAgentRun, projectUUID]);
 
   const handleChatCancel = useCallback(() => {
     chatAbortRef.current?.abort();
@@ -647,10 +747,9 @@ export function useAgentsLogic() {
     targetRunId, targetRunStatus, targetError,
     startAutopilotRun, handleTargetSubmit,
 
-    // Async scan run (status-polled; output tailed from the run's runtime.log).
-    // scanOutput is the active run's tailed log (drives the sessions-list
-    // default-collapse); scanResult/scanError surface the run's terminal
-    // outcome (a failed/errored run's message included alongside submit errors).
+    // Async scan run (status-polled). Full runtime.log pages load in the shared viewer;
+    // scanOutput contains only the optional live tail. scanResult/scanError surface
+    // the durable run outcome independently of the chosen log display mode.
     scanOutput: activeRunId ? sessionLogs : '',
     scanResult,
     scanError: scanError
@@ -658,15 +757,23 @@ export function useAgentsLogic() {
         ? (activeRunStatus?.error || 'run failed')
         : ''),
     isScanStreaming, handleScanCancel,
+    activeRunStatusError, cancelError,
+    activeRunStatusRetry: () => activeRunQuery.refetch?.(),
     streamingOpen, setStreamingOpen,
+    consoleMode, setConsoleMode,
     scanOutputRef: scanOutputTail.ref,
     onScanOutputScroll: scanOutputTail.onScroll,
 
-    // The panel always tails the watched session's runtime.log; "streaming"
-    // covers both the submit round-trip and the live log tail.
+    // Run status and log connection status are independent: losing the console
+    // connection does not stop the durable server-side agent run.
     panelOutput: sessionLogs,
-    panelIsStreaming: isScanStreaming || isSessionLogStreaming,
-    panelError: scanError || sessionLogError || '',
+    panelIsRunning: startAgentRun.isPending || (!!expandedSessionUuid &&
+      (sessionDetail?.status ? !isTerminalAgentStatus(sessionDetail.status) : activeRunId === expandedSessionUuid && !activeRunTerminal)),
+    panelConnection: sessionLog.connection,
+    panelTruncated: sessionLog.truncated,
+    panelLogSize: sessionLog.logSize,
+    panelRetry: sessionLog.retry,
+    panelError: [scanError, sessionLog.error].filter(Boolean).join('\n'),
     panelPlaceholder: sessionsData?.data && sessionsData.data.length > 0
       ? 'Select a session above or start a new scan...'
       : 'agent output will appear here...',
@@ -683,6 +790,12 @@ export function useAgentsLogic() {
 
     // Sessions
     expandedSessionUuid, setExpandedSessionUuid,
-    sessionsData, sessionDetail,
+    sessionsData, sessionsLoading, sessionsBusy, sessionsError,
+    sessionsOffset, sessionsCount, sessionsTotal, sessionsHasNext, sessionsPrevious, sessionsNext,
+    sessionsRetry: () => sessionsQuery.refetch?.(),
+    sessionDetail, sessionDetailError,
+    sessionDetailLoading: !!sessionDetailQuery.isPending,
+    sessionDetailRetry: () => sessionDetailQuery.refetch?.(),
+    sessionSelectionKey,
   };
 }

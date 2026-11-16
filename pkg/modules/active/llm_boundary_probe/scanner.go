@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	urlutil "github.com/projectdiscovery/utils/url"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra/llm"
@@ -69,6 +70,7 @@ func (m *Module) RequiredTechs() []string { return []string{"llm"} }
 
 // formHit records one prompt form that leaked a secret, with the wire evidence.
 type formHit struct {
+	receipt  *evidence.Exchange
 	prompt   string
 	rawReq   string
 	respBody string
@@ -116,10 +118,10 @@ func (m *Module) ScanPerRequest(
 // leaked a validated secret, and reports a finding only when the SAME secret is
 // returned by at least two different forms. Returns nil on refusals, on prompt-
 // prose without a concrete secret, or when only a single form leaked.
-func (m *Module) checkSecretDisclosure(client *llm.Client, u *urlutil.URL, fieldName string) *output.ResultEvent {
+func (m *Module) checkSecretDisclosure(client *llm.Client, u *urlutil.URL, fieldName string) (result *output.ResultEvent) {
 	var hits []formHit
 	for _, p := range promptForms {
-		assistant, rawReq, respBody, err := client.Chat(context.Background(), p)
+		assistant, rawReq, respBody, receipt, err := client.ChatCapture(context.Background(), p)
 		if err != nil {
 			continue
 		}
@@ -127,7 +129,7 @@ func (m *Module) checkSecretDisclosure(client *llm.Client, u *urlutil.URL, field
 		if !ok {
 			continue
 		}
-		hits = append(hits, formHit{prompt: p, rawReq: rawReq, respBody: respBody, secret: secret, rule: rule})
+		hits = append(hits, formHit{receipt: receipt, prompt: p, rawReq: rawReq, respBody: respBody, secret: secret, rule: rule})
 	}
 
 	group := agreeingSecret(hits)
@@ -137,8 +139,10 @@ func (m *Module) checkSecretDisclosure(client *llm.Client, u *urlutil.URL, field
 	first, second := group[0], group[1]
 
 	ev := modkit.NewEvidenceCollector()
-	ev.Add("prompt form 1: "+first.prompt, first.rawReq, first.respBody)
-	ev.Add("prompt form 2: "+second.prompt, second.rawReq, second.respBody)
+	ev.AddExchange(second.receipt, evidence.RoleConfirmation, "prompt form 2: "+second.prompt)
+	defer func() {
+		modkit.SetPrimaryEvidence(result, first.receipt, evidence.RoleAttack, "prompt form 1: "+first.prompt)
+	}()
 
 	return &output.ResultEvent{
 		ModuleID:           ModuleID,
@@ -150,6 +154,7 @@ func (m *Module) checkSecretDisclosure(client *llm.Client, u *urlutil.URL, field
 		FuzzingParameter:   fieldName,
 		ExtractedResults:   []string{"secret=" + first.secret, "rule=" + first.rule},
 		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
 		MatcherStatus:      true,
 		Metadata: map[string]interface{}{
 			"rule":        first.rule,

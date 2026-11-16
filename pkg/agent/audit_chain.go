@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -69,10 +70,13 @@ type PioliumChainScanner struct {
 
 	done chan struct{}
 
-	mu        sync.Mutex
-	err       error
-	cancelled bool
-	current   *AuditAgenticScanner
+	mu             sync.Mutex
+	err            error
+	processErr     error
+	evidenceErr    error
+	terminalStatus string
+	cancelled      bool
+	current        *AuditAgenticScanner
 
 	aggStats   FindingStats
 	aggCost    ScanCost
@@ -221,7 +225,9 @@ func (p *PioliumChainScanner) run(ctx context.Context, startErr chan<- error) {
 			inner.Cancel()
 		}
 
-		runErr := inner.Wait()
+		_ = inner.Wait()
+		outcome := inner.Outcome()
+		runErr := outcome.ProcessErr
 		p.recordRan(mode, inner)
 
 		// Stop the chain on cancellation — don't roll into the next mode.
@@ -233,6 +239,12 @@ func (p *PioliumChainScanner) run(ctx context.Context, startErr chan<- error) {
 			break
 		}
 
+		if runErr == nil && outcome.EvidenceErr != nil {
+			// Failed recording can also make state unreadable/stale. Do not let
+			// that state turn a successful process into an execution failure, or
+			// overwrite retained evidence by starting the next mode.
+			break
+		}
 		st := inner.Status()
 		complete := runErr == nil && (st == nil || st.Status == "" || st.Status == "complete")
 		if runErr != nil {
@@ -254,12 +266,7 @@ func (p *PioliumChainScanner) run(ctx context.Context, startErr chan<- error) {
 	// ctx cancelled before the first launch).
 	report(chainErr)
 
-	p.mu.Lock()
-	p.err = chainErr
-	p.current = nil
-	p.mu.Unlock()
-
-	p.finalizeAggregateRow(chainErr)
+	p.finishChain(ctx, chainErr)
 }
 
 // recordRan folds one completed inner runner's outcome into the chain
@@ -272,9 +279,11 @@ func (p *PioliumChainScanner) recordRan(mode string, inner *AuditAgenticScanner)
 	stats := inner.FindingStats()
 	cost := inner.CostSummary()
 	st := inner.Status()
+	outcome := inner.Outcome()
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.evidenceErr = errors.Join(p.evidenceErr, outcome.EvidenceErr)
 	p.ranModes = append(p.ranModes, mode)
 	p.aggStats = stats
 	if !cost.IsZero() {
@@ -370,14 +379,40 @@ func (p *PioliumChainScanner) createAggregateRow(ctx context.Context) {
 	}
 }
 
-func (p *PioliumChainScanner) finalizeAggregateRow(chainErr error) {
-	if p.repo == nil {
-		return
+func (p *PioliumChainScanner) finishChain(ctx context.Context, chainErr error) {
+	p.mu.Lock()
+	p.processErr = chainErr
+	p.cancelled = p.cancelled || (chainErr != nil && ctx.Err() != nil)
+	p.current = nil
+	p.mu.Unlock()
+	terminalErr := p.finalizeAggregateRow(chainErr)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.evidenceErr = errors.Join(p.evidenceErr, terminalErr)
+	run := &database.AgenticScan{}
+	applyAuditTerminalStatus(run, chainErr, p.cancelled)
+	if chainErr == nil && p.evidenceErr != nil {
+		run.Status = database.CompletedAgenticScanStatus(true)
 	}
-	ctx := context.Background()
+	p.terminalStatus = run.Status
+	p.err = errors.Join(chainErr, p.evidenceErr)
+}
+
+func (p *PioliumChainScanner) Outcome() AuditOutcome {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return AuditOutcome{ProcessErr: p.processErr, EvidenceErr: p.evidenceErr, Status: p.terminalStatus}
+}
+
+func (p *PioliumChainScanner) finalizeAggregateRow(chainErr error) error {
+	if p.repo == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), auditTerminalTimeout)
+	defer cancel()
 	run, err := p.repo.GetAgenticScan(ctx, p.agenticScanUUID)
 	if err != nil {
-		return
+		return fmt.Errorf("read audit chain terminal catalog: %w", err)
 	}
 
 	now := time.Now()
@@ -389,9 +424,16 @@ func (p *PioliumChainScanner) finalizeAggregateRow(chainErr error) {
 	stats := p.aggStats
 	cost := p.aggCost
 	last := p.lastStatus
+	evidenceErr := p.evidenceErr
 	p.mu.Unlock()
 
 	applyAuditTerminalStatus(run, chainErr, cancelled)
+	if chainErr == nil && evidenceErr != nil {
+		run.Status = database.CompletedAgenticScanStatus(true)
+	}
+	if combined := errors.Join(chainErr, evidenceErr); combined != nil {
+		run.ErrorMessage = combined.Error()
+	}
 	if last != nil {
 		run.CurrentPhase = ""
 		run.PhasesRun = nil
@@ -401,8 +443,10 @@ func (p *PioliumChainScanner) finalizeAggregateRow(chainErr error) {
 	applyScanCost(run, cost)
 
 	if uErr := p.repo.UpdateAgenticScan(ctx, run); uErr != nil {
-		zap.L().Debug("piolium chain: failed to finalize aggregate AgenticScan", zap.Error(uErr))
+		zap.L().Warn("piolium chain: failed to finalize aggregate AgenticScan", zap.Error(uErr))
+		return fmt.Errorf("persist audit chain terminal catalog: %w", uErr)
 	}
+	return nil
 }
 
 // deriveAuditScanUUID is the single source of truth for an audit run's

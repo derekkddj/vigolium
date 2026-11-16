@@ -68,6 +68,7 @@ func (m *Module) phaseBooleanSQLi(
 	}
 
 	for _, c := range candidates {
+		proof := &gqlProof{}
 		send := func(val string) (string, bool) {
 			q, ok := schema.RenderProbe(c.field, c.arg, graphqlx.QuoteString(val), 0)
 			if !ok {
@@ -79,6 +80,11 @@ func (m *Module) phaseBooleanSQLi(
 			}
 			if !graphqlx.LooksLikeGraphQLResponse([]byte(r.body)) {
 				return "", false
+			}
+			if val == sqliBase+sqliTrueSuffix {
+				proof.attack(r, graphqlx.QueryBody(q))
+			} else {
+				proof.control(r)
 			}
 			return r.body, true
 		}
@@ -125,7 +131,7 @@ func (m *Module) phaseBooleanSQLi(
 			continue
 		}
 
-		return &output.ResultEvent{
+		return proof.finding(&output.ResultEvent{
 			ModuleID:      ModuleID,
 			RecordKind:    output.RecordKindFinding,
 			EvidenceGrade: output.EvidenceGradeBypass,
@@ -154,7 +160,7 @@ func (m *Module) phaseBooleanSQLi(
 				"or_false_control":    true,
 				"query_logic_changed": true,
 			},
-		}
+		})
 	}
 	return nil
 }

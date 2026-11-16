@@ -263,9 +263,12 @@ func TestProcessResults_BaselineFindingLinksWithoutDuplicateRecord(t *testing.T)
 
 	_, rr := makeTestItem("example.com", "/test", "<html>body</html>")
 
-	// Simulate the ingestion-time pre-registration: the baseline request hash
-	// already maps to its persisted http_record UUID.
-	const baselineUUID = "baseline-record-uuid"
+	// Register a real persisted exchange: a request-hash cache alone cannot
+	// establish that a UUID represents the current service and response.
+	baselineUUID, err := e.repo.SaveRecord(ctx, rr, "spidering", e.projectUUID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	e.caches.requestUUIDs.Store(rr.Request().ID(), baselineUUID)
 
 	mod := &trackingPassiveModule{id: "passive-test"}
@@ -275,8 +278,8 @@ func TestProcessResults_BaselineFindingLinksWithoutDuplicateRecord(t *testing.T)
 
 	e.processResults(ctx, results, mod, rr, nil)
 
-	if got := countRecords(t, db); got != 0 {
-		t.Errorf("http_records = %d, want 0 (baseline finding must not create a duplicate record)", got)
+	if got := countRecords(t, db); got != 1 {
+		t.Errorf("http_records = %d, want 1 (baseline finding must reuse the real existing exchange)", got)
 	}
 	findings := loadFindings(t, db)
 	if len(findings) != 1 {
@@ -296,7 +299,10 @@ func TestProcessResults_MutatedFindingDoesNotLinkBaseline(t *testing.T) {
 
 	_, rr := makeTestItem("example.com", "/test", "<html>body</html>")
 
-	const baselineUUID = "baseline-record-uuid"
+	baselineUUID, err := e.repo.SaveRecord(ctx, rr, "spidering", e.projectUUID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	e.caches.requestUUIDs.Store(rr.Request().ID(), baselineUUID)
 
 	mod := &trackingPassiveModule{id: "active-test"}
@@ -310,8 +316,8 @@ func TestProcessResults_MutatedFindingDoesNotLinkBaseline(t *testing.T) {
 
 	e.processResults(ctx, results, mod, rr, nil)
 
-	if got := countRecords(t, db); got != 1 {
-		t.Errorf("http_records = %d, want 1 (mutated finding saves its own evidence record)", got)
+	if got := countRecords(t, db); got != 2 {
+		t.Errorf("http_records = %d, want 2 (mutated finding saves its own evidence alongside baseline)", got)
 	}
 	findings := loadFindings(t, db)
 	if len(findings) != 1 {
@@ -334,11 +340,9 @@ func newStubRecord(host, path string) *httpmsg.HttpRequestResponse {
 	return httpmsg.NewHttpRequestResponse(httpmsg.NewHttpRequestWithService(svc, raw), nil)
 }
 
-// TestSaveToDatabase_BackfillsStubResponse is the core regression guard for the
-// "spec endpoints show empty traffic" bug: a record stored as a request-only
-// stub (status 0, no response) that maps to an existing RecordUUID must have the
-// executor's freshly fetched baseline persisted back onto it — not discarded.
-func TestSaveToDatabase_BackfillsStubResponse(t *testing.T) {
+// A freshly fetched answer must be retained without rewriting the original
+// request-only discovery receipt. This also protects pending finding references.
+func TestSaveToDatabase_VersionsStubResponse(t *testing.T) {
 	e, db := newRepoExecutor(t)
 	ctx := context.Background()
 
@@ -362,21 +366,32 @@ func TestSaveToDatabase_BackfillsStubResponse(t *testing.T) {
 
 	e.saveToDatabase(ctx, item, req, nil)
 
-	rec, err := e.repo.GetRecordByUUID(ctx, uuid)
+	original, err := e.repo.GetRecordByUUID(ctx, uuid)
 	if err != nil {
-		t.Fatalf("GetRecordByUUID: %v", err)
+		t.Fatal(err)
+	}
+	if original.HasResponse || len(original.RawResponse) != 0 {
+		t.Fatal("discovery stub was rewritten")
+	}
+	newID := e.ResolveRequestUUID(req.Request().ID())
+	if newID == uuid {
+		t.Fatal("new observed exchange reused request-only UUID")
+	}
+	rec, err := e.repo.GetRecordByUUID(ctx, newID)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if !rec.HasResponse || rec.StatusCode != 401 {
-		t.Errorf("stub response not backfilled: status=%d hasResp=%v", rec.StatusCode, rec.HasResponse)
+		t.Fatalf("new answer lost: %+v", rec)
 	}
 	if !strings.Contains(rec.ResponseContentType, "application/json") {
-		t.Errorf("content-type not backfilled: %q", rec.ResponseContentType)
+		t.Error("new content-type lost")
 	}
-	if len(rec.RawResponse) == 0 {
-		t.Error("raw response not backfilled")
+	if string(rec.RawResponse) != string(req.Response().Raw()) {
+		t.Error("new raw response changed")
 	}
-	if got := countRecords(t, db); got != 1 {
-		t.Errorf("http_records = %d, want 1 (backfill must UPDATE, not insert a duplicate)", got)
+	if got := countRecords(t, db); got != 2 {
+		t.Errorf("http_records = %d, want original stub plus observed answer", got)
 	}
 }
 

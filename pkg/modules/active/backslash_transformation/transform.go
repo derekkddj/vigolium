@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 )
 
@@ -39,6 +40,7 @@ func (c Classification) String() string {
 
 // TransformResult represents a single transformation observation.
 type TransformResult struct {
+	exchange       *evidence.Exchange
 	Probe          string         // Original probe (e.g., "\\x41")
 	Received       string         // What we received back
 	Classification Classification // How we classified it

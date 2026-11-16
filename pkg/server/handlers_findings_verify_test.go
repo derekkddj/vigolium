@@ -17,6 +17,8 @@ import (
 
 	"github.com/vigolium/vigolium/pkg/apicontract"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
+	httpRequester "github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modtest"
 	"github.com/vigolium/vigolium/pkg/verify"
@@ -66,9 +68,67 @@ func verifyTestRecord(t *testing.T, repo *database.Repository, rr *httpmsg.HttpR
 	return uuid
 }
 
-// A passive finding is re-analyzed on its stored record (nothing sent), the
-// verdict is written, and the finding is addressable by hash prefix too.
+// A passive finding selects an actual stored observation receipt (nothing sent),
+// the verdict is written, and the finding is addressable by hash prefix too.
 func TestHandleVerifyFinding_Passive(t *testing.T) {
+	app, repo := verifyTestApp(t, "")
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Server", "Apache/2.4.41")
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer srv.Close()
+	chain, _, err := modtest.Requester(t).Execute(modtest.Request(t, srv.URL+"/item"), httpRequester.Options{NoClustering: true})
+	require.NoError(t, err)
+	x := httpRequester.CaptureEvidence(chain)
+	chain.Close()
+	require.NotNil(t, x)
+	require.Equal(t, evidence.ProvenanceCaptured, x.Provenance)
+	require.Equal(t, evidence.StateComplete, x.RequestState)
+	require.Equal(t, evidence.StateComplete, x.ResponseState)
+	rec, err := httpmsg.FromEvidenceExchange(x)
+	require.NoError(t, err)
+	f := verifyTestFinding(t, repo, &database.Finding{
+		ModuleID: "software-version-header", ModuleName: "Software Version Disclosed in Headers",
+		FindingHash: strings.Repeat("cd", 20), URL: srv.URL + "/item",
+		HTTPRecordUUIDs: []string{verifyTestRecord(t, repo, rec)},
+		EvidenceStatus:  "selected",
+		Evidence:        []evidence.Entry{evidence.Select(x, evidence.RoleObservation, true, "Version disclosure observation")},
+	})
+	stored, err := repo.GetEvidenceExchange(context.Background(), x.ID, database.DefaultProjectUUID)
+	require.NoError(t, err)
+	assert.Equal(t, x.Request, stored.Request)
+	assert.Equal(t, x.Response, stored.Response)
+	hits.Store(0) // exclude the original capture from verification's request count
+
+	status, body := doReq(t, app, http.MethodPost, "/api/findings/"+strings.Repeat("cd", 6)+"/verify", "", nil)
+	require.Equal(t, http.StatusOK, status, string(body))
+	var res verify.Result
+	require.NoError(t, json.Unmarshal(body, &res))
+	assert.Equal(t, f.ID, res.ID)
+	assert.Equal(t, database.VerdictConfirmed, res.Verdict, res.Reason)
+	assert.Positive(t, res.Matched)
+	assert.Zero(t, res.UnclassifiedMatched)
+	require.NotNil(t, res.Plan)
+	require.NotNil(t, res.Plan.Baseline)
+	assert.Equal(t, verify.BaselineSelectedExchange, res.Plan.Baseline.Source)
+	assert.Equal(t, x.ID, res.Plan.Baseline.ExchangeID)
+	assert.Equal(t, evidence.RoleObservation, res.Plan.Baseline.Role)
+	assert.False(t, res.Plan.Network)
+	assert.True(t, res.Written)
+	assert.Zero(t, hits.Load(), "a passive verify sends nothing")
+
+	got, err := repo.GetFindingByID(context.Background(), f.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.Verification)
+	assert.Equal(t, database.VerdictConfirmed, got.Verification.Verdict)
+	assert.Equal(t, "v-test", got.Verification.ModuleVersion)
+}
+
+// Historical linked HTTP remains unknown-role context even when it contains the
+// version header. Verification persists inconclusive and --mark cannot confirm it.
+func TestHandleVerifyFinding_PassiveLegacyIsInconclusive(t *testing.T) {
 	app, repo := verifyTestApp(t, "")
 	var hits atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -80,24 +140,36 @@ func TestHandleVerifyFinding_Passive(t *testing.T) {
 		"HTTP/1.1 200 OK\r\nServer: Apache/2.4.41\r\nContent-Type: text/html\r\n\r\nbody")))
 	f := verifyTestFinding(t, repo, &database.Finding{
 		ModuleID: "software-version-header", ModuleName: "Software Version Disclosed in Headers",
-		FindingHash: strings.Repeat("cd", 20), URL: srv.URL + "/item",
+		FindingHash: strings.Repeat("bc", 20), URL: srv.URL + "/item",
 		HTTPRecordUUIDs: []string{verifyTestRecord(t, repo, rec)},
+		Request:         string(rec.Request().Raw()), Response: string(rec.Response().Raw()),
 	})
-
-	status, body := doReq(t, app, http.MethodPost, "/api/findings/"+strings.Repeat("cd", 6)+"/verify", "", nil)
+	path := "/api/findings/" + strconv.FormatInt(f.ID, 10) + "/verify"
+	status, body := doReq(t, app, http.MethodPost, path, `{"mark":true}`, nil)
 	require.Equal(t, http.StatusOK, status, string(body))
 	var res verify.Result
 	require.NoError(t, json.Unmarshal(body, &res))
-	assert.Equal(t, f.ID, res.ID)
-	assert.Equal(t, database.VerdictConfirmed, res.Verdict, res.Reason)
+	assert.Equal(t, database.VerdictInconclusive, res.Verdict, res.Reason)
+	assert.Contains(t, res.Reason, "unknown observation role")
+	assert.Zero(t, res.Matched)
+	assert.Zero(t, res.UnclassifiedMatched, "legacy context is rejected before module execution")
 	assert.True(t, res.Written)
-	assert.Zero(t, hits.Load(), "a passive verify sends nothing")
+	assert.Nil(t, res.Status, "inconclusive verification must not mark the finding confirmed")
+	require.NotNil(t, res.Plan)
+	require.NotNil(t, res.Plan.Baseline)
+	assert.Equal(t, verify.BaselineLinkedRecord, res.Plan.Baseline.Source)
+	assert.Equal(t, evidence.RoleUnknown, res.Plan.Baseline.Role)
+	assert.False(t, res.Plan.Network)
+	assert.Zero(t, hits.Load(), "legacy stored context sends nothing")
 
 	got, err := repo.GetFindingByID(context.Background(), f.ID)
 	require.NoError(t, err)
 	require.NotNil(t, got.Verification)
-	assert.Equal(t, database.VerdictConfirmed, got.Verification.Verdict)
+	assert.Equal(t, database.VerdictInconclusive, got.Verification.Verdict)
+	assert.Equal(t, res.Reason, got.Verification.Reason)
 	assert.Equal(t, "v-test", got.Verification.ModuleVersion)
+	assert.Equal(t, f.Status, got.Status)
+	assert.Empty(t, got.Evidence, "verification must not infer evidence selection from a linked record")
 }
 
 // An active finding re-runs its module against the local target; mark moves

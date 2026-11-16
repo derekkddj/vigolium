@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -295,7 +296,9 @@ func (m *Module) probeFile(
 	p probe,
 	probePath string,
 	fp *notFoundFingerprint,
-) *output.ResultEvent {
+) (guardResult *output.ResultEvent) {
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(guardResult, guardProof) }()
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
@@ -371,7 +374,7 @@ func (m *Module) probeFile(
 		return nil
 	}
 
-	matchedMarkers, ok := modkit.MatchAndConfirmSibling(ctx, httpClient, probePath, body, p.markers)
+	matchedMarkers, ok := modkit.MatchAndConfirmSiblingWithEvidence(ctx, httpClient, probePath, body, p.markers, guardProof)
 	if !ok {
 		return nil
 	}
@@ -379,7 +382,7 @@ func (m *Module) probeFile(
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,
 		Request:          string(modifiedRaw),
@@ -394,4 +397,6 @@ func (m *Module) probeFile(
 			Reference:   []string{"https://www.drupal.org/docs/administering-a-drupal-site/security-in-drupal/securing-your-site"},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+	return result
 }

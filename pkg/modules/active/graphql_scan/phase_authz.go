@@ -74,6 +74,7 @@ func (m *Module) probeIDOR(
 	schema *graphqlx.Schema,
 	lookup graphqlx.IDLookupField,
 	endpointPath string,
+	proofs ...*gqlProof,
 ) bool {
 	argType := lookup.IDArgType()
 	field := lookup.Field.Name
@@ -86,6 +87,13 @@ func (m *Module) probeIDOR(
 		r, err := m.send(ctx, httpClient, "POST", endpointPath, "application/json", graphqlx.QueryBody(q))
 		if err != nil || r.blocked {
 			return nil, false
+		}
+		for _, proof := range proofs {
+			if val == controlValue(argType) {
+				proof.control(r)
+			} else {
+				proof.attack(r, graphqlx.QueryBody(q))
+			}
 		}
 		return r, true
 	}
@@ -146,14 +154,15 @@ func (m *Module) phaseAuthz(
 	var results []*output.ResultEvent
 	for _, lookup := range lookups {
 		field := lookup.Field.Name
+		proof := &gqlProof{}
 		// The predictable-ID pattern must reproduce across independent rounds.
 		if !confirmRounds(defaultConfirmRounds, func() (bool, error) {
-			return m.probeIDOR(ctx, httpClient, schema, lookup, endpointPath), nil
+			return m.probeIDOR(ctx, httpClient, schema, lookup, endpointPath, proof), nil
 		}) {
 			continue
 		}
 
-		results = append(results, &output.ResultEvent{
+		results = append(results, proof.observation(&output.ResultEvent{
 			ModuleID:      ModuleID,
 			RecordKind:    output.RecordKindCandidate,
 			EvidenceGrade: output.EvidenceGradeDifferential,
@@ -183,7 +192,7 @@ func (m *Module) phaseAuthz(
 				"negative_id_control": true,
 				"confirmation_rounds": defaultConfirmRounds,
 			},
-		})
+		}))
 		// One representative finding per host is enough to flag the surface.
 		break
 	}

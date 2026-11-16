@@ -4,7 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"slices"
@@ -70,8 +73,8 @@ func SwarmPhasePrompt(phase string) string {
 // simple markdown-section format that is highly resistant to LLM output errors.
 // Phase 2 (extensions) is conditional — it only runs when the plan indicates
 // custom extensions are needed — and produces JavaScript code blocks in isolation.
-// If Phase 2 fails, the plan from Phase 1 is still valid and the scan proceeds
-// without custom extensions (graceful degradation).
+// If Phase 2 fails normally, the plan from Phase 1 is still valid and the scan
+// proceeds without custom extensions. Cancellation instead interrupts the run.
 // runMasterAgent's techStackMd parameter is the pre-rendered recon
 // markdown (see pkg/agent/recon). Pass "" when no recon ran (e.g.
 // --source mode or --skip recon); the prompt template handles an empty
@@ -104,6 +107,14 @@ func (s *SwarmRunner) runMasterAgent(ctx context.Context, cfg SwarmConfig, recor
 			// Graceful degradation: log the error but proceed with the plan from Phase 1.
 			// Stamp the error onto the plan so the Plan-phase summary can surface Case C.
 			plan.ExtensionAgentError = extErr.Error()
+			if extRaw != "" {
+				rawOutput += "\n\n--- Extension Agent (failed; partial/unvalidated output) ---\n\n" + extRaw
+			}
+			// Optional extension failures may degrade the plan, but cancellation
+			// must not checkpoint it as complete or start subsequent scan phases.
+			if ctx.Err() != nil || errors.Is(extErr, context.Canceled) {
+				return nil, rawOutput, renderedPrompt, fmt.Errorf("extension agent interrupted: %w", errors.Join(extErr, ctx.Err()))
+			}
 			zap.L().Warn("Extension agent failed after retries — scanning without custom extensions",
 				zap.Error(extErr))
 			fmt.Fprintf(os.Stderr, "%s Extension agent failed — scanning without custom extensions: %s\n",
@@ -133,6 +144,7 @@ func (s *SwarmRunner) runPlanAgent(ctx context.Context, cfg SwarmConfig, records
 	opts := Options{
 		AgentName:      cfg.AgentName,
 		PromptTemplate: SwarmPromptPlan,
+		PlanningOnly:   true,
 		TargetURL:      targetURL,
 		Hostname:       hostname,
 		SourcePath:     cfg.SourcePath,
@@ -143,6 +155,7 @@ func (s *SwarmRunner) runPlanAgent(ctx context.Context, cfg SwarmConfig, records
 		ProjectUUID:    cfg.ProjectUUID,
 		StreamWriter:   cfg.StreamWriter,
 		Verbose:        cfg.Verbose,
+		SessionDir:     cfg.SessionDir,
 	}
 
 	// Resolve effective vuln focus: --vuln-type takes precedence, the intent-parsed focus is a broader hint
@@ -175,7 +188,8 @@ func (s *SwarmRunner) runPlanAgent(ctx context.Context, cfg SwarmConfig, records
 				zap.Int("attempt", attempt),
 				zap.Error(lastErr))
 			opts.Append = buildPlanRetryFeedback(effectiveVulnType, lastErr, lastRawOutput)
-			extraContext = retryTruncateContext(records)
+			// Formatting repair keeps the original evidence snapshot. Reducing
+			// it to method/URL would force the model to guess missing details.
 		}
 
 		// Pass the full skill registry so the planner sees the <available_skills>
@@ -185,7 +199,12 @@ func (s *SwarmRunner) runPlanAgent(ctx context.Context, cfg SwarmConfig, records
 			"VulnType":       effectiveVulnType,
 			"TechStack":      techStackMd,
 		}, s.skills)
+		if result != nil {
+			lastRawOutput = result.RawOutput
+			lastRenderedPrompt = result.RenderedPrompt
+		}
 		if runErr != nil {
+			persistFailedPhaseAttempt(cfg, "plan", attempt, "execution_failed", result, runErr)
 			if isRetryableAgentError(ctx, runErr) && attempt < maxAttempts {
 				zap.L().Warn("plan agent execution failed (retryable), will retry",
 					zap.Int("attempt", attempt),
@@ -193,21 +212,20 @@ func (s *SwarmRunner) runPlanAgent(ctx context.Context, cfg SwarmConfig, records
 				lastErr = runErr
 				continue
 			}
-			return nil, "", "", "", fmt.Errorf("plan agent execution failed: %w", runErr)
+			return nil, "", lastRawOutput, lastRenderedPrompt, fmt.Errorf("plan agent execution failed: %w", runErr)
 		}
-
-		lastRawOutput = result.RawOutput
-		lastRenderedPrompt = result.RenderedPrompt
 
 		if cfg.DryRun {
 			return nil, "", result.RawOutput, result.RenderedPrompt, nil
 		}
 
 		parsed, parseErr := parsing.ParseSwarmPlan(result.RawOutput)
+		if parseErr == nil {
+			parseErr = validatePlanningDeliverable(parsed)
+		}
 		if parseErr != nil {
-			zap.L().Debug("plan agent raw output (parse failed)",
-				zap.String("output", result.RawOutput),
-				zap.Int("attempt", attempt))
+			persistFailedPhaseAttempt(cfg, "plan", attempt, "invalid_output", result, parseErr)
+			zap.L().Debug("plan agent output could not be parsed", zap.Int("attempt", attempt))
 			lastErr = parseErr
 			continue
 		}
@@ -247,6 +265,9 @@ func (s *SwarmRunner) runExtensionAgentWithRetry(ctx context.Context, cfg SwarmC
 				s.extensionCache.Store(cacheKey, extensionCacheEntry{Plan: extPlan2, RawOutput: raw})
 			}
 			return extPlan2, raw, nil
+		}
+		if ctx.Err() != nil || errors.Is(lastErr, context.Canceled) {
+			break
 		}
 		if attempt < maxAttempts {
 			zap.L().Warn("Extension agent parse/run failed, will retry",
@@ -335,6 +356,7 @@ func (s *SwarmRunner) runExtensionAgent(ctx context.Context, cfg SwarmConfig, re
 		ProjectUUID:    cfg.ProjectUUID,
 		StreamWriter:   cfg.StreamWriter,
 		Verbose:        cfg.Verbose,
+		SessionDir:     cfg.SessionDir,
 	}
 
 	// Resolve effective vuln focus for extension agent
@@ -345,7 +367,9 @@ func (s *SwarmRunner) runExtensionAgent(ctx context.Context, cfg SwarmConfig, re
 
 	const maxExtRetries = 3
 	var result *Result
+	var completedAttempt int
 	for extAttempt := 1; extAttempt <= maxExtRetries; extAttempt++ {
+		completedAttempt = extAttempt
 		var runErr error
 		result, runErr = s.engine.RunWithExtra(ctx, opts, map[string]string{
 			"RequestContext": requestContext,
@@ -356,11 +380,15 @@ func (s *SwarmRunner) runExtensionAgent(ctx context.Context, cfg SwarmConfig, re
 		if runErr == nil {
 			break
 		}
+		persistFailedPhaseAttempt(cfg, "extension", extAttempt, "execution_failed", result, runErr)
 		if isRetryableAgentError(ctx, runErr) && extAttempt < maxExtRetries {
 			zap.L().Warn("extension agent failed (retryable), will retry",
 				zap.Int("attempt", extAttempt),
 				zap.Error(runErr))
 			continue
+		}
+		if result != nil {
+			return nil, "", result.RawOutput, result.RenderedPrompt, fmt.Errorf("extension agent execution failed: %w", runErr)
 		}
 		return nil, "", "", "", fmt.Errorf("extension agent execution failed: %w", runErr)
 	}
@@ -372,11 +400,51 @@ func (s *SwarmRunner) runExtensionAgent(ctx context.Context, cfg SwarmConfig, re
 	// Parse extensions from the output — we only care about extensions, quick_checks, snippets
 	parsed, parseErr := parsing.ParseSwarmExtensions(result.RawOutput)
 	if parseErr != nil {
+		persistFailedPhaseAttempt(cfg, "extension", completedAttempt, "invalid_output", result, parseErr)
 		return nil, "", result.RawOutput, result.RenderedPrompt,
 			fmt.Errorf("extension agent output unparseable: %w", parseErr)
 	}
 
 	return parsed, "", result.RawOutput, result.RenderedPrompt, nil
+}
+
+// persistFailedPhaseAttempt preserves failed output without treating it as a
+// valid plan or exposing prompts/tool evidence in general runtime logs. CreateTemp
+// gives each call (including parallel batches and repeated outer retries) its
+// own exclusively created, owner-only artifact.
+func persistFailedPhaseAttempt(cfg SwarmConfig, phase string, attempt int, status string, result *Result, runErr error) {
+	if cfg.SessionDir == "" || result == nil {
+		return
+	}
+	artifact := struct {
+		Phase          string `json:"phase"`
+		Attempt        int    `json:"attempt"`
+		Status         string `json:"status"`
+		Error          string `json:"error"`
+		RawOutput      string `json:"raw_output"`
+		RenderedPrompt string `json:"rendered_prompt"`
+	}{phase, attempt, status, runErr.Error(), result.RawOutput, result.RenderedPrompt}
+	f, err := os.CreateTemp(cfg.SessionDir, "failed-"+phase+"-attempt-*.json")
+	if err == nil {
+		var body []byte
+		body, err = json.Marshal(artifact)
+		if err == nil {
+			body = append(body, '\n')
+			var n int
+			n, err = f.Write(body)
+			if n != len(body) {
+				err = errors.Join(err, io.ErrShortWrite)
+			}
+		}
+		err = errors.Join(err, f.Sync(), f.Close())
+		if err != nil {
+			_ = os.Remove(f.Name())
+		}
+	}
+	if err != nil {
+		zap.L().Warn("Failed agent attempt artifact could not be persisted", zap.Error(err))
+		_ = WriteRuntimeProgress(cfg.StreamWriter, "agent", phase, "Evidence degraded: failed-attempt artifact could not be persisted")
+	}
 }
 
 // buildPlanContext formats the plan as a readable summary for the extension agent prompt.
@@ -501,18 +569,18 @@ func buildPlanRetryFeedback(vulnType string, parseErr error, rawOutput string) s
 
 	if rawOutput != "" {
 		snippet := rawOutput
-		if len(snippet) > 500 {
-			snippet = snippet[:500] + "..."
+		if len(snippet) > 8192 {
+			snippet = snippet[:4096] + fmt.Sprintf("\n[retry preview omitted %d bytes]\n", len(snippet)-8192) + snippet[len(snippet)-4096:]
 		}
-		fmt.Fprintf(&sb, "Your previous output (truncated):\n```\n%s\n```\n\n", snippet)
+		fmt.Fprintf(&sb, "Your previous output (bounded repair context):\n```\n%s\n```\n\n", snippet)
 	}
 
 	sb.WriteString("You MUST use the markdown section format. Requirements:\n")
-	sb.WriteString("1. Use `## MODULE_TAGS` heading followed by a comma-separated list on the next line.\n")
-	sb.WriteString("2. Use `## MODULE_IDS` heading followed by a comma-separated list on the next line.\n")
-	sb.WriteString("3. Use `## FOCUS_AREAS` heading followed by a bulleted list.\n")
-	sb.WriteString("4. Use `## NOTES` heading followed by free-text notes.\n")
-	sb.WriteString("5. Do NOT output JSON or code blocks. Only markdown sections.\n")
+	sb.WriteString("1. Use `## FOCUS_AREAS` followed by a nonempty bulleted list based on the supplied evidence.\n")
+	sb.WriteString("2. Use `## NOTES` for observations and missing-context limitations.\n")
+	sb.WriteString("3. MODULE_TAGS and MODULE_IDS are optional; omit restrictive selections unless supported by evidence.\n")
+	sb.WriteString("4. RECOMMENDED_SKILLS lists matching names for later triage only; never execute workflows here.\n")
+	sb.WriteString("5. Produce the final plan now, without tools, JSON or code blocks.\n")
 	return sb.String()
 }
 
@@ -559,6 +627,7 @@ func (s *SwarmRunner) runMasterAgentBatched(ctx context.Context, cfg SwarmConfig
 		rawOutput string
 		prompt    string
 		batchNum  int
+		status    string
 		err       error
 	}
 
@@ -573,8 +642,8 @@ func (s *SwarmRunner) runMasterAgentBatched(ctx context.Context, cfg SwarmConfig
 		batchConcurrency = len(batches)
 	}
 	sem := make(chan struct{}, batchConcurrency)
-	gCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	gCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 
 	var wg sync.WaitGroup
 	for _, b := range batches {
@@ -587,7 +656,11 @@ func (s *SwarmRunner) runMasterAgentBatched(ctx context.Context, cfg SwarmConfig
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
 			case <-gCtx.Done():
-				resultsCh <- batchResult{err: gCtx.Err()}
+				resultsCh <- batchResult{batchNum: b.num, status: "not_started", err: gCtx.Err()}
+				return
+			}
+			if gCtx.Err() != nil {
+				resultsCh <- batchResult{batchNum: b.num, status: "not_started", err: gCtx.Err()}
 				return
 			}
 
@@ -600,8 +673,13 @@ func (s *SwarmRunner) runMasterAgentBatched(ctx context.Context, cfg SwarmConfig
 			batch := records[b.start:b.end]
 			plan, rawOutput, prompt, err := s.runMasterAgent(gCtx, cfg, batch, targetURL, techStackMd, recordSummary)
 			if err != nil {
-				cancel() // Cancel remaining batches on first error
-				resultsCh <- batchResult{err: fmt.Errorf("master agent batch %d-%d failed: %w", b.start, b.end, err)}
+				batchErr := fmt.Errorf("master agent batch %d-%d failed: %w", b.start, b.end, err)
+				status := "failed"
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) && gCtx.Err() != nil {
+					status = "cancelled"
+				}
+				cancel(batchErr) // retain the originating cause before siblings exit
+				resultsCh <- batchResult{rawOutput: rawOutput, prompt: prompt, batchNum: b.num, status: status, err: batchErr}
 				return
 			}
 			if cfg.ProgressCallback != nil {
@@ -618,6 +696,7 @@ func (s *SwarmRunner) runMasterAgentBatched(ctx context.Context, cfg SwarmConfig
 				rawOutput: rawOutput,
 				prompt:    prompt,
 				batchNum:  b.num,
+				status:    "completed",
 			}
 		}()
 	}
@@ -641,7 +720,6 @@ func (s *SwarmRunner) runMasterAgentBatched(ctx context.Context, cfg SwarmConfig
 			if firstErr == nil {
 				firstErr = r.err
 			}
-			continue
 		}
 		orderedResults = append(orderedResults, r)
 	}
@@ -650,16 +728,28 @@ func (s *SwarmRunner) runMasterAgentBatched(ctx context.Context, cfg SwarmConfig
 		return orderedResults[i].batchNum < orderedResults[j].batchNum
 	})
 
+	if cause := context.Cause(gCtx); cause != nil {
+		firstErr = cause // never let a sibling cancellation obscure the root
+	}
 	var plans []*SwarmPlan
+	var planBatchNumbers []int
+	var outcomes []planningBatchOutcome
 	for _, r := range orderedResults {
+		b := batches[r.batchNum-1]
+		outcomes = append(outcomes, planningBatchOutcome{Batch: b.num, Start: b.start, End: b.end, Status: r.status})
 		if r.rawOutput != "" {
-			allRawOutputs = append(allRawOutputs, r.rawOutput)
+			raw := r.rawOutput
+			if r.err != nil {
+				raw = fmt.Sprintf("--- Batch %d (failed; partial/unvalidated output) ---\n\n%s", r.batchNum, raw)
+			}
+			allRawOutputs = append(allRawOutputs, raw)
 		}
 		if r.prompt != "" {
 			allRenderedPrompts = append(allRenderedPrompts, r.prompt)
 		}
-		if r.plan != nil {
+		if r.plan != nil && r.err == nil {
 			plans = append(plans, r.plan)
+			planBatchNumbers = append(planBatchNumbers, r.batchNum)
 		}
 	}
 
@@ -672,11 +762,10 @@ func (s *SwarmRunner) runMasterAgentBatched(ctx context.Context, cfg SwarmConfig
 	// Merge all collected plans in one pass
 	var mergedPlan *SwarmPlan
 	var batchProv *BatchProvenance
-	if len(plans) == 1 {
-		mergedPlan = plans[0]
-	} else if len(plans) > 1 {
-		mergedPlan, batchProv = mergeSwarmPlans(plans)
+	if len(plans) > 0 {
+		mergedPlan, batchProv = mergeSwarmPlansWithBatchNumbers(plans, planBatchNumbers)
 	}
+	persistPlanningBatches(cfg, outcomes, firstErr == nil, mergedPlan, batchProv)
 
 	if firstErr != nil {
 		zap.L().Warn("Batch execution had failures",
@@ -695,9 +784,14 @@ func (s *SwarmRunner) runMasterAgentBatched(ctx context.Context, cfg SwarmConfig
 // When merging multiple plans, batch provenance is returned separately
 // to track which batch contributed each tag, ID, extension, and focus area.
 func mergeSwarmPlans(plans []*SwarmPlan) (*SwarmPlan, *BatchProvenance) {
+	return mergeSwarmPlansWithBatchNumbers(plans, nil)
+}
+
+func mergeSwarmPlansWithBatchNumbers(plans []*SwarmPlan, batchNumbers []int) (*SwarmPlan, *BatchProvenance) {
 	tagSet := make(map[string]bool)
 	idSet := make(map[string]bool)
 	focusSet := make(map[string]bool)
+	skillSet := make(map[string]bool)
 	extMap := make(map[string]GeneratedExtension)
 	extNames := make(map[string]bool) // maintained alongside extMap to avoid rebuilding per collision
 	qcMap := make(map[string]QuickCheck)
@@ -705,7 +799,7 @@ func mergeSwarmPlans(plans []*SwarmPlan) (*SwarmPlan, *BatchProvenance) {
 	var notes []string
 
 	// Provenance tracking (batch number is 1-indexed)
-	trackProvenance := len(plans) > 1
+	trackProvenance := len(plans) > 1 || len(batchNumbers) > 0
 	var prov *BatchProvenance
 	if trackProvenance {
 		prov = &BatchProvenance{
@@ -721,6 +815,12 @@ func mergeSwarmPlans(plans []*SwarmPlan) (*SwarmPlan, *BatchProvenance) {
 	var extAgentErr string
 	for batchIdx, p := range plans {
 		batchNum := batchIdx + 1
+		if batchIdx < len(batchNumbers) {
+			batchNum = batchNumbers[batchIdx]
+		}
+		for _, name := range p.RecommendedSkills {
+			skillSet[name] = true
+		}
 		if p.NeedsExtensions {
 			needsExt = true
 			if needsExtReason == "" && p.NeedsExtensionsReason != "" {
@@ -777,6 +877,7 @@ func mergeSwarmPlans(plans []*SwarmPlan) (*SwarmPlan, *BatchProvenance) {
 		ModuleTags:            slices.Sorted(maps.Keys(tagSet)),
 		ModuleIDs:             slices.Sorted(maps.Keys(idSet)),
 		FocusAreas:            slices.Sorted(maps.Keys(focusSet)),
+		RecommendedSkills:     slices.Sorted(maps.Keys(skillSet)),
 		Notes:                 strings.Join(notes, "; "),
 		NeedsExtensions:       needsExt,
 		NeedsExtensionsReason: needsExtReason,

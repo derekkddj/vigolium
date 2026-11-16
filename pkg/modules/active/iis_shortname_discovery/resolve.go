@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/vigolium/vigolium/internal/resources/wordlists"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -171,6 +172,7 @@ func splitFileExt(w string) (file, ext string) {
 
 // probeResp is a lightweight snapshot of a probe response.
 type probeResp struct {
+	receipt  *evidence.Exchange
 	status   int
 	body     []byte
 	location string
@@ -210,12 +212,13 @@ func sendProbeFull(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester,
 		loc = r.Header.Get("Location")
 	}
 
-	return probeResp{status: r.StatusCode, body: cp, location: loc}, nil
+	return probeResp{receipt: http.CaptureEvidence(resp), status: r.StatusCode, body: cp, location: loc}, nil
 }
 
 // negBaseline captures how the server answers a non-existent path for a given
 // extension.
 type negBaseline struct {
+	receipts []*evidence.Exchange
 	status   int
 	body     []byte
 	unstable bool
@@ -223,15 +226,18 @@ type negBaseline struct {
 
 // resolver carries per-host state for full-name resolution.
 type resolver struct {
-	idx        *nameIndex
-	targetURL  string // scheme://host (no trailing slash)
-	neg        map[string]negBaseline
-	methodDone bool
-	methodOK   bool
+	idx            *nameIndex
+	targetURL      string // scheme://host (no trailing slash)
+	neg            map[string]negBaseline
+	methodDone     bool
+	methodOK       bool
+	methodReceipts []*evidence.Exchange
+	context        *modkit.EvidenceCollector
 }
 
 func newResolver(targetURL string) *resolver {
 	return &resolver{
+		context:   modkit.NewEvidenceCollector(),
 		idx:       resolverIndex(),
 		targetURL: strings.TrimRight(targetURL, "/"),
 		neg:       make(map[string]negBaseline),
@@ -378,6 +384,9 @@ func (r *resolver) confirm(
 		if err != nil {
 			return false
 		}
+		if m.status == 405 {
+			r.addResolvedEvidence(got, m, neg, fullName)
+		}
 		return m.status == 405 // 405 on an existing resource; two signals agree
 	}
 
@@ -391,7 +400,11 @@ func (r *resolver) confirm(
 	if err != nil || again.status != got.status {
 		return false
 	}
-	return modkit.BodiesSimilar(string(got.body), string(again.body))
+	confirmed := modkit.BodiesSimilar(string(got.body), string(again.body))
+	if confirmed {
+		r.addResolvedEvidence(got, again, neg, fullName)
+	}
+	return confirmed
 }
 
 // negBaselineFor samples (and caches) the response to a non-existent path with
@@ -425,6 +438,7 @@ func (r *resolver) negBaselineFor(
 		b = negBaseline{status: a.status, body: a.body}
 	}
 
+	b.receipts = []*evidence.Exchange{a.receipt, c.receipt}
 	r.neg[ext] = b
 	return b
 }
@@ -446,6 +460,7 @@ func (r *resolver) calibrateMethodOracle(
 	exist, errE := sendProbeFull(ctx, httpClient, bogusMethod, basePath)
 	reqBudget.inc()
 	missing, errM := sendProbeFull(ctx, httpClient, bogusMethod, basePath+utils.RandomString(14))
+	r.methodReceipts = []*evidence.Exchange{exist.receipt, missing.receipt}
 	if errE != nil || errM != nil {
 		return
 	}
@@ -469,7 +484,11 @@ func (r *resolver) isDirectory(
 		return false
 	}
 	loc := strings.ToLower(strings.TrimSpace(got.location))
-	return strings.HasSuffix(loc, "/")
+	confirmed := strings.HasSuffix(loc, "/")
+	if confirmed {
+		r.context.AddExchange(got.receipt, evidence.RoleObservation, "Resolved directory redirect")
+	}
+	return confirmed
 }
 
 // classifyName flags filenames whose disclosure is security-sensitive.

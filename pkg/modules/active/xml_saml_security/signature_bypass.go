@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"regexp"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -65,6 +66,7 @@ type authSig struct {
 	location string
 	body     string
 	ok       bool
+	receipt  *evidence.Exchange
 }
 
 // scanSignatureBypass tests whether the SP accepts a SAML assertion whose XML
@@ -154,11 +156,22 @@ func (m *Module) scanSignatureBypass(
 	if urlx != nil {
 		target = urlx.String()
 	}
-	return &output.ResultEvent{
-		ModuleID:         ModuleID,
-		URL:              target,
-		Matched:          target,
-		FuzzingParameter: ip.Name(),
+	ev := modkit.NewEvidenceCollector()
+	if r0.receipt != nil {
+		ev.AddExchange(r0.receipt, evidence.RoleBaseline, "signed assertion baseline")
+	} else {
+		ev.AddBaseline("input signed assertion baseline", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
+	}
+	ev.AddExchange(rBogus.receipt, evidence.RoleControl, "wrong-identity assertion")
+	ev.AddExchange(rStrip2.receipt, evidence.RoleConfirmation, "signature-stripping replay")
+	ev.AddExchange(rBogus2.receipt, evidence.RoleControl, "fresh wrong-identity assertion")
+	result := &output.ResultEvent{
+		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
+		ModuleID:           ModuleID,
+		URL:                target,
+		Matched:            target,
+		FuzzingParameter:   ip.Name(),
 		ExtractedResults: []string{
 			"attack=SAML signature stripping",
 			fmt.Sprintf("baseline_status=%d stripped_status=%d bogus_status=%d", r0.status, rStrip.status, rBogus.status),
@@ -171,6 +184,8 @@ func (m *Module) scanSignatureBypass(
 			Tags:        append(append([]string{}, ModuleTags...), "signature-bypass", "auth-bypass"),
 		},
 	}
+	modkit.SetPrimaryEvidence(result, rStrip.receipt, evidence.RoleAttack, "signature-stripped assertion")
+	return result
 }
 
 // baselineSig returns the auth signal for the original signed assertion: the
@@ -218,6 +233,7 @@ func (m *Module) sendSAMLVariant(
 		location: resp.Response().Header.Get("Location"),
 		body:     resp.Body().String(),
 		ok:       true,
+		receipt:  http.CaptureEvidence(resp),
 	}
 }
 

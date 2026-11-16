@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -162,6 +163,7 @@ func (m *Module) ScanPerRequest(
 					Confidence:  findingConfidence,
 				},
 			})
+			modkit.SetPrimaryEvidence(results[len(results)-1], http.CaptureEvidence(resp), evidence.RoleAttack, "matched Host-header probe")
 			resp.Close()
 			return results, nil
 		}

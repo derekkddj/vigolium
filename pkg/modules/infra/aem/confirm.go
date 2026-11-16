@@ -22,6 +22,7 @@ func ReproduceMarker(
 	path string,
 	rounds int,
 	match MarkerMatch,
+	proofs ...*Proof,
 ) bool {
 	if match == nil {
 		return false
@@ -31,6 +32,9 @@ func ReproduceMarker(
 	}
 	for i := 0; i < rounds; i++ {
 		res := Get(ctx, client, path, nil)
+		for _, proof := range proofs {
+			proof.Confirmation(res)
+		}
 		if !res.OK || !match(res) {
 			return false
 		}

@@ -9,6 +9,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	vighttp "github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -33,6 +34,7 @@ type jsonpDocument struct {
 }
 
 type jsonpCapture struct {
+	exchange   *evidence.Exchange
 	document   jsonpDocument
 	status     int
 	ctype      string
@@ -147,6 +149,7 @@ func (m *Module) execute(ctx *httpmsg.HttpRequestResponse, client *vighttp.Reque
 	body := strings.TrimSpace(resp.BodyString())
 	document, _ := parseJSONP(body)
 	capture := jsonpCapture{
+		exchange: vighttp.CaptureEvidence(resp),
 		document: document,
 		status:   resp.Response().StatusCode,
 		ctype:    resp.Response().Header.Get("Content-Type"),
@@ -167,6 +170,7 @@ func captureFromObserved(ctx *httpmsg.HttpRequestResponse, document jsonpDocumen
 	ctype := ctx.Response().Header("Content-Type")
 	nosniff := strings.EqualFold(strings.TrimSpace(ctx.Response().Header("X-Content-Type-Options")), "nosniff")
 	return jsonpCapture{
+		exchange:   ctx.Evidence(), // actual input observation, not a probe receipt
 		document:   document,
 		status:     ctx.Response().StatusCode(),
 		ctype:      ctype,
@@ -211,7 +215,10 @@ func (m *Module) confirmAnonymousLacksSensitive(ctx *httpmsg.HttpRequestResponse
 	return captures, true
 }
 
-func (m *Module) result(target, param string, dynamic bool, first, second jsonpCapture, anonymous []jsonpCapture, anonymousRejected bool, sensitive []string, crossSiteCookie bool) *output.ResultEvent {
+func (m *Module) result(target, param string, dynamic bool, first, second jsonpCapture, anonymous []jsonpCapture, anonymousRejected bool, sensitive []string, crossSiteCookie bool) (finding *output.ResultEvent) {
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, first.exchange, evidence.RoleObservation, "selected JSONP response")
+	}()
 	kind := output.RecordKindObservation
 	grade := output.EvidenceGradeObservation
 	sev := severity.Info
@@ -239,9 +246,11 @@ func (m *Module) result(target, param string, dynamic bool, first, second jsonpC
 		description = "A browser-executable JSONP response returned sensitive values with a known SameSite=None; Secure session cookie, while two isolated credential-free controls did not. This confirms credential-dependent cross-origin script-readable data exposure."
 	}
 
+	selected := []evidence.Entry{evidence.Select(second.exchange, evidence.RoleConfirmation, false, "fresh callback confirmation")}
 	additional := []string{output.BuildEvidence("fresh callback confirmation", second.request, second.response)}
 	for i, control := range anonymous {
 		additional = append(additional, output.BuildEvidence(fmt.Sprintf("credential-free control %d", i+1), control.request, control.response))
+		selected = append(selected, evidence.Select(control.exchange, evidence.RoleControl, false, "credential-free control"))
 	}
 	extracted := []string{
 		fmt.Sprintf("Dynamic callback parameter: %t", dynamic),
@@ -262,6 +271,7 @@ func (m *Module) result(target, param string, dynamic bool, first, second jsonpC
 		Request:            first.request,
 		Response:           first.response,
 		AdditionalEvidence: additional,
+		Evidence:           selected,
 		FuzzingParameter:   param,
 		ExtractedResults:   extracted,
 		Info: output.Info{

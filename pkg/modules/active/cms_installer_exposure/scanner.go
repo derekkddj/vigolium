@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -201,7 +202,9 @@ func (m *Module) probeInstaller(
 	scanCtx *modkit.ScanContext,
 	p probe,
 	fp *notFoundFingerprint,
-) *output.ResultEvent {
+) (guardResult *output.ResultEvent) {
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(guardResult, guardProof) }()
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
@@ -279,7 +282,7 @@ func (m *Module) probeInstaller(
 	// wildcard shell (the same 200 body served for any random path), mirroring
 	// wp_misconfig. Fails open on a transient probe error.
 	location := resp.Response().Header.Get("Location")
-	if !modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, status, []byte(body), location) {
+	if !modkit.ConfirmNotSoft404WithEvidence(scanCtx, httpClient, ctx, status, []byte(body), location, guardProof) {
 		return nil
 	}
 
@@ -294,18 +297,18 @@ func (m *Module) probeInstaller(
 	// it returns the same 200 status and still satisfies the CMS-anchor +
 	// installer-context marker groups, the markers are the host's catch-all, not a
 	// real installer, so drop. A real installer's decoy 404s, leaving the finding.
-	if modkit.MultiRoundExtDecoyCatchAll(ctx, httpClient, p.path, body, status, 2,
+	if modkit.MultiRoundExtDecoyCatchAllWithEvidence(ctx, httpClient, p.path, body, status, 2,
 		func(decoyBody string) bool {
 			_, ok := modkit.MatchAllGroups(decoyBody, p.markers)
 			return ok
-		}) {
+		}, guardProof) {
 		return nil
 	}
 
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + p.path
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,
 		Request:          string(modifiedRaw),
@@ -320,4 +323,6 @@ func (m *Module) probeInstaller(
 			Reference:   []string{"https://owasp.org/www-project-web-security-testing-guide/"},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+	return result
 }

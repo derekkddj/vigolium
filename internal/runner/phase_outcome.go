@@ -382,6 +382,16 @@ func DirectScanCompletion(rep core.ExecutionReport, reached, interrupted bool, e
 	if rep.DeferredFlushSkipped {
 		reasons[database.ReasonDeferredFlushSkipped] = struct{}{}
 	}
+	if rep.FindingStoreFailed > 0 {
+		reasons[database.ReasonPersistence] = struct{}{}
+		// This is the failed subset of direct repository attempts. Writer-backed
+		// persistence is reported separately through the writer's shutdown.
+		da.Persistence = &database.PersistenceOutcome{
+			Writer:   database.PersistenceWriterFindings,
+			Accepted: rep.FindingStoreFailed,
+			Failed:   rep.FindingStoreFailed,
+		}
+	}
 	if interrupted {
 		reasons[database.ReasonCancelled] = struct{}{}
 	}

@@ -600,6 +600,14 @@ func sarifResultProperties(f *ReportFinding) map[string]any {
 	if len(f.AdditionalEvidence) > 0 {
 		props["additionalEvidence"] = truncateStrings(f.AdditionalEvidence)
 	}
+	// Selected receipts are byte-safe, full raw evidence; legacy text previews
+	// above may be capped but never replace or relabel these manifest roles.
+	if f.EvidenceStatus != "" {
+		props["evidenceStatus"] = f.EvidenceStatus
+	}
+	if len(f.Evidence) > 0 {
+		props["evidence"] = f.Evidence
+	}
 	if len(f.Tags) > 0 {
 		props["tags"] = f.Tags
 	}

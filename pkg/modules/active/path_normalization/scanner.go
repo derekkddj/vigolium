@@ -11,6 +11,7 @@ import (
 	syncutils "github.com/projectdiscovery/utils/sync"
 	urlutil "github.com/projectdiscovery/utils/url"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	evidencepkg "github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -288,9 +289,12 @@ func (m *Module) ScanPerRequest(
 				// runs only after the local oracle admits the candidate, so the
 				// (memoized) probe never fires for a record that has no candidate worth
 				// reporting.
-				if modkit.RandomDirCatchAll(scanCtx, ctx, httpClient, func(b string) bool {
+				guardProof := modkit.NewEvidenceCollector()
+				guardProof.AddExchange(root.exchange, evidencepkg.RoleControl, "site-root shell comparison")
+				guardProof.AddExchange(nonExistent.exchange, evidencepkg.RoleControl, "nonexistent-path shell comparison")
+				if modkit.RandomDirCatchAllWithEvidence(scanCtx, ctx, httpClient, func(b string) bool {
 					return modkit.BodiesSimilarSig(backedSig, b)
-				}) {
+				}, guardProof) {
 					continue
 				}
 
@@ -305,6 +309,7 @@ func (m *Module) ScanPerRequest(
 				// suppresses a genuine, base-specific resource.
 				if controlPath, okControl := collapseControlPath(basePathForPayload, payload, i-1); okControl {
 					control := m.probePath(rawRequest, controlPath, httpService, httpClient, true)
+					guardProof.AddExchange(control.exchange, evidencepkg.RoleControl, "random-base traversal-shape control")
 					if control.ok && isResourceReached(control.status) &&
 						modkit.RatioSimilar(backedSig, modkit.NewResponseSignature(control.status, control.body, "")) {
 						continue
@@ -337,6 +342,7 @@ func (m *Module) ScanPerRequest(
 				// genuinely distinct resource.
 				if originalPath != "/" {
 					freshRoot := m.probePath(rawRequest, "/", httpService, httpClient, true)
+					guardProof.AddExchange(freshRoot.exchange, evidencepkg.RoleControl, "fresh root-resolution control")
 					if isTransientBlock(freshRoot) {
 						continue
 					}
@@ -358,11 +364,12 @@ func (m *Module) ScanPerRequest(
 				// skipped outright when the scanned path already IS "/". Prove the
 				// endpoint is a function of the request before reporting; memoized
 				// per record, so only candidate-producing hosts pay for it.
-				if modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+				if modkit.EndpointVolatileWithEvidence(scanCtx, ctx, httpClient, guardProof) {
 					return
 				}
 
 				ev := m.buildFinding(urlx, payload, fuzzedPath, backedOffPath, baseline, fuzz, backed, confirm, accessUnlock)
+				modkit.AppendEvidence(ev, guardProof)
 
 				mutex.Lock()
 				results = append(results, ev)
@@ -394,7 +401,10 @@ func (m *Module) buildFinding(
 	payload, fuzzedPath, backedOffPath string,
 	baseline, fuzz, backed, confirm pathProbe,
 	accessUnlock bool,
-) *output.ResultEvent {
+) (finding *output.ResultEvent) {
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, backed.exchange, evidencepkg.RoleAttack, "backed-off traversal probe")
+	}()
 	// Build the URL string by concatenation (not url.URL.String(), which would
 	// re-escape the `%` in the encoded payload and corrupt the path).
 	vulnURLString := urlx.Scheme + "://" + urlx.Host + backedOffPath
@@ -417,16 +427,10 @@ func (m *Module) buildFinding(
 		payload, fuzzURLString, fuzz.status, vulnURLString, backed.status, oracleClause,
 	)
 
-	evidence := make([]string, 0, 3)
-	for _, e := range []string{
-		probeEvidence("baseline (clean path)", baseline),
-		probeEvidence("over-traversed (rejected)", fuzz),
-		probeEvidence("confirmation (re-fetch)", confirm),
-	} {
-		if e != "" {
-			evidence = append(evidence, e)
-		}
-	}
+	collector := modkit.NewEvidenceCollector()
+	collector.AddExchange(baseline.exchange, evidencepkg.RoleBaseline, "baseline (clean path)")
+	collector.AddExchange(fuzz.exchange, evidencepkg.RoleControl, "over-traversed (rejected)")
+	collector.AddExchange(confirm.exchange, evidencepkg.RoleConfirmation, "confirmation (re-fetch)")
 
 	return &output.ResultEvent{
 		ModuleID: m.ID(),
@@ -445,7 +449,8 @@ func (m *Module) buildFinding(
 		Matched:            vulnURLString,
 		Request:            backed.requestRaw,
 		Response:           truncateBody(backed.body),
-		AdditionalEvidence: evidence,
+		AdditionalEvidence: collector.Entries(),
+		Evidence:           collector.Evidence(),
 		ExtractedResults:   []string{backedOffPath},
 		Timestamp:          time.Now(),
 	}
@@ -522,6 +527,7 @@ type pathProbe struct {
 	binary      bool // static-asset / binary content type
 	requestRaw  string
 	ok          bool
+	exchange    *evidencepkg.Exchange
 }
 
 // probePath issues a GET to path (query string cleared, encoded payload preserved
@@ -563,5 +569,6 @@ func (m *Module) probePath(
 		binary:      modkit.IsStaticAssetContentType(ct),
 		requestRaw:  string(modifiedRaw),
 		ok:          true,
+		exchange:    http.CaptureEvidence(resp),
 	}
 }

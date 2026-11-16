@@ -54,13 +54,18 @@ func ServletResponded(status int) bool {
 // SiblingIs404 fetches a guaranteed-nonexistent sibling under path's parent
 // directory and reports whether it 404s — proving path is a specific servlet
 // mount rather than a wildcard/catch-all. Fails closed (returns false) for a
-// root-level path, a probe error, or any non-404 sibling.
-func SiblingIs404(ctx *httpmsg.HttpRequestResponse, client *http.Requester, path string) bool {
+// root-level path, a probe error, or any non-404 sibling. Optional proofs retain
+// the existing sibling request as a control without issuing any additional probe;
+// callers using the original three arguments remain supported.
+func SiblingIs404(ctx *httpmsg.HttpRequestResponse, client *http.Requester, path string, proofs ...*Proof) bool {
 	i := strings.LastIndex(path, "/")
 	if i <= 0 {
 		return false // root-level: no same-parent sibling to differentiate
 	}
 	res := Get(ctx, client, path[:i]+"/"+modkit.FreshCanary(), nil)
+	for _, proof := range proofs {
+		proof.Control(res)
+	}
 	return res.OK && res.Status == 404
 }
 

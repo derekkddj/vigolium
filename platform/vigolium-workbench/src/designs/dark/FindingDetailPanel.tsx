@@ -5,10 +5,13 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import Prism from 'prismjs';
 import 'prismjs/components/prism-markdown';
-import { Eye, Code, Copy, Check, Link, Terminal } from 'lucide-react';
+import { Eye, Code, Copy, Check, Link } from 'lucide-react';
+import FindingEvidence, { FindingIdentity } from '@/components/shared/FindingEvidence';
+import HttpRecordDetailPanel from './HttpRecordDetailPanel';
 import { useFinding, useUpdateFindingStatus } from '@/api/hooks';
 import { formatDate } from '@/lib/formatters';
-import { rawRequestToCurl } from '@/lib/curl';
+import { boundedPreview } from '@/lib/findingEvidence';
+import { detailSelectionHref } from '@/lib/detailSelection';
 import Dropdown from './Dropdown';
 import { SEVERITY_COLORS, CONFIDENCE_COLORS } from './theme';
 import { FINDING_STATUSES } from '@/api/types';
@@ -73,13 +76,7 @@ export default function FindingDetailPanel({ findingId, onClose }: Props) {
   const [copied, setCopied] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
   const [copiedExtracted, setCopiedExtracted] = useState(false);
-  const [copiedRequest, setCopiedRequest] = useState(false);
-  const [copiedCurl, setCopiedCurl] = useState(false);
-  const [copiedResponse, setCopiedResponse] = useState(false);
-  const [evidenceTab, setEvidenceTab] = useState(0);
-  const [copiedEvidence, setCopiedEvidence] = useState(false);
   const [matchedAtExpanded, setMatchedAtExpanded] = useState(false);
-  const [evidenceExpanded, setEvidenceExpanded] = useState(false);
 
   return (
     <div className="border-l border-[#2e2b26] bg-[#1c1b19] h-full overflow-y-auto">
@@ -87,9 +84,17 @@ export default function FindingDetailPanel({ findingId, onClose }: Props) {
         <span className="text-[#7fd962] text-xs font-bold">FINDING #{findingId}</span>
         <div className="flex items-center gap-1">
           <button
-            onClick={() => { navigator.clipboard.writeText(window.location.href); setLinkCopied(true); setTimeout(() => setLinkCopied(false), 2000); }}
+            onClick={async () => {
+              try {
+                await navigator.clipboard.writeText(new URL(detailSelectionHref('finding', findingId), window.location.origin).href);
+                setLinkCopied(true);
+                setTimeout(() => setLinkCopied(false), 2000);
+              } catch {
+                toast('Could not copy link', 'error');
+              }
+            }}
             className="text-[#918175] hover:text-[#68a8e4] text-xs px-1"
-            title="Copy link"
+            title="Copy link (active project; does not switch projects)"
           >
             {linkCopied ? <Check className="w-3 h-3" /> : <Link className="w-3 h-3" />}
           </button>
@@ -107,6 +112,7 @@ export default function FindingDetailPanel({ findingId, onClose }: Props) {
 
       {finding && (
         <div className="p-3 space-y-3 text-xs">
+          <FindingIdentity finding={finding} theme="dark" />
           {/* Severity + Confidence + Type + Source */}
           <div className="flex flex-wrap gap-x-3 gap-y-0.5">
             <div>
@@ -209,8 +215,6 @@ export default function FindingDetailPanel({ findingId, onClose }: Props) {
             <div className="flex flex-wrap gap-x-3 text-[#918175]">
               <span>finding_hash: <span className="text-[#fce8c3] break-all">{finding.finding_hash}</span></span>
               <span>found_at: <span className="text-[#fce8c3]">{formatDate(finding.found_at)}</span></span>
-              {finding.scan_uuid && <span>scan_uuid: <span className="text-[#fce8c3]">{finding.scan_uuid}</span></span>}
-              {finding.agent_run_uuid && <span>agent_run: <span className="text-[#fce8c3]">{finding.agent_run_uuid}</span></span>}
             </div>
           </div>
 
@@ -240,14 +244,15 @@ export default function FindingDetailPanel({ findingId, onClose }: Props) {
                   </button>
                 </div>
               </div>
+              {boundedPreview(finding.description).truncated && <p className="text-[#918175] mb-1">Description preview truncated to 64 Ki characters; copy retains the full text.</p>}
               {descTab === 'rendered' ? (
                 <div className={`bg-[#141310] border border-[#2e2b26] p-2 overflow-x-auto overflow-y-auto text-[#fce8c3] ${finding.module_type === 'whitebox' ? 'max-h-[600px]' : 'max-h-64'} [&_p]:mb-1.5 [&_p]:leading-relaxed [&_h1]:text-sm [&_h1]:font-bold [&_h1]:text-[#fce8c3] [&_h1]:mb-1.5 [&_h1]:mt-2 [&_h2]:text-xs [&_h2]:font-bold [&_h2]:text-[#fce8c3] [&_h2]:mb-1 [&_h2]:mt-2 [&_h3]:text-xs [&_h3]:font-semibold [&_h3]:text-[#fce8c3] [&_h3]:mb-1 [&_h3]:mt-1.5 [&_ul]:list-disc [&_ul]:pl-4 [&_ul]:mb-1.5 [&_ol]:list-decimal [&_ol]:pl-4 [&_ol]:mb-1.5 [&_li]:mb-0.5 [&_li]:leading-relaxed [&_a]:text-[#68a8e4] [&_a]:underline [&_strong]:font-bold [&_strong]:text-[#fce8c3] [&_em]:italic [&_code]:text-[#98bc37] [&_code]:bg-[#0e0d0b] [&_code]:px-1 [&_code]:py-0.5 [&_code]:rounded-sm [&_pre]:bg-[#0e0d0b] [&_pre]:p-2 [&_pre]:rounded [&_pre]:overflow-x-auto [&_pre]:mb-1.5 [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_blockquote]:border-l-2 [&_blockquote]:border-[#918175] [&_blockquote]:pl-2 [&_blockquote]:text-[#918175] [&_blockquote]:mb-1.5 [&_hr]:border-[#2e2b26] [&_hr]:my-2 [&_table]:w-full [&_table]:mb-1.5 [&_th]:border [&_th]:border-[#2e2b26] [&_th]:px-1.5 [&_th]:py-0.5 [&_th]:text-left [&_td]:border [&_td]:border-[#2e2b26] [&_td]:px-1.5 [&_td]:py-0.5`}>
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{finding.description}</ReactMarkdown>
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{boundedPreview(finding.description).text}</ReactMarkdown>
                 </div>
               ) : (
                 <pre
                   className={`bg-[#141310] border border-[#2e2b26] p-2 overflow-x-auto text-[#fce8c3] whitespace-pre-wrap break-all overflow-y-auto ${finding.module_type === 'whitebox' ? 'max-h-[600px]' : 'max-h-64'}`}
-                  dangerouslySetInnerHTML={{ __html: highlightMarkdown(finding.description) }}
+                  dangerouslySetInnerHTML={{ __html: highlightMarkdown(boundedPreview(finding.description).text) }}
                 />
               )}
             </div>
@@ -266,127 +271,13 @@ export default function FindingDetailPanel({ findingId, onClose }: Props) {
                 </button>
               </div>
               <pre className="bg-[#141310] border border-[#2e2b26] p-2 overflow-x-auto text-[#fce8c3] whitespace-pre-wrap break-all max-h-32 overflow-y-auto">
-                {finding.extracted_results.join('\n')}
+                {boundedPreview(finding.extracted_results.join('\n')).text}
+                {boundedPreview(finding.extracted_results.join('\n')).truncated && '\n[Preview truncated; copy retains full results]'}
               </pre>
             </div>
           )}
 
-          {/* HTTP Record UUIDs */}
-          {finding.http_record_uuids && finding.http_record_uuids.length > 0 && (
-            <div>
-              <div className="text-[#918175] mb-0.5">http_records:</div>
-              <ul className="space-y-0.5">
-                {finding.http_record_uuids.map((uuid) => (
-                  <li key={uuid} className="text-[#68a8e4] break-all">{uuid}</li>
-                ))}
-              </ul>
-            </div>
-          )}
-
-          {/* Raw Request */}
-          {finding.request && (
-            <div>
-              <div className="flex items-center gap-2 mb-0.5">
-                <span className="text-[#918175]">request:</span>
-                <button
-                  onClick={() => { navigator.clipboard.writeText(finding.request!); setCopiedRequest(true); setTimeout(() => setCopiedRequest(false), 1500); }}
-                  className="px-1.5 py-0.5 text-[10px] border border-[#2e2b26] text-[#918175] hover:text-[#fce8c3]"
-                >
-                  {copiedRequest ? <><Check size={10} className="inline-block mr-0.5 -mt-px" />copied!</> : <><Copy size={10} className="inline-block mr-0.5 -mt-px" />copy</>}
-                </button>
-                <button
-                  onClick={() => { navigator.clipboard.writeText(rawRequestToCurl(finding.request!, finding.matched_at)); setCopiedCurl(true); setTimeout(() => setCopiedCurl(false), 1500); }}
-                  className="px-1.5 py-0.5 text-[10px] border border-[#2e2b26] text-[#918175] hover:text-[#fce8c3]"
-                >
-                  {copiedCurl ? <><Check size={10} className="inline-block mr-0.5 -mt-px" />copied!</> : <><Terminal size={10} className="inline-block mr-0.5 -mt-px" />curl</>}
-                </button>
-              </div>
-              <pre className="bg-[#141310] border border-[#2e2b26] p-2 overflow-x-auto text-[#fce8c3] whitespace-pre-wrap break-all max-h-64 overflow-y-auto">
-                {finding.request}
-              </pre>
-            </div>
-          )}
-
-          {/* Raw Response */}
-          {finding.response && (
-            <div>
-              <div className="flex items-center gap-2 mb-0.5">
-                <span className="text-[#918175]">response:</span>
-                <button
-                  onClick={() => { navigator.clipboard.writeText(finding.response!); setCopiedResponse(true); setTimeout(() => setCopiedResponse(false), 1500); }}
-                  className="px-1.5 py-0.5 text-[10px] border border-[#2e2b26] text-[#918175] hover:text-[#fce8c3]"
-                >
-                  {copiedResponse ? <><Check size={10} className="inline-block mr-0.5 -mt-px" />copied!</> : <><Copy size={10} className="inline-block mr-0.5 -mt-px" />copy</>}
-                </button>
-              </div>
-              <pre className="bg-[#141310] border border-[#2e2b26] p-2 overflow-x-auto text-[#fce8c3] whitespace-pre-wrap break-all max-h-64 overflow-y-auto">
-                {finding.response}
-              </pre>
-            </div>
-          )}
-
-          {/* Additional Evidence */}
-          {finding.additional_evidence && finding.additional_evidence.length > 0 && (() => {
-            const EVIDENCE_LIMIT = 20;
-            const allItems = finding.additional_evidence!;
-            const needsCollapse = allItems.length > EVIDENCE_LIMIT;
-            const visibleItems = needsCollapse && !evidenceExpanded ? allItems.slice(0, EVIDENCE_LIMIT) : allItems;
-            const evidence = allItems[evidenceTab] || allItems[0];
-            // A labeled entry begins with a "# [label]" marker line (baseline /
-            // attack / confirm round N). Surface it on the tab button, and strip it
-            // from the request pane so it isn't shown twice.
-            const evidenceLabel = (item: string, i: number) => {
-              const m = item.match(/^# \[([^\]]+)\]/);
-              return m ? m[1] : `#${i + 1}`;
-            };
-            const parts = evidence.split('\n---------\n');
-            let reqPart = parts[0] || '';
-            reqPart = reqPart.replace(/^# \[[^\]]+\]\n?/, '');
-            const resPart = parts[1] || '';
-            return (
-              <div>
-                <div className="flex items-start gap-2 mb-0.5">
-                  <span className="text-[#918175] shrink-0 pt-0.5">additional_evidence: <span className="text-[#403d38]">({allItems.length})</span></span>
-                  <div className="flex flex-wrap gap-0.5">
-                    {visibleItems.map((item, i) => (
-                      <button
-                        key={i}
-                        onClick={() => setEvidenceTab(i)}
-                        className={`px-1.5 py-0.5 text-[10px] border ${evidenceTab === i ? 'border-[#7fd962] text-[#7fd962] bg-[#141310]' : 'border-[#2e2b26] text-[#918175] hover:text-[#fce8c3]'}`}
-                      >
-                        {evidenceLabel(item, i)}
-                      </button>
-                    ))}
-                    {needsCollapse && (
-                      <button
-                        onClick={() => { setEvidenceExpanded((v) => !v); if (evidenceExpanded && evidenceTab >= EVIDENCE_LIMIT) setEvidenceTab(0); }}
-                        className="px-1.5 py-0.5 text-[10px] border border-[#2e2b26] text-[#68a8e4] hover:underline"
-                      >
-                        {evidenceExpanded ? `[collapse to ${EVIDENCE_LIMIT}]` : `[show all ${allItems.length}]`}
-                      </button>
-                    )}
-                    <button
-                      onClick={() => { navigator.clipboard.writeText(evidence); setCopiedEvidence(true); setTimeout(() => setCopiedEvidence(false), 1500); }}
-                      className="px-1.5 py-0.5 text-[10px] border border-[#2e2b26] text-[#918175] hover:text-[#fce8c3]"
-                    >
-                      {copiedEvidence ? <><Check size={10} className="inline-block mr-0.5 -mt-px" />copied!</> : <><Copy size={10} className="inline-block mr-0.5 -mt-px" />copy</>}
-                    </button>
-                  </div>
-                </div>
-                <div className="border border-[#2e2b26] bg-[#141310] overflow-hidden min-h-80">
-                  {reqPart && (
-                    <pre className="p-2 text-[#fce8c3] whitespace-pre-wrap break-all max-h-64 overflow-y-auto">{reqPart}</pre>
-                  )}
-                  {resPart && (
-                    <>
-                      <div className="border-t border-dashed border-[#2e2b26] mx-2" />
-                      <pre className="p-2 text-[#fce8c3] whitespace-pre-wrap break-all max-h-64 overflow-y-auto">{resPart}</pre>
-                    </>
-                  )}
-                </div>
-              </div>
-            );
-          })()}
+          <FindingEvidence finding={finding} theme="dark" RecordInspector={HttpRecordDetailPanel} />
         </div>
       )}
     </div>

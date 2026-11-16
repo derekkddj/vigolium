@@ -98,6 +98,10 @@ type Runner struct {
 	// New alongside done; nil (Hurry a no-op) on a runner built without it.
 	hurry     chan struct{}
 	hurryOnce sync.Once
+	// harvestVersions holds the current run/project's UUID-only seed -> version
+	// handoff and receive admission acknowledgements, never captured exchanges.
+	harvestVersions harvestVersionAdoptions
+
 	ctx       context.Context       // cancellable context for graceful shutdown
 	cancel    context.CancelFunc    // cancels ctx to signal workers to stop
 	done      chan struct{}         // closed when RunNativeScan finishes

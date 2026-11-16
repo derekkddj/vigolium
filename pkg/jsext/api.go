@@ -6,6 +6,8 @@ import (
 
 // SetupAPI installs the vigolium.* global namespace on a sobek VM.
 func SetupAPI(vm *sobek.Runtime, opts APIOptions) {
+	receipts(vm).opts = opts
+	resetReceipts(vm)
 	// Create top-level vigolium object
 	vigolium := vm.NewObject()
 	_ = vm.Set("vigolium", vigolium)

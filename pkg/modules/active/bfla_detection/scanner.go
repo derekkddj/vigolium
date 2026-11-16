@@ -11,6 +11,7 @@ import (
 	urlutil "github.com/projectdiscovery/utils/url"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -160,7 +161,8 @@ func (m *Module) ScanPerRequest(
 	// Probe the host with a random nonexistent path. If the original "admin"
 	// response is just the host's wildcard / SPA shell, every BFLA test will
 	// fire because removing auth still returns the same shell. Bail out.
-	wildcard, _ := scanCtx.WildcardProbe(ctx, httpClient)
+	guardProof := modkit.NewEvidenceCollector()
+	wildcard, _ := scanCtx.WildcardProbeWithEvidence(ctx, httpClient, guardProof)
 	if wildcard.MatchesBody(origStatus, origBody) {
 		return nil, nil
 	}
@@ -208,6 +210,9 @@ func (m *Module) ScanPerRequest(
 		results = append(results, methodResults...)
 	}
 
+	for _, result := range results {
+		modkit.AppendEvidence(result, guardProof)
+	}
 	return results, nil
 }
 
@@ -286,8 +291,9 @@ func (m *Module) testNoAuth(
 		// serves the same 200 shell (login bounce, empty body) for every path is a
 		// catch-all, not a real authorization bypass — the byte-head wildcard guard
 		// misses this when a reflected path makes the shell's head bytes differ.
+		ev := modkit.NewEvidenceCollector()
 		method, _ := httpmsg.GetMethod(modifiedRaw)
-		baseStatus, baseBody, ok := probeMethodBaseline(ctx, httpClient, method)
+		baseStatus, baseBody, ok := probeMethodBaseline(ctx, httpClient, method, ev)
 		if ok && matchesMethodBaseline(respStatus, respBodyBytes, baseStatus, baseBody) {
 			return nil, nil
 		}
@@ -296,17 +302,17 @@ func (m *Module) testNoAuth(
 		// (rotating tokens, A/B variants, edge-cache flapping) can cross the
 		// similarity threshold once by chance; a real authorization bypass returns
 		// the same privileged content every time, a coincidental match does not.
-		if !confirmPrivilegedReproduces(ctx, httpClient, modifiedRaw, origStatus, origBody) {
+		if !confirmPrivilegedReproduces(ctx, httpClient, modifiedRaw, origStatus, origBody, ev) {
 			return nil, nil
 		}
-		ev := modkit.NewEvidenceCollector()
-		ev.Add("original-auth", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
-		return &output.ResultEvent{
+		ev.AddBaseline("original-auth", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
+		result := &output.ResultEvent{
 			URL:                urlx.String(),
 			Matched:            urlx.String(),
 			Request:            string(modifiedRaw),
 			Response:           respBody,
 			AdditionalEvidence: ev.Entries(),
+			Evidence:           ev.Evidence(),
 			FuzzingParameter:   "Authorization",
 			ExtractedResults: []string{
 				fmt.Sprintf("Original status: %d, Unauthenticated status: %d", origStatus, respStatus),
@@ -316,7 +322,9 @@ func (m *Module) testNoAuth(
 				Name:        "BFLA: Unauthenticated Access to Privileged Endpoint",
 				Description: "The privileged endpoint returns a successful response after removing Authorization and Cookie headers, indicating broken function-level authorization.",
 			},
-		}, nil
+		}
+		modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleAttack, "selected probe")
+		return result, nil
 	}
 
 	return nil, nil
@@ -375,25 +383,26 @@ func (m *Module) testDowngradedAuth(
 		bodiesContentSimilar(origStatus, origBody, respStatus, respBodyBytes) {
 		// Reject the catch-all case where the host answers identically for a random
 		// path with this same method (see testNoAuth for the rationale).
+		ev := modkit.NewEvidenceCollector()
 		method, _ := httpmsg.GetMethod(modifiedRaw)
-		baseStatus, baseBody, ok := probeMethodBaseline(ctx, httpClient, method)
+		baseStatus, baseBody, ok := probeMethodBaseline(ctx, httpClient, method, ev)
 		if ok && matchesMethodBaseline(respStatus, respBodyBytes, baseStatus, baseBody) {
 			return nil, nil
 		}
 		// Require the privileged content to reproduce across several downgraded
 		// requests, rejecting endpoints whose body merely happens to look similar
 		// on a single dynamic sample (see testNoAuth for the rationale).
-		if !confirmPrivilegedReproduces(ctx, httpClient, modifiedRaw, origStatus, origBody) {
+		if !confirmPrivilegedReproduces(ctx, httpClient, modifiedRaw, origStatus, origBody, ev) {
 			return nil, nil
 		}
-		ev := modkit.NewEvidenceCollector()
-		ev.Add("original-auth", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
-		return &output.ResultEvent{
+		ev.AddBaseline("original-auth", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
+		result := &output.ResultEvent{
 			URL:                urlx.String(),
 			Matched:            urlx.String(),
 			Request:            string(modifiedRaw),
 			Response:           respBody,
 			AdditionalEvidence: ev.Entries(),
+			Evidence:           ev.Evidence(),
 			FuzzingParameter:   "Authorization",
 			ExtractedResults: []string{
 				fmt.Sprintf("Original status: %d, Downgraded token status: %d", origStatus, respStatus),
@@ -403,7 +412,9 @@ func (m *Module) testDowngradedAuth(
 				Name:        "BFLA: Downgraded Token Accepted on Privileged Endpoint",
 				Description: "The privileged endpoint returns a successful response with an invalid/downgraded Bearer token, indicating broken function-level authorization.",
 			},
-		}, nil
+		}
+		modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleAttack, "selected probe")
+		return result, nil
 	}
 
 	return nil, nil
@@ -464,6 +475,7 @@ func (m *Module) testMethodSwitching(
 			respStatus := resp.Response().StatusCode
 			candBody := append([]byte(nil), resp.Body().Bytes()...)
 			respBody := resp.FullResponseString()
+			exchange := http.CaptureEvidence(resp)
 			resp.Close()
 
 			// A switched-method response with an empty body is not evidence that the
@@ -495,7 +507,8 @@ func (m *Module) testMethodSwitching(
 			// POST/PUT/DELETE everywhere (e.g. an empty Content-Length:0 200 from an
 			// edge gateway) returns the same thing for "/", "/includes/" and the
 			// admin path alike — a catch-all, not a function-level auth bypass.
-			baseStatus, baseBody, ok := probeMethodBaseline(ctx, httpClient, tryMethod)
+			ev := modkit.NewEvidenceCollector()
+			baseStatus, baseBody, ok := probeMethodBaseline(ctx, httpClient, tryMethod, ev)
 			if ok && matchesMethodBaseline(respStatus, candBody, baseStatus, baseBody) {
 				continue
 			}
@@ -506,18 +519,18 @@ func (m *Module) testMethodSwitching(
 			// live dashboard, per-request token) that merely differs from the
 			// method-baseline once will not reproduce content-similar, so it is
 			// dropped rather than flagged as a function-level auth bypass.
-			if !confirmPrivilegedReproduces(ctx, httpClient, modifiedRaw, respStatus, candBody) {
+			if !confirmPrivilegedReproduces(ctx, httpClient, modifiedRaw, respStatus, candBody, ev) {
 				continue
 			}
 
-			ev := modkit.NewEvidenceCollector()
-			ev.Add("original-auth", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
-			results = append(results, &output.ResultEvent{
+			ev.AddBaseline("original-auth", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
+			result := &output.ResultEvent{
 				URL:                urlx.String(),
 				Matched:            urlx.String(),
 				Request:            string(modifiedRaw),
 				Response:           respBody,
 				AdditionalEvidence: ev.Entries(),
+				Evidence:           ev.Evidence(),
 				FuzzingParameter:   "method",
 				ExtractedResults: []string{
 					fmt.Sprintf("Method %s accepted without authentication on admin path", tryMethod),
@@ -526,7 +539,9 @@ func (m *Module) testMethodSwitching(
 					Name:        fmt.Sprintf("BFLA: Unauthenticated %s on Privileged Endpoint", tryMethod),
 					Description: fmt.Sprintf("The privileged endpoint accepts %s requests without authentication, indicating broken function-level authorization.", tryMethod),
 				},
-			})
+			}
+			modkit.SetPrimaryEvidence(result, exchange, evidence.RoleAttack, "selected probe")
+			results = append(results, result)
 			return results, nil
 		}
 		resp.Close()
@@ -550,6 +565,7 @@ func probeMethodBaseline(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	method string,
+	collectors ...*modkit.EvidenceCollector,
 ) (status int, body []byte, ok bool) {
 	probePath := "/" + utils.RandomString(12) + "-vigolium-wp/" + utils.RandomString(8)
 
@@ -578,6 +594,9 @@ func probeMethodBaseline(
 	defer resp.Close()
 	if resp.Response() == nil {
 		return 0, nil, false
+	}
+	if len(collectors) > 0 {
+		collectors[0].AddExchange(http.CaptureEvidence(resp), evidence.RoleControl, "random same-method path")
 	}
 	return resp.Response().StatusCode, append([]byte(nil), resp.Body().Bytes()...), true
 }
@@ -614,6 +633,7 @@ func confirmPrivilegedReproduces(
 	modifiedRaw []byte,
 	origStatus int,
 	origBody []byte,
+	collectors ...*modkit.EvidenceCollector,
 ) bool {
 	for i := 0; i < bflaConfirmSamples; i++ {
 		// modifiedRaw is already well-formed, so wrap directly instead of
@@ -633,6 +653,9 @@ func confirmPrivilegedReproduces(
 		}
 		status := resp.Response().StatusCode
 		body := append([]byte(nil), resp.Body().Bytes()...)
+		if len(collectors) > 0 {
+			collectors[0].AddExchange(http.CaptureEvidence(resp), evidence.RoleConfirmation, "privileged response replay")
+		}
 		resp.Close()
 
 		if status != origStatus || !bodiesContentSimilar(origStatus, origBody, status, body) {

@@ -935,7 +935,15 @@ func (db *DB) renderDDL(tmpl string) string {
 //	   So did the websocket_frames table (the browser crawl's WebSocket frames,
 //	   websocket_frames.go): a new table is created on every open like a
 //	   column migration, and no reader of an older store depends on it.
-const currentSchemaVersion = 6
+//	7  Immutable selected evidence receipts and finding associations, additive
+//	   (min reader stays 6). Historical inline evidence is NOT backfilled or
+//	   assigned proof roles.
+//	8  Pending OAST planting receipts, additive. Historical reads remain valid
+//	   without this table; writes require central schema readiness.
+//	9  Canonical OAST exchange bindings; migrate legacy planting JSON atomically.
+//	   Explicit injection labels; nanosecond payload and collaborator timestamps.
+//	10 Raw-record capture fidelity, additive; no inference/backfill for old rows.
+const currentSchemaVersion = 10
 
 // legacyBackfillsVersion is the version that gated the pre-versioning backfills
 // and index reshaping in CreateSchema. A store at or past it has had them.
@@ -1081,6 +1089,9 @@ func (db *DB) CreateSchema(ctx context.Context) error {
 	// aborts CreateSchema on the first error, so building a new column's index
 	// before the column exists fails schema init entirely and leaves repo nil.
 	db.runColumnMigrations(ctx)
+	if err := db.migrateOASTPlantingStorage(ctx); err != nil {
+		return fmt.Errorf("failed to migrate canonical OAST planting storage: %w", err)
+	}
 
 	// A Postgres store created before the per-dialect templates may hold bool
 	// columns as INTEGER, which no CREATE/ADD COLUMN can fix and every bool

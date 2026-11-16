@@ -20,6 +20,9 @@ func TestAttributeScanToAgenticScan(t *testing.T) {
 	agenticUUID := uuid.NewString()
 	scanUUID := uuid.NewString()
 	otherScan := uuid.NewString()
+	if err := repo.CreateAgenticScan(ctx, &AgenticScan{UUID: agenticUUID, ProjectUUID: proj, Mode: "swarm", Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := repo.CreateScan(ctx, &Scan{
 		UUID:        scanUUID,

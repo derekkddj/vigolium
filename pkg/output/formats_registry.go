@@ -29,12 +29,12 @@ const (
 	SurfaceDBExport = formats.SurfaceDBExport
 )
 
-// ReportRenderer renders a materialized item set (the unified {type,data}
-// export envelopes) to outputPath.
+// ReportRenderer is the small-input compatibility API for materialized unified
+// {type,data} envelopes. Production report feeding uses RenderStream.
 type ReportRenderer func(items []any, outputPath string, meta HTMLReportMeta) error
 
-// StreamReportRenderer renders by pulling items one at a time from a producer,
-// so the result set never lives in memory at once.
+// StreamReportRenderer pulls items one at a time, keeping the raw HTTP corpus
+// off heap. Renderers may retain summary/TOC/tabular metadata or disk snapshots.
 type StreamReportRenderer func(produce ReportItemProducer, outputPath string, meta HTMLReportMeta) error
 
 // OutputFormat is one table row plus the renderer bound to it. Render is nil
@@ -59,13 +59,13 @@ const defaultReportTitle = "Vigolium Scan Report"
 // TestFormatRegistryRenderers keeps this map and the table in lockstep.
 var reportRenderers = map[string]reportBinding{
 	"html":     {render: GenerateHTMLReport, renderStream: GenerateHTMLReportStreaming, defaultTitle: "Vigolium Static Report"},
-	"report":   {render: GenerateDocumentReport, defaultTitle: defaultReportTitle},
-	"pdf":      {render: GeneratePDFReport, defaultTitle: defaultReportTitle},
-	"markdown": {render: GenerateMarkdownReport, defaultTitle: defaultReportTitle},
-	"sarif":    {render: GenerateSARIFReport, defaultTitle: defaultReportTitle},
-	"csv":      {render: GenerateCSVReport, defaultTitle: defaultReportTitle},
-	"junit":    {render: GenerateJUnitReport, defaultTitle: defaultReportTitle},
-	"github":   {render: GenerateGitHubAnnotations, defaultTitle: defaultReportTitle},
+	"report":   {render: GenerateDocumentReport, renderStream: GenerateDocumentReportStreaming, defaultTitle: defaultReportTitle},
+	"pdf":      {render: GeneratePDFReport, renderStream: GeneratePDFReportStreaming, defaultTitle: defaultReportTitle},
+	"markdown": {render: GenerateMarkdownReport, renderStream: GenerateMarkdownReportStreaming, defaultTitle: defaultReportTitle},
+	"sarif":    {render: GenerateSARIFReport, renderStream: GenerateSARIFReportStreaming, defaultTitle: defaultReportTitle},
+	"csv":      {render: GenerateCSVReport, renderStream: GenerateCSVReportStreaming, defaultTitle: defaultReportTitle},
+	"junit":    {render: GenerateJUnitReport, renderStream: GenerateJUnitReportStreaming, defaultTitle: defaultReportTitle},
+	"github":   {render: GenerateGitHubAnnotations, renderStream: GenerateGitHubAnnotationsStreaming, defaultTitle: defaultReportTitle},
 }
 
 func bind(f formats.Format) OutputFormat {

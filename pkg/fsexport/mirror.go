@@ -17,6 +17,7 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/vigolium/vigolium/internal/atomicfile"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"go.uber.org/zap"
 )
 
@@ -92,8 +93,9 @@ func newMirrorLinkCache() *lru.Cache[string, string] {
 }
 
 type mirrorJob struct {
-	record  *database.HTTPRecord
-	finding *database.Finding
+	record     *database.HTTPRecord
+	finding    *database.Finding
+	occurrence bool
 }
 
 // NewMirror creates a filesystem mirror rooted at dir (writing dir/traffic and
@@ -150,10 +152,33 @@ func (m *Mirror) OnRecord(rec *database.HTTPRecord) {
 
 // OnFinding queues a newly saved finding for mirroring.
 func (m *Mirror) OnFinding(f *database.Finding) {
+	m.enqueueFinding(f, false)
+}
+
+func (m *Mirror) enqueueFinding(f *database.Finding, occurrence bool) {
 	if f == nil {
 		return
 	}
-	m.enqueue(mirrorJob{finding: f})
+	owned := *f
+	owned.Evidence = evidence.CloneEntries(f.Evidence)
+	owned.HTTPRecordUUIDs = append([]string(nil), f.HTTPRecordUUIDs...)
+	owned.Tags = append([]string(nil), f.Tags...)
+	owned.MatchedAt = append([]string(nil), f.MatchedAt...)
+	owned.ExtractedResults = append([]string(nil), f.ExtractedResults...)
+	owned.AdditionalEvidence = append([]string(nil), f.AdditionalEvidence...)
+	if f.InsertionPoint != nil {
+		point := *f.InsertionPoint
+		owned.InsertionPoint = &point
+	}
+	m.enqueue(mirrorJob{finding: &owned, occurrence: occurrence})
+}
+
+// OnFindingOccurrence queues the postcommit incoming occurrence snapshot. It also
+// handles the initial insert; callers must wire this OR OnFinding, not both.
+// Each occurrence gets fresh sequential files and an index row with the canonical
+// finding/project identity. Prior files and their original status are immutable.
+func (m *Mirror) OnFindingOccurrence(f *database.Finding) {
+	m.enqueueFinding(f, true)
 }
 
 // enqueue offers a job to the writer. A full buffer gets a bounded wait rather
@@ -214,7 +239,7 @@ func (m *Mirror) run() {
 			m.writeRecord(j.record)
 		}
 		if j.finding != nil {
-			m.writeFinding(j.finding)
+			m.writeFinding(j.finding, j.occurrence)
 		}
 	}
 	closeIndex(m.trafficIndex)
@@ -257,7 +282,7 @@ func (m *Mirror) writeRecord(rec *database.HTTPRecord) {
 	}
 
 	relPath := host + "/" + id
-	m.uuidToPath.Add(rec.UUID, relPath)
+	m.uuidToPath.Add(mirrorRecordKey(rec.ProjectUUID, rec.UUID), relPath)
 	m.appendIndex(&m.trafficIndex, filepath.Join(m.trafficRoot, "index.jsonl"), TrafficEntry{
 		ID:          id,
 		Host:        rec.Hostname,
@@ -270,7 +295,7 @@ func (m *Mirror) writeRecord(rec *database.HTTPRecord) {
 	})
 }
 
-func (m *Mirror) writeFinding(f *database.Finding) {
+func (m *Mirror) writeFinding(f *database.Finding, occurrence bool) {
 	host := SanitizeHost(FindingHost(f))
 	dir := filepath.Join(m.findingsRoot, host)
 	if err := os.MkdirAll(dir, mirrorDirMode); err != nil {
@@ -283,32 +308,64 @@ func (m *Mirror) writeFinding(f *database.Finding) {
 	var linked []LinkedRecord
 	var linkedPaths []string
 	for _, u := range f.HTTPRecordUUIDs {
-		if p, ok := m.uuidToPath.Get(u); ok {
+		if p, ok := m.uuidToPath.Get(mirrorRecordKey(f.ProjectUUID, u)); ok {
 			linked = append(linked, ReadLinkedRecord(m.trafficRoot, p, m.omitResponse))
 			linkedPaths = append(linkedPaths, p)
 		}
 	}
 
+	statusScope := "stored_finding"
+	if occurrence {
+		statusScope = "incoming_occurrence"
+	}
+	if err := writeFindingEvidenceFiles(dir, id, f, mirrorFileMode, statusScope); err != nil {
+		zap.L().Warn("fsexport mirror: write selected evidence", zap.Error(err))
+		return
+	}
 	md := RenderFindingMarkdown(f, linked, "traffic")
+	var occurrenceIDs []string
+	seen := make(map[string]bool)
+	for _, entry := range f.Evidence {
+		if entry.OccurrenceID != "" && !seen[entry.OccurrenceID] {
+			seen[entry.OccurrenceID] = true
+			occurrenceIDs = append(occurrenceIDs, entry.OccurrenceID)
+		}
+	}
+	if occurrence {
+		md = bytes.Replace(md, []byte("Stored finding evidence status:"), []byte("Incoming occurrence evidence status:"), 1)
+		md = bytes.Replace(md, []byte("Original finding metadata; each occurrence retains its own role/primary flag. Later selections do not reclassify legacy evidence."), []byte("Immutable incoming occurrence snapshot, not the survivor's aggregate manifest or original status. Earlier occurrence files retain their own metadata; later selections do not reclassify them."), 1)
+	}
+	md = append(md, []byte(fmt.Sprintf("\nCanonical finding: %d · project: %s · hash: %s\n\n[Selected evidence bundle](%s.evidence.json)\n", f.ID, f.ProjectUUID, f.FindingHash, id))...)
 	if err := writeFileAtomic(filepath.Join(dir, id+".md"), md, mirrorFileMode); err != nil {
 		zap.L().Warn("fsexport mirror: write finding", zap.Error(err))
 		return
 	}
 
+	historyPath, err := m.mergeFindingHistory(f, host+"/"+id)
+	if err != nil {
+		zap.L().Warn("fsexport mirror: merge finding occurrence history (prior files retained)", zap.Error(err))
+	}
 	title := f.ModuleName
 	if title == "" {
 		title = f.ModuleID
 	}
 	m.appendIndex(&m.findingIndex, filepath.Join(m.findingsRoot, "index.jsonl"), FindingEntry{
-		ID:         id,
-		Host:       FindingHost(f),
-		Path:       host + "/" + id + ".md",
-		Severity:   f.Severity,
-		Confidence: f.Confidence,
-		Module:     f.ModuleID,
-		Title:      title,
-		URL:        f.URL,
-		Traffic:    linkedPaths,
+		ID:                  id,
+		Host:                FindingHost(f),
+		Path:                host + "/" + id + ".md",
+		Severity:            f.Severity,
+		Confidence:          f.Confidence,
+		Module:              f.ModuleID,
+		Title:               title,
+		URL:                 f.URL,
+		Traffic:             linkedPaths,
+		ProjectUUID:         f.ProjectUUID,
+		FindingID:           f.ID,
+		FindingHash:         f.FindingHash,
+		EvidenceStatus:      f.EvidenceStatus,
+		EvidenceStatusScope: statusScope,
+		OccurrenceIDs:       occurrenceIDs,
+		EvidenceHistory:     historyPath,
 	})
 }
 
@@ -347,6 +404,13 @@ func (m *Mirror) appendIndex(fp **os.File, path string, entry any) {
 func (m *Mirror) resume() {
 	m.trafficSeq = scanMaxSeq(m.trafficRoot, ".req")
 	m.findingSeq = scanMaxSeq(m.findingsRoot, ".md")
+	// An occurrence bundle may have landed before its Markdown/index did. Do
+	// not reuse that sequence after a crash and overwrite its earlier sidecars.
+	for host, seq := range scanMaxSeq(m.findingsRoot, ".evidence.json") {
+		if seq > m.findingSeq[host] {
+			m.findingSeq[host] = seq
+		}
+	}
 	reconcileIndex(filepath.Join(m.trafficRoot, "index.jsonl"), m.trafficSeq)
 	reconcileIndex(filepath.Join(m.findingsRoot, "index.jsonl"), m.findingSeq)
 }

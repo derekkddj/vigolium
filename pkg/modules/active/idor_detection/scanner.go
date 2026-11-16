@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -224,7 +225,7 @@ func (m *Module) probeNeighbor(
 	host string,
 	urlStr string,
 	classification authzutil.IDClassification,
-) (*output.ResultEvent, error) {
+) (finding *output.ResultEvent, err error) {
 	// Build the probe request
 	fuzzedRaw := ip.BuildRequest([]byte(neighborID))
 	// fuzzedRaw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
@@ -260,6 +261,7 @@ func (m *Module) probeNeighbor(
 	probeBody := append([]byte(nil), resp.Body().Bytes()...)
 	probeRequest := string(fuzzedRaw)
 	probeResponse := resp.FullResponseString()
+	selectedExchange := http.CaptureEvidence(resp)
 	resp.Close()
 
 	// Hard denial: 401, 403 → authorization enforced
@@ -305,7 +307,8 @@ func (m *Module) probeNeighbor(
 	// the original-id baseline plus the same-id determinism refetches (added by
 	// ConfirmCrossIDDifferential via the Evidence field below).
 	ev := modkit.NewEvidenceCollector()
-	ev.Add("original-id", baseline.Request, baseline.Response)
+	defer func() { modkit.AppendEvidence(finding, ev) }()
+	ev.AddBaseline("original-id", baseline.Request, baseline.Response)
 
 	// Determinism gate: re-issue the ORIGINAL id a couple of times to measure how
 	// much this endpoint varies its response for an UNCHANGED id. Analytics /
@@ -336,7 +339,7 @@ func (m *Module) probeNeighbor(
 	// difference looks like broken object-level authorization. Sampling the
 	// unmodified request harder settles it, and the verdict is memoized per record
 	// so it is paid once no matter how many ids this endpoint offers.
-	if modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+	if modkit.EndpointVolatileWithEvidence(scanCtx, ctx, httpClient, ev) {
 		return nil, nil
 	}
 
@@ -363,6 +366,9 @@ func (m *Module) probeNeighbor(
 		desc += fmt.Sprintf(" User-specific fields differ: %s.", strings.Join(comparison.DifferingFields, ", "))
 	}
 
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, selectedExchange, evidence.RoleAttack, "selected neighbor-ID probe")
+	}()
 	return &output.ResultEvent{
 		ModuleID:           ModuleID,
 		Host:               host,
@@ -372,6 +378,7 @@ func (m *Module) probeNeighbor(
 		Response:           probeResponse,
 		FuzzingParameter:   ip.Name(),
 		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
 		ExtractedResults: []string{
 			fmt.Sprintf("%s=%s → %s", ip.Name(), ip.BaseValue(), neighborID),
 		},

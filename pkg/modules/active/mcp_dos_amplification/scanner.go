@@ -89,10 +89,11 @@ func (m *Module) ScanPerHost(
 	if err != nil {
 		return nil, err
 	}
-	baseResp, _, err := client.PostRaw(baselineBody)
-	if err != nil || baseResp == "" {
+	baseOp, err := client.PostRawEvidence(baselineBody)
+	if err != nil || baseOp.Body == "" {
 		return nil, nil
 	}
+	baseResp := baseOp.Body
 	var baseArr []mcpinfra.JSONRPCResponse
 	if uerr := json.Unmarshal([]byte(mcpinfra.ExtractJSONFromSSE(baseResp)), &baseArr); uerr != nil {
 		// Not an array response => the server does not process batches.
@@ -114,11 +115,12 @@ func (m *Module) ScanPerHost(
 	if err != nil {
 		return nil, err
 	}
-	oversizedResp, _, err := client.PostRaw(oversizedBody)
-	if err != nil || oversizedResp == "" {
+	oversizedOp, err := client.PostRawEvidence(oversizedBody)
+	if err != nil || oversizedOp.Body == "" {
 		return nil, nil
 	}
 
+	oversizedResp := oversizedOp.Body
 	var results []mcpinfra.JSONRPCResponse
 	if uerr := json.Unmarshal([]byte(mcpinfra.ExtractJSONFromSSE(oversizedResp)), &results); uerr != nil {
 		// The server rejected the oversized batch (e.g. a single error object)
@@ -141,8 +143,11 @@ func (m *Module) ScanPerHost(
 		return nil, nil
 	}
 
+	proof := mcpinfra.NewProof(oversizedOp.Exchange)
+	proof.Control(baseOp.Exchange)
+	proof.Payload = string(oversizedBody)
 	return []*output.ResultEvent{
-		{
+		proof.Attack(&output.ResultEvent{
 			ModuleID:      ModuleID,
 			RecordKind:    output.RecordKindCandidate,
 			EvidenceGrade: output.EvidenceGradeDifferential,
@@ -163,7 +168,7 @@ func (m *Module) ScanPerHost(
 				Reference:   []string{"https://www.jsonrpc.org/specification"},
 			},
 			Metadata: map[string]any{"batch_size": oversizedBatchSize, "processed": processed, "service_degradation_observed": false, "resource_exhaustion_measured": false, "rate_limit_window_tested": false},
-		},
+		}),
 	}, nil
 }
 

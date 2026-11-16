@@ -7,6 +7,7 @@ import (
 	urlutil "github.com/projectdiscovery/utils/url"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -138,12 +139,18 @@ func (m *Module) ScanPerRequest(
 	}
 
 	// Wildcard guard: a host that 200s every path is not a traversal.
-	wildcard, _ := scanCtx.WildcardProbe(ctx, httpClient)
+	guardProof := modkit.NewEvidenceCollector()
+	wildcard, _ := scanCtx.WildcardProbeWithEvidence(ctx, httpClient, guardProof)
+
+	ev := modkit.NewEvidenceCollector()
+	ev.AddExchange(base.exchange, evidence.RoleBaseline, "clean object")
+	ev.AddExchange(base2.exchange, evidence.RoleConfirmation, "clean object replay")
 
 	// Catch-all guard: a non-collapsing matrix-param suffix must NOT list.
 	for _, c := range controlTokens {
 		cb := m.fetch(httpClient, service, rawGET, joinProbe(objPath, c), false, &budget)
 		if cb.ok {
+			ev.AddExchange(cb.exchange, evidence.RoleControl, "non-collapsing suffix")
 			if _, isList := storagesig.StrongListing(cb.body); isList {
 				return nil, nil // blanket listing -> reject candidate
 			}
@@ -187,12 +194,19 @@ func (m *Module) ScanPerRequest(
 			if cleanPath := collapsedParentPath(objPath, tk.tok); cleanPath != "" {
 				cp := m.fetch(httpClient, service, rawGET, cleanPath, true, &budget)
 				if cp.ok {
+					ev.AddExchange(cp.exchange, evidence.RoleControl, "canonical parent")
 					if _, isList := storagesig.StrongListing(cp.body); isList {
 						return nil, nil
 					}
 				}
 			}
-			return []*output.ResultEvent{m.buildFinding(urlx, rawGET, probePath, pb.body, prov, tk.tok, leaf)}, nil
+			result := m.buildFinding(urlx, rawGET, probePath, pb.body, prov, tk.tok, leaf)
+			ev.AddExchange(rb.exchange, evidence.RoleConfirmation, "listing replay")
+			result.Evidence = ev.Evidence()
+			result.AdditionalEvidence = ev.Entries()
+			modkit.SetPrimaryEvidence(result, pb.exchange, evidence.RoleAttack, "traversal listing probe")
+			modkit.AppendEvidence(result, guardProof)
+			return []*output.ResultEvent{result}, nil
 		}
 		if pass == 1 && !promising {
 			return nil, nil // tier 1 reached nothing distinct -> don't unfurl tier 2
@@ -202,9 +216,10 @@ func (m *Module) ScanPerRequest(
 }
 
 type probeResult struct {
-	status int
-	body   string
-	ok     bool
+	exchange *evidence.Exchange
+	status   int
+	body     string
+	ok       bool
 }
 
 func (m *Module) fetch(
@@ -238,7 +253,7 @@ func (m *Module) fetch(
 	if resp.Response() == nil {
 		return probeResult{}
 	}
-	return probeResult{status: resp.Response().StatusCode, body: resp.Body().String(), ok: true}
+	return probeResult{status: resp.Response().StatusCode, body: resp.Body().String(), exchange: http.CaptureEvidence(resp), ok: true}
 }
 
 func (m *Module) buildFinding(

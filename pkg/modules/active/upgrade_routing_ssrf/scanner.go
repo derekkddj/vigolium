@@ -9,6 +9,7 @@ import (
 
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -88,7 +89,8 @@ func (m *Module) ScanPerRequest(
 		target := "http://" + tgt.Effective
 
 		// (1) Probe WITH the upgrade handshake.
-		pStatus, pBody, pResp, pBlocked, ok, fatal := m.fire(httpClient, service, baseRaw, target, withUpgrade(tgt.ExtraHeaders))
+		var pReceipt, cReceipt *evidence.Exchange
+		pStatus, pBody, pResp, pBlocked, ok, fatal := m.fire(httpClient, service, baseRaw, target, withUpgrade(tgt.ExtraHeaders), &pReceipt)
 		if fatal {
 			return nil, nil
 		}
@@ -106,7 +108,7 @@ func (m *Module) ScanPerRequest(
 		// (2) Control WITHOUT the upgrade handshake. If the markers are present here
 		// too, this is a plain request-line routing SSRF (routing-ssrf reports it) —
 		// not an upgrade bypass — so we must NOT double-report it.
-		cStatus, cBody, cResp, cBlocked, ok2, _ := m.fire(httpClient, service, baseRaw, target, tgt.ExtraHeaders)
+		cStatus, cBody, _, cBlocked, ok2, _ := m.fire(httpClient, service, baseRaw, target, tgt.ExtraHeaders, &cReceipt)
 		if !ok2 {
 			continue // cannot establish the control → fail closed
 		}
@@ -116,8 +118,7 @@ func (m *Module) ScanPerRequest(
 
 		// (3) Reproduce the upgrade-only behaviour to reject per-request noise.
 		ev := modkit.NewEvidenceCollector()
-		ev.Add("with-upgrade (candidate)", displayRequest(baseRaw, target, true), pResp)
-		ev.Add("without-upgrade (control)", displayRequest(baseRaw, target, false), cResp)
+		ev.AddExchange(cReceipt, evidence.RoleControl, "without-upgrade (control)")
 		if !m.reproduce(httpClient, service, baseRaw, target, tgt, markers, ev) {
 			continue
 		}
@@ -127,20 +128,23 @@ func (m *Module) ScanPerRequest(
 			"WebSocket-upgrade SSRF bypass: the proxy reached %s (markers %s) only when the request carried Connection: Upgrade / Upgrade: websocket — the same request without the upgrade handshake did not. The response is a plain metadata body (not the app's HTML page), and the connection and Host header named the victim.",
 			tgt.Label, markerList,
 		)
-		return []*output.ResultEvent{{
+		result := &output.ResultEvent{
 			URL:                urlx.String(),
 			Request:            displayRequest(baseRaw, target, true),
 			Response:           pResp,
 			FuzzingParameter:   "request-line+upgrade",
 			ExtractedResults:   []string{target, tgt.Label, "markers=" + markerList, "bypass=Connection: Upgrade"},
 			AdditionalEvidence: ev.Entries(),
+			Evidence:           ev.Evidence(),
 			Info: output.Info{
 				Name:        "WebSocket-Upgrade SSRF Filter Bypass",
 				Description: desc,
 				Severity:    severity.Suspect,
 				Confidence:  severity.Tentative,
 			},
-		}}, nil
+		}
+		modkit.SetPrimaryEvidence(result, pReceipt, evidence.RoleAttack, "with-upgrade internal routing probe")
+		return []*output.ResultEvent{result}, nil
 	}
 	return nil, nil
 }
@@ -157,11 +161,12 @@ func (m *Module) reproduce(
 	ev *modkit.EvidenceCollector,
 ) bool {
 	for i := 0; i < confirmRounds; i++ {
-		status, body, resp, blocked, ok, fatal := m.fire(httpClient, service, baseRaw, target, withUpgrade(tgt.ExtraHeaders))
+		var receipt *evidence.Exchange
+		status, body, _, blocked, ok, fatal := m.fire(httpClient, service, baseRaw, target, withUpgrade(tgt.ExtraHeaders), &receipt)
 		if fatal || !ok || blocked || !is2xx(status) || !infra.MetadataBodyReproduces(body, markers) {
 			return false
 		}
-		ev.Add(fmt.Sprintf("reproduce-%d", i+1), displayRequest(baseRaw, target, true), resp)
+		ev.AddExchange(receipt, evidence.RoleConfirmation, fmt.Sprintf("reproduce-%d", i+1))
 	}
 	return true
 }
@@ -174,6 +179,7 @@ func (m *Module) fire(
 	baseRaw []byte,
 	target string,
 	headers map[string]string,
+	receiptOut ...**evidence.Exchange,
 ) (status int, body, fullResp string, blocked, ok, fatal bool) {
 	raw := baseRaw
 	var err error
@@ -202,6 +208,9 @@ func (m *Module) fire(
 	defer resp.Close()
 	if resp.Response() == nil {
 		return 0, "", "", false, false, false
+	}
+	if len(receiptOut) > 0 && receiptOut[0] != nil {
+		*receiptOut[0] = http.CaptureEvidence(resp)
 	}
 	return resp.Response().StatusCode, resp.Body().String(), resp.FullResponseString(), infra.IsBlockedResponse(resp), true, false
 }

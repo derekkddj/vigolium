@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/output"
 )
 
 // TrafficEntry is one row of a traffic index. `Path` is the ready-to-open prefix
@@ -65,15 +66,22 @@ type LinkedRecord struct {
 // within the findings dir; `Traffic` lists the traffic `Path` prefixes this
 // finding is linked to.
 type FindingEntry struct {
-	ID         string   `json:"id"`
-	Host       string   `json:"host"`
-	Path       string   `json:"path"`
-	Severity   string   `json:"severity"`
-	Confidence string   `json:"confidence"`
-	Module     string   `json:"module"`
-	Title      string   `json:"title"`
-	URL        string   `json:"url,omitempty"`
-	Traffic    []string `json:"traffic"`
+	ID                  string   `json:"id"`
+	Host                string   `json:"host"`
+	Path                string   `json:"path"`
+	Severity            string   `json:"severity"`
+	Confidence          string   `json:"confidence"`
+	Module              string   `json:"module"`
+	Title               string   `json:"title"`
+	URL                 string   `json:"url,omitempty"`
+	Traffic             []string `json:"traffic"`
+	ProjectUUID         string   `json:"project_uuid,omitempty"`
+	FindingID           int64    `json:"finding_id,omitempty"`
+	FindingHash         string   `json:"finding_hash,omitempty"`
+	EvidenceStatus      string   `json:"evidence_status,omitempty"`
+	EvidenceStatusScope string   `json:"evidence_status_scope,omitempty"`
+	OccurrenceIDs       []string `json:"occurrence_ids,omitempty"`
+	EvidenceHistory     string   `json:"evidence_history,omitempty"`
 }
 
 // TargetLine builds the "@target <scheme>://<authority>" header line prepended
@@ -272,11 +280,12 @@ func MaxSeverity(a, b string) string {
 // on its own, and — when linked traffic is present — also cross-links the full
 // .req/.resp files (relative to the findings dir, via trafficDirBase — e.g.
 // "traffic" for the live mirror or "<base>-traffic" for the one-shot export) so
-// the complete bodies and any additional records stay reachable. The inline
-// request/response prefers the finding's own curated evidence (active modules
-// capture the exact attack request) and falls back to the first linked record's
-// stored traffic (the usual source for passive findings, which carry none of
-// their own).
+// the complete bodies and any additional records stay reachable. Explicit
+// selected receipts retain their roles; legacy inline and linked traffic are
+// unknown-role context, never inferred proof. Linked previews are shown only when
+// the finding has neither inline text nor a selected manifest; otherwise traffic
+// remains links only, including when a selected receipt is unavailable. Exact
+// bytes live in sidecars.
 func RenderFindingMarkdown(f *database.Finding, linked []LinkedRecord, trafficDirBase string) []byte {
 	var b strings.Builder
 	title := f.ModuleName
@@ -326,46 +335,55 @@ func RenderFindingMarkdown(f *database.Finding, linked []LinkedRecord, trafficDi
 		b.WriteString("\n")
 	}
 
-	// Inline request/response — keep the finding self-contained. Prefer the
-	// finding's own curated evidence; fall back to the first linked record's
-	// stored traffic for findings (typically passive) that carry none of their own.
+	fmt.Fprintf(&b, "## Selected evidence\n\nStored finding evidence status: %s\n\n", OrDash(f.EvidenceStatus))
+	b.WriteString("Original finding metadata; each occurrence retains its own role/primary flag. Later selections do not reclassify legacy evidence.\n\n")
+	if len(f.Evidence) == 0 {
+		b.WriteString("Missing / unclassified: no selected exchange manifest. Legacy inline and traffic links are not proof.\n\n")
+	}
+	for i, entry := range f.Evidence {
+		fmt.Fprintf(&b, "### Exchange %d: %s — role %s, primary %t\n\n", i+1, entry.ExchangeID, entry.Role, entry.Primary)
+		fmt.Fprintf(&b, "Occurrence: %s · label: %s · finding URL: %s · scan: %s\n\n", entry.OccurrenceID, entry.Label, entry.FindingURL, entry.ScanUUID)
+		if entry.Exchange == nil {
+			b.WriteString("Selected bytes unavailable; no fallback substituted.\n\n")
+			continue
+		}
+		x := entry.Exchange
+		fmt.Fprintf(&b, "URL: %s · request state: %s · response state: %s · provenance: %s · hash: %s\n\n", x.URL, x.RequestState, x.ResponseState, x.Provenance, x.ContentHash)
+		b.WriteString("Authoritative raw bytes and full manifest are in the .evidence.json / .evidence-NNNN.*.bin sidecars. Text previews are non-authoritative. Baseline/control/unknown roles are not proof.\n\n")
+	}
+	// Never splice messages from different receipts or select first linked traffic.
 	inlineReq := f.Request
 	inlineResp := f.Response
-	bodyTruncated := false
-	truncPath := ""
-	if len(linked) > 0 {
-		lr := linked[0]
-		if inlineReq == "" {
-			inlineReq = lr.Request
-		}
-		if inlineResp == "" && (lr.ResponseHead != "" || lr.ResponseBody != "") {
-			inlineResp = lr.ResponseHead + lr.ResponseBody
-			bodyTruncated = lr.BodyTruncated
-			truncPath = lr.Path
-		}
-	}
 	if inlineReq != "" {
-		b.WriteString("## Request\n\n```http\n")
-		b.WriteString(strings.TrimRight(inlineReq, "\r\n"))
-		b.WriteString("\n```\n\n")
+		writeFindingHTTPPreview(&b, "## Legacy inline request — role unknown (not proof)", inlineReq)
 	}
 	if inlineResp != "" {
-		b.WriteString("## Response\n\n```http\n")
-		b.WriteString(strings.TrimRight(inlineResp, "\r\n"))
-		b.WriteString("\n```\n\n")
-		if bodyTruncated && truncPath != "" {
-			fmt.Fprintf(&b, "_Response body truncated to %d KB inline — full body: [%s.resp.body](../../%s/%s.resp.body)._\n\n",
-				InlineBodyCap/1024, truncPath, trafficDirBase, truncPath)
-		}
+		writeFindingHTTPPreview(&b, "## Legacy inline response — role unknown (not proof)", inlineResp)
 	}
+	// A manifest (even with missing receipts) or either inline message reserves
+	// the finding's evidence view. Do not duplicate linked bodies or fill a
+	// missing side with an unrelated exchange. All traffic links remain visible.
+	previewLinked := len(f.Evidence) == 0 && inlineReq == "" && inlineResp == ""
 
 	// Traffic links — the full .req/.resp files (complete bodies and any
 	// additional linked records not shown inline above).
 	if len(linked) > 0 {
-		b.WriteString("## Traffic\n\n")
+		b.WriteString("## Traffic — linked context, role unknown (not proof)\n\n")
 		for _, lr := range linked {
 			link := "../../" + trafficDirBase + "/" + lr.Path
 			fmt.Fprintf(&b, "- [request](%s.req) · [response headers](%s.resp.headers) · [response body](%s.resp.body)\n", link, link, link)
+			if !previewLinked {
+				continue
+			}
+			if lr.Request != "" {
+				writeFindingHTTPPreview(&b, "### Linked request — role unknown (not proof)", lr.Request)
+			}
+			if lr.ResponseHead != "" || lr.ResponseBody != "" {
+				writeFindingHTTPPreview(&b, "### Linked response — role unknown (not proof)", lr.ResponseHead+lr.ResponseBody)
+				if lr.BodyTruncated {
+					fmt.Fprintf(&b, "_Response body truncated to %d KB inline — full body: [%s.resp.body](%s.resp.body)._\n\n", InlineBodyCap/1024, lr.Path, link)
+				}
+			}
 		}
 		b.WriteString("\n")
 	}
@@ -377,6 +395,14 @@ func RenderFindingMarkdown(f *database.Finding, linked []LinkedRecord, trafficDi
 	}
 
 	return []byte(b.String())
+}
+
+// writeFindingHTTPPreview encloses untrusted HTTP in a fence longer than every
+// backtick run in the content. Previews are text only; sidecars keep exact bytes.
+func writeFindingHTTPPreview(b *strings.Builder, heading, raw string) {
+	body := strings.TrimRight(raw, "\r\n")
+	open, close := output.MarkdownFence(body, "http")
+	fmt.Fprintf(b, "%s\n\n%s\n%s\n%s\n\n", heading, open, body, close)
 }
 
 // OrDash returns s, or "-" when s is empty, for tidy markdown metadata lines.

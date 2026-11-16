@@ -1,8 +1,10 @@
 package sqli_boolean_blind
 
 import (
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
+	"github.com/vigolium/vigolium/pkg/modules/modkit"
 )
 
 // confirmRounds is how many independent rounds (with fresh random operands)
@@ -40,7 +42,12 @@ func (m *Module) confirmLogic(
 	ip httpmsg.InsertionPoint,
 	baseValue, prefix, suffix string,
 	prof branchProfile,
+	collectors ...*modkit.EvidenceCollector,
 ) (bool, error) {
+	var ev *modkit.EvidenceCollector
+	if len(collectors) > 0 {
+		ev = collectors[0]
+	}
 	// cond builds "<base><prefix> <logic> <left><cmp><right><suffix>", e.g.
 	// "1' AND 42<>17-- -". With cmp "=", a=a is TRUE and a=b is FALSE; with cmp
 	// "<>", a<>b is TRUE and a<>a is FALSE.
@@ -69,11 +76,17 @@ func (m *Module) confirmLogic(
 			f = form{cmp: "<>", tl: a, tr: b, fl: a, fr: a}
 		}
 
-		_, tSig, tBlocked, err := m.sendPayload(ctx, httpClient, ip, cond(logic, f.cmp, f.tl, f.tr))
+		_, tSig, tBlocked, tReceipt, err := m.sendPayloadReceipt(ctx, httpClient, ip, cond(logic, f.cmp, f.tl, f.tr))
+		if i == 0 || i == confirmRounds-1 {
+			ev.AddExchange(tReceipt, evidence.RoleConfirmation, "random-operand TRUE condition")
+		}
 		if err != nil {
 			return false, err
 		}
-		_, fSig, fBlocked, err := m.sendPayload(ctx, httpClient, ip, cond(logic, f.cmp, f.fl, f.fr))
+		_, fSig, fBlocked, fReceipt, err := m.sendPayloadReceipt(ctx, httpClient, ip, cond(logic, f.cmp, f.fl, f.fr))
+		if i == 0 {
+			ev.AddExchange(fReceipt, evidence.RoleControl, "random-operand FALSE condition")
+		}
 		if err != nil {
 			return false, err
 		}
@@ -103,7 +116,8 @@ func (m *Module) confirmLogic(
 	// is a syntax error on every SQL dialect. If the endpoint still renders the
 	// deterministic TRUE page, it does not react to SQL at all → false positive.
 	c, d := distinctNums()
-	_, invSig, invBlocked, err := m.sendPayload(ctx, httpClient, ip, baseValue+prefix+" AND "+c+" "+d+suffix)
+	_, invSig, invBlocked, invReceipt, err := m.sendPayloadReceipt(ctx, httpClient, ip, baseValue+prefix+" AND "+c+" "+d+suffix)
+	ev.AddExchange(invReceipt, evidence.RoleControl, "invalid SQL syntax")
 	if err != nil {
 		return false, err
 	}
@@ -165,14 +179,25 @@ func (m *Module) confirmRepeat(
 	ip httpmsg.InsertionPoint,
 	truePayload, falsePayload string,
 	prof branchProfile,
+	collectors ...*modkit.EvidenceCollector,
 ) (bool, error) {
+	var ev *modkit.EvidenceCollector
+	if len(collectors) > 0 {
+		ev = collectors[0]
+	}
 	var trueSigs, falseSigs []responseSignature
 	for i := 0; i < confirmRounds; i++ {
-		_, tSig, tBlocked, err := m.sendPayload(ctx, httpClient, ip, truePayload)
+		_, tSig, tBlocked, tReceipt, err := m.sendPayloadReceipt(ctx, httpClient, ip, truePayload)
+		if i == 0 || i == confirmRounds-1 {
+			ev.AddExchange(tReceipt, evidence.RoleConfirmation, "TRUE payload replay")
+		}
 		if err != nil {
 			return false, err
 		}
-		_, fSig, fBlocked, err := m.sendPayload(ctx, httpClient, ip, falsePayload)
+		_, fSig, fBlocked, fReceipt, err := m.sendPayloadReceipt(ctx, httpClient, ip, falsePayload)
+		if i == 0 {
+			ev.AddExchange(fReceipt, evidence.RoleControl, "FALSE payload replay")
+		}
 		if err != nil {
 			return false, err
 		}

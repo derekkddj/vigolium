@@ -8,6 +8,8 @@ import (
 	"io"
 	"math"
 	"time"
+
+	"github.com/vigolium/vigolium/pkg/httpmsg"
 )
 
 // Options holds parameters for a single agent run.
@@ -43,7 +45,10 @@ type Options struct {
 	// OfflineTools restricts the run to tools that reach neither the network
 	// nor a shell (read_file, ls, grep, glob): the agent reasons over what the
 	// prompt carries and cannot contact the target. `agent triage --no-probe`.
-	OfflineTools bool      `json:"-"`
+	OfflineTools bool `json:"-"`
+	// PlanningOnly is an orchestration policy, independent of editable prompts.
+	// Analyze supplied context and select skills; never execute tools or probes.
+	PlanningOnly bool      `json:"-"`
 	StreamWriter io.Writer `json:"-"` // when non-nil, agent output is streamed here in real-time
 	SessionDir   string    `json:"-"` // session directory for artifacts (transcripts, generated extensions, etc.)
 	Verbose      bool      `json:"-"` // when true, the toollog renders a per-tool result preview alongside the standard one-liner
@@ -73,6 +78,10 @@ type Result struct {
 	// the provider for this single agent call (sum across all turns of the
 	// multi-turn loop). Aggregated upward by SwarmRunner / autopilot.
 	TokenUsage TokenUsage `json:"token_usage,omitempty"`
+
+	// RecordingError reports a sanitized, non-fatal incomplete operator log,
+	// independently of execution/parsing. Never retry side effects for this.
+	RecordingError string `json:"recording_error,omitempty"`
 
 	// ParseError, when non-nil, signals that the LLM produced output but
 	// the parser couldn't extract structured findings/records from it.
@@ -195,6 +204,13 @@ type AgentHTTPRecord struct {
 	Headers map[string]string `json:"headers,omitempty"`
 	Body    string            `json:"body,omitempty"`
 	Notes   string            `json:"notes,omitempty"`
+
+	// RecordUUID and ObservedExchange carry the current saved exchange through
+	// source-analysis consumers. The fields above remain the agent's input
+	// description; they must not be paired with an observed response. These
+	// internal fields cannot be supplied by model output or serialized as it.
+	RecordUUID       string                       `json:"-"`
+	ObservedExchange *httpmsg.HttpRequestResponse `json:"-"`
 }
 
 // UnmarshalJSON implements custom unmarshaling that tolerates the body field

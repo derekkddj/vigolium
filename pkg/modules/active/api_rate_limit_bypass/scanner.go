@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -28,6 +29,7 @@ const (
 )
 
 type responseObservation struct {
+	exchange     *evidence.Exchange
 	status       int
 	body         string
 	fullResponse string // full raw response (status line + headers + body)
@@ -35,6 +37,7 @@ type responseObservation struct {
 }
 
 type bypassProof struct {
+	exchange       *evidence.Exchange
 	header         string
 	identityA      string
 	identityB      string
@@ -43,6 +46,7 @@ type bypassProof struct {
 	statusB        int
 	// responseB is the full raw response of the successful identity-B request —
 	// the finding's proof (its Request is the identity-B bypass request).
+	context   *modkit.EvidenceCollector
 	responseB string
 }
 
@@ -111,7 +115,7 @@ func (m *Module) ScanPerHost(ctx *httpmsg.HttpRequestResponse, httpClient *http.
 		}
 
 		modifiedRaw, _ := httpmsg.AddOrReplaceHeader(ctx.Request().Raw(), header, proof.identityB)
-		return []*output.ResultEvent{{
+		result := &output.ResultEvent{
 			ModuleID:      ModuleID,
 			RecordKind:    kind,
 			EvidenceGrade: grade,
@@ -133,7 +137,11 @@ func (m *Module) ScanPerHost(ctx *httpmsg.HttpRequestResponse, httpClient *http.
 				"bucket_rotation_proven": proof.bucketRotation,
 				"safe_method":            "GET",
 			},
-		}}, nil
+		}
+		result.Evidence = proof.context.Evidence()
+		result.AdditionalEvidence = proof.context.Entries()
+		modkit.SetPrimaryEvidence(result, proof.exchange, evidence.RoleAttack, "selected probe")
+		return []*output.ResultEvent{result}, nil
 	}
 	return nil, nil
 }
@@ -152,17 +160,19 @@ func (m *Module) triggerRateLimit(ctx *httpmsg.HttpRequestResponse, client *http
 }
 
 func (m *Module) proveHeaderDifferential(ctx *httpmsg.HttpRequestResponse, client *http.Requester, baseline modkit.ResponseSignature, header string) (bypassProof, bool) {
-	proof := bypassProof{header: header, identityA: spoofIdentityA, identityB: spoofIdentityB}
-	if !m.plainConsistentlyLimited(ctx, client) {
+	proof := bypassProof{header: header, identityA: spoofIdentityA, identityB: spoofIdentityB, context: modkit.NewEvidenceCollector()}
+	if !m.plainConsistentlyLimited(ctx, client, proof.context) {
 		return proof, false
 	}
 
-	aFirst := m.send(ctx, client, header, spoofIdentityA)
-	aReplay := m.send(ctx, client, header, spoofIdentityA)
+	aFirst := m.sendProof(ctx, client, header, spoofIdentityA)
+	aReplay := m.sendProof(ctx, client, header, spoofIdentityA)
 	if !matchesSuccessfulBaseline(aFirst, baseline) || !matchesSuccessfulBaseline(aReplay, baseline) {
 		return proof, false
 	}
 	proof.statusA = aFirst.status
+	proof.context.AddExchange(aFirst.exchange, evidence.RoleAttack, "identity A")
+	proof.context.AddExchange(aReplay.exchange, evidence.RoleConfirmation, "identity A replay")
 	if !m.plainConsistentlyLimited(ctx, client) {
 		return proof, false
 	}
@@ -173,12 +183,14 @@ func (m *Module) proveHeaderDifferential(ctx *httpmsg.HttpRequestResponse, clien
 	}
 	proof.statusB = bFirst.status
 	proof.responseB = bFirst.fullResponse
+	proof.exchange = bFirst.exchange
 
 	// Strong confirmation: make identity A reach its own 429 bucket, then show B
 	// still succeeds while A and the original/plain identity remain throttled.
 	aLimited := false
 	for range rateLimitRequestCount {
-		if observation := m.send(ctx, client, header, spoofIdentityA); observation.ok && observation.status == 429 {
+		if observation := m.sendProof(ctx, client, header, spoofIdentityA); observation.ok && observation.status == 429 {
+			proof.context.AddExchange(observation.exchange, evidence.RoleControl, "identity A exhausted")
 			aLimited = true
 			break
 		}
@@ -190,11 +202,14 @@ func (m *Module) proveHeaderDifferential(ctx *httpmsg.HttpRequestResponse, clien
 		return proof, true
 	}
 	bAfterA := m.sendProof(ctx, client, header, spoofIdentityB)
-	aAfter := m.send(ctx, client, header, spoofIdentityA)
-	if matchesSuccessfulBaseline(bAfterA, baseline) && aAfter.ok && aAfter.status == 429 && m.plainConsistentlyLimited(ctx, client) {
+	aAfter := m.sendProof(ctx, client, header, spoofIdentityA)
+	if matchesSuccessfulBaseline(bAfterA, baseline) && aAfter.ok && aAfter.status == 429 && m.plainConsistentlyLimited(ctx, client, proof.context) {
 		proof.bucketRotation = true
 		proof.statusB = bAfterA.status
 		proof.responseB = bAfterA.fullResponse
+		proof.context.AddExchange(bFirst.exchange, evidence.RoleAttack, "identity B before exhaustion")
+		proof.context.AddExchange(aAfter.exchange, evidence.RoleControl, "exhausted identity A replay")
+		proof.exchange = bAfterA.exchange
 	}
 	return proof, true
 }
@@ -209,12 +224,22 @@ func matchesSuccessfulBaseline(observation responseObservation, baseline modkit.
 
 // plainConsistentlyLimited requires two of three fresh samples to remain 429.
 // A single transient 429 or a reset window cannot satisfy the differential.
-func (m *Module) plainConsistentlyLimited(ctx *httpmsg.HttpRequestResponse, client *http.Requester) bool {
+func (m *Module) plainConsistentlyLimited(ctx *httpmsg.HttpRequestResponse, client *http.Requester, collectors ...*modkit.EvidenceCollector) bool {
 	limited := 0
+	var control *evidence.Exchange
 	for range 3 {
-		if observation := m.send(ctx, client, "", ""); observation.ok && observation.status == 429 {
+		var observation responseObservation
+		if len(collectors) > 0 {
+			observation = m.sendObservation(ctx, client, "", "", false, &control)
+		} else {
+			observation = m.send(ctx, client, "", "")
+		}
+		if observation.ok && observation.status == 429 {
 			limited++
 		}
+	}
+	if limited >= 2 && len(collectors) > 0 {
+		collectors[0].AddExchange(control, evidence.RoleControl, "plain identity remains limited")
 	}
 	return limited >= 2
 }
@@ -234,7 +259,7 @@ func (m *Module) sendProof(ctx *httpmsg.HttpRequestResponse, client *http.Reques
 	return m.sendObservation(ctx, client, name, value, true)
 }
 
-func (m *Module) sendObservation(ctx *httpmsg.HttpRequestResponse, client *http.Requester, name, value string, captureFull bool) responseObservation {
+func (m *Module) sendObservation(ctx *httpmsg.HttpRequestResponse, client *http.Requester, name, value string, captureFull bool, controls ...**evidence.Exchange) responseObservation {
 	raw := ctx.Request().Raw()
 	if name != "" {
 		var err error
@@ -262,6 +287,11 @@ func (m *Module) sendObservation(ctx *httpmsg.HttpRequestResponse, client *http.
 	}
 	if captureFull {
 		obs.fullResponse = resp.FullResponseString()
+		obs.exchange = http.CaptureEvidence(resp)
+	}
+	// Retain one decisive plain 429, not the rate-limit flood or unrelated calls.
+	if obs.status == 429 && len(controls) > 0 && *controls[0] == nil {
+		*controls[0] = http.CaptureEvidence(resp)
 	}
 	return obs
 }

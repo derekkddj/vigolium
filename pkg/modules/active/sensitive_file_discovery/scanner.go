@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -295,7 +296,8 @@ func (m *Module) probeFile(
 	// body is compared against both the reproduce and decoy bodies below, so its
 	// signature is built once here and reused.
 	bodySig := modkit.BodySignature(body)
-	repStatus, repBody, repOK := modkit.FetchPath(ctx, httpClient, probePath)
+	guardProof := modkit.NewEvidenceCollector()
+	repStatus, repBody, repOK := modkit.FetchPathWithEvidence(ctx, httpClient, probePath, guardProof)
 	if !repOK || repStatus != 200 || !modkit.BodiesSimilarSig(bodySig, repBody) {
 		return nil
 	}
@@ -309,7 +311,7 @@ func (m *Module) probeFile(
 	// fallback, a logging proxy, an object-store wildcard) that serve identical
 	// content for every <dir>/*.<ext> — the "/orders/run.log equals
 	// /orders/<random>.log" false positive.
-	if decoyStatus, decoyBody, served := modkit.DecoyFileBaseline(scanCtx, ctx, httpClient, probePath); served && decoyStatus == status {
+	if decoyStatus, decoyBody, served := modkit.DecoyFileBaselineWithEvidence(scanCtx, ctx, httpClient, probePath, guardProof); served && decoyStatus == status {
 		if modkit.BodiesSimilarSig(bodySig, decoyBody) {
 			return nil
 		}
@@ -321,7 +323,7 @@ func (m *Module) probeFile(
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,
 		Request:          string(modifiedRaw),
@@ -336,6 +338,9 @@ func (m *Module) probeFile(
 			Reference:   []string{"https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information"},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected file response")
+	modkit.AppendEvidence(result, guardProof)
+	return result
 }
 
 // probeGenericFile sends a GET request and validates using content-type and body
@@ -424,7 +429,7 @@ func (m *Module) probeGenericFile(
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + path
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:      targetURL,
 		Matched:  targetURL,
 		Request:  string(modifiedRaw),
@@ -438,4 +443,6 @@ func (m *Module) probeGenericFile(
 			Reference:   []string{"https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information"},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected file response")
+	return result
 }

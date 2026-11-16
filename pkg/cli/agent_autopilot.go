@@ -505,7 +505,8 @@ func runAgentAutopilot(cmd *cobra.Command, args []string) (err error) {
 	//   - stale run.pid files from prior crashed olium runs (and, in the
 	//     rare fork case, kill any still-alive orphan process group)
 	//   - stale /tmp/vigolium-swarm-ext-* temp dirs
-	//   - session directories older than 48h
+	// Session evidence is retained; directory age cannot establish that a run
+	// is inactive or that its findings/catalog can safely be removed.
 	// The olium autopilot runs in-process, so "orphan process" is almost
 	// always just a dead PID file lingering from a SIGKILL'd run.
 	sessionsDir := settings.Agent.EffectiveSessionsDir()
@@ -513,9 +514,7 @@ func runAgentAutopilot(cmd *cobra.Command, args []string) (err error) {
 		zap.L().Debug("Cleared stale autopilot pid files", zap.Int("count", n))
 	}
 	agent.CleanupStaleTempDirs()
-	if n, err := agent.CleanupSessionDirs(sessionsDir, 48*time.Hour); err == nil && n > 0 {
-		zap.L().Debug("Cleaned up stale session directories", zap.Int("count", n))
-	}
+	// Do not invoke age-only session cleanup here: another run may be active.
 
 	if storage.IsGCSURI(autopilotSource) && !autopilotDryRun {
 		// Pass the active project so --project-uuid (or --project-name) can
@@ -526,7 +525,7 @@ func runAgentAutopilot(cmd *cobra.Command, args []string) (err error) {
 		if gcsErr != nil {
 			return fmt.Errorf("failed to resolve gs:// source: %w", gcsErr)
 		}
-		defer cleanup()
+		defer func() { agent.CleanupAuditSource(extractedPath, cleanup, os.Stderr) }()
 		autopilotSource = extractedPath
 	}
 

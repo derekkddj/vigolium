@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/grafana/sobek"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	gohttp "github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/jsext/api/parse"
@@ -249,6 +250,9 @@ func (s *jsSession) updateJarFromResponse(urlStr string, resp sobek.Value) {
 	}
 
 	respObj := resp.ToObject(s.vm)
+	if v := respObj.Get("url"); isSet(v) {
+		urlStr = v.String()
+	}
 	rawVal := respObj.Get("raw")
 	if rawVal == nil || sobek.IsUndefined(rawVal) {
 		return
@@ -628,7 +632,7 @@ func httpSessionFuncDefs() []JSFuncDef {
 							results[i] = sobek.Undefined()
 							continue
 						}
-						results[i] = buildResponseObject(vm, slot.raw, slot.elapsed)
+						results[i] = buildResponseObject(vm, slot.raw, slot.elapsed, slot.exchange)
 					}
 					return vm.ToValue(results)
 				}
@@ -1082,9 +1086,10 @@ func removeHeadersFromRaw(rawReq string, vm *sobek.Runtime, removeArr *sobek.Obj
 
 // respSlot holds the result of a concurrent HTTP request.
 type respSlot struct {
-	raw     []byte
-	elapsed int64
-	err     bool
+	raw      []byte
+	elapsed  int64
+	err      bool
+	exchange *evidence.Exchange
 }
 
 // doRawRequestBytes is like doRawRequest but returns raw bytes for concurrent use (no VM access).
@@ -1098,7 +1103,7 @@ func doRawRequestBytes(httpClient *gohttp.Requester, rawReq string) respSlot {
 
 	hrr := httpmsg.NewHttpRequestResponse(req, nil)
 
-	respChain, elapsed, err := httpClient.Execute(hrr, gohttp.Options{})
+	respChain, elapsed, err := httpClient.Execute(hrr, gohttp.Options{NoClustering: true})
 	// The requester's own measurement, which starts after rate/host admission —
 	// so elapsed_ms reports the target's latency rather than vigolium's queue.
 	elapsedMs := elapsed.Milliseconds()
@@ -1108,16 +1113,17 @@ func doRawRequestBytes(httpClient *gohttp.Requester, rawReq string) respSlot {
 		return respSlot{err: true}
 	}
 
+	exchange := gohttp.CaptureEvidence(respChain)
 	fullResp := respChain.FullResponseBytes()
 	rawResponseCopy := make([]byte, len(fullResp))
 	copy(rawResponseCopy, fullResp)
 	respChain.Close()
 
-	return respSlot{raw: rawResponseCopy, elapsed: elapsedMs}
+	return respSlot{raw: rawResponseCopy, elapsed: elapsedMs, exchange: exchange}
 }
 
 // buildResponseObject creates a JS response object from raw bytes.
-func buildResponseObject(vm *sobek.Runtime, rawResponse []byte, elapsedMs int64) sobek.Value {
+func buildResponseObject(vm *sobek.Runtime, rawResponse []byte, elapsedMs int64, exchanges ...*evidence.Exchange) sobek.Value {
 	if len(rawResponse) == 0 {
 		return sobek.Undefined()
 	}
@@ -1129,6 +1135,9 @@ func buildResponseObject(vm *sobek.Runtime, rawResponse []byte, elapsedMs int64)
 	_ = result.Set("body", string(httpResp.Body()))
 	_ = result.Set("raw", string(rawResponse))
 	_ = result.Set("elapsed_ms", elapsedMs)
+	if len(exchanges) > 0 {
+		attachResponseExchange(vm, result, exchanges[0])
+	}
 
 	_ = result.Set("headers", newHeadersObject(vm, httpResp.Headers()))
 

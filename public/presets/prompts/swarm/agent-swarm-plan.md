@@ -39,6 +39,8 @@ Prioritize analysis targeting this vulnerability class. Still include other rele
 
 ## Your Task
 
+This is a planning-only phase. Use the supplied context; do not run commands, fetch URLs, test credentials, replay requests, or load/execute skills. Skills are a selection catalog for later triage. Missing evidence belongs in NOTES, not in an investigation loop.
+
 1. **Analyze the request and recon findings** — identify technology stack, interesting parameters, injection points, content types, authentication patterns
 2. **Identify attack vectors** — document specific areas of focus for the scan (endpoints, parameters, vulnerability types)
 3. **Pick module tags when the stack is clear** — when reconnaissance or the request itself strongly suggests a specific stack (Spring, WordPress, GraphQL, Express, etc.), emit `MODULE_TAGS` so the scanner focuses on stack-relevant modules

@@ -2,11 +2,15 @@ package diffscan
 
 import (
 	"github.com/vigolium/vigolium/pkg/anomaly"
+	"github.com/vigolium/vigolium/pkg/evidence"
 )
 
 type Attack struct {
-	FirstSnapshot *ResponseSnapshot
-	LastSnapshot  *ResponseSnapshot
+	// ConfirmationReceipts are explicitly recorded by verify, not inferred from
+	// LastSnapshot or fingerprint/baseline merges. Bounded to ten operations.
+	ConfirmationReceipts []*evidence.Exchange
+	FirstSnapshot        *ResponseSnapshot
+	LastSnapshot         *ResponseSnapshot
 
 	LastFingerprint map[string]any
 
@@ -89,6 +93,7 @@ func (s *Attack) initialiseQuantitativeMeasurements(keys []string, factor int) {
 func (s *Attack) AddAttack(attack *Attack) {
 	if s.FirstSnapshot == nil {
 		s.FirstSnapshot = attack.FirstSnapshot
+		s.LastSnapshot = attack.LastSnapshot
 		s.Anchor = attack.Anchor
 		s.Probe = attack.Probe
 		s.Payload = attack.Payload
@@ -118,7 +123,12 @@ func (s *Attack) AddAttack(attack *Attack) {
 	}
 
 	s.Fingerprint = generatedPrint
-	s.LastSnapshot = attack.LastSnapshot
+	// Fingerprint stabilization can merge a soft baseline into an escape seed.
+	// That baseline is NOT an escape/confirmation exchange and must not replace
+	// its corresponding receipt.
+	if s.Probe == attack.Probe {
+		s.LastSnapshot = attack.LastSnapshot
+	}
 	s.LastFingerprint = attack.Fingerprint
 }
 
@@ -210,6 +220,7 @@ func (s *Attack) rebuildFingerprint() {
 }
 
 func (s *Attack) Close() {
+	s.ConfirmationReceipts = nil
 	s.FirstSnapshot = nil
 	s.LastSnapshot = nil
 	s.LastFingerprint = nil

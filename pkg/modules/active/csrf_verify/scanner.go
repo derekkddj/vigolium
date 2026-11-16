@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -287,6 +288,7 @@ func (m *Module) ScanPerRequest(
 		respStatus := 0
 		respBody := ""
 		respFull := ""
+		var exchange *evidence.Exchange
 		if resp.Response() != nil {
 			respStatus = resp.Response().StatusCode
 			respBody = resp.Body().String()
@@ -296,6 +298,7 @@ func (m *Module) ScanPerRequest(
 			// Close. Reject responses skip the headers+body copy they'd never use.
 			if respStatus >= 200 && respStatus < 300 {
 				respFull = resp.FullResponseString()
+				exchange = http.CaptureEvidence(resp)
 			}
 		}
 		resp.Close()
@@ -315,7 +318,7 @@ func (m *Module) ScanPerRequest(
 			if !sameAsBaseline(respBody, baselineBody) {
 				continue
 			}
-			results = append(results, &output.ResultEvent{
+			result := &output.ResultEvent{
 				URL:              urlx.String(),
 				Matched:          urlx.String(),
 				Request:          string(mutatedRaw),
@@ -336,7 +339,9 @@ func (m *Module) ScanPerRequest(
 					"baseline_status": baselineStatus,
 					"probe_status":    respStatus,
 				},
-			})
+			}
+			modkit.SetPrimaryEvidence(result, exchange, evidence.RoleAttack, "selected probe")
+			results = append(results, result)
 			return results, nil
 		}
 	}

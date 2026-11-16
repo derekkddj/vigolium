@@ -14,8 +14,10 @@ import (
 	"time"
 
 	"github.com/projectdiscovery/interactsh/pkg/server"
+	"github.com/uptrace/bun"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/oast/oastclass"
+	"github.com/vigolium/vigolium/pkg/oast/planting"
 )
 
 // Offline ingestion of callbacks logged by the operator's own OAST endpoint
@@ -249,12 +251,12 @@ func (ci collaboratorInteraction) callback() (Callback, bool) {
 // decodeMaybeBase64 decodes s when it is standard base64 (Collaborator encodes
 // raw requests), returning it unchanged otherwise.
 func decodeMaybeBase64(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return ""
-	}
-	if b, err := base64.StdEncoding.DecodeString(s); err == nil {
-		return string(b)
+	// Whitespace normalization may help decode an encoded export, but must not
+	// trim genuine supplied HTTP bytes (body whitespace and final CRLF matter).
+	if encoded := strings.TrimSpace(s); encoded != "" {
+		if b, err := base64.StdEncoding.DecodeString(encoded); err == nil {
+			return string(b)
+		}
 	}
 	return s
 }
@@ -430,12 +432,12 @@ type IngestResult struct {
 	Findings   []IngestedFinding `json:"findings"`
 }
 
-// Ingest attributes callbacks to the payloads planted with a {nonce} oast_url
-// and reports them as findings of the scans that planted them. projectUUID
+// Ingest attributes callbacks to persisted live or fixed-template payloads
+// and reports them as findings of the scans that minted them. projectUUID
 // scopes the nonce lookup ("" searches every project, for a stateless
 // database). Callbacks without a known nonce are ignored; callbacks already
-// stored (same nonce, protocol, raw request and remote address) are skipped,
-// so ingesting the same log twice adds nothing.
+// stored (same nonce, protocol, both raw messages, remote address and timestamp)
+// are skipped, so ingesting the same log twice adds nothing.
 func Ingest(ctx context.Context, repo *database.Repository, projectUUID string, callbacks []Callback) (*IngestResult, error) {
 	if repo == nil {
 		return nil, fmt.Errorf("oast ingest needs a database")
@@ -445,7 +447,14 @@ func Ingest(ctx context.Context, repo *database.Repository, projectUUID string, 
 	perCallback := make([][]string, len(callbacks))
 	var all []string
 	for i, cb := range callbacks {
-		for _, w := range cb.Where {
+		locations := append([]string{cb.Interaction.UniqueID, cb.Interaction.FullId}, cb.Where...)
+		for _, w := range locations {
+			// Live interactsh IDs include correlation ID + nonce and are not
+			// necessarily the fixed template's 20-character xid. Prefer exact
+			// complete tokens; the database still establishes nonce ownership.
+			planting.WalkNonceTokens([]byte(strings.ToLower(w)), func(token string) {
+				perCallback[i] = append(perCallback[i], token)
+			})
 			perCallback[i] = append(perCallback[i], nonceCandidates(w)...)
 		}
 		all = append(all, perCallback[i]...)
@@ -490,13 +499,26 @@ func Ingest(ctx context.Context, repo *database.Repository, projectUUID string, 
 	for n := range matchedNonces {
 		nonces = append(nonces, n)
 	}
-	prior, err := repo.ListOASTInteractionsByUniqueIDs(ctx, projectUUID, nonces)
-	if err != nil {
-		return nil, err
+	// Load only callbacks for these matched nonces. Exact repeat identity includes
+	// both collector messages and timestamp; a changed response is not a repeat.
+	var prior []*database.OASTInteraction
+	for start := 0; start < len(nonces); start += 500 {
+		end := min(start+500, len(nonces))
+		var rows []*database.OASTInteraction
+		q := repo.DB().NewSelect().Model(&rows).
+			Column("id", "project_uuid", "scan_uuid", "unique_id", "protocol", "raw_request", "raw_response", "remote_address", "interacted_at").
+			Where("unique_id IN (?)", bun.List(nonces[start:end]))
+		if projectUUID != "" {
+			q = q.Where("project_uuid = ?", projectUUID)
+		}
+		if err := q.Scan(ctx); err != nil {
+			return nil, err
+		}
+		prior = append(prior, rows...)
 	}
 	seen := make(map[string]struct{}, len(prior))
 	for _, p := range prior {
-		seen[interactionKey(p.UniqueID, p.Protocol, p.RawRequest, p.RemoteAddress)] = struct{}{}
+		seen[interactionKey(p.UniqueID, p.Protocol, p.RawRequest, p.RawResponse, p.RemoteAddress, p.InteractedAt)] = struct{}{}
 	}
 
 	services := map[string]*Service{}
@@ -521,7 +543,7 @@ func Ingest(ctx context.Context, repo *database.Repository, projectUUID string, 
 		if in.FullId == "" {
 			in.FullId = m.where
 		}
-		key := interactionKey(in.UniqueID, in.Protocol, in.RawRequest, in.RemoteAddress)
+		key := interactionKey(in.UniqueID, in.Protocol, in.RawRequest, in.RawResponse, in.RemoteAddress, in.Timestamp)
 		if _, dup := seen[key]; dup {
 			res.Duplicates++
 			continue
@@ -553,17 +575,21 @@ func Ingest(ctx context.Context, repo *database.Repository, projectUUID string, 
 }
 
 // payloadContextFromRow restores the PayloadContext of a persisted payload.
-// The human label is not stored, so the class stands in for it. callback is
-// where the nonce was found (host, or host+path).
+// Historical contexts without a human label use the class as a fallback.
+// callback is where the nonce was found (host, or host+path).
 func payloadContextFromRow(row *database.OASTPayload, callback string) PayloadContext {
 	cls, ok := oastclass.Parse(row.Class)
 	if !ok {
 		cls = oastclass.Generic
 	}
+	label := row.InjectionType
+	if label == "" {
+		label = string(cls)
+	}
 	return PayloadContext{
 		TargetURL:     row.TargetURL,
 		ParameterName: row.Param,
-		InjectionType: string(cls),
+		InjectionType: label,
 		Class:         cls,
 		ModuleID:      row.ModuleID,
 		RequestHash:   row.RequestHash,
@@ -583,8 +609,10 @@ func locationOf(where []string, nonce string) string {
 }
 
 // interactionKey identifies a stored callback for duplicate detection.
-func interactionKey(uniqueID, protocol, rawRequest, remote string) string {
-	return strings.Join([]string{uniqueID, strings.ToLower(protocol), rawRequest, remote}, "\x00")
+func interactionKey(uniqueID, protocol, rawRequest, rawResponse, remote string, at time.Time) string {
+	// JSON framing is unambiguous even for binary NUL bytes in either message.
+	b, _ := json.Marshal([][]byte{[]byte(uniqueID), []byte(strings.ToLower(protocol)), []byte(rawRequest), []byte(rawResponse), []byte(remote), []byte(at.UTC().Format(time.RFC3339Nano))})
+	return string(b)
 }
 
 func firstNonEmpty(vals ...string) string {

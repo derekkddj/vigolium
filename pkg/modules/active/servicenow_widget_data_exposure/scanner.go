@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	sn "github.com/vigolium/vigolium/pkg/modules/infra/servicenow"
@@ -71,19 +72,23 @@ func (m *Module) ScanPerHost(
 		return nil, nil
 	}
 	sn.MarkServiceNow(scanCtx, host)
+	collector := modkit.NewEvidenceCollector()
+	collector.AddExchange(session.Exchange, evidence.RoleObservation, "Guest session acquisition")
 
 	// Pick a working widget endpoint and run the catch-all negative control:
 	// the endpoint must respond as the widget, a bogus table must NOT return
 	// records, and a missing/invalid token must not have 401'd our session.
-	endpoint, ok := m.chooseEndpoint(ctx, httpClient, session)
+	var control *evidence.Exchange
+	endpoint, ok := m.chooseEndpoint(ctx, httpClient, session, &control)
 	if !ok {
 		return nil, nil
 	}
+	collector.AddExchange(control, evidence.RoleControl, "Bogus table at selected widget endpoint")
 
 	baseURL := urlx.Scheme + "://" + urlx.Host
 	var results []*output.ResultEvent
 	for _, tbl := range seedTables {
-		if res := m.probeTable(ctx, httpClient, endpoint, session, tbl, baseURL, host); res != nil {
+		if res := m.probeTable(ctx, httpClient, endpoint, session, tbl, baseURL, host, collector); res != nil {
 			results = append(results, res)
 		}
 	}
@@ -94,7 +99,12 @@ func (m *Module) ScanPerHost(
 // returns the first that responds as a widget while NOT leaking records for the
 // bogus table. Returns ok=false on a 401 (token failure) or when a bogus table
 // does leak (catch-all → any positive would be a false positive).
-func (m *Module) chooseEndpoint(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, session sn.Session) (string, bool) {
+func (m *Module) chooseEndpoint(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, session sn.Session, receipts ...**evidence.Exchange) (string, bool) {
+	for _, receipt := range receipts {
+		if receipt != nil {
+			*receipt = nil
+		}
+	}
 	for _, ep := range sn.SimpleListEndpoints {
 		r := sn.PostSimpleList(ctx, httpClient, ep, bogusTable, "", session)
 		if !r.OK {
@@ -113,6 +123,11 @@ func (m *Module) chooseEndpoint(ctx *httpmsg.HttpRequestResponse, httpClient *ht
 			// widget; any positive would be a false positive.
 			return "", false
 		}
+		for _, receipt := range receipts {
+			if receipt != nil {
+				*receipt = r.Exchange
+			}
+		}
 		return ep, true
 	}
 	return "", false
@@ -126,7 +141,14 @@ func (m *Module) probeTable(
 	session sn.Session,
 	tbl snTable,
 	baseURL, host string,
+	support ...*modkit.EvidenceCollector,
 ) *output.ResultEvent {
+	collector := modkit.NewEvidenceCollector()
+	for _, parent := range support {
+		for _, entry := range parent.Evidence() {
+			collector.AddExchange(entry.Exchange, entry.Role, entry.Label)
+		}
+	}
 	r := sn.PostSimpleList(ctx, httpClient, endpoint, tbl.table, tbl.field, session)
 	if !r.OK || !sn.SimpleListExposed(r.Data) {
 		return nil
@@ -137,8 +159,13 @@ func (m *Module) probeTable(
 		if !rr.OK || !sn.SimpleListExposed(rr.Data) {
 			return nil
 		}
+		collector.AddExchange(rr.Exchange, evidence.RoleConfirmation, fmt.Sprintf("Table read confirmation %d", i+1))
 	}
-	return m.build(tbl, r.Data, endpoint, baseURL, host)
+	result := m.build(tbl, r.Data, endpoint, baseURL, host)
+	result.AdditionalEvidence, result.Evidence = collector.Entries(), collector.Evidence()
+	result.EvidenceStatus = "missing"
+	modkit.SetPrimaryEvidence(result, r.Exchange, evidence.RoleAttack, "Guest widget table read")
+	return result
 }
 
 func (m *Module) build(tbl snTable, d *sn.SimpleListData, endpoint, baseURL, host string) *output.ResultEvent {

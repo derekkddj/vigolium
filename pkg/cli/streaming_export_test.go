@@ -338,10 +338,10 @@ func TestExportBundleRequiresHTML(t *testing.T) {
 	out := filepath.Join(dir, "bundle.tar.gz")
 	require.NoError(t, os.WriteFile(out, []byte("previous-archive"), 0o644))
 
-	orig := renderBundleHTML
-	t.Cleanup(func() { renderBundleHTML = orig })
-	renderBundleHTML = func([]any, output.HTMLReportMeta) ([]byte, error) {
-		return nil, errors.New("template blew up")
+	orig := renderExportBundleHTML
+	t.Cleanup(func() { renderExportBundleHTML = orig })
+	renderExportBundleHTML = func(output.ReportItemProducer, string, output.HTMLReportMeta) error {
+		return errors.New("template blew up")
 	}
 
 	r := &exportRun{db: db}

@@ -357,6 +357,18 @@ func runFinding(cmd *cobra.Command, args []string) error {
 			page = listPage{}
 		}
 
+		repo := database.NewRepository(db)
+		selectedRaw := findingRaw || findingBurp || findingMarkdown || findingPushToBurp || findingToRepeater || findingCurl || findingCurlAll ||
+			(globalJSON && !agentViewOptionsFromFlags().noBodies)
+		// The list query deliberately excludes inline blobs. Hydrate only the
+		// selected page in evidence-oriented modes, AFTER --pick; plain tables,
+		// TSV and compact/metadata JSON remain lightweight.
+		inlineRaw := findingRaw || findingBurp || findingMarkdown || findingPushToBurp || findingToRepeater || findingCurl || findingCurlAll ||
+			(globalJSON && findingJSONNeedsInline(agentViewOptionsFromFlags()))
+		if err := hydrateFindingReaderEvidence(ctx, repo, findings, inlineRaw, selectedRaw); err != nil {
+			return err
+		}
+
 		// Burp push is an action, not a display — hand the selected findings'
 		// evidence to Burp and return before any table/TUI/JSON render.
 		if findingPushToBurp || findingToRepeater {
@@ -417,6 +429,21 @@ func runFinding(cmd *cobra.Command, args []string) error {
 		warnIfCapped(len(findings), total)
 		return nil
 	})
+}
+
+func findingJSONNeedsInline(opts agentViewOptions) bool {
+	if opts.noBodies {
+		return false
+	}
+	if len(opts.fields) == 0 || opts.fullBody {
+		return true
+	}
+	for _, field := range []string{"request", "response", "response_evidence", "additional_evidence"} {
+		if wantsField(opts.fields, field) {
+			return true
+		}
+	}
+	return false
 }
 
 // selectFindingsByPosition narrows findings to the 1-based positions named by
@@ -741,9 +768,20 @@ func displayFindingsBurp(db *database.DB, ctx context.Context, findings []*datab
 		}
 		fmt.Println()
 
-		// Show associated HTTP records
+		printSelectedEvidence(f, true)
+		// Legacy inline data has unknown role and never substitutes for selection.
 		records := recordsForFinding(byUUID, f)
+		if findingInlineDistinct(f, records) {
+			fmt.Println(terminal.Gray("Legacy inline finding evidence — role unknown (not proof)"))
+			if f.Request != "" {
+				printBurpRequest([]byte(f.Request))
+			}
+			if f.Response != "" {
+				printBurpResponse([]byte(f.Response), 0)
+			}
+		}
 		for _, rec := range records {
+			fmt.Println(terminal.Gray("Linked traffic — role unknown (replay context, not proof)"))
 			printBurpRequest(rec.RawRequest)
 			fmt.Println(terminal.Gray("---"))
 			if rec.HasResponse && len(rec.RawResponse) > 0 {
@@ -776,9 +814,20 @@ func displayFindingsRaw(db *database.DB, ctx context.Context, findings []*databa
 			f.Confidence, f.FindingSource, f.FoundAt.Format("2006-01-02 15:04:05"))
 		fmt.Println("──────────────────────────────────────────────────────────────────")
 
+		printSelectedEvidence(f, false)
 		records := recordsForFinding(byUUID, f)
+		if findingInlineDistinct(f, records) {
+			fmt.Println("Legacy inline finding evidence — role unknown (not proof)")
+			if f.Request != "" {
+				fmt.Println(f.Request)
+			}
+			if f.Response != "" {
+				fmt.Println("Response")
+				fmt.Println(f.Response)
+			}
+		}
 		for _, rec := range records {
-			fmt.Println()
+			fmt.Printf("\nLinked HTTP record %s (%s) — role unknown (replay context, not proof)\n", rec.UUID, rec.URL)
 			if len(rec.RawRequest) > 0 {
 				fmt.Println(string(rec.RawRequest))
 			}
@@ -791,24 +840,21 @@ func displayFindingsRaw(db *database.DB, ctx context.Context, findings []*databa
 				fmt.Println(string(rec.RawResponse))
 			}
 		}
-		if len(records) == 0 {
-			// Fall back to inline request/response stored on the finding itself
-			if f.Request != "" {
-				fmt.Println()
-				fmt.Println(f.Request)
-			}
-			if f.Response != "" {
-				fmt.Println()
-				fmt.Println("──────────────────────────────────────────────────────────────────")
-				fmt.Println("Response")
-				fmt.Println("──────────────────────────────────────────────────────────────────")
-				fmt.Println()
-				fmt.Println(f.Response)
-			}
-		}
 		fmt.Println()
 	}
 	return nil
+}
+
+func findingInlineDistinct(f *database.Finding, records []*database.HTTPRecord) bool {
+	if f.Request == "" && f.Response == "" {
+		return false
+	}
+	for _, record := range records {
+		if f.Request == string(record.RawRequest) && f.Response == string(record.RawResponse) {
+			return false
+		}
+	}
+	return true
 }
 
 // loadFindingRecords fetches the HTTP records associated with a single finding.
@@ -816,10 +862,10 @@ func displayFindingsRaw(db *database.DB, ctx context.Context, findings []*databa
 // findings to avoid an N+1 round-trip; this single-finding form is for callers
 // that already operate on one finding at a time.
 func loadFindingRecords(ctx context.Context, repo *database.Repository, f *database.Finding) []*database.HTTPRecord {
-	if len(f.HTTPRecordUUIDs) == 0 {
+	if err := repo.HydrateFindingRecordRefs(ctx, []*database.Finding{f}); err != nil {
 		return nil
 	}
-	records, err := repo.GetRecordsByUUIDs(ctx, f.HTTPRecordUUIDs)
+	records, err := repo.GetFindingRecordsScoped(ctx, f.ProjectUUID, f.HTTPRecordUUIDs)
 	if err != nil {
 		return nil
 	}
@@ -835,7 +881,7 @@ func recordsForFinding(byUUID map[string]*database.HTTPRecord, f *database.Findi
 	}
 	records := make([]*database.HTTPRecord, 0, len(f.HTTPRecordUUIDs))
 	for _, u := range f.HTTPRecordUUIDs {
-		if r := byUUID[u]; r != nil {
+		if r := byUUID[u]; r != nil && findingRecordProject(r.ProjectUUID) == findingRecordProject(f.ProjectUUID) {
 			records = append(records, r)
 		}
 	}

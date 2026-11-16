@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra/saasprobe"
@@ -30,44 +31,61 @@ var contextTokenRe = regexp.MustCompile(`/s/sfsites/l/([a-zA-Z0-9\-_~.%]+)/[^/]+
 // contextHarvestPaths are pages likely to embed the aura.context asset URL.
 var contextHarvestPaths = []string{"/s/", "/", "/s/global-search/%40sfdc%40"}
 
+// HarvestResult couples the extracted value to the landing-page operation that
+// supplied it. Redirects retain the final page's receipt, not the original path.
+type HarvestResult struct {
+	Value    string
+	OK       bool
+	Exchange *evidence.Exchange
+}
+
 // harvestLandingPages fetches each community landing page in contextHarvestPaths
-// (following redirects, cache-bypassed) and applies extract to the first body it
-// retrieves, returning on the first successful extraction. It is the shared
-// fetch-and-scan loop behind HarvestAuraContext and HarvestAuraMode.
-func harvestLandingPages(ctx *httpmsg.HttpRequestResponse, client *http.Requester, extract func(body string) (string, bool)) (string, bool) {
+// (following redirects, cache-bypassed) and returns on the first extraction. It
+// is the shared loop behind HarvestAuraContext and HarvestAuraMode.
+func harvestLandingPages(ctx *httpmsg.HttpRequestResponse, client *http.Requester, extract func(body string) (string, bool)) HarvestResult {
 	for _, p := range contextHarvestPaths {
 		res := saasprobe.GetFollow(ctx, client, p, nil)
 		if !res.OK {
 			continue
 		}
 		if v, ok := extract(res.Body); ok {
-			return v, true
+			return HarvestResult{Value: v, OK: true, Exchange: res.Exchange}
 		}
 	}
-	return "", false
+	return HarvestResult{}
 }
 
 // HarvestAuraContext fetches a community landing page and extracts the
 // aura.context token needed to invoke Aura actions. Returns ("", false) when no
 // context can be found (the modules then skip the host — a stale/absent context
 // only produces framework errors, never data).
-func HarvestAuraContext(ctx *httpmsg.HttpRequestResponse, client *http.Requester) (string, bool) {
-	return harvestLandingPages(ctx, client, func(body string) (string, bool) {
+func HarvestAuraContext(ctx *httpmsg.HttpRequestResponse, client *http.Requester, receipts ...**evidence.Exchange) (string, bool) {
+	res := harvestLandingPages(ctx, client, func(body string) (string, bool) {
 		if m := contextTokenRe.FindStringSubmatch(body); m != nil {
 			return m[1], true
 		}
 		return "", false
 	})
+	for _, receipt := range receipts {
+		if receipt != nil {
+			*receipt = res.Exchange
+		}
+	}
+	return res.Value, res.OK
 }
 
 // PrepareGateway locates a live Aura gateway and marks the tech registry on
 // presence — a live gateway is definitive Salesforce, independent of any finding.
 // It is the shared presence gate for modules that need only gateway presence, not
 // the aura.context. ok=false when no gateway responds (a non-Salesforce host).
-func PrepareGateway(ctx *httpmsg.HttpRequestResponse, client *http.Requester, sc *modkit.ScanContext) (endpoint string, ok bool) {
-	endpoint, ok = FindLiveAuraGateway(ctx, client)
+func PrepareGateway(ctx *httpmsg.HttpRequestResponse, client *http.Requester, sc *modkit.ScanContext, support ...*modkit.EvidenceCollector) (endpoint string, ok bool) {
+	var exchange *evidence.Exchange
+	endpoint, ok = FindLiveAuraGateway(ctx, client, &exchange)
 	if !ok {
 		return "", false
+	}
+	for _, collector := range support {
+		collector.AddExchange(exchange, evidence.RoleObservation, "Live Aura gateway presence")
 	}
 	MarkSalesforce(sc, hostOf(ctx))
 	return endpoint, true
@@ -77,14 +95,18 @@ func PrepareGateway(ctx *httpmsg.HttpRequestResponse, client *http.Requester, sc
 // modules need before invoking any action. It layers the context harvest on the
 // shared PrepareGateway presence gate: ok=false when either is missing (a
 // non-Salesforce host has no gateway), so a module skips the host cleanly.
-func Prepare(ctx *httpmsg.HttpRequestResponse, client *http.Requester, sc *modkit.ScanContext) (endpoint, auraContext string, ok bool) {
-	endpoint, ok = PrepareGateway(ctx, client, sc)
+func Prepare(ctx *httpmsg.HttpRequestResponse, client *http.Requester, sc *modkit.ScanContext, support ...*modkit.EvidenceCollector) (endpoint, auraContext string, ok bool) {
+	endpoint, ok = PrepareGateway(ctx, client, sc, support...)
 	if !ok {
 		return "", "", false
 	}
-	auraContext, ok = HarvestAuraContext(ctx, client)
+	var exchange *evidence.Exchange
+	auraContext, ok = HarvestAuraContext(ctx, client, &exchange)
 	if !ok {
 		return "", "", false
+	}
+	for _, collector := range support {
+		collector.AddExchange(exchange, evidence.RoleObservation, "Aura context acquisition")
 	}
 	return endpoint, auraContext, true
 }

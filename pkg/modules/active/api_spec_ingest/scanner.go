@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -185,6 +186,7 @@ func (m *Module) ScanPerRequest(
 		// concurrent request reusing that buffer — observed as encoding/json's
 		// "data changing underfoot" panic. (Same fix as idor_detection / authz_compare.)
 		body := append([]byte(nil), resp.Body().Bytes()...)
+		exchange := http.CaptureEvidence(resp)
 		resp.Close()
 
 		if statusCode != 200 || len(body) < 50 {
@@ -229,14 +231,16 @@ func (m *Module) ScanPerRequest(
 				"Discovered OpenAPI/Swagger spec %s — auto-ingesting %d endpoints "+
 					"(extra traffic queued: scan takes longer but yields more results)",
 				specURL, count))
-			results = append(results, &output.ResultEvent{
+			result := &output.ResultEvent{
 				URL:     specURL,
 				Matched: specURL,
 				Info: output.Info{
 					Name:        ModuleName,
 					Description: fmt.Sprintf("Discovered API spec at %s, ingested %d endpoints", probePath, count),
 				},
-			})
+			}
+			modkit.SetPrimaryEvidence(result, exchange, evidence.RoleObservation, "selected observation")
+			results = append(results, result)
 		}
 	}
 

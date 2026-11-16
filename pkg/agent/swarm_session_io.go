@@ -31,7 +31,7 @@ func writeSessionConfigToDir(cfg *AgentSessionConfig, sessionDir string) {
 		return
 	}
 	path := filepath.Join(sessionDir, "session-config.json")
-	if writeErr := os.WriteFile(path, data, 0644); writeErr != nil {
+	if writeErr := os.WriteFile(path, data, 0o600); writeErr != nil {
 		zap.L().Warn("Failed to write session config", zap.Error(writeErr))
 		return
 	}
@@ -47,14 +47,14 @@ func writeSourceExtensionsToSessionDir(extensions []GeneratedExtension, sessionD
 		return
 	}
 	extDir := filepath.Join(sessionDir, "extensions")
-	if err := os.MkdirAll(extDir, 0755); err != nil {
+	if err := os.MkdirAll(extDir, 0o700); err != nil {
 		zap.L().Warn("Failed to create extensions dir for source extensions", zap.Error(err))
 		return
 	}
 	for i, ext := range extensions {
 		filename := sanitizeExtensionFilename(ext.Filename, i)
 		path := filepath.Join(extDir, filename)
-		if writeErr := os.WriteFile(path, []byte(ext.Code), 0644); writeErr != nil {
+		if writeErr := os.WriteFile(path, []byte(ext.Code), 0o600); writeErr != nil {
 			zap.L().Warn("Failed to write source extension",
 				zap.String("filename", filename),
 				zap.Error(writeErr))
@@ -72,7 +72,7 @@ func writePromptToSessionDir(sessionDir, filename, prompt string) {
 		return
 	}
 	path := filepath.Join(sessionDir, filename)
-	if err := os.WriteFile(path, []byte(prompt), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(prompt), 0o600); err != nil {
 		zap.L().Warn("Failed to write prompt to session dir",
 			zap.String("filename", filename), zap.Error(err))
 		return
@@ -123,7 +123,7 @@ func writeInputsToSessionDir(sessionDir string, records []*httpmsg.HttpRequestRe
 		return
 	}
 	path := filepath.Join(sessionDir, "inputs.json")
-	if writeErr := os.WriteFile(path, data, 0644); writeErr != nil {
+	if writeErr := os.WriteFile(path, data, 0o600); writeErr != nil {
 		zap.L().Warn("Failed to write inputs to session dir", zap.Error(writeErr))
 		return
 	}

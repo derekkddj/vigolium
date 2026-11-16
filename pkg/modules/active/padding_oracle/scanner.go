@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -118,11 +119,12 @@ func (m *Module) ScanPerInsertionPoint(
 
 // probeResult is a single mutation probe's captured response.
 type probeResult struct {
-	status  int
-	body    string
-	rawReq  string
-	rawResp string
-	blocked bool
+	exchange *evidence.Exchange
+	status   int
+	body     string
+	rawReq   string
+	rawResp  string
+	blocked  bool
 }
 
 func (pr probeResult) hasPaddingError() bool { return paddingErrorRe.MatchString(pr.body) }
@@ -154,7 +156,7 @@ func (m *Module) probe(
 	}
 	defer resp.Close()
 
-	pr := probeResult{rawReq: string(raw)}
+	pr := probeResult{rawReq: string(raw), exchange: http.CaptureEvidence(resp)}
 	if resp.Response() != nil {
 		pr.status = resp.Response().StatusCode
 	}
@@ -230,11 +232,11 @@ func (m *Module) confirmExplicitError(
 	}
 
 	ev := modkit.NewEvidenceCollector()
-	ev.Add("baseline 1 (original ciphertext)", base1.rawReq, base1.rawResp)
-	ev.Add("baseline 2 (original ciphertext)", base2.rawReq, base2.rawResp)
-	ev.Add("malformed-encoding control (pre-decrypt decode error)", malformed.rawReq, malformed.rawResp)
+	ev.AddExchange(base1.exchange, evidence.RoleBaseline, "baseline 1 (original ciphertext)")
+	ev.AddExchange(base2.exchange, evidence.RoleBaseline, "baseline 2 (original ciphertext)")
+	ev.AddExchange(malformed.exchange, evidence.RoleControl, "malformed-encoding control (pre-decrypt decode error)")
 	for i, mut := range muts {
-		ev.Add(fmt.Sprintf("round %d mutation (penultimate byte offset %d)", i/2+1, i+1), mut.rawReq, mut.rawResp)
+		ev.AddExchange(mut.exchange, evidence.RoleAttack, fmt.Sprintf("round %d mutation (penultimate byte offset %d)", i/2+1, i+1))
 	}
 
 	return m.buildFinding(ip, cand, "explicit-error", 2, muts[0], ev), nil
@@ -294,9 +296,9 @@ func (m *Module) confirmBehavioral(
 	}
 
 	ev := modkit.NewEvidenceCollector()
-	ev.Add("malformed-encoding control (separate decode-error class)", malformed.rawReq, malformed.rawResp)
-	ev.Add(fmt.Sprintf("dominant invalid-padding cluster (%d/%d)", dom1.count, deepSweepValues), dom1.rep.rawReq, dom1.rep.rawResp)
-	ev.Add(fmt.Sprintf("minority valid-padding cluster (%d/%d)", min1.count, deepSweepValues), min1.rep.rawReq, min1.rep.rawResp)
+	ev.AddExchange(malformed.exchange, evidence.RoleControl, "malformed-encoding control (separate decode-error class)")
+	ev.AddExchange(dom1.rep.exchange, evidence.RoleAttack, fmt.Sprintf("dominant invalid-padding cluster (%d/%d)", dom1.count, deepSweepValues))
+	ev.AddExchange(min1.rep.exchange, evidence.RoleAttack, fmt.Sprintf("minority valid-padding cluster (%d/%d)", min1.count, deepSweepValues))
 
 	return m.buildFinding(ip, cand, "behavioral", 2, dom1.rep, ev), nil
 }
@@ -387,7 +389,10 @@ func (m *Module) buildFinding(
 	rounds int,
 	proof probeResult,
 	ev *modkit.EvidenceCollector,
-) *output.ResultEvent {
+) (finding *output.ResultEvent) {
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, proof.exchange, evidence.RoleAttack, "selected ciphertext mutation")
+	}()
 	desc := fmt.Sprintf(
 		"Confirmed a CBC padding oracle in parameter %q. The %s-encoded, %d-byte "+
 			"block-aligned ciphertext was mutated in the penultimate block and the "+
@@ -404,6 +409,7 @@ func (m *Module) buildFinding(
 		FuzzingParameter:   ip.Name(),
 		MatcherStatus:      true,
 		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
 		ExtractedResults: []string{
 			fmt.Sprintf("encoding=%s", cand.Encoding.String()),
 			fmt.Sprintf("block_size=%d", cand.BlockSize),

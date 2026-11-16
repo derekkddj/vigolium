@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -92,14 +93,14 @@ func (m *Module) ScanPerRequest(
 	}
 
 	// Malicious probe: crafted reference must crash the decoder (500 + error digest).
-	malStatus, malBody, malRaw, malFull, ok := m.sendActionProbe(ctx, httpClient, maliciousRef)
+	malStatus, malBody, malRaw, malFull, primary, ok := m.sendActionProbeEvidence(ctx, httpClient, maliciousRef)
 	if !ok || !crashed(malStatus, malBody) {
 		return nil, nil
 	}
 
 	// Reproduce the crash: a one-off 500 (a deploy blip or an unrelated error) is not
 	// enough — the crafted reference must trigger the same 500 + digest again.
-	mal2Status, mal2Body, _, _, ok2 := m.sendActionProbe(ctx, httpClient, maliciousRef)
+	mal2Status, mal2Body, _, _, confirmation, ok2 := m.sendActionProbeEvidence(ctx, httpClient, maliciousRef)
 	if !ok2 || !crashed(mal2Status, mal2Body) {
 		return nil, nil
 	}
@@ -107,17 +108,22 @@ func (m *Module) ScanPerRequest(
 	// Negative control: a well-formed reference must NOT reproduce the crash. If it
 	// does, the endpoint 500s on any server-action call and the digest is not
 	// evidence of the decoder flaw — drop.
-	ctrlStatus, ctrlBody, _, _, ctrlOK := m.sendActionProbe(ctx, httpClient, benignRef)
+	ctrlStatus, ctrlBody, _, _, control, ctrlOK := m.sendActionProbeEvidence(ctx, httpClient, benignRef)
 	if ctrlOK && crashed(ctrlStatus, ctrlBody) {
 		return nil, nil
 	}
 
 	target := urlx.Scheme + "://" + urlx.Host + "/"
-	return []*output.ResultEvent{{
-		URL:      target,
-		Matched:  target,
-		Request:  string(malRaw),
-		Response: malFull,
+	collector := modkit.NewEvidenceCollector()
+	collector.AddExchange(confirmation, evidence.RoleConfirmation, "decoder crash replay")
+	collector.AddExchange(control, evidence.RoleControl, "benign reference")
+	finding := &output.ResultEvent{
+		Evidence:           collector.Evidence(),
+		AdditionalEvidence: collector.Entries(),
+		URL:                target,
+		Matched:            target,
+		Request:            string(malRaw),
+		Response:           malFull,
 		ExtractedResults: []string{
 			"malicious_status=500 (error digest present)",
 			fmt.Sprintf("control_status=%d (no error digest)", ctrlStatus),
@@ -134,27 +140,29 @@ func (m *Module) ScanPerRequest(
 				"https://nvd.nist.gov/vuln/detail/CVE-2025-66478",
 			},
 		},
-	}}, nil
+	}
+	modkit.SetPrimaryEvidence(finding, primary, evidence.RoleAttack, "crafted server-action reference")
+	return []*output.ResultEvent{finding}, nil
 }
 
 // sendActionProbe issues one server-action POST to "/" carrying ref as the sole
 // action argument, and returns the response status, body, the request bytes and the
 // full response string.
-func (m *Module) sendActionProbe(
+func (m *Module) sendActionProbeEvidence(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	ref string,
-) (status int, body string, rawReq []byte, full string, ok bool) {
+) (status int, body string, rawReq []byte, full string, exchange *evidence.Exchange, ok bool) {
 	boundary := "----VigoliumRSC" + utils.RandomString(8)
 	mpBody := buildMultipart(boundary, ref)
 
 	raw := ctx.Request().Raw()
 	var err error
 	if raw, err = httpmsg.SetMethod(raw, "POST"); err != nil {
-		return 0, "", nil, "", false
+		return 0, "", nil, "", nil, false
 	}
 	if raw, err = httpmsg.SetPath(raw, "/"); err != nil {
-		return 0, "", nil, "", false
+		return 0, "", nil, "", nil, false
 	}
 	for _, h := range [][2]string{
 		{"Content-Type", "multipart/form-data; boundary=" + boundary},
@@ -164,23 +172,23 @@ func (m *Module) sendActionProbe(
 		{"X-Nextjs-Request-Id", uuid.NewString()},
 	} {
 		if raw, err = httpmsg.AddOrReplaceHeader(raw, h[0], h[1]); err != nil {
-			return 0, "", nil, "", false
+			return 0, "", nil, "", nil, false
 		}
 	}
 	if raw, err = httpmsg.SetBody(raw, []byte(mpBody)); err != nil {
-		return 0, "", nil, "", false
+		return 0, "", nil, "", nil, false
 	}
 
 	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
 	resp, _, execErr := httpClient.Execute(req, http.Options{NoRedirects: true, NoClustering: true})
 	if execErr != nil {
-		return 0, "", nil, "", false
+		return 0, "", nil, "", nil, false
 	}
 	defer resp.Close()
 	if resp.Response() == nil {
-		return 0, "", nil, "", false
+		return 0, "", nil, "", nil, false
 	}
-	return resp.Response().StatusCode, resp.Body().String(), raw, resp.FullResponseString(), true
+	return resp.Response().StatusCode, resp.Body().String(), raw, resp.FullResponseString(), http.CaptureEvidence(resp), true
 }
 
 // crashed reports the decoder-crash signature: a 500 carrying a Next.js error digest.

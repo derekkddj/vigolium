@@ -36,6 +36,11 @@ func TestScanPerHost_DetectsDeprecatedProtocols(t *testing.T) {
 	res, err := New().ScanPerHost(rr, nil, &modkit.ScanContext{})
 	require.NoError(t, err)
 	require.Len(t, res, 1, "expected a weak-TLS finding")
+	assert.Equal(t, "missing", res[0].EvidenceStatus, "negotiated TLS settings are not HTTP receipts")
+	assert.Empty(t, res[0].Request)
+	assert.Empty(t, res[0].Response)
+	assert.Empty(t, res[0].Evidence)
+	assert.False(t, res[0].BaselineEvidence)
 
 	tags := res[0].Info.Tags
 	assert.Contains(t, tags, "tls10")

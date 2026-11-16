@@ -225,8 +225,9 @@ type Options struct {
 	// Out is where streaming assistant text is written. Default: stdout.
 	Out io.Writer
 
-	// ToolLog is where one-liner tool activity is written for operator
-	// visibility. Default: stderr. Set to io.Discard to silence.
+	// ToolLog receives operator tool activity: full arguments/results for
+	// recorded SessionDir runs, concise cards otherwise. Default: stderr.
+	// Set to io.Discard to silence.
 	ToolLog io.Writer
 
 	// Verbose enables the per-tool result preview in the tool log. Off
@@ -348,6 +349,10 @@ type Result struct {
 	// runs); ≥1 = the coverage probe surfaced enough new endpoints that
 	// the loop nudged the model to continue. Capped at maxPostHaltReentries.
 	Reentries int
+
+	// RecordingError is a sanitized non-fatal runtime tool-log degradation,
+	// not a model/execution failure or permission to repeat tool side effects.
+	RecordingError string
 }
 
 // Budget stop kinds reported in Result.BudgetStop.
@@ -855,7 +860,7 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	// while the per-turn `[turn done …]` usage line goes to Out (the
 	// assistant text stream) so it always lands AFTER the model's message
 	// — stdout/stderr can buffer independently and reorder otherwise.
-	tlog := toollog.NewWithStreams(opts.ToolLog, opts.Out, opts.Verbose)
+	tlog := toollog.NewWithStreams(opts.ToolLog, opts.Out, opts.Verbose).WithFullOutput(opts.SessionDir)
 
 	// When running over Claude Code's CLI, engine-level tools never wire
 	// in (the provider treats the CLI as a black-box LLM with its own
@@ -1316,6 +1321,11 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	// When a verification re-entry fired, surface BOTH the original halt
 	// reason and the post-verification reason so the operator can see what
 	// the model thought before and after the probe.
+	var recordingError string
+	if err := tlog.Err(); err != nil {
+		recordingError = err.Error()
+		tlog.ReportIncomplete()
+	}
 	finalReason := reason
 	if firstHaltReason != "" && firstHaltReason != reason {
 		finalReason = fmt.Sprintf("%s (post-verify: %s)", firstHaltReason, reason)
@@ -1334,6 +1344,7 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		Stalled:           stalled,
 		BudgetStop:        budgetStop,
 		CostUSD:           runCostUSD(opts.Model, usage.in, usage.out, usage.cacheRead, usage.cacheCreate),
+		RecordingError:    recordingError,
 	}, fatalErr
 }
 

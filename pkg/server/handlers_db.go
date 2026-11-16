@@ -58,6 +58,9 @@ func (h *Handlers) HandleListDBTableColumns(c fiber.Ctx) error {
 // GET /api/db/tables/:table/records
 func (h *Handlers) HandleListDBRecords(c fiber.Ctx) error {
 	tableName := c.Params("table")
+	if err := database.ValidateGenericTableAccess(tableName); err != nil {
+		return respondError(c, fiber.StatusForbidden, err)
+	}
 
 	opts, err := parseGenericQueryOptions(c)
 	if err != nil {
@@ -122,6 +125,9 @@ func (h *Handlers) HandleListDBRecords(c fiber.Ctx) error {
 // GET /api/db/tables/:table/records/:id
 func (h *Handlers) HandleGetDBRecord(c fiber.Ctx) error {
 	tableName := c.Params("table")
+	if err := database.ValidateGenericTableAccess(tableName); err != nil {
+		return respondError(c, fiber.StatusForbidden, err)
+	}
 	pkValue := c.Params("id")
 
 	scoped, err := h.tableProjectScoped(c, tableName)
@@ -132,7 +138,7 @@ func (h *Handlers) HandleGetDBRecord(c fiber.Ctx) error {
 		return respondErrorMsg(c, fiber.StatusForbidden, "table is not project-scoped; admin only")
 	}
 
-	record, err := database.GetGenericRecord(c.Context(), h.db, tableName, pkValue)
+	record, err := h.getScopedGenericDBRecord(c, tableName, pkValue, false)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return respondErrorMsg(c, fiber.StatusNotFound, "record not found")
@@ -159,6 +165,12 @@ func (h *Handlers) HandleGetDBRecord(c fiber.Ctx) error {
 // POST /api/db/tables/:table/records
 func (h *Handlers) HandleCreateDBRecord(c fiber.Ctx) error {
 	tableName := c.Params("table")
+	if err := database.ValidateGenericTableAccess(tableName); err != nil {
+		return respondError(c, fiber.StatusForbidden, err)
+	}
+	if strings.EqualFold(tableName, "http_records") {
+		return respondError(c, fiber.StatusForbidden, database.ErrGenericInsertUnsupported)
+	}
 
 	var fields map[string]interface{}
 	if err := c.Bind().JSON(&fields); err != nil {
@@ -169,9 +181,11 @@ func (h *Handlers) HandleCreateDBRecord(c fiber.Ctx) error {
 	if scoped, err := h.tableProjectScoped(c, tableName); err != nil {
 		return respondError(c, fiber.StatusNotFound, err)
 	} else if scoped {
-		if _, ok := fields["project_uuid"]; !ok {
-			fields["project_uuid"] = getProjectUUID(c)
+		projectUUID := getProjectUUID(c)
+		if supplied, ok := fields["project_uuid"]; ok && supplied != projectUUID {
+			return respondErrorMsg(c, fiber.StatusForbidden, "generic inserts cannot target another project")
 		}
+		fields["project_uuid"] = projectUUID
 	}
 
 	if err := database.InsertGenericRecord(c.Context(), h.db, tableName, fields); err != nil {
@@ -192,11 +206,26 @@ func (h *Handlers) HandleCreateDBRecord(c fiber.Ctx) error {
 // PUT /api/db/tables/:table/records/:id
 func (h *Handlers) HandleUpdateDBRecord(c fiber.Ctx) error {
 	tableName := c.Params("table")
+	if err := database.ValidateGenericTableAccess(tableName); err != nil {
+		return respondError(c, fiber.StatusForbidden, err)
+	}
 	pkValue := c.Params("id")
 
 	var fields map[string]interface{}
 	if err := c.Bind().JSON(&fields); err != nil {
 		return respondError(c, fiber.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err))
+	}
+
+	if h.projectScopedTable(c, tableName) {
+		if _, err := h.getScopedGenericDBRecord(c, tableName, pkValue, true); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return respondErrorMsg(c, fiber.StatusNotFound, "record not found")
+			}
+			return respondError(c, fiber.StatusBadRequest, err)
+		}
+		if _, ok := fields["project_uuid"]; ok {
+			return respondErrorMsg(c, fiber.StatusForbidden, "generic updates cannot change project ownership")
+		}
 	}
 
 	if err := database.UpdateGenericRecord(c.Context(), h.db, tableName, pkValue, fields); err != nil {
@@ -206,6 +235,9 @@ func (h *Handlers) HandleUpdateDBRecord(c fiber.Ctx) error {
 		status := fiber.StatusInternalServerError
 		if errors.Is(err, database.ErrInvalidColumn) || errors.Is(err, database.ErrImmutablePrimaryKey) || errors.Is(err, database.ErrNoValidFields) {
 			status = fiber.StatusBadRequest
+		}
+		if errors.Is(err, database.ErrImmutableRecordExchange) {
+			status = fiber.StatusForbidden
 		}
 		return respondError(c, status, err)
 	}
@@ -221,7 +253,19 @@ func (h *Handlers) HandleUpdateDBRecord(c fiber.Ctx) error {
 // DELETE /api/db/tables/:table/records/:id
 func (h *Handlers) HandleDeleteDBRecord(c fiber.Ctx) error {
 	tableName := c.Params("table")
+	if err := database.ValidateGenericTableAccess(tableName); err != nil {
+		return respondError(c, fiber.StatusForbidden, err)
+	}
 	pkValue := c.Params("id")
+
+	if h.projectScopedTable(c, tableName) {
+		if _, err := h.getScopedGenericDBRecord(c, tableName, pkValue, true); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return respondErrorMsg(c, fiber.StatusNotFound, "record not found")
+			}
+			return respondError(c, fiber.StatusBadRequest, err)
+		}
+	}
 
 	if err := database.DeleteGenericRecord(c.Context(), h.db, tableName, pkValue); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -242,6 +286,39 @@ func (h *Handlers) HandleDeleteDBRecord(c fiber.Ctx) error {
 }
 
 // --- Helpers ---
+
+// getScopedGenericDBRecord checks ownership before loading a record's body or
+// allowing metadata edits. all_projects never bypasses single-record ownership.
+func (h *Handlers) getScopedGenericDBRecord(c fiber.Ctx, tableName, pkValue string, metadataOnly bool) (map[string]interface{}, error) {
+	if !h.projectScopedTable(c, tableName) {
+		return database.GetGenericRecord(c.Context(), h.db, tableName, pkValue)
+	}
+	if err := database.ValidateTableName(c.Context(), h.db, tableName); err != nil {
+		return nil, err
+	}
+	pk, err := database.DetectPrimaryKey(c.Context(), h.db, tableName)
+	if err != nil {
+		return nil, err
+	}
+	if len(pk.Columns) != 1 {
+		return nil, database.ErrCompositePKUnsupported
+	}
+	opts := database.GenericQueryOptions{Limit: 1, Filters: []database.GenericFilter{
+		{Column: pk.Columns[0], Operator: "eq", Value: pkValue},
+		{Column: "project_uuid", Operator: "eq", Value: getProjectUUID(c)},
+	}}
+	if metadataOnly {
+		opts.Columns = []string{pk.Columns[0], "project_uuid"}
+	}
+	records, _, _, err := database.QueryGenericTableFiltered(c.Context(), h.db, tableName, opts)
+	if err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return nil, sql.ErrNoRows
+	}
+	return records[0], nil
+}
 
 // parseGenericQueryOptions extracts GenericQueryOptions from query parameters.
 func parseGenericQueryOptions(c fiber.Ctx) (database.GenericQueryOptions, error) {
@@ -339,6 +416,14 @@ func (h *Handlers) tableProjectScoped(c fiber.Ctx, tableName string) (bool, erro
 		}
 	}
 	return false, nil
+}
+
+// projectScopedTable is tableProjectScoped for callers that already validated
+// the table: a table whose columns cannot be read is treated as unscoped, and
+// the generic access checks that follow reject it.
+func (h *Handlers) projectScopedTable(c fiber.Ctx, tableName string) bool {
+	scoped, err := h.tableProjectScoped(c, tableName)
+	return err == nil && scoped
 }
 
 // isAdminRequest reports whether the caller holds the admin role. With auth

@@ -150,6 +150,7 @@ func (h *Handlers) prepareAuditRun(plan auditRunPlan) auditRunSetup {
 		sourcePath = extractedPath
 	}
 
+	setup.sourcePath = sourcePath // retain the recovery path even if resolution fails
 	if sourcePath != "" || plan.diff != "" || plan.lastCommits > 0 {
 		resolved, _, _, err := agent.ResolveSourceAndDiff(
 			sourcePath, plan.diff, plan.lastCommits, files, sessionDir,
@@ -164,7 +165,7 @@ func (h *Handlers) prepareAuditRun(plan auditRunPlan) auditRunSetup {
 	setup.sourcePath = sourcePath
 
 	logPath := filepath.Join(sessionDir, config.RuntimeLogFilename)
-	if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+	if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
 		setup.logFile = f
 	} else {
 		zap.L().Warn("Failed to open audit runtime.log",
@@ -194,7 +195,7 @@ func (h *Handlers) runBackgroundAudit(plan auditRunPlan) {
 
 	setup := h.prepareAuditRun(plan)
 	if setup.cleanup != nil {
-		defer setup.cleanup()
+		defer func() { agent.CleanupAuditSource(setup.sourcePath, setup.cleanup, setup.logFile, plan.harness) }()
 	}
 	if setup.logFile != nil {
 		defer func() { _ = setup.logFile.Close() }()
@@ -248,7 +249,7 @@ func (h *Handlers) handleAuditSSE(c fiber.Ctx, plan auditRunPlan) error {
 
 		setup := h.prepareAuditRun(plan)
 		if setup.cleanup != nil {
-			defer setup.cleanup()
+			defer func() { agent.CleanupAuditSource(setup.sourcePath, setup.cleanup, setup.logFile, plan.harness) }()
 		}
 		if setup.logFile != nil {
 			defer func() { _ = setup.logFile.Close() }()
@@ -296,14 +297,18 @@ func (h *Handlers) handleAuditSSE(c fiber.Ctx, plan auditRunPlan) error {
 		clientConnected := drainAgentPipeToSSE(sink, pr, cancel)
 
 		runErr := <-done
-		h.finalizeAuditRun(plan, runner, runErr, setup.sessionDir)
+		catalogErr := h.finalizeAuditRun(plan, runner, runErr, setup.sessionDir)
 
 		if !clientConnected {
 			return
 		}
-		if runErr != nil {
-			_ = sink.send(sseEvent{Type: "error", Error: runErr.Error()})
+		outcome := agent.AuditRunnerOutcome(runner, runErr)
+		if outcome.ProcessErr != nil {
+			_ = sink.send(sseEvent{Type: "error", Error: outcome.ProcessErr.Error()})
 			return
+		}
+		if outcome.EvidenceErr != nil || catalogErr != nil {
+			_ = sink.send(sseEvent{Type: "warning", Error: "Audit evidence degraded; inspect retained run evidence"})
 		}
 		_ = sink.send(sseEvent{Type: "done"})
 	})
@@ -363,17 +368,16 @@ func (h *Handlers) waitAuditRunner(ctx context.Context, runner agent.AuditRunner
 // uploads the session bundle. The audit_agent runner already persists status,
 // duration, phases, and result_json — this handler covers the FindingCount
 // column (audit_agent doesn't write it) and the in-memory status snapshot.
-func (h *Handlers) finalizeAuditRun(plan auditRunPlan, runner agent.AuditRunner, runErr error, sessionDir string) {
+func (h *Handlers) finalizeAuditRun(plan auditRunPlan, runner agent.AuditRunner, runErr error, sessionDir string) error {
 	now := time.Now()
 	stats := runner.FindingStats()
+	outcome := agent.AuditRunnerOutcome(runner, runErr)
 
 	h.agentMu.Lock()
 	if status := h.agenticScanStatus[plan.agenticScanUUID]; status != nil {
+		status.Status = outcome.Status
 		if runErr != nil {
-			status.Status = "failed"
 			status.Error = runErr.Error()
-		} else {
-			status.Status = "completed"
 		}
 		status.CompletedAt = &now
 		status.FindingCount = stats.Parsed
@@ -382,7 +386,12 @@ func (h *Handlers) finalizeAuditRun(plan auditRunPlan, runner agent.AuditRunner,
 	h.agentMu.Unlock()
 
 	// Top up the FindingCount column — audit_agent's finalize doesn't set it.
-	h.enrichAgenticScanRecord(plan.agenticScanUUID, func(run *database.AgenticScan) {
+	catalogErr := h.persistAuditCatalog(plan.agenticScanUUID, func(run *database.AgenticScan) {
+		run.Status = outcome.Status
+		run.CompletedAt = now
+		if runErr != nil {
+			run.ErrorMessage = runErr.Error()
+		}
 		if stats.Parsed > 0 {
 			run.FindingCount = stats.Parsed
 		}
@@ -391,7 +400,10 @@ func (h *Handlers) finalizeAuditRun(plan auditRunPlan, runner agent.AuditRunner,
 		}
 	})
 
-	if plan.uploadResults && sessionDir != "" {
+	if catalogErr != nil {
+		h.markAuditCatalogDegraded(plan.agenticScanUUID)
+	}
+	if plan.uploadResults && sessionDir != "" && catalogErr == nil && outcome.EvidenceErr == nil && outcome.ProcessErr == nil {
 		h.uploadAgenticResults(plan.projectUUID, plan.agenticScanUUID, sessionDir)
 	}
 
@@ -403,6 +415,43 @@ func (h *Handlers) finalizeAuditRun(plan auditRunPlan, runner agent.AuditRunner,
 		zap.String("session_dir", sessionDir),
 		zap.Int("findings_parsed", stats.Parsed),
 		zap.Int("findings_saved", stats.Saved))
+	return catalogErr
+}
+
+// markAuditCatalogDegraded exposes failure even when the catalog is unavailable.
+// No successful execution is relabelled as a provider failure, and no raw DB
+// error (which might contain evidence) is included in the operator warning.
+func (h *Handlers) markAuditCatalogDegraded(uuid string) {
+	h.agentMu.Lock()
+	defer h.agentMu.Unlock()
+	if status := h.agenticScanStatus[uuid]; status != nil {
+		if status.Status == "completed" {
+			status.Status = database.CompletedAgenticScanStatus(true)
+		}
+		if status.Error != "" {
+			status.Error += "; "
+		}
+		status.Error += "Audit terminal summary persistence incomplete; inspect retained run evidence"
+	}
+}
+
+// persistAuditCatalog bounds the server's terminal summary update independently
+// of the execution context and reports persistence failure without retrying work.
+func (h *Handlers) persistAuditCatalog(uuid string, mutate func(*database.AgenticScan)) error {
+	if h.repo == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	run, err := h.repo.GetAgenticScan(ctx, uuid)
+	if err == nil {
+		mutate(run)
+		err = h.repo.UpdateAgenticScan(ctx, run)
+	}
+	if err != nil {
+		zap.L().Warn("Audit summary persistence incomplete", zap.String("run", uuid))
+	}
+	return err
 }
 
 // recordAuditFailure marks the run as failed before the audit scanner has had
@@ -419,12 +468,14 @@ func (h *Handlers) recordAuditFailure(agenticScanUUID string, err error) {
 	}
 	h.agentMu.Unlock()
 
-	h.enrichAgenticScanRecord(agenticScanUUID, func(run *database.AgenticScan) {
+	if catalogErr := h.persistAuditCatalog(agenticScanUUID, func(run *database.AgenticScan) {
 		run.Status = "failed"
 		run.ErrorMessage = err.Error()
 		run.CompletedAt = now
 		run.DurationMs = now.Sub(run.StartedAt).Milliseconds()
-	})
+	}); catalogErr != nil {
+		h.markAuditCatalogDegraded(agenticScanUUID)
+	}
 
 	webhook.FireAgenticScan(h.settings, h.repo, agenticScanUUID)
 

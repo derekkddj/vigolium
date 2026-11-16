@@ -18,7 +18,9 @@ import (
 	"time"
 
 	"github.com/vigolium/vigolium/pkg/core/network"
+	vhttp "github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/http/proxyenv"
+	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/proxytarget"
 )
 
@@ -110,10 +112,19 @@ type sendTarget struct {
 	// exact sends the bytes as given: no User-Agent is added and the
 	// transport adds no Accept-Encoding (--raw-request).
 	exact bool
+	// capture retains the final sent/received exchange on the Summary.
+	capture bool
 }
 
-func sendRawHTTPWith(ctx context.Context, client *gohttp.Client, raw []byte, t sendTarget, noRedirects bool, excerptCap int) *Summary {
-	scheme, hostname, port := t.scheme, t.hostname, t.port
+func sendRawHTTPWith(ctx context.Context, client *gohttp.Client, raw []byte, t sendTarget, noRedirects bool, excerptCap int) (summary *Summary) {
+	// Even a complete capture certifies only the normalized request actually
+	// sent, not preservation of an independently addressed absolute-form target.
+	defer func() {
+		if summary != nil {
+			summary.RequestTargetPolicy = httpmsg.NativeRequestTargetPolicy(raw)
+		}
+	}()
+	scheme, hostname, port, capture := t.scheme, t.hostname, t.port, t.capture
 	if excerptCap <= 0 {
 		excerptCap = DefaultExcerptCap
 	}
@@ -149,8 +160,10 @@ func sendRawHTTPWith(ctx context.Context, client *gohttp.Client, raw []byte, t s
 		RawQuery:   req.URL.RawQuery,
 		ForceQuery: req.URL.ForceQuery,
 	}
-	// req.Host already holds the raw Host header (ReadRequest moves it there);
-	// when it is empty net/http sends req.URL.Host, the destination authority.
+	// ReadRequest prefers an absolute target's authority over the Host header.
+	// Replay's destination, request target and explicit virtual Host are separate:
+	// restore the raw Host, or let an absent Host fall back to the destination.
+	req.Host = httpmsg.NewHttpRequest(raw).Header("Host")
 	req.RequestURI = ""
 
 	if t.exact {
@@ -187,12 +200,57 @@ func sendRawHTTPWith(ctx context.Context, client *gohttp.Client, raw []byte, t s
 		sendClient.Transport = uncompressedTransport(client.Transport)
 	}
 
+	if capture && req.Body != nil && req.Body != gohttp.NoBody {
+		// ReadRequest does not install GetBody. Retain the parsed body so the
+		// transport receipt (and 307/308 redirects) can replay the actual bytes.
+		body, readErr := io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		if readErr != nil {
+			return &Summary{Error: fmt.Sprintf("read request body: %v", readErr)}
+		}
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
+	}
 	req = req.WithContext(ctx)
 	var reqDump []byte
 	if TrafficDump != nil {
 		reqDump, _ = httputil.DumpRequestOut(req, true)
 	}
 	start := time.Now()
+	if capture {
+		chain, captureErr := vhttp.DoCaptured(&sendClient, req, defaultMaxResponseBytes)
+		elapsed := time.Since(start)
+		summary := &Summary{ResponseTimeMs: elapsed.Milliseconds()}
+		if captureErr != nil {
+			summary.Error = fmt.Sprintf("request failed: %v", captureErr)
+		}
+		if chain == nil {
+			if captureErr == nil {
+				summary.Error = "request completed without a captured response"
+			}
+			return summary
+		}
+		defer chain.Close()
+		// A failed execution can still own a completed sent request or a real
+		// partial response. Capture before close and before returning the error;
+		// never reconstruct a response from intended bytes or a default status.
+		summary.Exchange = vhttp.CaptureEvidence(chain)
+		resp := chain.Response()
+		if resp == nil || resp.StatusCode == 0 {
+			if captureErr == nil {
+				summary.Error = "request completed without a captured response"
+			}
+			return summary
+		}
+		body := bytes.Clone(chain.BodyBytes())
+		sum := sha256.Sum256(body)
+		summary.Status, summary.ResponseLen = resp.StatusCode, len(body)
+		summary.ContentHash = hex.EncodeToString(sum[:8])
+		summary.Headers = resp.Header.Clone()
+		summary.Excerpt, summary.Truncated = clipBytes(body, excerptCap)
+		summary.RawBody = body
+		return summary
+	}
 	resp, err := sendClient.Do(req)
 	elapsed := time.Since(start)
 	if TrafficDump != nil {
@@ -341,7 +399,8 @@ func Do(ctx context.Context, opts Options) (*Result, error) {
 		}
 		return sendRawHTTPWith(ctx, opts.Client, raw, sendTarget{
 			scheme: opts.Scheme, hostname: opts.Hostname, port: opts.Port,
-			exact: len(opts.RawRequest) > 0,
+			exact:   len(opts.RawRequest) > 0,
+			capture: opts.CaptureExchange,
 		}, opts.NoRedirects, excerptCap)
 	}
 

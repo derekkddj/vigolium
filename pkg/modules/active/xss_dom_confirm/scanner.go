@@ -11,6 +11,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/dedup"
 	"github.com/vigolium/vigolium/pkg/deparos/waf"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -156,9 +157,10 @@ func (m *Module) ScanPerInsertionPoint(
 // capturedResp holds the response parts the fallback needs to classify a WAF
 // block when an attempt fails the prefilter.
 type capturedResp struct {
-	status int
-	header nethttp.Header
-	body   string
+	status  int
+	header  nethttp.Header
+	body    string
+	receipt *evidence.Exchange // HTTP prefilter send only; browser navigation is separate
 }
 
 // attempt injects bodyPayload at ip, prefilters the reflection, and on a pass
@@ -218,7 +220,9 @@ func (m *Module) attempt(
 		return nil, plain
 	}
 
-	return m.buildResult(ctx, ip, fuzzedRaw, payload, probeURL, reason, *dialog), plain
+	result := m.buildResult(ctx, ip, fuzzedRaw, payload, probeURL, reason, *dialog)
+	modkit.SetPrimaryEvidence(result, plain.receipt, evidence.RoleAttack, "HTTP prefilter payload (not browser navigation)")
+	return result, plain
 }
 
 // probeUsable reports whether a probe result carries enough information to
@@ -244,7 +248,7 @@ func sendAndCapture(httpClient *http.Requester, req *httpmsg.HttpRequestResponse
 	}
 	defer resp.Close()
 
-	cr := &capturedResp{}
+	cr := &capturedResp{receipt: http.CaptureEvidence(resp)}
 	if r := resp.Response(); r != nil {
 		cr.status = r.StatusCode
 		cr.header = r.Header

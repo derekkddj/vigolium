@@ -5,6 +5,7 @@ import (
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/utils"
@@ -21,9 +22,10 @@ const (
 
 // decoyResult is a memoized catch-all decoy probe response.
 type decoyResult struct {
-	status int
-	body   string
-	ok     bool
+	status  int
+	body    string
+	ok      bool
+	receipt *evidence.Exchange // immutable cache-owned full exchange, separate from body cap
 }
 
 func (sc *ScanContext) getDecoyCache() *lru.Cache[string, *decoyResult] {
@@ -51,11 +53,16 @@ func (sc *ScanContext) decoyProbe(
 	buildPath func(canary string) string,
 ) decoyResult {
 	fetch := func() decoyResult {
-		status, body, ok := fetchGET(ctx, client, buildPath(FreshCanary()), opts)
+		proof := NewEvidenceCollector()
+		status, body, ok := fetchGETWithEvidence(ctx, client, buildPath(FreshCanary()), opts, proof, evidence.RoleControl, "decoy probe")
+		var receipt *evidence.Exchange
+		if entries := proof.Evidence(); len(entries) > 0 {
+			receipt = entries[0].Exchange
+		}
 		if len(body) > decoyBodyCap {
 			body = body[:decoyBodyCap]
 		}
-		return decoyResult{status: status, body: body, ok: ok}
+		return decoyResult{status: status, body: body, ok: ok, receipt: receipt}
 	}
 
 	if sc == nil || ctx == nil || ctx.Request() == nil {
@@ -245,12 +252,13 @@ func MatchAllGroups(body string, requireAll [][]string) (matched []string, ok bo
 // caller's existing root 404 fingerprint already covers. Returns false on any
 // build/transport error or a non-200 sibling so a flaky probe never suppresses a
 // real finding.
-func SiblingPathCatchAll(
+func SiblingPathCatchAllWithEvidence(
 	sc *ScanContext,
 	ctx *httpmsg.HttpRequestResponse,
 	client *http.Requester,
 	probePath string,
 	match func(body string) bool,
+	sink *EvidenceCollector,
 ) bool {
 	if ctx == nil || ctx.Request() == nil || client == nil || match == nil {
 		return false
@@ -263,6 +271,7 @@ func SiblingPathCatchAll(
 
 	res := sc.decoyProbe(ctx, client, "sibling", parent, "", http.Options{NoRedirects: true},
 		func(canary string) string { return parent + "/" + canary })
+	sink.AddExchange(res.receipt, evidence.RoleControl, "nonexistent sibling")
 	if !res.ok || res.status != 200 {
 		return false
 	}
@@ -285,11 +294,12 @@ func SiblingPathCatchAll(
 // response, so a flaky decoy fetch never suppresses a real finding (fail-open).
 // The probe runs with NoClustering so the host's per-request response cache does
 // not alias it to the candidate's own cached entry.
-func DecoyFileBaseline(
+func DecoyFileBaselineWithEvidence(
 	sc *ScanContext,
 	ctx *httpmsg.HttpRequestResponse,
 	client *http.Requester,
 	probePath string,
+	sink *EvidenceCollector,
 ) (status int, body string, ok bool) {
 	if ctx == nil || ctx.Request() == nil || client == nil {
 		return 0, "", false
@@ -298,6 +308,7 @@ func DecoyFileBaseline(
 	// NoRedirects: a decoy that 30x-redirects is not a served baseline body.
 	res := sc.decoyProbe(ctx, client, "decoyfile", dir, ext, http.Options{NoRedirects: true, NoClustering: true},
 		func(canary string) string { return dir + "vigolium-decoy-" + canary + ext })
+	sink.AddExchange(res.receipt, evidence.RoleControl, "nonexistent extension-matched file")
 	return res.status, res.body, res.ok
 }
 
@@ -335,17 +346,19 @@ func decoyFileParts(probePath string) (dir, ext string) {
 // not aliased to a cached entry). Returns false on any build/transport error, a
 // missing/non-2xx response, or a nil match (fail-open — a flaky probe never
 // suppresses a real finding).
-func RandomDirCatchAll(
+func RandomDirCatchAllWithEvidence(
 	sc *ScanContext,
 	ctx *httpmsg.HttpRequestResponse,
 	client *http.Requester,
 	match func(body string) bool,
+	sink *EvidenceCollector,
 ) bool {
 	if match == nil {
 		return false
 	}
 	res := sc.decoyProbe(ctx, client, "randomdir", "/", "", http.Options{NoRedirects: true, NoClustering: true},
 		func(canary string) string { return "/vigolium-catchall-dir-" + canary + "/" })
+	sink.AddExchange(res.receipt, evidence.RoleControl, "nonexistent directory")
 	if !res.ok || res.status < 200 || res.status >= 300 {
 		return false
 	}
@@ -364,17 +377,19 @@ func RandomDirCatchAll(
 // served shell) and NoClustering (so the probe is not aliased to a cached entry).
 // Returns false on any build/transport error or a non-2xx root, so a flaky root
 // fetch never suppresses a real finding (fail-open toward "not a catch-all").
-func RootPageCatchAll(
+func RootPageCatchAllWithEvidence(
 	sc *ScanContext,
 	ctx *httpmsg.HttpRequestResponse,
 	client *http.Requester,
 	match func(body string) bool,
+	sink *EvidenceCollector,
 ) bool {
 	if match == nil {
 		return false
 	}
 	res := sc.decoyProbe(ctx, client, "rootpage", "/", "", http.Options{NoRedirects: true, NoClustering: true},
 		func(string) string { return "/" })
+	sink.AddExchange(res.receipt, evidence.RoleControl, "root-page shell comparison")
 	if !res.ok || res.status < 200 || res.status >= 300 {
 		return false
 	}
@@ -408,23 +423,27 @@ func RootPageCatchAll(
 // genuine hit can legitimately equal the home page (e.g. an index.php PATH_INFO
 // misconfig where /index.php renders the homepage) — such a module should call
 // ResemblesObservedPage + RandomDirCatchAll directly and skip RootPageCatchAll.
-func ResemblesCatchAllShell(
+func ResemblesCatchAllShellWithEvidence(
 	scanCtx *ScanContext,
 	ctx *httpmsg.HttpRequestResponse,
 	client *http.Requester,
 	hitBody string,
+	sink *EvidenceCollector,
 ) bool {
 	// Tokenize the hit body once and reuse the signature for the observed-page
 	// compare and both shell probes.
 	hitSig := BodySignature(hitBody)
+	if ctx != nil {
+		sink.AddExchange(ctx.Evidence(), evidence.RoleBaseline, "observed-page shell comparison")
+	}
 	if ResemblesObservedPageSig(ctx, hitSig) {
 		return true
 	}
 	shellMatch := func(b string) bool { return BodiesSimilarSig(hitSig, b) }
-	if RandomDirCatchAll(scanCtx, ctx, client, shellMatch) {
+	if RandomDirCatchAllWithEvidence(scanCtx, ctx, client, shellMatch, sink) {
 		return true
 	}
-	return RootPageCatchAll(scanCtx, ctx, client, shellMatch)
+	return RootPageCatchAllWithEvidence(scanCtx, ctx, client, shellMatch, sink)
 }
 
 // MultiRoundExtDecoyCatchAll probes `rounds` distinct guaranteed-nonexistent
@@ -452,12 +471,13 @@ func ResemblesCatchAllShell(
 // cannot alias the decoys to one another. rounds < 1 is treated as 1. Fails OPEN
 // per round (a transport error or missing decoy response cannot prove a catch-all)
 // so a flaky probe never suppresses a real finding.
-func MultiRoundExtDecoyCatchAll(
+func MultiRoundExtDecoyCatchAllWithEvidence(
 	ctx *httpmsg.HttpRequestResponse,
 	client *http.Requester,
 	probePath, candidateBody string,
 	candidateStatus, rounds int,
 	markerMatch func(body string) bool,
+	sink *EvidenceCollector,
 ) bool {
 	if rounds < 1 {
 		rounds = 1
@@ -473,7 +493,7 @@ func MultiRoundExtDecoyCatchAll(
 		// Pass a nil ScanContext so each round is a genuinely distinct fetch with
 		// a fresh canary — the multi-round confirmation deliberately wants several
 		// independent decoys, not one memoized result.
-		decoyStatus, decoyBody, served := DecoyFileBaseline(nil, ctx, client, probePath)
+		decoyStatus, decoyBody, served := DecoyFileBaselineWithEvidence(nil, ctx, client, probePath, sink)
 		if !served || decoyStatus != candidateStatus {
 			continue // a 404 / differently-statused / errored decoy is the real-file case
 		}
@@ -493,18 +513,21 @@ func MultiRoundExtDecoyCatchAll(
 // the response status and body; ok is false on any build/transport error so a
 // flaky fetch never suppresses a finding (fail-open). It is the shared re-fetch
 // primitive behind the file-discovery confirmation rounds.
-func FetchPath(ctx *httpmsg.HttpRequestResponse, client *http.Requester, probePath string) (status int, body string, ok bool) {
-	return fetchGET(ctx, client, probePath, http.Options{NoClustering: true})
+func FetchPathWithEvidence(ctx *httpmsg.HttpRequestResponse, client *http.Requester, probePath string, sink *EvidenceCollector) (status int, body string, ok bool) {
+	return fetchGETWithEvidence(ctx, client, probePath, http.Options{NoClustering: true}, sink, evidence.RoleConfirmation, "path reproduction")
 }
 
 // fetchGET is the shared GET primitive: it rebuilds the observed request as a GET
 // to path (preserving headers and service) and executes it with opts. ok is false
 // on any build/transport error or a missing response, so every caller fails open.
-func fetchGET(
+func fetchGETWithEvidence(
 	ctx *httpmsg.HttpRequestResponse,
 	client *http.Requester,
 	path string,
 	opts http.Options,
+	sink *EvidenceCollector,
+	role evidence.Role,
+	label string,
 ) (status int, body string, ok bool) {
 	if ctx == nil || ctx.Request() == nil || client == nil {
 		return 0, "", false
@@ -531,6 +554,9 @@ func fetchGET(
 	if resp.Response() == nil {
 		return 0, "", false
 	}
+	if sink != nil && sink.Len() < MaxEvidencePairs {
+		sink.AddExchange(http.CaptureEvidence(resp), role, label)
+	}
 	return resp.Response().StatusCode, resp.Body().String(), true
 }
 
@@ -541,21 +567,22 @@ func fetchGET(
 // "for marker := range markers { strings.Contains }" closure the path-probing
 // modules each hand-rolled. Returns false (no catch-all detected) for empty
 // markers, a root-level probe path, or any probe error.
-func SiblingServesAnyMarker(
+func SiblingServesAnyMarkerWithEvidence(
 	sc *ScanContext,
 	ctx *httpmsg.HttpRequestResponse,
 	client *http.Requester,
 	probePath string,
 	markers []string,
+	sink *EvidenceCollector,
 ) bool {
-	return SiblingPathCatchAll(sc, ctx, client, probePath, func(b string) bool {
+	return SiblingPathCatchAllWithEvidence(sc, ctx, client, probePath, func(b string) bool {
 		for _, marker := range markers {
 			if marker != "" && strings.Contains(b, marker) {
 				return true
 			}
 		}
 		return false
-	})
+	}, sink)
 }
 
 // ResemblesObservedPage reports whether probeBody is textually equivalent
@@ -657,11 +684,12 @@ func StripReflected(body, payload string) string {
 // matched carries the evidence substrings for ExtractedResults; ok is false (and
 // matched nil) when the body doesn't satisfy the groups, the sibling reveals a
 // catch-all, or the anchor is only a reflected path slug.
-func MatchAndConfirmSibling(
+func MatchAndConfirmSiblingWithEvidence(
 	ctx *httpmsg.HttpRequestResponse,
 	client *http.Requester,
 	probePath, body string,
 	markers [][]string,
+	sink *EvidenceCollector,
 ) (matched []string, ok bool) {
 	matched, ok = MatchAllGroups(body, markers)
 	if !ok {
@@ -670,10 +698,10 @@ func MatchAndConfirmSibling(
 	// Uncached sibling probe (nil ScanContext): these marker-confirmation callers
 	// span the FP-tuned Spring/CMS family and are left on the direct path. The
 	// per-record decoy cache is opt-in via the sc-taking probe entry points.
-	if SiblingPathCatchAll(nil, ctx, client, probePath, func(b string) bool {
+	if SiblingPathCatchAllWithEvidence(nil, ctx, client, probePath, func(b string) bool {
 		_, sibOK := MatchAllGroups(b, markers)
 		return sibOK
-	}) {
+	}, sink) {
 		return nil, false
 	}
 	// Slug-reflection guard: when the framework anchor (the first group's hit) is
@@ -688,7 +716,7 @@ func MatchAndConfirmSibling(
 	// from the later groups, so the anchor is the one hit that must not be a mere
 	// slug echo. This is the /topic/filament FP that matched the reflected word
 	// "Filament", not a Filament panel.
-	if SlugReflectionFP(ctx, client, probePath, matched[:1]) {
+	if SlugReflectionFPWithEvidence(ctx, client, probePath, matched[:1], sink) {
 		return nil, false
 	}
 	return matched, true
@@ -735,10 +763,11 @@ func splitProbePath(probePath string) (parent, segment string) {
 // is not a reflected body) and NoClustering (the control must be a distinct fetch,
 // never aliased to the candidate's cached entry). Fails open (false) on any
 // build/transport error so a flaky control probe never suppresses a real finding.
-func PathSegmentReflected(
+func PathSegmentReflectedWithEvidence(
 	ctx *httpmsg.HttpRequestResponse,
 	client *http.Requester,
 	probePath string,
+	sink *EvidenceCollector,
 ) bool {
 	if ctx == nil || ctx.Request() == nil || client == nil {
 		return false
@@ -750,7 +779,7 @@ func PathSegmentReflected(
 	}
 
 	canary := FreshCanary()
-	status, body, ok := fetchGET(ctx, client, base+canary, http.Options{NoRedirects: true, NoClustering: true})
+	status, body, ok := fetchGETWithEvidence(ctx, client, base+canary, http.Options{NoRedirects: true, NoClustering: true}, sink, evidence.RoleControl, "path-segment reflection control")
 	if !ok || status != 200 {
 		return false
 	}
@@ -779,11 +808,12 @@ func PathSegmentReflected(
 // grouped MatchAndConfirmSibling passes only the anchor (matched[:1]): its later
 // groups already supplied real corroboration, so only the anchor hit needs the
 // reflection check.
-func SlugReflectionFP(
+func SlugReflectionFPWithEvidence(
 	ctx *httpmsg.HttpRequestResponse,
 	client *http.Requester,
 	probePath string,
 	matchedMarkers []string,
+	sink *EvidenceCollector,
 ) bool {
 	if len(matchedMarkers) == 0 {
 		return false
@@ -798,5 +828,5 @@ func SlugReflectionFP(
 			return false // a structural / non-reflected marker supports the finding
 		}
 	}
-	return PathSegmentReflected(ctx, client, probePath)
+	return PathSegmentReflectedWithEvidence(ctx, client, probePath, sink)
 }

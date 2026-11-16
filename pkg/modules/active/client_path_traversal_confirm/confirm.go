@@ -8,11 +8,14 @@ import (
 	"net/url"
 	"path"
 	"strings"
+
+	"github.com/vigolium/vigolium/pkg/evidence"
 )
 
 // confirmResult is the evidence bundle for one browser-confirmed CSPT primitive.
 type confirmResult struct {
-	Candidate Candidate
+	control, attack, replay *evidence.Exchange
+	Candidate               Candidate
 
 	ControlURL    string
 	ControlMethod string
@@ -49,6 +52,7 @@ func (m *Module) confirmCandidate(ctx context.Context, base string, cand Candida
 	controlReqs := m.navigate(ctx, base, cand.SourceParam, controlTok, cookies)
 	controlUnder, controlEscaped := false, false
 	var controlURL, controlMethod string
+	var controlReceipt *evidence.Exchange
 	for _, r := range controlReqs {
 		if !strings.Contains(cleanRawPath(r.URL), controlTok) {
 			continue // not our injected request
@@ -58,6 +62,7 @@ func (m *Module) confirmCandidate(ctx context.Context, base string, cand Candida
 		} else {
 			controlUnder = true
 			controlURL, controlMethod = r.URL, r.Method
+			controlReceipt = r.Exchange
 		}
 	}
 	if !controlUnder || controlEscaped {
@@ -76,6 +81,9 @@ func (m *Module) confirmCandidate(ctx context.Context, base string, cand Candida
 
 	return &confirmResult{
 		Candidate:     cand,
+		control:       controlReceipt,
+		attack:        r1.exchange,
+		replay:        r2.exchange,
 		ControlURL:    controlURL,
 		ControlMethod: controlMethod,
 		Payload1URL:   r1.url,
@@ -88,10 +96,11 @@ func (m *Module) confirmCandidate(ctx context.Context, base string, cand Candida
 }
 
 type roundResult struct {
-	url    string
-	method string
-	norm   string
-	canary string
+	exchange *evidence.Exchange
+	url      string
+	method   string
+	norm     string
+	canary   string
 }
 
 // escapeRound navigates one `../<canary>` payload and returns the captured
@@ -102,7 +111,7 @@ func (m *Module) escapeRound(ctx context.Context, base string, cand Candidate, c
 	for _, r := range m.navigate(ctx, base, cand.SourceParam, value, cookies) {
 		esc, norm := escapesPrefix(prefix, r.URL)
 		if esc && strings.Contains(norm, canary) {
-			return &roundResult{url: r.URL, method: r.Method, norm: norm, canary: canary}
+			return &roundResult{exchange: r.Exchange, url: r.URL, method: r.Method, norm: norm, canary: canary}
 		}
 	}
 	return nil

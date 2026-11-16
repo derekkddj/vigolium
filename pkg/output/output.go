@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/terminal"
 	"github.com/vigolium/vigolium/pkg/types"
 	"github.com/vigolium/vigolium/pkg/types/severity"
@@ -84,6 +85,16 @@ type ResultEvent struct {
 	Request            string   `json:"request,omitempty"`
 	Response           string   `json:"response,omitempty"`
 	AdditionalEvidence []string `json:"additional_evidence,omitempty"`
+
+	// Evidence is the authoritative, role-aware selection. Legacy text remains
+	// available, but cannot establish a captured exchange or a proof role.
+	Evidence []evidence.Entry `json:"evidence,omitempty"`
+	// EvidenceStatus: selected, missing, or unclassified. Empty historical
+	// values remain unknown; absence must never be repaired by URL inference.
+	EvidenceStatus string `json:"evidence_status,omitempty"`
+	// BaselineEvidence is positive producer intent for active baseline analysis.
+	// Passive modules implicitly analyze their input; probes must select receipts.
+	BaselineEvidence bool `json:"baseline_evidence,omitempty"`
 
 	// Metadata
 	Metadata  map[string]interface{} `json:"meta,omitempty"`

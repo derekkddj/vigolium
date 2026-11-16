@@ -8,6 +8,7 @@ import (
 
 	httputil "github.com/projectdiscovery/utils/http"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -234,10 +235,11 @@ type controlReading struct {
 // sent is one completed send: how long it took, whether something in front of
 // the application answered, and the response for evidence.
 type sent struct {
-	elapsed time.Duration
-	blocked bool
-	body    string
-	err     error
+	exchange *evidence.Exchange
+	elapsed  time.Duration
+	blocked  bool
+	body     string
+	err      error
 }
 
 // sendOnce writes raw to the wire verbatim and times the round trip.
@@ -269,7 +271,10 @@ func sendOnce(
 	if resp != nil {
 		out.blocked = isEdgeOrGateResponse(resp)
 		out.body = resp.FullResponseString()
+		out.exchange = http.CaptureEvidence(resp)
 		resp.Close()
+	} else if err != nil {
+		out.exchange = http.CaptureFailureEvidence(err)
 	}
 	return out
 }
@@ -348,10 +353,12 @@ func measureControl(
 // distinguishes a real desync from a host that is simply slow for POST traffic,
 // instead of asserting it in prose.
 type desyncEvidence struct {
-	reElapsed   time.Duration
-	probeResp   string
-	ctrlElapsed time.Duration
-	ctrlResp    string
+	probeExchange   *evidence.Exchange
+	controlExchange *evidence.Exchange
+	reElapsed       time.Duration
+	probeResp       string
+	ctrlElapsed     time.Duration
+	ctrlResp        string
 }
 
 // confirmTimingDesync re-validates a probe that produced an initial timing
@@ -374,7 +381,11 @@ func confirmTimingDesync(
 	// 1. Reconfirm the anomaly with a fresh send of the same probe. A reproduced
 	// block means the edge is rejecting us, not a desync.
 	reprobe := sendOnce(ctx, httpClient, probeRaw)
-	ev := desyncEvidence{reElapsed: reprobe.elapsed, probeResp: reprobe.body}
+	ev := desyncEvidence{reElapsed: reprobe.elapsed, probeResp: reprobe.body, probeExchange: reprobe.exchange}
+	if ev.probeExchange == nil {
+		// No actual failure receipt was available; never promote intended raw.
+		ev.probeExchange = evidence.NewExchange("", "", nil, nil, evidence.ProvenanceSupplied)
+	}
 	if reprobe.err == nil && reprobe.blocked {
 		return ev, false
 	}
@@ -390,6 +401,7 @@ func confirmTimingDesync(
 	}
 	ev.ctrlElapsed = ctrl.elapsed
 	ev.ctrlResp = ctrl.body
+	ev.controlExchange = ctrl.exchange
 
 	// The probe must out-run the control the confirmation round just measured,
 	// not only the one measured before the probes began.
@@ -461,15 +473,17 @@ func buildResult(
 	elapsed time.Duration,
 	timeout bool,
 	ev desyncEvidence,
-) *output.ResultEvent {
+) (finding *output.ResultEvent) {
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, ev.probeExchange, evidence.RoleConfirmation, "reconfirmed desync probe")
+	}()
 	nameSuffix, timingNote := "", ""
 	if timeout {
 		nameSuffix, timingNote = " (Timeout)", " (timeout)"
 	}
 
 	collector := modkit.NewEvidenceCollector()
-	collector.Add("reconfirm probe (anomaly reproduced)", string(probeRaw), ev.probeResp)
-	collector.Add("well-formed control (re-measured after the probe)", string(control.raw), ev.ctrlResp)
+	collector.AddExchange(ev.controlExchange, evidence.RoleControl, "well-formed control (re-measured after the probe)")
 
 	return &output.ResultEvent{
 		URL:                ctx.Target(),
@@ -477,6 +491,7 @@ func buildResult(
 		Request:            string(probeRaw),
 		Response:           ev.probeResp,
 		AdditionalEvidence: collector.Entries(),
+		Evidence:           collector.Evidence(),
 		ExtractedResults: []string{
 			fmt.Sprintf("Probe: %s", probe.name),
 			fmt.Sprintf("Probe: %s%s vs well-formed control: %s (median of %d)",

@@ -51,6 +51,33 @@
         "record_uuid": {
           "type": "string"
         },
+        "exchange_id": {
+          "type": "string"
+        },
+        "evidence_role": {
+          "type": "string"
+        },
+        "evidence_status": {
+          "type": "string"
+        },
+        "request_source": {
+          "type": "string"
+        },
+        "occurrence_id": {
+          "type": "string"
+        },
+        "finding_url": {
+          "type": "string"
+        },
+        "scan_uuid": {
+          "type": "string"
+        },
+        "evidence_label": {
+          "type": "string"
+        },
+        "evidence_primary": {
+          "type": "boolean"
+        },
         "method": {
           "type": "string"
         },
@@ -119,6 +146,25 @@
           "type": "string"
         },
         "evidence_grade": {
+          "type": "string"
+        },
+        "evidence_status": {
+          "type": "string"
+        },
+        "evidence": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/evidence.Entry"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "project_uuid": {
           "type": "string"
         },
         "short": {
@@ -262,6 +308,9 @@
         "finding_source",
         "record_kind",
         "evidence_grade",
+        "evidence_status",
+        "evidence",
+        "project_uuid",
         "found_at"
       ]
     },
@@ -686,6 +735,87 @@
       "required": [
         "verdict",
         "at"
+      ]
+    },
+    "evidence.Entry": {
+      "properties": {
+        "exchange_id": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string"
+        },
+        "primary": {
+          "type": "boolean"
+        },
+        "label": {
+          "type": "string"
+        },
+        "occurrence_id": {
+          "type": "string"
+        },
+        "finding_url": {
+          "type": "string"
+        },
+        "scan_uuid": {
+          "type": "string"
+        },
+        "exchange": {
+          "$ref": "#/$defs/evidence.Exchange"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "exchange_id",
+        "role"
+      ]
+    },
+    "evidence.Exchange": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        },
+        "service": {
+          "type": "string"
+        },
+        "request": {
+          "type": "string",
+          "contentEncoding": "base64"
+        },
+        "response": {
+          "type": "string",
+          "contentEncoding": "base64"
+        },
+        "request_state": {
+          "type": "string"
+        },
+        "response_state": {
+          "type": "string"
+        },
+        "provenance": {
+          "type": "string"
+        },
+        "content_hash": {
+          "type": "string"
+        },
+        "captured_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "id",
+        "request_state",
+        "response_state",
+        "provenance",
+        "content_hash",
+        "captured_at"
       ]
     },
     "output.ProofControl": {

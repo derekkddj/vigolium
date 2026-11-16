@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -137,6 +138,7 @@ func (m *Module) ScanPerInsertionPoint(
 					resp.Close()
 					return append(results, ev), nil
 				}
+				modkit.SetPrimaryEvidence(ev, http.CaptureEvidence(resp), evidence.RoleAttack, "matched include probe")
 				resp.Close()
 				// A confirmed read proves an include-shaped sink; the execution
 				// probes decide whether it also runs code, which outranks the read.

@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	evidencepkg "github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -128,7 +129,8 @@ func (m *Module) ScanPerInsertionPoint(
 	var results []*output.ResultEvent
 
 	for i, p := range m.payloads {
-		location, fuzzedRawStr, evidence, contentType, found, err := m.probePayload(ctx, ip, httpClient, p, m.canary, m.headerPattern)
+		var primary *evidencepkg.Exchange
+		location, fuzzedRawStr, evidence, contentType, found, err := m.probePayload(ctx, ip, httpClient, p, m.canary, m.headerPattern, &primary)
 		if err != nil {
 			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
 				return results, nil
@@ -143,7 +145,8 @@ func (m *Module) ScanPerInsertionPoint(
 		// canaries across multiple rounds. A real injection copies the changing
 		// attacker-controlled value into the response every round; a coincidental
 		// match (or a server echoing a fixed string) will not track the canary.
-		confirmed, cerr := m.confirmInjection(ctx, ip, httpClient, i)
+		confirmationEv := modkit.NewEvidenceCollector()
+		confirmed, cerr := m.confirmInjection(ctx, ip, httpClient, i, confirmationEv)
 		if cerr != nil {
 			if errors.Is(cerr, hosterrors.ErrUnresponsiveHost) {
 				return results, nil
@@ -163,7 +166,15 @@ func (m *Module) ScanPerInsertionPoint(
 		if location != locBodyReflection {
 			rqpAmplified, rqpEvidence = infra.RQPAmplification(ctx.Response())
 		}
-		results = append(results, m.buildResult(urlx.String(), ip.Name(), p.name, location, contentType, fuzzedRawStr, evidence, rqpAmplified, rqpEvidence))
+		event := m.buildResult(urlx.String(), ip.Name(), p.name, location, contentType, fuzzedRawStr, evidence, rqpAmplified, rqpEvidence)
+		event.AdditionalEvidence = confirmationEv.Entries()
+		event.Evidence = confirmationEv.Evidence()
+		role := evidencepkg.RoleAttack
+		if location == locBodyReflection {
+			role = evidencepkg.RoleObservation
+		}
+		modkit.SetPrimaryEvidence(event, primary, role, "CRLF probe exchange")
+		results = append(results, event)
 		return results, nil
 	}
 
@@ -184,6 +195,7 @@ func (m *Module) probePayload(
 	p payload,
 	canary string,
 	pattern *regexp.Regexp,
+	exchanges ...**evidencepkg.Exchange,
 ) (location, fuzzedRawStr, evidence, contentType string, found bool, err error) {
 	// Pre-encoded payloads (%0d%0a) keep their own encoding through
 	// httpmsg.BuildPreEncoded; the old hand-rolled string splice only
@@ -202,6 +214,12 @@ func (m *Module) probePayload(
 		return "", "", "", "", false, rerr
 	}
 	defer resp.Close()
+	x := http.CaptureEvidence(resp)
+	for _, selected := range exchanges {
+		if selected != nil {
+			*selected = x.Clone()
+		}
+	}
 
 	headersStr := resp.HeadersString()
 	if nativeResp := resp.Response(); nativeResp != nil {
@@ -308,10 +326,15 @@ func (m *Module) confirmInjection(
 	ip httpmsg.InsertionPoint,
 	httpClient *http.Requester,
 	techniqueIdx int,
+	collectors ...*modkit.EvidenceCollector,
 ) (bool, error) {
 	return modkit.ConfirmReflection(2, func(canary string) (bool, error) {
 		p := buildHeaderPayloads(canary)[techniqueIdx]
-		_, _, _, _, found, perr := m.probePayload(ctx, ip, httpClient, p, canary, headerPatternFor(canary))
+		var x *evidencepkg.Exchange
+		_, _, _, _, found, perr := m.probePayload(ctx, ip, httpClient, p, canary, headerPatternFor(canary), &x)
+		for _, ev := range collectors {
+			ev.AddExchange(x, evidencepkg.RoleConfirmation, "fresh-canary CRLF reproduction")
+		}
 		return found, perr
 	})
 }

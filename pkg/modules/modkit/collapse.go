@@ -3,6 +3,7 @@ package modkit
 import (
 	"sort"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/output"
 )
 
@@ -86,11 +87,59 @@ func CollapseFindings(results []*output.ResultEvent, spec CollapseSpec) []*outpu
 			}
 			sort.SliceStable(scored, func(i, j int) bool { return scored[i].rank > scored[j].rank })
 			collector := NewEvidenceCollector()
+			// The survivor owns this emitted occurrence. Related selections must
+			// never introduce another primary when the executor stamps that occurrence.
+			g.primary.Evidence = evidence.CloneEntries(g.primary.Evidence)
+			hasPrimary := false
+			for _, entry := range g.primary.Evidence {
+				hasPrimary = hasPrimary || entry.Primary
+			}
+			if !hasPrimary {
+				// Typed supporting context must not hide a still-legacy primary.
+				legacy := NewEvidenceCollector().ForResult(g.primary.Request, g.primary.Response)
+				g.primary.Evidence = append(legacy, g.primary.Evidence...)
+			}
+			contextCount := 0
+			primarySeen := false
+			for i := range g.primary.Evidence {
+				entry := &g.primary.Evidence[i]
+				if entry.Primary && !primarySeen {
+					primarySeen = true
+				} else {
+					if entry.Primary && entry.Role == evidence.RoleAttack {
+						entry.Role = evidence.RoleConfirmation
+					}
+					entry.Primary = false
+					contextCount++
+				}
+			}
 			for _, s := range scored {
 				collector.Add(label(s.finding), s.finding.Request, s.finding.Response)
+				related := evidence.CloneEntries(s.finding.Evidence)
+				if len(related) == 0 {
+					// Legacy-only producers stay supplied/unknown; labels cannot
+					// upgrade their missing transport receipt or establish a role.
+					legacy := NewEvidenceCollector()
+					legacy.Add(label(s.finding), s.finding.Request, s.finding.Response)
+					related = legacy.Evidence()
+				}
+				for _, entry := range related {
+					if contextCount >= MaxEvidencePairs {
+						break
+					}
+					if entry.Primary && entry.Role == evidence.RoleAttack {
+						entry.Role = evidence.RoleConfirmation
+					}
+					entry.Primary = false
+					g.primary.Evidence = append(g.primary.Evidence, entry)
+					contextCount++
+				}
 			}
 			if ev := collector.Entries(); len(ev) > 0 {
-				g.primary.AdditionalEvidence = append(g.primary.AdditionalEvidence, ev...)
+				remaining := MaxEvidencePairs - len(g.primary.AdditionalEvidence)
+				if remaining > 0 {
+					g.primary.AdditionalEvidence = append(g.primary.AdditionalEvidence, ev[:min(len(ev), remaining)]...)
+				}
 			}
 		}
 		out = append(out, g.primary)

@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -52,11 +53,13 @@ var dimensions = []dimension{
 // length. full/raw are populated only for the first (reported) fetch of a variant;
 // the reproduction fetch is signature-only.
 type probe struct {
-	status  int
-	bodyLen int
-	full    string
-	raw     []byte
-	ok      bool
+	replay   *evidence.Exchange
+	exchange *evidence.Exchange
+	status   int
+	bodyLen  int
+	full     string
+	raw      []byte
+	ok       bool
 }
 
 // Module implements the Referer/User-Agent dependent-response scanner.
@@ -147,11 +150,12 @@ func (m *Module) testDimension(
 		return nil, false
 	}
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:      urlStr,
 		Matched:  urlStr,
 		Request:  string(a.raw),
 		Response: a.full,
+		Evidence: []evidence.Entry{evidence.Select(b.exchange, evidence.RoleControl, false, "variant B"), evidence.Select(a.replay, evidence.RoleConfirmation, false, "variant A replay"), evidence.Select(b.replay, evidence.RoleConfirmation, false, "variant B replay")},
 		AdditionalEvidence: []string{
 			output.BuildEvidence(d.header+" = "+d.descB, string(b.raw), b.full),
 		},
@@ -170,7 +174,9 @@ func (m *Module) testDimension(
 			Confidence: ModuleConfidence,
 			Tags:       ModuleTags,
 		},
-	}, false
+	}
+	modkit.SetPrimaryEvidence(result, a.exchange, evidence.RoleObservation, "selected observation")
+	return result, false
 }
 
 // stableVariant fetches header=value twice and reports whether the two responses match
@@ -186,10 +192,11 @@ func (m *Module) stableVariant(
 	if abort {
 		return probe{}, false, true
 	}
-	p2, abort := m.fetch(ctx, httpClient, header, value, false)
+	p2, abort := m.fetch(ctx, httpClient, header, value, true)
 	if abort {
 		return probe{}, false, true
 	}
+	p1.replay = p2.exchange
 	return p1, p1.ok && p2.ok && stable(p1, p2), false
 }
 
@@ -200,7 +207,7 @@ func (m *Module) fetch(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	header, value string,
-	evidence bool,
+	capture bool,
 ) (probe, bool) {
 	raw := ctx.Request().Raw()
 	var err error
@@ -230,8 +237,9 @@ func (m *Module) fetch(
 		bodyLen: len(resp.Body().String()),
 		ok:      true,
 	}
-	if evidence {
+	if capture {
 		p.full = resp.FullResponseString()
+		p.exchange = http.CaptureEvidence(resp)
 		p.raw = raw
 	}
 	return p, false

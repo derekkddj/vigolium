@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -55,11 +56,12 @@ var authHeadersToStrip = []string{
 }
 
 type observedResponse struct {
-	status int
-	body   string
-	full   string
-	cache  infra.CacheInfo
-	ok     bool
+	exchange *evidence.Exchange
+	status   int
+	body     string
+	full     string
+	cache    infra.CacheInfo
+	ok       bool
 }
 
 // Module implements the Web Cache Deception active scanner.
@@ -110,7 +112,8 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, httpClient *ht
 		return nil, nil
 	}
 
-	wildcard, _ := scanCtx.WildcardProbe(ctx, httpClient)
+	guardProof := modkit.NewEvidenceCollector()
+	wildcard, _ := scanCtx.WildcardProbeWithEvidence(ctx, httpClient, guardProof)
 	if wildcard.MatchesBody(baseline.StatusCode, baseline.Response.Body()) {
 		return nil, nil
 	}
@@ -134,7 +137,6 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, httpClient *ht
 	if pathErr != nil {
 		return nil, nil
 	}
-	baselineReqStr := string(ctx.Request().Raw())
 	baselineRespStr := string(baseline.Response.Raw())
 
 	for _, technique := range techniques {
@@ -172,23 +174,33 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, httpClient *ht
 		sev := severity.Low
 		name := "Authenticated Cache-Hit Candidate: " + technique.desc
 		description := fmt.Sprintf("The isolated confused path returned the protected baseline with %s to the authenticated client, but two credential-free attacker requests did not reproduce the protected content. This may be a private or per-user cache.", authedReplay.cache.Evidence)
-		additional := []string{
-			output.BuildEvidence("protected baseline", baselineReqStr, baselineRespStr),
-			output.BuildEvidence("authenticated cache prime", string(authRaw), prime.full),
-		}
 		if crossClientLeak {
 			kind = output.RecordKindFinding
 			grade = output.EvidenceGradeImpact
 			sev = ModuleSeverity
 			name = "Cross-Client Web Cache Deception: " + technique.desc
 			description = fmt.Sprintf("Two credential-free requests to the isolated confused path received the protected authenticated baseline, with shared-cache evidence (%s). This directly confirms cross-client disclosure.", firstNonEmptyCacheEvidence(attackerFirst.cache, attackerReplay.cache, authedReplay.cache))
-			additional = append(additional,
-				output.BuildEvidence("anonymous attacker replay 1", string(attackerRaw), attackerFirst.full),
-				output.BuildEvidence("anonymous attacker replay 2", string(attackerRaw), attackerReplay.full),
-			)
 		}
 
-		return []*output.ResultEvent{{
+		selected := authedReplay.exchange
+		ev := modkit.NewEvidenceCollector()
+		if baseline.Receipt != nil {
+			ev.AddExchange(baseline.Receipt, evidence.RoleBaseline, "protected baseline")
+		} else {
+			// A legacy supplied baseline without its receipt has no known sent request.
+			ev.AddBaseline("protected baseline", "", baselineRespStr)
+		}
+		ev.AddExchange(anonymousOriginal.exchange, evidence.RoleControl, "anonymous original")
+		ev.AddExchange(prime.exchange, evidence.RoleAttack, "cache prime")
+		if crossClientLeak {
+			selected = attackerFirst.exchange
+			ev.AddExchange(attackerReplay.exchange, evidence.RoleConfirmation, "anonymous replay")
+			ev.AddExchange(authedReplay.exchange, evidence.RoleConfirmation, "authenticated replay")
+		} else {
+			ev.AddExchange(attackerFirst.exchange, evidence.RoleControl, "anonymous attacker control")
+			ev.AddExchange(attackerReplay.exchange, evidence.RoleConfirmation, "anonymous attacker control replay")
+		}
+		result := &output.ResultEvent{
 			ModuleID:           ModuleID,
 			RecordKind:         kind,
 			EvidenceGrade:      grade,
@@ -197,7 +209,7 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, httpClient *ht
 			Matched:            urlx.String(),
 			Request:            string(authRaw),
 			Response:           authedReplay.full,
-			AdditionalEvidence: additional,
+			AdditionalEvidence: ev.Entries(),
 			ExtractedResults: []string{
 				"technique=" + technique.desc,
 				"confused_path=" + confusedPath,
@@ -211,7 +223,11 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, httpClient *ht
 				"isolated_cache_key":      probeID,
 				"normal_url_cache_primed": false,
 			},
-		}}, nil
+		}
+		result.Evidence = ev.Evidence()
+		modkit.SetPrimaryEvidence(result, selected, evidence.RoleAttack, "selected probe")
+		modkit.AppendEvidence(result, guardProof)
+		return []*output.ResultEvent{result}, nil
 	}
 	return nil, nil
 }
@@ -227,11 +243,12 @@ func fetchResponse(client *http.Requester, service *httpmsg.Service, raw []byte)
 	}
 	defer resp.Close()
 	return observedResponse{
-		status: resp.Response().StatusCode,
-		body:   resp.Body().String(),
-		full:   resp.FullResponseString(),
-		cache:  infra.CacheState(resp.Response().Header.Get),
-		ok:     true,
+		status:   resp.Response().StatusCode,
+		body:     resp.Body().String(),
+		full:     resp.FullResponseString(),
+		exchange: http.CaptureEvidence(resp),
+		cache:    infra.CacheState(resp.Response().Header.Get),
+		ok:       true,
 	}
 }
 

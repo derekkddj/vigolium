@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -271,7 +272,8 @@ func (m *Module) probeEndpoint(
 	// catch-all serves the same markers for a nonexistent sibling (a handler that
 	// 200s every child path). Root-level probes are covered by the random-path 404
 	// fingerprint above, so the sibling probe is a no-op for them.
-	matchedMarkers, ok := modkit.MatchAndConfirmSibling(ctx, httpClient, probePath, body, p.markers)
+	guardProof := modkit.NewEvidenceCollector()
+	matchedMarkers, ok := modkit.MatchAndConfirmSiblingWithEvidence(ctx, httpClient, probePath, body, p.markers, guardProof)
 	if !ok {
 		return nil, status
 	}
@@ -279,7 +281,7 @@ func (m *Module) probeEndpoint(
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,
 		Request:          string(modifiedRaw),
@@ -293,5 +295,8 @@ func (m *Module) probeEndpoint(
 			Tags:        []string{"spring", "java", "admin", "monitoring", "misconfiguration"},
 			Reference:   []string{"https://codecentric.github.io/spring-boot-admin/current/"},
 		},
-	}, status
+	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected endpoint response")
+	modkit.AppendEvidence(result, guardProof)
+	return result, status
 }

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect"
 
 	"github.com/vigolium/vigolium/pkg/output"
 	"go.uber.org/zap"
@@ -96,6 +97,16 @@ func migrateFindingRecordsTx(ctx context.Context, tx bun.Tx, survivorID int64, d
 	if len(dupIDs) == 0 {
 		return nil
 	}
+	if err := migrateFindingEvidenceTx(ctx, tx, survivorID, dupIDs); err != nil {
+		return fmt.Errorf("migrate selected finding evidence: %w", err)
+	}
+	if tx.Dialect().Name() == dialect.PG {
+		var id int64
+		if err := tx.NewSelect().Model((*Finding)(nil)).Column("id").
+			Where("id = ?", survivorID).For("UPDATE").Scan(ctx, &id); err != nil {
+			return err
+		}
+	}
 	for chunk := range slices.Chunk(dupIDs, SQLChunkSize) {
 		if _, err := tx.NewRaw(
 			`INSERT INTO finding_records (finding_id, record_uuid)
@@ -109,6 +120,20 @@ func migrateFindingRecordsTx(ctx context.Context, tx bun.Tx, survivorID int64, d
 			survivorID, bun.List(chunk), survivorID,
 		).Exec(ctx); err != nil {
 			return fmt.Errorf("failed to migrate finding_records to survivor: %w", err)
+		}
+		// Older imports may carry array-only soft refs. Preserve those too,
+		// then synchronize the survivor's compatibility array with the junction.
+		var dups []*Finding
+		if err := tx.NewSelect().Model(&dups).Column("http_record_uuids").
+			Where("id IN (?)", bun.List(chunk)).Order("id ASC").Scan(ctx); err != nil {
+			return err
+		}
+		var extra []string
+		for _, dup := range dups {
+			extra = mergeUniqueStrings(extra, dup.HTTPRecordUUIDs)
+		}
+		if _, err := syncFindingRecordRefs(ctx, tx, survivorID, extra); err != nil {
+			return fmt.Errorf("synchronize survivor record references: %w", err)
 		}
 	}
 	return nil
@@ -143,7 +168,7 @@ func (r *Repository) DeduplicateRecordsBySource(ctx context.Context, projectUUID
 	dupQuery := `
 		SELECT uuid FROM (
 			SELECT uuid, ROW_NUMBER() OVER (
-				PARTITION BY hostname, scheme, port, method, status_code, response_content_length, response_hash
+				PARTITION BY ` + recordCaptureStateSQL() + `, hostname, scheme, port, method, status_code, response_content_length, response_hash
 				ORDER BY LENGTH(path) ASC, created_at ASC
 			) AS rn
 			FROM http_records
@@ -200,12 +225,12 @@ func (r *Repository) DeduplicateSoftDeparosRecords(ctx context.Context, projectU
 		SELECT uuid FROM (
 			SELECT uuid,
 				ROW_NUMBER() OVER (
-					PARTITION BY hostname, scheme, port, method, status_code,
+					PARTITION BY `+recordCaptureStateSQL()+`, hostname, scheme, port, method, status_code,
 						response_words, response_content_type, %s
 					ORDER BY LENGTH(path) ASC, created_at ASC
 				) AS rn,
 				COUNT(*) OVER (
-					PARTITION BY hostname, scheme, port, method, status_code,
+					PARTITION BY `+recordCaptureStateSQL()+`, hostname, scheme, port, method, status_code,
 						response_words, response_content_type, %s
 				) AS group_size
 			FROM http_records
@@ -332,7 +357,7 @@ func (r *Repository) ApplyDeparosStatusPolicy(ctx context.Context, projectUUID s
 		collapseQuery := `
 			SELECT uuid FROM (
 				SELECT uuid, ROW_NUMBER() OVER (
-					PARTITION BY hostname, scheme, port, status_code
+					PARTITION BY ` + recordCaptureStateSQL() + `, hostname, scheme, port, status_code
 					ORDER BY LENGTH(path) ASC, created_at ASC
 				) AS rn
 				FROM http_records
@@ -355,7 +380,7 @@ func (r *Repository) ApplyDeparosStatusPolicy(ctx context.Context, projectUUID s
 		pathDupQuery := `
 			SELECT uuid FROM (
 				SELECT uuid, ROW_NUMBER() OVER (
-					PARTITION BY hostname, scheme, port, status_code, path
+					PARTITION BY ` + recordCaptureStateSQL() + `, hostname, scheme, port, status_code, path
 					ORDER BY created_at ASC
 				) AS rn
 				FROM http_records
@@ -387,7 +412,7 @@ func (r *Repository) ApplyDeparosStatusPolicy(ctx context.Context, projectUUID s
 			capQuery := `
 				SELECT uuid FROM (
 					SELECT uuid, status_code, DENSE_RANK() OVER (
-						PARTITION BY hostname, scheme, port, status_code
+						PARTITION BY ` + recordCaptureStateSQL() + `, hostname, scheme, port, status_code
 						ORDER BY LENGTH(path) ASC, path ASC
 					) AS pr
 					FROM http_records
@@ -442,7 +467,7 @@ func (r *Repository) DeduplicateDeparosByNormHash(ctx context.Context, projectUU
 	dupQuery := `
 		SELECT uuid FROM (
 			SELECT uuid, ROW_NUMBER() OVER (
-				PARTITION BY hostname, scheme, port, method, status_code, response_content_type, response_norm_hash
+				PARTITION BY ` + recordCaptureStateSQL() + `, hostname, scheme, port, method, status_code, response_content_type, response_norm_hash
 				ORDER BY LENGTH(path) ASC, created_at ASC
 			) AS rn
 			FROM http_records
@@ -1061,11 +1086,16 @@ func (r *Repository) GroupFindingsByValue(ctx context.Context, projectUUID strin
 			primary := buildEvidence(g.survivorRequest, g.survivorResponse)
 			mergedEvidence := appendUniqueEvidence(g.existingEvidence, primary, g.dupEvidence...)
 			upd := tx.NewUpdate().Model((*Finding)(nil)).Where("id = ?", g.survivorID)
+			hasUpdate := false
+			set := func(expr string, args ...any) {
+				upd = upd.Set(expr, args...)
+				hasUpdate = true
+			}
 			if len(mergedMatched) > 0 {
-				upd = upd.Set("matched_at = ?", mergedMatched)
+				set("matched_at = ?", mergedMatched)
 			}
 			if len(mergedEvidence) > 0 {
-				upd = upd.Set("additional_evidence = ?", mergedEvidence)
+				set("additional_evidence = ?", mergedEvidence)
 			}
 			// By-module/by-rule groups: merge the distinct extracted values onto the
 			// survivor (bounded by MaxURLs) and note the rollup in the description so
@@ -1076,7 +1106,7 @@ func (r *Repository) GroupFindingsByValue(ctx context.Context, projectUUID strin
 					mergedExtracted = mergedExtracted[:opts.MaxURLs]
 				}
 				if len(mergedExtracted) > 0 {
-					upd = upd.Set("extracted_results = ?", mergedExtracted)
+					set("extracted_results = ?", mergedExtracted)
 				}
 				// A Suspect bundle folds several DISTINCT generic rules under one
 				// survivor, so the survivor's own (single-rule) description would
@@ -1087,13 +1117,18 @@ func (r *Repository) GroupFindingsByValue(ctx context.Context, projectUUID strin
 					descBase = suspectBundleDescription
 				}
 				if desc := withGroupRollup(descBase, len(mergedMatched), len(mergedExtracted)); desc != "" {
-					upd = upd.Set("description = ?", desc)
+					set("description = ?", desc)
 				}
 			}
 			// A collapsed Suspect bundle folds many distinct rules into one survivor,
 			// so retitle it rather than leave it labeled with the first rule's name.
 			if g.suspectBundle {
-				upd = upd.Set("module_name = ?", suspectBundleFindingName)
+				set("module_name = ?", suspectBundleFindingName)
+			}
+			// Receipt-only findings may have no legacy fields to union. Their
+			// associations/history still migrate even when no UPDATE is needed.
+			if !hasUpdate {
+				continue
 			}
 			if _, err := upd.Exec(ctx); err != nil {
 				return fmt.Errorf("failed to update grouped survivor: %w", err)

@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -171,7 +172,7 @@ func (m *Module) testPayload(
 	payload nosqliPayload,
 	baselineBody string,
 	baselineStatus int,
-) (*output.ResultEvent, error) {
+) (finding *output.ResultEvent, resultErr error) {
 	var fuzzedValue string
 	if payload.detectType == detectAuthBypass || payload.detectType == detectSizeChange {
 		// Replace the entire value with the operator payload
@@ -216,6 +217,9 @@ func (m *Module) testPayload(
 		return nil, nil
 	}
 
+	ev := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(finding, ev) }()
+	ev.AddExchange(ctx.Evidence(), evidence.RoleBaseline, "input comparison")
 	var detected bool
 	var detectionDesc string
 	var detection string
@@ -231,7 +235,7 @@ func (m *Module) testPayload(
 	switch payload.detectType {
 	case detectAuthBypass:
 		if analyzeAuthBypass(baselineStatus, probeStatus) &&
-			m.confirmAuthBypass(ctx, ip, httpClient, fuzzedValue) {
+			m.confirmAuthBypass(ctx, ip, httpClient, fuzzedValue, ev) {
 			detected = true
 			detection = detectionAuthBypass
 			detectionDesc = fmt.Sprintf("Auth bypass: status changed from %d to %d", baselineStatus, probeStatus)
@@ -269,8 +273,8 @@ func (m *Module) testPayload(
 		// equivalent, and it is what fired on such a pool.
 		if baselineStatus >= 200 && baselineStatus < 300 && len(baselineBody) > 0 &&
 			analyzeSizeIncrease(len(baselineBody), len(body)) &&
-			m.confirmSizeIncrease(ctx, ip, httpClient, fuzzedValue, body) &&
-			!modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+			m.confirmSizeIncrease(ctx, ip, httpClient, fuzzedValue, body, ev) &&
+			!modkit.EndpointVolatileWithEvidence(scanCtx, ctx, httpClient, ev) {
 			detected = true
 			detection = detectionSizeChange
 			detectionDesc = fmt.Sprintf("Data exfiltration: body size increased from %d to %d bytes", len(baselineBody), len(body))
@@ -281,8 +285,10 @@ func (m *Module) testPayload(
 		return nil, nil
 	}
 
-	ev := modkit.NewEvidenceCollector()
-	ev.Add("baseline", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
+	selectedExchange := http.CaptureEvidence(resp)
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, selectedExchange, evidence.RoleAttack, "operator mutation")
+	}()
 
 	urlx, _ := ctx.URL()
 	return &output.ResultEvent{
@@ -293,6 +299,7 @@ func (m *Module) testPayload(
 		FuzzingParameter:   ip.Name(),
 		ExtractedResults:   []string{payload.value},
 		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
 		Info: output.Info{
 			Name:        "NoSQL Operator Injection",
 			Description: fmt.Sprintf("%s — %s via parameter %q", detectionDesc, payload.desc, ip.Name()),
@@ -333,10 +340,14 @@ func (m *Module) confirmAuthBypass(
 	ip httpmsg.InsertionPoint,
 	httpClient *http.Requester,
 	payloadValue string,
+	collectors ...*modkit.EvidenceCollector,
 ) bool {
 	const rounds = 2
 	for range rounds {
-		baseStatus, baseBlocked, err := m.freshStatus(ctx, ip, httpClient, ip.BaseValue())
+		baseStatus, baseBlocked, baseExchange, err := m.freshStatusEvidence(ctx, ip, httpClient, ip.BaseValue())
+		for _, ev := range collectors {
+			ev.AddExchange(baseExchange, evidence.RoleControl, "original-value denial control")
+		}
 		if err != nil {
 			return true // fail open on transport error
 		}
@@ -352,7 +363,10 @@ func (m *Module) confirmAuthBypass(
 		// (length/entropy tripping a WAF), not on operator interpretation — the
 		// operator is not the discriminator, so the 401/403→2xx transition is not
 		// a NoSQL auth bypass.
-		ctrlStatus, ctrlBlocked, err := m.freshStatus(ctx, ip, httpClient, benignProbeSuffix)
+		ctrlStatus, ctrlBlocked, ctrlExchange, err := m.freshStatusEvidence(ctx, ip, httpClient, benignProbeSuffix)
+		for _, ev := range collectors {
+			ev.AddExchange(ctrlExchange, evidence.RoleControl, "operator-free denial control")
+		}
 		if err != nil {
 			return true
 		}
@@ -360,7 +374,10 @@ func (m *Module) confirmAuthBypass(
 			return false // benign non-operator value allowed → not operator-attributable
 		}
 
-		probeStatus, probeBlocked, err := m.freshStatus(ctx, ip, httpClient, payloadValue)
+		probeStatus, probeBlocked, probeExchange, err := m.freshStatusEvidence(ctx, ip, httpClient, payloadValue)
+		for _, ev := range collectors {
+			ev.AddExchange(probeExchange, evidence.RoleConfirmation, "operator bypass reproduction")
+		}
 		if err != nil {
 			return true
 		}
@@ -382,22 +399,28 @@ func (m *Module) freshStatus(
 	httpClient *http.Requester,
 	value string,
 ) (status int, edgeBlocked bool, err error) {
+	status, edgeBlocked, _, err = m.freshStatusEvidence(ctx, ip, httpClient, value)
+	return
+}
+
+func (m *Module) freshStatusEvidence(ctx *httpmsg.HttpRequestResponse, ip httpmsg.InsertionPoint, httpClient *http.Requester, value string) (status int, edgeBlocked bool, exchange *evidence.Exchange, err error) {
 	// BuildRequest produces well-formed raw, so wrap directly instead
 	// of re-parsing on this hot path.
 	req := httpmsg.NewRequestResponseRaw(ip.BuildRequest([]byte(value)), ctx.Service())
 	resp, _, err := httpClient.Execute(req, http.Options{NoClustering: true})
 	if err != nil {
-		return 0, false, err
+		return 0, false, nil, err
 	}
 	defer resp.Close()
+	exchange = http.CaptureEvidence(resp)
 	// A vendor-identified edge block is detected before reading the status so a
 	// blocked 403/429 is never mistaken for an application denial. Validate flags
 	// only vendor WAF/CDN blocks and challenges, not a plain app 401/403.
 	edgeBlocked = infra.GetBlockDetectionValidator().Validate(resp) != nil
 	if resp.Response() == nil {
-		return 0, edgeBlocked, nil
+		return 0, edgeBlocked, exchange, nil
 	}
-	return resp.Response().StatusCode, edgeBlocked, nil
+	return resp.Response().StatusCode, edgeBlocked, exchange, nil
 }
 
 // confirmSizeIncrease re-confirms a detectSizeChange hit by checking the body
@@ -426,11 +449,15 @@ func (m *Module) confirmSizeIncrease(
 	httpClient *http.Requester,
 	payloadValue string,
 	firstProbeBody string,
+	collectors ...*modkit.EvidenceCollector,
 ) bool {
 	maxClean := 0
 	var cleanBody string
 	for i := 0; i < 2; i++ {
-		_, body, blocked, err := m.measureDuration(ctx, ip, httpClient, ip.BaseValue())
+		_, body, blocked, x, err := m.measureDurationEvidence(ctx, ip, httpClient, ip.BaseValue())
+		for _, ev := range collectors {
+			ev.AddExchange(x, evidence.RoleControl, "clean size control")
+		}
 		if err != nil {
 			return false // fail closed: cannot reproduce a clean baseline
 		}
@@ -452,7 +479,10 @@ func (m *Module) confirmSizeIncrease(
 		return false
 	}
 
-	_, probeBody, _, err := m.measureDuration(ctx, ip, httpClient, payloadValue)
+	_, probeBody, _, x, err := m.measureDurationEvidence(ctx, ip, httpClient, payloadValue)
+	for _, ev := range collectors {
+		ev.AddExchange(x, evidence.RoleConfirmation, "size mutation reproduction")
+	}
 	if err != nil {
 		return false // fail closed
 	}
@@ -480,8 +510,11 @@ func (m *Module) testTimeBasedPayload(
 	ip httpmsg.InsertionPoint,
 	httpClient *http.Requester,
 	payload nosqliPayload,
-) (*output.ResultEvent, error) {
-	baselineDuration, _, baselineBlocked, err := m.measureDuration(ctx, ip, httpClient, ip.BaseValue())
+) (finding *output.ResultEvent, resultErr error) {
+	baselineDuration, _, baselineBlocked, baselineExchange, err := m.measureDurationEvidence(ctx, ip, httpClient, ip.BaseValue())
+	ev := modkit.NewEvidenceCollector()
+	ev.AddExchange(baselineExchange, evidence.RoleBaseline, "fresh timing baseline")
+	var primary *evidence.Exchange
 	if err != nil {
 		return nil, err
 	}
@@ -503,31 +536,32 @@ func (m *Module) testTimeBasedPayload(
 	// probe measures one sleep magnitude, reporting whether the response is unusable
 	// as a timing sample (a WAF/CDN block or a NoSQL error surface, on which latency
 	// proves nothing).
-	probe := func(value string) (dur time.Duration, unusable bool, err error) {
-		d, body, blocked, err := m.measureDuration(ctx, ip, httpClient, value)
+	probe := func(value string, role evidence.Role, label string) (dur time.Duration, unusable bool, exchange *evidence.Exchange, err error) {
+		d, body, blocked, x, err := m.measureDurationEvidence(ctx, ip, httpClient, value)
 		if err != nil {
-			return 0, false, err
+			return 0, false, nil, err
 		}
-		return d, blocked || containsNoSQLError(body), nil
+		ev.AddExchange(x, role, label)
+		return d, blocked || containsNoSQLError(body), x, nil
 	}
 
 	var lastControl, lastLow, lastHigh time.Duration
 	for i := 0; i < timeBasedConfirmationRounds; i++ {
-		control, bad, err := probe(controlVal)
+		control, bad, _, err := probe(controlVal, evidence.RoleControl, "no-sleep timing control")
 		if err != nil {
 			return nil, err
 		}
 		if bad {
 			return nil, nil
 		}
-		low, bad, err := probe(lowVal)
+		low, bad, _, err := probe(lowVal, evidence.RoleAttack, "low-sleep timing mutation")
 		if err != nil {
 			return nil, err
 		}
 		if bad {
 			return nil, nil
 		}
-		high, bad, err := probe(highVal)
+		high, bad, highExchange, err := probe(highVal, evidence.RoleConfirmation, "high-sleep scaling confirmation")
 		if err != nil {
 			return nil, err
 		}
@@ -549,10 +583,14 @@ func (m *Module) testTimeBasedPayload(
 			return nil, nil
 		}
 		lastControl, lastLow, lastHigh = control, low, high
+		if primary == nil {
+			primary = highExchange
+		}
 	}
 
-	ev := modkit.NewEvidenceCollector()
-	ev.Add("baseline", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, primary, evidence.RoleConfirmation, "scaled high-sleep proof")
+	}()
 
 	urlx, _ := ctx.URL()
 	return &output.ResultEvent{
@@ -562,6 +600,7 @@ func (m *Module) testTimeBasedPayload(
 		FuzzingParameter:   ip.Name(),
 		ExtractedResults:   []string{whereSleep(timeBasedHighMs), whereSleep(timeBasedControlMs)},
 		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
 		Info: output.Info{
 			Name: "NoSQL Operator Injection",
 			Description: fmt.Sprintf(
@@ -608,6 +647,11 @@ func (m *Module) measureDuration(
 	httpClient *http.Requester,
 	value string,
 ) (time.Duration, string, bool, error) {
+	d, body, blocked, _, err := m.measureDurationEvidence(ctx, ip, httpClient, value)
+	return d, body, blocked, err
+}
+
+func (m *Module) measureDurationEvidence(ctx *httpmsg.HttpRequestResponse, ip httpmsg.InsertionPoint, httpClient *http.Requester, value string) (time.Duration, string, bool, *evidence.Exchange, error) {
 	raw := ip.BuildRequest([]byte(value))
 	// BuildRequest produces well-formed raw, so wrap directly instead
 	// of re-parsing on this hot path.
@@ -617,12 +661,13 @@ func (m *Module) measureDuration(
 	// identical timing probes both reach the server.
 	resp, duration, err := modkit.SendTimed(httpClient, req, http.Options{})
 	if err != nil {
-		return 0, "", false, err
+		return 0, "", false, nil, err
 	}
 	body := resp.Body().String()
 	blocked := infra.IsBlockedResponse(resp)
+	x := http.CaptureEvidence(resp)
 	resp.Close()
-	return duration, body, blocked, nil
+	return duration, body, blocked, x, nil
 }
 
 // boolSample is one probe of a boolean-diff condition, carrying the signals the
@@ -634,6 +679,13 @@ type boolSample struct {
 	blocked  bool // WAF/CDN/auth/rate-limit page — not the application
 	binary   bool // non-text body (image/font/archive) — text diff is meaningless
 	nosqlErr bool // NoSQL driver error — defer to nosqli_error_based
+	exchange *evidence.Exchange
+}
+
+// booleanReceipts retains the first actual execution of each scheduled condition,
+// independently of the body-only comparison slices.
+type booleanReceipts struct {
+	trueExchange, falseExchange, neutralExchange *evidence.Exchange
 }
 
 // testBooleanDiff tests structurally-matched always-true / always-false payload
@@ -658,15 +710,17 @@ func (m *Module) testBooleanDiff(
 	ip httpmsg.InsertionPoint,
 	httpClient *http.Requester,
 	baselineBody string,
-) (*output.ResultEvent, error) {
+) (finding *output.ResultEvent, resultErr error) {
 	// #4 surface gate — header/size only, sends no traffic.
 	if modkit.DifferentialSurfaceUnreliable(ctx.Response()) {
 		return nil, nil
 	}
 
 	// #5 relevance precheck for path-segment / header insertion points.
+	precheckProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(finding, precheckProof) }()
 	if pathOrHeaderInsertionTypes.Contains(ip.Type()) {
-		inert, err := m.insertionPointIsInert(ctx, ip, httpClient, baselineBody)
+		inert, err := m.insertionPointIsInert(ctx, ip, httpClient, baselineBody, precheckProof)
 		if err != nil {
 			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
 				return nil, err
@@ -680,8 +734,9 @@ func (m *Module) testBooleanDiff(
 	order := interleavedProbeOrder3(boolTrueSamples, boolFalseSamples, boolNeutralSamples)
 
 	for _, pair := range booleanDiffPairs {
+		var initial, secondary booleanReceipts
 		trueBodies, falseBodies, neutralBodies, outcome, err := m.runBooleanProbeSet(
-			ctx, ip, httpClient, order, pair.truePayload, pair.falsePayload)
+			ctx, ip, httpClient, order, pair.truePayload, pair.falsePayload, &initial)
 		if err != nil {
 			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
 				return nil, err
@@ -704,7 +759,7 @@ func (m *Module) testBooleanDiff(
 		// fluke (cache miss, round-robin upstream, momentary variant), not a boolean
 		// oracle that flips the response for every constant.
 		secTrue, secFalse, secNeutral, secOutcome, secErr := m.runBooleanProbeSet(
-			ctx, ip, httpClient, order, pair.secTruePayload, pair.secFalsePayload)
+			ctx, ip, httpClient, order, pair.secTruePayload, pair.secFalsePayload, &secondary)
 		if secErr != nil {
 			if errors.Is(secErr, hosterrors.ErrUnresponsiveHost) {
 				return nil, secErr
@@ -716,17 +771,17 @@ func (m *Module) testBooleanDiff(
 			continue
 		}
 
-		trueReq := string(ip.BuildRequest([]byte(ip.BaseValue() + pair.truePayload)))
-		falseReq := string(ip.BuildRequest([]byte(ip.BaseValue() + pair.falsePayload)))
-		secTrueReq := string(ip.BuildRequest([]byte(ip.BaseValue() + pair.secTruePayload)))
-		secFalseReq := string(ip.BuildRequest([]byte(ip.BaseValue() + pair.secFalsePayload)))
-
+		trueReq := string(initial.trueExchange.Request)
 		ev := modkit.NewEvidenceCollector()
-		ev.Add("baseline", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
-		ev.Add("true-payload", trueReq, trueBodies[0])
-		ev.Add("false-payload", falseReq, falseBodies[0])
-		ev.Add("recheck-true-payload", secTrueReq, secTrue[0])
-		ev.Add("recheck-false-payload", secFalseReq, secFalse[0])
+		ev.AddExchange(ctx.Evidence(), evidence.RoleBaseline, "input comparison")
+		ev.AddExchange(initial.falseExchange, evidence.RoleControl, "false-payload")
+		ev.AddExchange(initial.neutralExchange, evidence.RoleControl, "operator-free cadence control")
+		ev.AddExchange(secondary.trueExchange, evidence.RoleConfirmation, "recheck-true-payload")
+		ev.AddExchange(secondary.falseExchange, evidence.RoleControl, "recheck-false-payload")
+		ev.AddExchange(secondary.neutralExchange, evidence.RoleControl, "recheck cadence control")
+		defer func() {
+			modkit.SetPrimaryEvidence(finding, initial.trueExchange, evidence.RoleAttack, "boolean true condition")
+		}()
 
 		urlx, _ := ctx.URL()
 		return &output.ResultEvent{
@@ -736,6 +791,7 @@ func (m *Module) testBooleanDiff(
 			FuzzingParameter:   ip.Name(),
 			ExtractedResults:   []string{pair.truePayload, pair.falsePayload},
 			AdditionalEvidence: ev.Entries(),
+			Evidence:           ev.Evidence(),
 			Info: output.Info{
 				Name: "NoSQL Boolean-based Injection",
 				Description: fmt.Sprintf(
@@ -812,6 +868,7 @@ func (m *Module) runBooleanProbeSet(
 	httpClient *http.Requester,
 	order []probeCond,
 	truePayload, falsePayload string,
+	receipts ...*booleanReceipts,
 ) (trueBodies, falseBodies, neutralBodies []string, outcome probeOutcome, err error) {
 	for _, cond := range order {
 		suffix := benignProbeSuffix
@@ -845,6 +902,25 @@ func (m *Module) runBooleanProbeSet(
 		if s.status < 200 || s.status >= 300 {
 			return nil, nil, nil, probeSkipPair, nil
 		}
+		for _, selected := range receipts {
+			if selected == nil {
+				continue
+			}
+			switch cond {
+			case condTrue:
+				if selected.trueExchange == nil {
+					selected.trueExchange = s.exchange.Clone()
+				}
+			case condFalse:
+				if selected.falseExchange == nil {
+					selected.falseExchange = s.exchange.Clone()
+				}
+			case condNeutral:
+				if selected.neutralExchange == nil {
+					selected.neutralExchange = s.exchange.Clone()
+				}
+			}
+		}
 		switch cond {
 		case condTrue:
 			trueBodies = append(trueBodies, s.body)
@@ -869,11 +945,15 @@ func (m *Module) insertionPointIsInert(
 	ip httpmsg.InsertionPoint,
 	httpClient *http.Requester,
 	baselineBody string,
+	collectors ...*modkit.EvidenceCollector,
 ) (bool, error) {
 	if baselineBody == "" {
 		return false, nil
 	}
 	s, err := m.probeBoolean(ctx, ip, httpClient, benignProbeSuffix)
+	for _, proof := range collectors {
+		proof.AddExchange(s.exchange, evidence.RoleControl, "benign insertion-point relevance precheck")
+	}
 	if err != nil {
 		return false, err
 	}
@@ -912,11 +992,11 @@ func (m *Module) probeBoolean(
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoClustering: true})
 	if err != nil {
-		return boolSample{}, err
+		return boolSample{exchange: http.CaptureFailureEvidence(err)}, err
 	}
 	defer resp.Close()
 
-	s := boolSample{blocked: infra.IsBlockedResponse(resp)}
+	s := boolSample{blocked: infra.IsBlockedResponse(resp), exchange: http.CaptureEvidence(resp)}
 	if resp.Response() != nil {
 		s.status = resp.Response().StatusCode
 		s.binary = isBinaryContentType(resp.Response().Header.Get("Content-Type"))

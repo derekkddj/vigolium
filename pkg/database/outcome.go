@@ -8,8 +8,9 @@ import (
 )
 
 // PersistenceOutcome is what a writer can say, after shutdown, about writes it
-// accepted. Committed+Failed+Unknown == Accepted. Unknown = still queued or in
-// flight when the close deadline passed: it may or may not have landed.
+// accepted or rejected. Committed+Failed+Unknown == Accepted; Rejected is outside
+// that invariant because the writer never accepted those persistence requests.
+// Unknown = still queued or in flight at shutdown: it may or may not have landed.
 //
 // The distinction between Failed and Unknown is the point. Before this existed,
 // Close() returned nothing: a writer that drained cleanly, a writer that lost a
@@ -21,8 +22,9 @@ import (
 type PersistenceOutcome struct {
 	Writer    string `json:"writer"` // "records" | "findings" | "mixed"
 	Accepted  int64  `json:"accepted"`
-	Committed int64  `json:"committed"` // persisted, or deduplicated onto an existing row
-	Failed    int64  `json:"failed,omitempty"`
+	Committed int64  `json:"committed"`          // persisted, or deduplicated onto an existing row
+	Failed    int64  `json:"failed,omitempty"`   // accepted but known not to have persisted
+	Rejected  int64  `json:"rejected,omitempty"` // refused before acceptance; known persistence loss
 	Unknown   int64  `json:"unknown,omitempty"`
 	TimedOut  bool   `json:"timed_out,omitempty"`
 }
@@ -41,9 +43,12 @@ const (
 	PersistenceWriterMixed    = "mixed"
 )
 
-// Clean reports whether everything the writer accepted reached a known-good end.
-// A clean outcome is the only one a caller may report as an unqualified success.
-func (o PersistenceOutcome) Clean() bool { return o.Failed == 0 && o.Unknown == 0 }
+// Clean reports whether no persistence request was rejected and everything the
+// writer accepted reached a known-good end. A clean outcome is the only one a
+// caller may report as an unqualified success.
+func (o PersistenceOutcome) Clean() bool {
+	return o.Rejected == 0 && o.Failed == 0 && o.Unknown == 0
+}
 
 // Merge folds p into o, so a phase that shuts down several writers can report one
 // number. The writer label collapses to "mixed" once two different writers are
@@ -58,6 +63,7 @@ func (o *PersistenceOutcome) Merge(p PersistenceOutcome) {
 	o.Accepted += p.Accepted
 	o.Committed += p.Committed
 	o.Failed += p.Failed
+	o.Rejected += p.Rejected
 	o.Unknown += p.Unknown
 	o.TimedOut = o.TimedOut || p.TimedOut
 }

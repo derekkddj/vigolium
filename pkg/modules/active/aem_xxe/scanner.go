@@ -88,6 +88,7 @@ func (m *Module) ScanPerHost(
 // round and confirms the parser EXPANDS it (marker appears, the literal entity
 // reference &xxe; does not) rather than merely echoing the payload back.
 func (m *Module) probe(ctx *httpmsg.HttpRequestResponse, client *http.Requester, path, baseURL string) *output.ResultEvent {
+	proof := &aem.Proof{}
 	expanded, err := modkit.ConfirmReflectionWithValue(confirmRounds, modkit.FreshCanary, func(marker string) (bool, error) {
 		res := aem.Post(ctx, client, path, xxeBody(marker), map[string]string{
 			"Content-Type": "application/x-www-form-urlencoded",
@@ -105,12 +106,21 @@ func (m *Module) probe(ctx *httpmsg.HttpRequestResponse, client *http.Requester,
 		if strings.Contains(res.Body, "vigent") {
 			return false, nil
 		}
-		return strings.Contains(res.Body, marker), nil
+		if !strings.Contains(res.Body, marker) {
+			return false, nil
+		}
+		if proof.Primary == nil {
+			proof.Primary = res.Exchange
+			proof.Payload = xxeBody(marker)
+		} else {
+			proof.Confirmation(res)
+		}
+		return true, nil
 	})
 	if err != nil || !expanded {
 		return nil
 	}
-	return m.build(path, baseURL)
+	return m.build(path, baseURL, proof)
 }
 
 // xxeBody builds the guideState form body carrying an internal-entity XML that
@@ -122,9 +132,9 @@ func xxeBody(marker string) string {
 	return "guideState=" + url.QueryEscape(guideState)
 }
 
-func (m *Module) build(path, baseURL string) *output.ResultEvent {
+func (m *Module) build(path, baseURL string, proof *aem.Proof) *output.ResultEvent {
 	matchedURL := baseURL + path
-	return &output.ResultEvent{
+	return proof.Attack(&output.ResultEvent{
 		ModuleID:      ModuleID,
 		Host:          aem.HostFromBase(baseURL),
 		URL:           matchedURL,
@@ -148,5 +158,5 @@ func (m *Module) build(path, baseURL string) *output.ResultEvent {
 				"https://github.com/0ang3el/aem-hacker",
 			},
 		},
-	}
+	})
 }

@@ -35,12 +35,13 @@ func gzipBytes(t *testing.T, s string) []byte {
 // schema, and the finding→traffic cross-link.
 func TestWriteFSExport(t *testing.T) {
 	ctx := context.Background()
-	db := newExportTestDB(t)
+	db := newDBAtPath(t, ":memory:")
 
 	// alpha: https record with a gzip-encoded body + a linked High finding.
 	gzBody := gzipBytes(t, "<html>HELLO-DECODED</html>")
 	_, err := db.NewInsert().Model(&database.HTTPRecord{
 		UUID:                "rec-alpha",
+		ProjectUUID:         database.DefaultProjectUUID,
 		Scheme:              "https",
 		Hostname:            "alpha.example",
 		Port:                443,
@@ -59,6 +60,7 @@ func TestWriteFSExport(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, database.NewRepository(db).SaveFindingDirect(ctx, &database.Finding{
+		ProjectUUID:     database.DefaultProjectUUID,
 		HTTPRecordUUIDs: []string{"rec-alpha"},
 		ModuleID:        "broken-auth",
 		ModuleName:      "Broken Authentication",
@@ -75,6 +77,7 @@ func TestWriteFSExport(t *testing.T) {
 	// bravo: a second host with no finding, to assert finding:null + host count.
 	_, err = db.NewInsert().Model(&database.HTTPRecord{
 		UUID:        "rec-bravo",
+		ProjectUUID: database.DefaultProjectUUID,
 		Scheme:      "http",
 		Hostname:    "bravo.example",
 		Port:        80,
@@ -143,10 +146,12 @@ func TestWriteFSExport(t *testing.T) {
 	md := string(mdData)
 	assert.Contains(t, md, "# HIGH — Broken Authentication")
 	assert.Contains(t, md, "../../out-traffic/alpha.example/0001.req")
-	assert.Contains(t, md, "## Request")
+	assert.Contains(t, md, "### Linked request — role unknown (not proof)")
+	assert.NotContains(t, md, "\n## Request\n", "linked traffic is not primary proof")
 	assert.Contains(t, md, "GET /alpha HTTP/1.1", "raw request must be embedded inline")
 	assert.NotContains(t, md, "@target", "the synthetic @target marker line must be stripped from the inline request")
-	assert.Contains(t, md, "## Response")
+	assert.Contains(t, md, "### Linked response — role unknown (not proof)")
+	assert.NotContains(t, md, "\n## Response\n", "linked traffic is not primary proof")
 	assert.Contains(t, md, "<html>HELLO-DECODED</html>", "decoded response body must be embedded inline")
 
 	// findings index.json links to the traffic path.
@@ -167,12 +172,13 @@ func TestWriteFSExport(t *testing.T) {
 // and is not.
 func TestWriteFSExportUUIDBoundsFindings(t *testing.T) {
 	ctx := context.Background()
-	db := newExportTestDB(t)
+	db := newDBAtPath(t, ":memory:")
 	repo := database.NewRepository(db)
 
 	for _, host := range []string{"alpha", "bravo"} {
 		_, err := db.NewInsert().Model(&database.HTTPRecord{
 			UUID:        "rec-" + host,
+			ProjectUUID: database.DefaultProjectUUID,
 			Scheme:      "https",
 			Hostname:    host + ".example",
 			Port:        443,
@@ -189,6 +195,7 @@ func TestWriteFSExportUUIDBoundsFindings(t *testing.T) {
 		require.NoError(t, err)
 
 		require.NoError(t, repo.SaveFindingDirect(ctx, &database.Finding{
+			ProjectUUID:     database.DefaultProjectUUID,
 			HTTPRecordUUIDs: []string{"rec-" + host},
 			ModuleID:        "mod-" + host,
 			ModuleName:      "Module " + host,
@@ -223,7 +230,7 @@ func TestWriteFSExportUUIDBoundsFindings(t *testing.T) {
 // TestWriteFSExportOmitResponse drops the .resp.* files but keeps .req + index.
 func TestWriteFSExportOmitResponse(t *testing.T) {
 	ctx := context.Background()
-	db := newExportTestDB(t)
+	db := newDBAtPath(t, ":memory:")
 	seedRecordWithBodies(t, db, "alpha")
 
 	base := filepath.Join(t.TempDir(), "out")
@@ -266,12 +273,14 @@ func readJSON(t *testing.T, path string, v any) {
 	require.NoError(t, json.Unmarshal(data, v))
 }
 
-// fsSeedRecord inserts one minimal record, optionally with a response body.
+// fsSeedRecord inserts one minimal record in the default project, optionally
+// with a response body. Direct inserts do not apply repository project defaults.
 func fsSeedRecord(t *testing.T, db *database.DB, uuid, host, path, body string) {
 	t.Helper()
 	resp := []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n" + body)
 	_, err := db.NewInsert().Model(&database.HTTPRecord{
 		UUID:        uuid,
+		ProjectUUID: database.DefaultProjectUUID,
 		Scheme:      "https",
 		Hostname:    host,
 		Port:        443,
@@ -306,7 +315,7 @@ func fsStagingLeftovers(t *testing.T, base string) []string {
 // that disagreed with its own contents.
 func TestFSExportReexportRemovesStaleFiles(t *testing.T) {
 	ctx := context.Background()
-	db := newExportTestDB(t)
+	db := newDBAtPath(t, ":memory:")
 	for i, name := range []string{"a", "b", "c"} {
 		fsSeedRecord(t, db, "rec-"+name, "alpha.example", fmt.Sprintf("/%d", i), "body-"+name)
 	}
@@ -336,7 +345,7 @@ func TestFSExportReexportRemovesStaleFiles(t *testing.T) {
 // describe this one.
 func TestFSExportEmptyReplacesStaleTrees(t *testing.T) {
 	ctx := context.Background()
-	db := newExportTestDB(t)
+	db := newDBAtPath(t, ":memory:")
 	fsSeedRecord(t, db, "rec-a", "alpha.example", "/a", "body-a")
 
 	base := filepath.Join(t.TempDir(), "out")
@@ -361,7 +370,7 @@ func TestFSExportEmptyReplacesStaleTrees(t *testing.T) {
 // summary's "Nothing to export" is literally true.
 func TestFSExportFreshEmptyCreatesNothing(t *testing.T) {
 	ctx := context.Background()
-	db := newExportTestDB(t)
+	db := newDBAtPath(t, ":memory:")
 
 	dir := t.TempDir()
 	base := filepath.Join(dir, "out")
@@ -379,7 +388,7 @@ func TestFSExportFreshEmptyCreatesNothing(t *testing.T) {
 // worth an error. Deleting their files is not a reasonable way to report it.
 func TestFSExportRefusesForeignDir(t *testing.T) {
 	ctx := context.Background()
-	db := newExportTestDB(t)
+	db := newDBAtPath(t, ":memory:")
 	fsSeedRecord(t, db, "rec-a", "alpha.example", "/a", "body-a")
 
 	dir := t.TempDir()
@@ -402,9 +411,10 @@ func TestFSExportRefusesForeignDir(t *testing.T) {
 // findings tree in place and says that traffic was already updated.
 func TestFSExportFailureKeepsPrevious(t *testing.T) {
 	ctx := context.Background()
-	db := newExportTestDB(t)
+	db := newDBAtPath(t, ":memory:")
 	fsSeedRecord(t, db, "rec-a", "alpha.example", "/a", "body-a")
 	require.NoError(t, database.NewRepository(db).SaveFindingDirect(ctx, &database.Finding{
+		ProjectUUID:     database.DefaultProjectUUID,
 		HTTPRecordUUIDs: []string{"rec-a"},
 		ModuleID:        "mod-a",
 		ModuleName:      "Module A",
@@ -439,7 +449,7 @@ func TestFSExportFailureKeepsPrevious(t *testing.T) {
 // re-inherited the previous generation's body at the same host/id.
 func TestFSExportNoStaleBodyInFinding(t *testing.T) {
 	ctx := context.Background()
-	db := newExportTestDB(t)
+	db := newDBAtPath(t, ":memory:")
 	fsSeedRecord(t, db, "rec-a", "alpha.example", "/a", "SECRET-FROM-RUN-ONE")
 
 	base := filepath.Join(t.TempDir(), "out")
@@ -453,6 +463,7 @@ func TestFSExportNoStaleBodyInFinding(t *testing.T) {
 	require.NoError(t, err)
 	fsSeedRecord(t, db, "rec-b", "alpha.example", "/b", "")
 	require.NoError(t, database.NewRepository(db).SaveFindingDirect(ctx, &database.Finding{
+		ProjectUUID:     database.DefaultProjectUUID,
 		HTTPRecordUUIDs: []string{"rec-b"},
 		ModuleID:        "mod-b",
 		ModuleName:      "Module B",
@@ -479,7 +490,7 @@ func TestFSExportNoStaleBodyInFinding(t *testing.T) {
 // always has an index.json, and a half-made one has nothing worth keeping).
 func TestFSExportPublishesOverAnEmptyDir(t *testing.T) {
 	ctx := context.Background()
-	db := newExportTestDB(t)
+	db := newDBAtPath(t, ":memory:")
 	fsSeedRecord(t, db, "rec-a", "alpha.example", "/a", "body-a")
 
 	base := filepath.Join(t.TempDir(), "out")
@@ -495,7 +506,7 @@ func TestFSExportPublishesOverAnEmptyDir(t *testing.T) {
 // does — but only once it is old enough not to be a live concurrent export.
 func TestFSExportSweepsAbandonedStagingTrees(t *testing.T) {
 	ctx := context.Background()
-	db := newExportTestDB(t)
+	db := newDBAtPath(t, ":memory:")
 	fsSeedRecord(t, db, "rec-a", "alpha.example", "/a", "body-a")
 
 	dir := t.TempDir()
@@ -521,7 +532,7 @@ func TestFSExportSweepsAbandonedStagingTrees(t *testing.T) {
 // directories inside stayed 0755.
 func TestFSExportRootKeepsDirectoryMode(t *testing.T) {
 	ctx := context.Background()
-	db := newExportTestDB(t)
+	db := newDBAtPath(t, ":memory:")
 	fsSeedRecord(t, db, "rec-a", "alpha.example", "/a", "body-a")
 
 	base := filepath.Join(t.TempDir(), "out")

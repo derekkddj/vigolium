@@ -2,7 +2,9 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -103,15 +105,22 @@ func (r *Repository) aggregateScanFindings(ctx context.Context, scanUUID string)
 
 // queryScanFindings is aggregateScanFindings with the query error reported.
 func (r *Repository) queryScanFindings(ctx context.Context, scanUUID string) (scanSeverityCounts, error) {
+	return r.queryScanFindingsForProject(ctx, scanUUID, "")
+}
+
+func (r *Repository) queryScanFindingsForProject(ctx context.Context, scanUUID, projectUUID string) (scanSeverityCounts, error) {
 	var rows []SeverityCount
-	err := r.db.NewSelect().
+	q := r.db.NewSelect().
 		TableExpr("findings").
 		ColumnExpr("severity").
 		ColumnExpr("COUNT(*) AS count").
 		Where("(scan_uuid = ? OR EXISTS (SELECT 1 FROM finding_observations o WHERE o.finding_id = findings.id AND o.scan_uuid = ?))", scanUUID, scanUUID).
 		Where("(record_kind IS NULL OR record_kind = '' OR record_kind = ?)", RecordKindFinding).
-		GroupExpr("severity").
-		Scan(ctx, &rows)
+		GroupExpr("severity")
+	if projectUUID != "" {
+		q = q.Where("project_uuid = ?", projectUUID)
+	}
+	err := q.Scan(ctx, &rows)
 
 	var sc scanSeverityCounts
 	for _, row := range rows {
@@ -157,6 +166,16 @@ func (r *Repository) ScanSeverityTally(ctx context.Context, scanUUID string) map
 // is the query's: a caller should print no count rather than a wrong zero.
 func (r *Repository) ScanFindingTotal(ctx context.Context, scanUUID string) (int, map[string]int, error) {
 	sc, err := r.queryScanFindings(ctx, scanUUID)
+	if err != nil {
+		return 0, nil, err
+	}
+	return int(sc.Total), severityTally(sc), nil
+}
+
+// ScanFindingTotalForProject is the scoped counterpart used by native scan
+// completion summaries. Empty means default, never an all-projects count.
+func (r *Repository) ScanFindingTotalForProject(ctx context.Context, projectUUID, scanUUID string) (int, map[string]int, error) {
+	sc, err := r.queryScanFindingsForProject(ctx, scanUUID, defaultProjectUUID(projectUUID))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -230,17 +249,31 @@ func (r *Repository) CompleteScan(ctx context.Context, scanUUID string, errMsg s
 // A zero ScanCompletion writes nothing to the three columns, which is how a
 // caller says "I don't know" without overwriting a verdict with a guess.
 func (r *Repository) CompleteScanWithOutcome(ctx context.Context, scanUUID string, errMsg string, c ScanCompletion) error {
+	return r.completeScanWithOutcome(ctx, scanUUID, "", errMsg, c)
+}
+
+// CompleteScanWithOutcomeForProject is the direct CLI/native runner's scoped finalizer. Both
+// timing/count reads and the terminal write stay in the captured project; a
+// missing/reassigned row is an error, never a successful no-op or store fallback.
+func (r *Repository) CompleteScanWithOutcomeForProject(ctx context.Context, projectUUID, scanUUID, errMsg string, c ScanCompletion) error {
+	return r.completeScanWithOutcome(ctx, scanUUID, defaultProjectUUID(projectUUID), errMsg, c)
+}
+
+func (r *Repository) completeScanWithOutcome(ctx context.Context, scanUUID, projectUUID, errMsg string, c ScanCompletion) error {
 	status := ScanTerminalStatus(errMsg)
 
 	// Compute duration from started_at so the scan row doesn't report 0ms after
 	// it finishes. We read started_at first rather than using SQL arithmetic to
 	// keep the logic portable across SQLite and PostgreSQL.
 	var startedAt time.Time
-	if err := r.db.NewSelect().
+	startQuery := r.db.NewSelect().
 		Model((*Scan)(nil)).
 		Column("started_at").
-		Where("uuid = ?", scanUUID).
-		Scan(ctx, &startedAt); err != nil {
+		Where("uuid = ?", scanUUID)
+	if projectUUID != "" {
+		startQuery = startQuery.Where("project_uuid = ?", projectUUID)
+	}
+	if err := startQuery.Scan(ctx, &startedAt); err != nil {
 		return fmt.Errorf("load scan start time: %w", err)
 	}
 	finishedAt := time.Now()
@@ -249,7 +282,16 @@ func (r *Repository) CompleteScanWithOutcome(ctx context.Context, scanUUID strin
 		durationMs = 0
 	}
 
-	sc := r.aggregateScanFindings(ctx, scanUUID)
+	var sc scanSeverityCounts
+	if projectUUID == "" {
+		sc = r.aggregateScanFindings(ctx, scanUUID) // Preserve generic best-effort behavior.
+	} else {
+		var err error
+		sc, err = r.queryScanFindingsForProject(ctx, scanUUID, projectUUID)
+		if err != nil {
+			return fmt.Errorf("count project scan findings: %w", err)
+		}
+	}
 	q := r.db.NewUpdate().
 		Model((*Scan)(nil)).
 		Set("status = ?", status).
@@ -258,11 +300,22 @@ func (r *Repository) CompleteScanWithOutcome(ctx context.Context, scanUUID strin
 		Set("duration_ms = ?", durationMs).
 		Set("updated_at = CURRENT_TIMESTAMP").
 		Where("uuid = ?", scanUUID)
+	if projectUUID != "" {
+		q = q.Where("project_uuid = ?", projectUUID)
+	}
 	q = applySeverityCounts(q, sc)
 	q = applyScanCompletionColumns(q, c)
 
-	_, err := q.Exec(ctx)
-	return err
+	res, err := q.Exec(ctx)
+	if err != nil {
+		return err
+	}
+	if projectUUID != "" {
+		if n, err := res.RowsAffected(); err != nil || n != 1 {
+			return fmt.Errorf("%w: scan row missing or reassigned during completion", ErrScanProjectMismatch)
+		}
+	}
+	return nil
 }
 
 // ScanCancelledMessage is the error_message a run cancelled by its caller
@@ -441,6 +494,73 @@ func (r *Repository) CreateScanWithCursor(ctx context.Context, scan *Scan) error
 	return nil
 }
 
+// CreateServerReceiveScan creates an incremental scan-on-receive receipt in the
+// captured project. Unlike native scans, a receive service resumes the greatest
+// persisted receipt cursor regardless of status or modules. With no valid receipt
+// cursor it starts at the project's traffic high-water mark, not historical input.
+// Selection and insertion share a transaction; historical rows are never changed.
+func (r *Repository) CreateServerReceiveScan(ctx context.Context, scan *Scan) error {
+	if scan == nil {
+		return fmt.Errorf("invalid Scan")
+	}
+	if scan.ScanSource != "scan-on-receive" || scan.ScanMode != "incremental" {
+		return fmt.Errorf("server receive scan requires scan_source scan-on-receive and scan_mode incremental")
+	}
+
+	projectUUID := defaultProjectUUID(scan.ProjectUUID)
+	receipt := *scan
+	err := r.db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		var cursorAt time.Time
+		var cursorUUID string
+		cursorTimeColumn := dbCursorTimeExpr(r.db.Driver(), "cursor_at")
+		recordTimeColumn := dbCursorTimeExpr(r.db.Driver(), "created_at")
+		err := tx.NewSelect().Model((*Scan)(nil)).
+			Column("cursor_at", "cursor_uuid").
+			Where("project_uuid = ?", projectUUID).
+			Where("scan_source = ?", "scan-on-receive").
+			Where("scan_mode = ?", "incremental").
+			Where(cursorTimeColumn+" IS NOT NULL").
+			Where(cursorTimeColumn+" <> ?", dbCursorTimeValue(r.db.Driver(), time.Time{})).
+			Where("cursor_uuid IS NOT NULL AND cursor_uuid <> ''").
+			OrderExpr(cursorTimeColumn+" DESC, cursor_uuid DESC").
+			Limit(1).
+			Scan(ctx, &cursorAt, &cursorUUID)
+		if errors.Is(err, sql.ErrNoRows) {
+			err = tx.NewSelect().Model((*HTTPRecord)(nil)).
+				Column("created_at", "uuid").
+				Where("project_uuid = ?", projectUUID).
+				OrderExpr(recordTimeColumn+" DESC, uuid DESC").
+				Limit(1).
+				Scan(ctx, &cursorAt, &cursorUUID)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("load server receive traffic high-water mark: %w", err)
+			}
+		} else if err != nil {
+			return fmt.Errorf("load server receive receipt cursor: %w", err)
+		}
+
+		receipt.ProjectUUID = projectUUID
+		receipt.StartCursorAt, receipt.StartCursorUUID = cursorAt, cursorUUID
+		receipt.CursorAt, receipt.CursorUUID = cursorAt, cursorUUID
+		insert := tx.NewInsert().Model(&receipt)
+		if !cursorAt.IsZero() {
+			// Bun's SQLite time serialization caps precision at microseconds.
+			// Cursor keys must retain the exact high-water/receipt timestamp.
+			bound := dbCursorTimeValue(r.db.Driver(), cursorAt)
+			insert = insert.Value("start_cursor_at", "?", bound).Value("cursor_at", "?", bound)
+		}
+		if _, err := insert.Exec(ctx); err != nil {
+			return fmt.Errorf("failed to insert server receive scan: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	*scan = receipt
+	return nil
+}
+
 // IncrementProcessedCount adds delta to the scan's processed_count.
 // Use this for phases that don't advance the cursor (discovery, spidering, etc.).
 func (r *Repository) IncrementProcessedCount(ctx context.Context, scanUUID string, delta int64) error {
@@ -461,14 +581,16 @@ func (r *Repository) AdvanceScanCursor(ctx context.Context, scanUUID string, rec
 	return r.AdvanceScanCursorBy(ctx, scanUUID, recordCreatedAt, recordUUID, 1)
 }
 
-// AdvanceScanCursorBy updates the cursor position and increments ProcessedCount by delta.
+// AdvanceScanCursorBy checkpoints the cursor and adds the actual processed delta.
+// Zero is meaningful for a snapshot whose rows were all explicitly excluded or
+// coalesced away: advancing its position must not invent an assessed record.
 func (r *Repository) AdvanceScanCursorBy(ctx context.Context, scanUUID string, recordCreatedAt time.Time, recordUUID string, delta int64) error {
-	if delta <= 0 {
-		delta = 1
+	if delta < 0 {
+		return fmt.Errorf("scan cursor processed delta must not be negative")
 	}
-	// Format cursor_at to match SQLite's CURRENT_TIMESTAMP format (no timezone suffix).
-	// Go's time.Time serialization adds timezone info that breaks SQLite text comparison.
-	cursorAt := dbTimestampString(r.db.Driver(), recordCreatedAt)
+	// Preserve the exact cursor key: truncating SQLite fractional timestamps
+	// moves the durable position backwards and replays acknowledged records.
+	cursorAt := dbCursorTimeValue(r.db.Driver(), recordCreatedAt)
 	_, err := r.db.NewUpdate().
 		Model((*Scan)(nil)).
 		Set("cursor_at = ?", cursorAt).
@@ -525,15 +647,7 @@ func (r *Repository) countRecordsAfterCursor(ctx context.Context, projectUUID st
 		q = q.Where("project_uuid = ?", projectUUID)
 	}
 
-	if !cursorAt.IsZero() {
-		// The same text form the cursor keyset compares everywhere else: bun's
-		// time.Time rendering carries a zone suffix that SQLite's
-		// CURRENT_TIMESTAMP text does not, which made same-second rows compare
-		// wrong.
-		at := dbTimestampString(r.db.Driver(), cursorAt)
-		q = q.Where("(created_at > ? OR (created_at = ? AND uuid > ?))", at, at, cursorUUID)
-	}
-
+	q = applyRecordsAfterCursor(q, r.db.Driver(), cursorAt, cursorUUID)
 	q = applyHostScopeFilter(q, hosts)
 
 	if len(sources) > 0 {
@@ -631,20 +745,24 @@ func (r *Repository) CreateScanLogBatch(ctx context.Context, logs []*ScanLog) er
 	return nil
 }
 
-// ListScanLogs returns log entries for a scan, ordered by created_at ascending.
+// ListScanLogs returns only logs matching the stored scan's project, excluding
+// orphaned or historically mis-scoped entries. Callers still authorize access
+// to the scan itself; log producers must supply its confirmed project scope.
+// Ordering is chronological, with ID breaking timestamp ties for stable pages.
 // Both level and phase are optional filters; pass "" to skip.
 func (r *Repository) ListScanLogs(ctx context.Context, scanUUID string, level, phase string, limit, offset int) ([]*ScanLog, int64, error) {
 	var logs []*ScanLog
 	q := r.db.NewSelect().
 		Model(&logs).
-		Where("scan_uuid = ?", scanUUID).
-		OrderExpr("created_at ASC")
+		Where("sl.scan_uuid = ?", scanUUID).
+		Where("EXISTS (SELECT 1 FROM scans s WHERE s.uuid = sl.scan_uuid AND s.project_uuid = sl.project_uuid)").
+		OrderExpr("sl.created_at ASC, sl.id ASC")
 
 	if level != "" {
-		q = q.Where("level = ?", level)
+		q = q.Where("sl.level = ?", level)
 	}
 	if phase != "" {
-		q = q.Where("phase = ?", phase)
+		q = q.Where("sl.phase = ?", phase)
 	}
 
 	q = q.Limit(int64(limit)).Offset(int64(offset))

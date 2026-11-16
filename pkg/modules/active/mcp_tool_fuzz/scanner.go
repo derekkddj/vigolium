@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	mcpinfra "github.com/vigolium/vigolium/pkg/modules/infra/mcp"
@@ -124,7 +125,7 @@ func (m *Module) ScanPerHost(
 
 		// Baseline: a single benign call to confirm callability and get
 		// a baseline duration + body for false-positive suppression.
-		baselineDuration, baselineBody, baselineOK := timedCall(client, 1000+i*100, tool.Name, baseArgs)
+		baselineDuration, baselineBody, baselineExchange, baselineOK := timedCall(client, 1000+i*100, tool.Name, baseArgs)
 		if !baselineOK {
 			continue
 		}
@@ -133,7 +134,8 @@ func (m *Module) ScanPerHost(
 		bc := baseCtx{
 			client: client, targetURL: urlx.String(), toolName: tool.Name,
 			baseArgs: baseArgs, baselineBody: baselineBody, baselineDuration: baselineDuration,
-			callID: 2000 + i*100,
+			callID:           2000 + i*100,
+			baselineExchange: baselineExchange,
 		}
 
 		// String args get the full payload set.
@@ -151,6 +153,7 @@ func (m *Module) ScanPerHost(
 
 // baseCtx bundles the per-tool state a single argument's fuzz loop needs.
 type baseCtx struct {
+	baselineExchange *evidence.Exchange
 	client           *mcpinfra.Client
 	targetURL        string
 	toolName         string
@@ -170,27 +173,30 @@ func (m *Module) fuzzArg(bc baseCtx, argName string, payloads []payload) []*outp
 		mut := cloneArgs(bc.baseArgs)
 		mut[argName] = p.value
 		idForCall := bc.callID + j
+		proof := &mcpinfra.Proof{Payload: p.value}
+		proof.Control(bc.baselineExchange)
 
 		switch {
 		case p.timed:
-			if m.confirmTimedDelay(bc.client, idForCall, bc.toolName, mut, bc.baselineDuration) {
+			if m.confirmTimedDelay(bc.client, idForCall, bc.toolName, mut, bc.baselineDuration, proof) {
 				out = append(out, m.makeFinding(bc.targetURL, bc.toolName, argName, p,
-					fmt.Sprintf("response delay reproduced across %d rounds (baseline %ds)", timedConfirmRounds, bc.baselineDuration)))
+					fmt.Sprintf("response delay reproduced across %d rounds (baseline %ds)", timedConfirmRounds, bc.baselineDuration), proof))
 			}
 		default:
-			_, body, ok := plainCall(bc.client, idForCall, bc.toolName, mut)
+			_, body, exchange, ok := plainCall(bc.client, idForCall, bc.toolName, mut)
+			proof.Primary = exchange
 			if !ok {
 				continue
 			}
 			if p.prompt {
 				if p.marker != "" && strings.Contains(body, p.marker) {
-					out = append(out, m.makeFinding(bc.targetURL, bc.toolName, argName, p, "sentinel reflected in response"))
+					out = append(out, m.makeFinding(bc.targetURL, bc.toolName, argName, p, "sentinel reflected in response", proof))
 				}
 				continue
 			}
 			if p.confirm != nil {
 				if ok, n := p.confirm(body, bc.baselineBody); ok {
-					out = append(out, m.makeFinding(bc.targetURL, bc.toolName, argName, p, fmt.Sprintf("%d content marker(s) confirmed", n)))
+					out = append(out, m.makeFinding(bc.targetURL, bc.toolName, argName, p, fmt.Sprintf("%d content marker(s) confirmed", n), proof))
 				}
 			}
 			// A payload with no prompt/confirm (the OAST SSRF/RCE vectors) is
@@ -204,9 +210,14 @@ func (m *Module) fuzzArg(bc baseCtx, argName string, payloads []payload) []*outp
 // confirmTimedDelay re-runs a sleep-based payload timedConfirmRounds times and
 // returns true only if the delay reproduces every round — a one-off backend
 // latency spike will not survive.
-func (m *Module) confirmTimedDelay(client *mcpinfra.Client, id int, name string, args map[string]any, baselineDuration int) bool {
+func (m *Module) confirmTimedDelay(client *mcpinfra.Client, id int, name string, args map[string]any, baselineDuration int, proof *mcpinfra.Proof) bool {
 	for round := 0; round < timedConfirmRounds; round++ {
-		duration, _, ok := timedCall(client, id+round*10000, name, args)
+		duration, _, exchange, ok := timedCall(client, id+round*10000, name, args)
+		if proof.Primary == nil {
+			proof.Primary = exchange
+		} else {
+			proof.Confirmation(exchange)
+		}
 		if !ok {
 			return false
 		}
@@ -232,7 +243,7 @@ func capSlice(s []string, n int) []string {
 	return s
 }
 
-func (m *Module) makeFinding(targetURL, toolName, argName string, p payload, evidence string) *output.ResultEvent {
+func (m *Module) makeFinding(targetURL, toolName, argName string, p payload, evidence string, proof *mcpinfra.Proof) *output.ResultEvent {
 	desc := fmt.Sprintf("MCP tool %q argument %q vulnerable to %s. Evidence: %s.", toolName, argName, p.name, evidence)
 	tags := append([]string{"mcp", p.vulnTag, "injection"}, m.ModuleTags...)
 	sev, conf := p.severity, severity.Firm
@@ -241,7 +252,7 @@ func (m *Module) makeFinding(targetURL, toolName, argName string, p payload, evi
 		// positives — flag as suspect/tentative rather than the payload default.
 		sev, conf = severity.Suspect, severity.Tentative
 	}
-	return &output.ResultEvent{
+	return proof.Attack(&output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,
 		FuzzingParameter: argName,
@@ -254,7 +265,7 @@ func (m *Module) makeFinding(targetURL, toolName, argName string, p payload, evi
 			Tags:        tags,
 			Reference:   []string{"https://modelcontextprotocol.io/specification/2025-11-25/server/tools"},
 		},
-	}
+	})
 }
 
 // --------------------------------------------------------------------------
@@ -304,22 +315,22 @@ func cloneArgs(in map[string]any) map[string]any {
 
 // timedCall invokes a tool and returns the elapsed whole seconds, the raw
 // response body, and whether a response was obtained.
-func timedCall(client *mcpinfra.Client, id int, name string, args map[string]any) (int, string, bool) {
+func timedCall(client *mcpinfra.Client, id int, name string, args map[string]any) (int, string, *evidence.Exchange, bool) {
 	start := time.Now()
-	_, raw, err := client.CallTool(id, name, args)
+	_, raw, exchange, err := client.CallToolEvidence(id, name, args)
 	elapsed := int(time.Since(start).Seconds())
 	if err != nil && raw == "" {
-		return elapsed, "", false
+		return elapsed, "", exchange, false
 	}
-	return elapsed, raw, true
+	return elapsed, raw, exchange, true
 }
 
-func plainCall(client *mcpinfra.Client, id int, name string, args map[string]any) (*mcpinfra.ToolsCallResult, string, bool) {
-	res, raw, err := client.CallTool(id, name, args)
+func plainCall(client *mcpinfra.Client, id int, name string, args map[string]any) (*mcpinfra.ToolsCallResult, string, *evidence.Exchange, bool) {
+	res, raw, exchange, err := client.CallToolEvidence(id, name, args)
 	if err != nil {
-		return nil, "", false
+		return nil, "", exchange, false
 	}
-	return res, raw, true
+	return res, raw, exchange, true
 }
 
 func sentinelMarker(argName string) string {

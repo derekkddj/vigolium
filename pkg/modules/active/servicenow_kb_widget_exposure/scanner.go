@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	sn "github.com/vigolium/vigolium/pkg/modules/infra/servicenow"
@@ -76,6 +77,8 @@ func (m *Module) ScanPerHost(
 		return nil, nil
 	}
 	sn.MarkServiceNow(scanCtx, host)
+	collector := modkit.NewEvidenceCollector()
+	collector.AddExchange(session.Exchange, evidence.RoleObservation, "Guest session acquisition")
 
 	// Negative control: a non-existent KB id must not return article content.
 	neg := sn.PostKBArticle(ctx, httpClient, bogusKB, session)
@@ -86,10 +89,24 @@ func (m *Module) ScanPerHost(
 		return nil, nil // catch-all → any positive would be a false positive
 	}
 
+	collector.AddExchange(neg.Exchange, evidence.RoleControl, "Non-existent knowledge article")
 	var exposed []string
+	var primary *evidence.Exchange
 	for i := 1; i <= kbBruteCount; i++ {
 		kb := fmt.Sprintf("KB%07d", i)
-		if m.confirmKB(ctx, httpClient, kb, session) {
+		round := m.confirmKBCapture(ctx, httpClient, kb, session)
+		if round.OK {
+			// Keep representative successful articles and their actual replays under
+			// the shared cap; failed article attempts contribute no finding context.
+			for j, exchange := range round.Exchanges {
+				if j == 0 && len(exposed) == 0 {
+					primary = exchange
+				} else if j == 0 {
+					collector.AddExchange(exchange, evidence.RoleAttack, "Guest knowledge article "+kb)
+				} else {
+					collector.AddExchange(exchange, evidence.RoleConfirmation, fmt.Sprintf("Article %s confirmation %d", kb, j))
+				}
+			}
 			exposed = append(exposed, kb)
 		}
 	}
@@ -97,23 +114,39 @@ func (m *Module) ScanPerHost(
 		return nil, nil
 	}
 
-	return []*output.ResultEvent{m.build(exposed, urlx.Scheme+"://"+urlx.Host, host)}, nil
+	result := m.build(exposed, urlx.Scheme+"://"+urlx.Host, host)
+	result.AdditionalEvidence, result.Evidence = collector.Entries(), collector.Evidence()
+	result.EvidenceStatus = "missing"
+	modkit.SetPrimaryEvidence(result, primary, evidence.RoleAttack, "Guest knowledge article read")
+	return []*output.ResultEvent{result}, nil
 }
 
 // confirmKB reads one KB article across independent rounds and reports whether it
 // is consistently exposed.
 func (m *Module) confirmKB(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, kb string, session sn.Session) bool {
+	return m.confirmKBCapture(ctx, httpClient, kb, session).OK
+}
+
+type kbProbeResult struct {
+	OK        bool
+	Exchanges []*evidence.Exchange
+}
+
+func (m *Module) confirmKBCapture(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, kb string, session sn.Session) kbProbeResult {
 	r := sn.PostKBArticle(ctx, httpClient, kb, session)
 	if !r.OK || !sn.KBExposed(r.Data) {
-		return false
+		return kbProbeResult{}
 	}
+	out := kbProbeResult{Exchanges: []*evidence.Exchange{r.Exchange}}
 	for i := 0; i < confirmRounds; i++ {
 		rr := sn.PostKBArticle(ctx, httpClient, kb, session)
 		if !rr.OK || !sn.KBExposed(rr.Data) {
-			return false
+			return kbProbeResult{}
 		}
+		out.Exchanges = append(out.Exchanges, rr.Exchange)
 	}
-	return true
+	out.OK = true
+	return out
 }
 
 func (m *Module) build(exposed []string, baseURL, host string) *output.ResultEvent {

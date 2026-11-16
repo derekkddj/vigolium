@@ -35,11 +35,14 @@ func NewVMPool(script *LoadedScript, opts APIOptions) (*VMPool, error) {
 
 // Get returns a ready-to-use VM from the pool.
 func (p *VMPool) Get() *sobek.Runtime {
-	return p.pool.Get().(*sobek.Runtime)
+	vm := p.pool.Get().(*sobek.Runtime)
+	resetReceipts(vm)
+	return vm
 }
 
 // Put returns a VM to the pool for reuse.
 func (p *VMPool) Put(vm *sobek.Runtime) {
+	resetReceipts(vm)
 	p.pool.Put(vm)
 }
 
@@ -51,6 +54,7 @@ func (p *VMPool) PutUnlessPoisoned(vm *sobek.Runtime, poisoned bool) {
 	if poisoned {
 		return
 	}
+	resetReceipts(vm)
 	p.pool.Put(vm)
 }
 

@@ -6,8 +6,10 @@ import (
 	goruntime "runtime"
 	"strings"
 
+	"github.com/google/uuid"
 	urlutil "github.com/projectdiscovery/utils/url"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -30,52 +32,7 @@ func (e *Executor) processResults(ctx context.Context, results []*output.ResultE
 		result.FindingSource = database.FindingSourceDynamicAssessment
 		e.assignModuleInfo(result, m)
 
-		// Backfill request/response from original item when the module
-		// did not populate them so the finding always carries raw data
-		// and can be linked to an http_record.
-		//
-		// When we backfill the request, result.Request IS the unchanged baseline
-		// request — pass that request to emitResult so it reuses the baseline's
-		// memoized hash for the record-link lookup instead of allocating a temp
-		// request and re-hashing the raw bytes per finding. For DB-sourced items
-		// the baseline's hash is pre-registered in requestUUIDs (at item
-		// ingestion), so the lookup hits and links to the existing record rather
-		// than saving a duplicate. A module that sets its own (mutated) request
-		// leaves baselineReq nil and takes the unchanged parse/save path.
-		var baselineReq *httpmsg.HttpRequest
-		// The item's live response object, carried alongside baselineReq when the
-		// finding adopts the baseline exchange. It differs from
-		// NewHttpResponse([]byte(result.Response)) in one way that matters: it
-		// carries the MEASURED round-trip duration, which raw bytes cannot. A
-		// finding-evidence record dedups onto (or becomes) the item's own record,
-		// so rebuilding from bytes here is how response_time_ms got lost on every
-		// record a passive module happened to report on.
-		var baselineResp *httpmsg.HttpResponse
-		if item != nil {
-			// Whether the module supplied its own request. Captured BEFORE the
-			// request backfill below so we can tell a module-mutated request
-			// apart from the baseline one when deciding on the response.
-			moduleSuppliedRequest := result.Request != ""
-			if result.Request == "" && item.Request() != nil {
-				result.Request = string(item.Request().Raw())
-				baselineReq = item.Request()
-			}
-			// Backfill the baseline response ONLY when it actually corresponds to
-			// result.Request. That holds when the module supplied no request (the
-			// finding adopts the whole baseline exchange) or its own request is
-			// byte-identical to the baseline. If the module supplied a *mutated*
-			// request, the baseline response never came from it — pairing them
-			// would fabricate a (request, response) exchange that never happened
-			// on the wire. In that case leave Response empty; a module with a real
-			// proving response is expected to set it itself.
-			if result.Response == "" && item.HasResponse() {
-				if !moduleSuppliedRequest ||
-					(item.Request() != nil && result.Request == string(item.Request().Raw())) {
-					result.Response = string(item.Response().Raw())
-					baselineResp = item.Response()
-				}
-			}
-		}
+		baselineReq, baselineResp := e.prepareResultEvidence(result, item, moduleType == database.ModuleTypePassive)
 
 		// Body-differential safety net: for modules that opt in, re-confirm the
 		// payload-vs-baseline difference before reporting. Drops the finding when
@@ -128,8 +85,27 @@ func (e *Executor) reconfirmBodyDifferential(
 	if e.httpClient == nil {
 		return true // not enough context to re-confirm
 	}
+	// Only a role-aware receipt declares an authoritative probe destination.
+	// Legacy bytes without a URL can infer https even for an http input; that
+	// compatibility guess must not disable reconfirmation of the supplied input.
+	for _, entry := range result.Evidence {
+		if entry.Primary && proofRole(entry.Role) {
+			if selected, err := resultEvidenceMessages(result, nil); err == nil && item != nil && evidenceService(selected) != evidenceService(item) {
+				return true // another destination has no comparable clean baseline here
+			}
+			break
+		}
+	}
 
 	res := modkit.ReconfirmFinding(e.httpClient.WithContext(ctx), item, result.Request)
+	// Reconfirmation exchanges are selected independently of the original
+	// attack; retain raw receipts even on an inconclusive, fail-open outcome.
+	if evidence.HasSelectedEvidence(result.Evidence) {
+		for i := range res.Evidence {
+			res.Evidence[i].Primary = false
+		}
+	}
+	result.Evidence = append(result.Evidence, res.Evidence...)
 	if !res.Ran {
 		zap.L().Debug("body-differential re-confirmation inconclusive; keeping finding",
 			zap.String("module", m.ID()),
@@ -170,7 +146,13 @@ func (e *Executor) setReplayContext(result *output.ResultEvent, item *httpmsg.Ht
 		}
 	}
 	if result.OriginRecordUUID == "" && e.caches.requestUUIDs != nil {
-		result.OriginRecordUUID = e.ResolveRequestUUID(item.Request().ID())
+		id := e.ResolveRequestUUID(item.Request().ID())
+		if id != "" && e.repo != nil {
+			record, err := e.repo.GetRecordByUUID(context.Background(), id)
+			if err == nil && e.recordMatchesInput(record, item) {
+				result.OriginRecordUUID = id
+			}
+		}
 	}
 	if ip == nil {
 		return
@@ -277,6 +259,14 @@ type emissionResult struct {
 }
 
 func (e *Executor) emitResult(ctx context.Context, result *output.ResultEvent, baselineReq *httpmsg.HttpRequest, baselineResp *httpmsg.HttpResponse) emissionResult {
+	e.normalizeLegacyEvidence(result)
+	// Keep conflicting original IDs sealed as rejected even if a post-hook
+	// attempts to reintroduce a variant after finalization removes its bytes.
+	sealed := sealPostHookEvidence(result.Evidence)
+	e.finalizeEvidence(result)
+	// Allocate once per emitted module-result occurrence, independently of
+	// producer IDs and event object reuse. This is not imported history.
+	occurrence := uuid.NewString()
 	// Run post-hooks (may modify or drop result)
 	if e.hooks != nil {
 		hooked, err := e.hooks.RunPostHooks(result)
@@ -289,6 +279,12 @@ func (e *Executor) emitResult(ctx context.Context, result *output.ResultEvent, b
 		result = hooked
 	}
 
+	restorePostHookEvidence(result, sealed)
+	e.normalizeLegacyEvidence(result)
+	for i := range result.Evidence {
+		result.Evidence[i].OccurrenceID = occurrence
+	}
+	e.finalizeEvidence(result)
 	result.RecordKind = result.EffectiveRecordKind()
 	if result.IsFinding() {
 		clampTentativeSeverity(result)
@@ -322,28 +318,32 @@ func (e *Executor) emitResult(ctx context.Context, result *output.ResultEvent, b
 			// alloc, no re-hash); otherwise hash the raw bytes of the (mutated)
 			// finding request.
 			var reqHash string
-			if baselineReq != nil {
+			if baselineReq != nil && result.Request == string(baselineReq.Raw()) {
 				reqHash = baselineReq.ID()
 			} else {
 				reqHash = httpmsg.NewHttpRequest([]byte(result.Request)).ID()
 			}
 
-			// Look up the database record UUID
-			recordUUID, exists := e.caches.requestUUIDs.Load(reqHash)
+			// This cache is a crawl/replay hint, never exchange identity. Validate
+			// BOTH messages and service before linking it; the same request can
+			// legitimately receive a different answer on every execution.
+			var recordUUID string
+			var exists bool
+			if e.caches.requestUUIDs != nil {
+				recordUUID, exists = e.caches.requestUUIDs.Load(reqHash)
+			}
+			if exists {
+				record, err := e.repo.GetRecordByUUID(ctx, recordUUID)
+				exists = err == nil && e.recordMatchesResult(record, result)
+			}
 
 			if !exists {
-				// Parse raw request to extract service info (host/port/protocol) from Host header
-				var findingRR *httpmsg.HttpRequestResponse
-				var parseErr error
-				if result.URL != "" {
-					findingRR, parseErr = httpmsg.ParseRawRequestWithURL(result.Request, result.URL)
-				} else {
-					findingRR, parseErr = httpmsg.ParseRawRequest(result.Request)
-				}
+				// Receipt service/raw bytes are transport identity. Finding URL is
+				// attribution, and ingestion body reconciliation must not rewrite proof.
+				findingRR, parseErr := resultEvidenceMessages(result, baselineResp)
 				if parseErr != nil {
 					zap.L().Debug("Failed to parse finding request, skipping http_record save", zap.Error(parseErr))
 				} else {
-					findingRR = findingRR.WithResponse(findingResponse(result.Response, baselineResp))
 					// RecordKind, not the executor's own source: this row is the
 					// finding's evidence. Normalized by EffectiveRecordKind above,
 					// so never empty. Zero lineage — evidence is not part of a
@@ -356,8 +356,14 @@ func (e *Executor) emitResult(ctx context.Context, result *output.ResultEvent, b
 					if err != nil {
 						zap.L().Warn("Failed to save finding http_record", zap.Error(err))
 					} else {
-						e.caches.requestUUIDs.Store(reqHash, recordUUID)
-						exists = true
+						record, readErr := e.repo.GetRecordByUUID(ctx, recordUUID)
+						exists = readErr == nil && e.recordMatchesResult(record, result)
+						if exists && e.caches.requestUUIDs != nil {
+							e.caches.requestUUIDs.Store(reqHash, recordUUID)
+						}
+						if !exists {
+							zap.L().Warn("saved HTTP record does not match evidence; not linking", zap.String("uuid", recordUUID))
+						}
 					}
 				}
 			}
@@ -380,6 +386,11 @@ func (e *Executor) emitResult(ctx context.Context, result *output.ResultEvent, b
 			saveErr = e.findingWriter.Save(ctx, result, recordUUIDs, e.scanUUID, e.projectUUID)
 		} else {
 			insertedNew, saveErr = e.repo.SaveFindingInserted(ctx, result, recordUUIDs, e.scanUUID, e.projectUUID)
+			if saveErr != nil {
+				// Writer-backed saves own their rejection, inline and async failure
+				// counts. Only the direct fallback needs executor accounting.
+				e.findingStoreFailed.Add(1)
+			}
 		}
 		if saveErr != nil {
 			// A dropped finding is a data-loss event for the operator, not a debug
@@ -578,6 +589,9 @@ func (e *Executor) runScanFnGuarded(
 // have replaced result.Response after the backfill, and pairing a stale
 // baseline response with it would record an exchange that never happened.
 func findingResponse(raw string, baseline *httpmsg.HttpResponse) *httpmsg.HttpResponse {
+	if raw == "" {
+		return nil // absence is not a zero-byte response observation
+	}
 	if baseline != nil && string(baseline.Raw()) == raw {
 		return baseline
 	}
