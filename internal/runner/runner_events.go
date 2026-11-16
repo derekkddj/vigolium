@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/core"
 	"github.com/vigolium/vigolium/pkg/database"
@@ -19,6 +20,134 @@ import (
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/scanevents"
 )
+
+// SetEventCallback sets this runner's structured event destination. Configure it
+// before RunNativeScan; calls after the first run starts are ignored, including
+// calls with nil. A nil callback preserves the process-global CLI event path.
+// A non-nil callback neither installs nor writes to that process-global emitter.
+// It receives emissions owned by internal/runner, not process-global emissions
+// from other packages (for example, the executor's module.error events).
+//
+// Calls are synchronous and serialized per runner (including worker findings and
+// the phase heartbeat). Delivery closes permanently on the first scan.finished;
+// terminal delivery waits for in-flight calls, and late events are dropped, never
+// redirected to the CLI emitter. The callback must return promptly, must not panic
+// or wait for scan/phase completion, and must treat event payloads as read-only. No HTTP
+// request/response bodies or finding payloads are passed to it.
+func (r *Runner) SetEventCallback(callback func(scanevents.Event)) {
+	r.eventCallbackMu.Lock()
+	defer r.eventCallbackMu.Unlock()
+	if !r.eventCallbackFrozen {
+		r.eventCallback = callback
+	}
+}
+
+func (r *Runner) getEventCallback() func(scanevents.Event) {
+	r.eventCallbackMu.Lock()
+	defer r.eventCallbackMu.Unlock()
+	return r.eventCallback
+}
+
+func (r *Runner) eventsOn() bool {
+	return r.getEventCallback() != nil || scanevents.On()
+}
+
+// emitEvent is the instance-owned seam, never a subscription to global events.
+// The CLI stamps its own envelope; callbacks get an equivalent local envelope.
+func (r *Runner) emitEvent(ev scanevents.Event) {
+	callback := r.getEventCallback()
+	r.eventEmitMu.Lock()
+	defer r.eventEmitMu.Unlock()
+	// This check precedes even the CLI fallback: closing delivery must never
+	// route an abandoned worker's late event into another scan's global stream.
+	if r.eventCallbackClosed {
+		return
+	}
+	if callback == nil {
+		scanevents.Emit(ev)
+		return
+	}
+	if ev.Type == scanevents.TypeScanFinished {
+		// The same lock joins in-flight delivery and makes the terminal event
+		// exactly once. Close before invoking user code, even if it panics.
+		r.eventCallbackClosed = true
+	}
+	r.eventSeq++
+	ev.V = scanevents.SchemaVersion
+	ev.TS = scanevents.FormatTime(time.Now())
+	ev.Seq = r.eventSeq
+	// Never inherit an identity from the process emitter or a finding's input.
+	ev.ScanUUID = ""
+	if r.options != nil {
+		ev.ScanUUID = r.options.ScanUUID
+	}
+	// A panicking callback violates the contract; do not swallow its panic, but
+	// fail closed so unwinding or a surviving worker cannot deliver more events.
+	returned := false
+	defer func() {
+		if !returned {
+			r.eventCallbackClosed = true
+		}
+	}()
+	callback(ev)
+	returned = true
+}
+
+func (r *Runner) freezeEventCallback() {
+	r.eventCallbackMu.Lock()
+	r.eventCallbackFrozen = true
+	r.eventCallbackMu.Unlock()
+}
+
+// beginCallbackScan runs after configuration is frozen and before infrastructure
+// producers start. The CLI already owns scan.started/finished, so only callback
+// scans get lifecycle events here.
+func (r *Runner) beginCallbackScan(plan NativeScanPlan) bool {
+	if r.getEventCallback() == nil {
+		return false
+	}
+	if r.options.ScanUUID == "" {
+		r.options.ScanUUID = uuid.New().String()
+	}
+	var phases []string
+	for _, step := range plan.Steps {
+		if step.Enabled {
+			phases = append(phases, string(step.Phase))
+		}
+	}
+	r.emitEvent(scanevents.Event{
+		Type:    scanevents.TypeScanStarted,
+		Target:  strings.Join(r.options.Targets, ", "),
+		Targets: len(r.options.Targets),
+		Project: r.options.ProjectUUID,
+		Phases:  phases,
+	})
+	return true
+}
+
+func (r *Runner) finishCallbackScan(ctx context.Context, start time.Time, err error) {
+	completion := r.Completion()
+	ev := scanevents.Event{
+		Type:         scanevents.TypeScanFinished,
+		Status:       scanevents.StatusCompleted,
+		DurationMS:   time.Since(start).Milliseconds(),
+		StopReason:   completion.StopReason,
+		ModuleErrors: r.ModuleErrors(),
+	}
+	switch {
+	case err != nil:
+		ev.Status = scanevents.StatusFailed
+		ev.Message = err.Error()
+	case r.ctx.Err() != nil:
+		ev.Status = scanevents.StatusInterrupted
+	case completion.Completeness == database.CompletenessPartial:
+		ev.Status = scanevents.StatusCurtailed
+	}
+	if ev.StopReason == "" && ctx.Err() != nil {
+		ev.StopReason = scanStopReason(ctx, r.ctx)
+	}
+	r.emitEvent(ev)
+}
 
 // progressInterval is how often a running phase reports phase.progress.
 //
@@ -52,6 +181,7 @@ type phaseTracker struct {
 	phase     string
 	start     time.Time
 	requester *http.Requester
+	emit      func(scanevents.Event) // pinned to the runner that owns this phase
 	baseSent  int64
 	findings  atomic.Int64
 	stop      chan struct{}
@@ -206,23 +336,33 @@ func (r *Runner) beginPhase(ctx context.Context, phase string, requester *http.R
 		phase:     phase,
 		start:     time.Now(),
 		requester: requester,
+		emit:      r.emitEvent,
 		reasons:   make(map[string]struct{}),
 		limits:    make(map[string]struct{}),
 	}
 	if requester != nil {
+		t.baseSent = requester.RequestsSent()
 		t.baseBlocks = requester.BlockCounts()
 	}
 	t.ledger = r.moduleErrors.Load()
-	if !scanevents.On() {
+	if !r.eventsOn() {
 		return t
 	}
-	t.baseSent = requester.RequestsSent()
-	scanevents.Emit(scanevents.Event{Type: scanevents.TypePhaseStarted, Phase: phase})
+	t.emitEvent(scanevents.Event{Type: scanevents.TypePhaseStarted, Phase: phase})
 
 	t.stop = make(chan struct{})
 	t.stopped = make(chan struct{})
 	go t.heartbeat(ctx)
 	return t
+}
+
+// emitEvent also tolerates bare trackers used only as outcome ledgers.
+func (t *phaseTracker) emitEvent(ev scanevents.Event) {
+	if t.emit != nil {
+		t.emit(ev)
+	} else {
+		scanevents.Emit(ev)
+	}
 }
 
 func (t *phaseTracker) heartbeat(ctx context.Context) {
@@ -240,7 +380,7 @@ func (t *phaseTracker) heartbeat(ctx context.Context) {
 			}
 			t.fillInScope(&ev)
 			t.fillProgress(&ev)
-			scanevents.Emit(ev)
+			t.emitEvent(ev)
 		case <-t.stop:
 			return
 		case <-ctx.Done():
@@ -718,8 +858,8 @@ func (t *phaseTracker) finish(ctx context.Context, err error) database.PhaseOutc
 		DurationMS:   out.DurationMS,
 		RequestsSent: scanevents.Int64(t.sentSoFar()),
 		Findings:     scanevents.Int64(t.findings.Load()),
-		Reasons:      out.Reasons,
-		Limits:       out.Limits,
+		Reasons:      append([]string(nil), out.Reasons...),
+		Limits:       append([]string(nil), out.Limits...),
 	}
 	if len(out.FindingsCapped) > 0 {
 		ev.FindingsCapped = out.FindingsCapped
@@ -729,7 +869,7 @@ func (t *phaseTracker) finish(ctx context.Context, err error) database.PhaseOutc
 	}
 	t.fillInScope(&ev)
 	t.fillProgress(&ev)
-	scanevents.Emit(ev)
+	t.emitEvent(ev)
 	return out
 }
 
@@ -804,7 +944,7 @@ func (r *Runner) attachEventObserver() {
 		if ev != nil {
 			r.liveness.Load().RecordFinding(ev.Info.Severity.String())
 		}
-		emitFindingEvent(ev)
+		r.emitFindingEvent(ev)
 	}
 }
 
@@ -823,15 +963,12 @@ func (t *phaseTracker) noteError(err error) {
 	if t == nil || err == nil {
 		return
 	}
-	// Record BEFORE the stream check. The outcome ledger is what the scan row and
-	// the console banner read, and it has to be right whether or not --events was
+	// Record independently of emission. The outcome ledger is what the scan row
+	// and the console banner read, and it has to be right whether or not --events was
 	// passed — a phase that failed on a plain CLI run used to leave no structured
 	// trace at all because this method bailed out here first.
 	t.recordError(err)
-	if !scanevents.On() {
-		return
-	}
-	scanevents.Emit(scanevents.Event{
+	t.emitEvent(scanevents.Event{
 		Type:    scanevents.TypeError,
 		Phase:   t.phase,
 		Message: err.Error(),
@@ -862,15 +999,15 @@ func (t *phaseTracker) recordError(err error) {
 // the machine stream. Both hang off the same notifier, so a consumer never has
 // to scrape a rendered session log to recover a block — which is what it had to
 // do before, at the cost of an N+1 subprocess walk per sweep.
-func emitBlockEvent(n http.BlockNotice) {
-	if !scanevents.On() {
+func (r *Runner) emitBlockEvent(n http.BlockNotice) {
+	if !r.eventsOn() {
 		return
 	}
 	vendor := n.WAFType
 	if vendor == "" || vendor == "generic" {
 		vendor = "unknown"
 	}
-	scanevents.Emit(scanevents.Event{
+	r.emitEvent(scanevents.Event{
 		Type:       scanevents.TypeWAFBlock,
 		Host:       n.Host,
 		Vendor:     vendor,
@@ -882,14 +1019,14 @@ func emitBlockEvent(n http.BlockNotice) {
 // emitPacingEvent mirrors [waf-pacing-armed] onto the machine stream, spelling
 // out the concurrency drop so a consumer can attribute a slowdown to the pacing
 // decision rather than to the target.
-func emitPacingEvent(host, vendor string, from, to int) {
-	if !scanevents.On() {
+func (r *Runner) emitPacingEvent(host, vendor string, from, to int) {
+	if !r.eventsOn() {
 		return
 	}
 	if vendor == "" {
 		vendor = "unknown"
 	}
-	scanevents.Emit(scanevents.Event{
+	r.emitEvent(scanevents.Event{
 		Type:            scanevents.TypeWAFPacing,
 		Host:            host,
 		Vendor:          vendor,
@@ -904,11 +1041,11 @@ func emitPacingEvent(host, vendor string, from, to int) {
 // evidence lives in the database the consumer already has a handle to (the path
 // is on scan.started). Carrying request/response bytes here would make the
 // stream large enough that flushing per line stops being cheap.
-func emitFindingEvent(result *output.ResultEvent) {
-	if result == nil || !scanevents.On() {
+func (r *Runner) emitFindingEvent(result *output.ResultEvent) {
+	if result == nil || !r.eventsOn() {
 		return
 	}
-	scanevents.Emit(scanevents.Event{
+	r.emitEvent(scanevents.Event{
 		Type:       scanevents.TypeFindingNew,
 		Severity:   strings.ToLower(result.Info.Severity.String()),
 		Confidence: strings.ToLower(result.Info.Confidence.String()),

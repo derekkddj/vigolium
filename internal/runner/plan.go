@@ -748,7 +748,7 @@ func (r *Runner) announcePlan(ctx context.Context, infra *phaseInfra, admission 
 		return
 	}
 	zap.L().Debug("Scan plan resolved", zap.String("plan", planSummaryLine(plan)))
-	scanevents.Emit(scanevents.Event{Type: scanevents.TypeScanPlan, Plan: plan})
+	r.emitEvent(scanevents.Event{Type: scanevents.TypeScanPlan, Plan: plan})
 	if r.repository == nil || infra == nil || infra.scanUUID == "" {
 		return
 	}

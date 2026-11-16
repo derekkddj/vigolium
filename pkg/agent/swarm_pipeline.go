@@ -34,6 +34,7 @@ type swarmPipelineState struct {
 	checkpoint       *SwarmCheckpoint
 	completedPhases  []string
 	phaseTimings     map[string]time.Duration
+	activePhases     map[string]time.Time
 	recordStats      swarmRecordStats
 	targetURL        string
 	records          []*httpmsg.HttpRequestResponse
@@ -67,6 +68,16 @@ func (s *SwarmRunner) runSwarmPipeline(ctx context.Context, cfg SwarmConfig, age
 	if cleanup != nil {
 		defer cleanup()
 	}
+	defer func() {
+		// Fatal exits do not checkpoint the unfinished phase, but still retain
+		// its duration and log a terminal event. Run logs the error detail.
+		for phase, started := range state.activePhases {
+			state.phaseTimings[phase] = time.Since(started)
+			_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", phase, fmt.Sprintf(
+				"phase interrupted: duration=%s", state.phaseTimings[phase].Round(time.Millisecond)))
+		}
+		result.PhaseTimings = state.phaseTimings
+	}()
 
 	steps := []swarmPhaseStep{
 		normalizeSwarmStep{},
@@ -104,6 +115,7 @@ func (s *SwarmRunner) newSwarmPipelineState(ctx context.Context, cfg SwarmConfig
 		sessionDir, err = EnsureSessionDir(cfg.SessionsDir, agenticScan.UUID)
 		if err != nil {
 			zap.L().Warn("Failed to create session dir, falling back to temp dirs", zap.Error(err))
+			_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", "run", "warning: failed to create session dir; see run details")
 		}
 	}
 	result.SessionDir = sessionDir
@@ -128,6 +140,7 @@ func (s *SwarmRunner) newSwarmPipelineState(ctx context.Context, cfg SwarmConfig
 		cp, err := loadCheckpoint(cfg.ResumeDir)
 		if err != nil {
 			zap.L().Warn("Failed to load checkpoint, starting fresh", zap.Error(err))
+			_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", "run", "warning: failed to load checkpoint; see run details")
 		} else {
 			checkpoint = cp
 			zap.L().Info("Resuming from checkpoint",
@@ -184,16 +197,31 @@ func (ps *swarmPipelineState) runFindingCounts(ctx context.Context) (int, map[st
 }
 
 func (ps *swarmPipelineState) startPhase(ctx context.Context, phase string, emit bool) time.Time {
+	started := time.Now()
+	if ps.activePhases == nil {
+		ps.activePhases = make(map[string]time.Time)
+	}
+	ps.activePhases[phase] = started
 	ps.agenticScan.CurrentPhase = phase
 	ps.runner.persistPhase(ctx, ps.agenticScan)
 	if emit {
 		ps.runner.emitPhase(ps.cfg, phase)
+	} else {
+		// Silent CLI phases still belong in the session transcript.
+		_ = WriteRuntimeProgress(ps.cfg.StreamWriter, "swarm", phase, "phase started: "+phase)
 	}
-	return time.Now()
+	return started
+}
+
+func (ps *swarmPipelineState) recordPhaseFinish(phase string, started time.Time) {
+	ps.phaseTimings[phase] = time.Since(started)
+	delete(ps.activePhases, phase)
+	_ = WriteRuntimeProgress(ps.cfg.StreamWriter, "swarm", phase, fmt.Sprintf(
+		"phase finished: duration=%s", ps.phaseTimings[phase].Round(time.Millisecond)))
 }
 
 func (ps *swarmPipelineState) finishPhase(phase string, started time.Time) {
-	ps.phaseTimings[phase] = time.Since(started)
+	ps.recordPhaseFinish(phase, started)
 	ps.completedPhases = append(ps.completedPhases, phase)
 }
 
@@ -212,6 +240,7 @@ func (ps *swarmPipelineState) writeCheckpoint(plan *SwarmPlan, triageRound int) 
 		ps.recordStats,
 	); err != nil {
 		zap.L().Warn("Failed to write swarm checkpoint", zap.Error(err))
+		_ = WriteRuntimeProgress(ps.cfg.StreamWriter, "swarm", ps.agenticScan.CurrentPhase, "warning: failed to write checkpoint; see run details")
 	}
 }
 
@@ -484,6 +513,7 @@ func (ps *swarmPipelineState) hydrateSourceAnalysisSessions(ctx context.Context,
 				if len(rows) > 0 {
 					if err := ps.runner.repo.SaveAuthenticationHostnames(ctx, rows); err != nil {
 						zap.L().Warn("Failed to persist session config to database", zap.Error(err))
+						_ = WriteRuntimeProgress(ps.cfg.StreamWriter, "swarm", SwarmPhaseSourceAnalysis, "warning: failed to persist session config")
 					} else {
 						printPhaseLine("source-analysis", fmt.Sprintf("persisted session config  hostname=%s sessions=%d", hostname, len(rows)))
 					}
@@ -656,8 +686,9 @@ func (planSwarmStep) Run(ctx context.Context, ps *swarmPipelineState) error {
 	if ps.checkpoint != nil && phaseCompleted(ps.checkpoint, SwarmPhasePlan) && ps.checkpoint.Plan != nil {
 		ps.plan = ps.checkpoint.Plan
 		zap.L().Info("Restored plan from checkpoint", zap.Int("module_tags", len(ps.plan.ModuleTags)))
+		_ = WriteRuntimeProgress(ps.cfg.StreamWriter, "swarm", SwarmPhasePlan, "plan restored from checkpoint")
 	} else {
-		ps.startPhase(ctx, SwarmPhasePlan, true)
+		started = ps.startPhase(ctx, SwarmPhasePlan, true)
 		var err error
 		var masterRawOutput, masterRenderedPrompt string
 		if len(planRecords) <= ps.cfg.MasterBatchSize {
@@ -715,7 +746,7 @@ func (planSwarmStep) Run(ctx context.Context, ps *swarmPipelineState) error {
 		}
 	}
 
-	ps.phaseTimings[SwarmPhasePlan] = time.Since(started)
+	ps.recordPhaseFinish(SwarmPhasePlan, started)
 	ps.result.BatchProvenance = ps.batchProv
 	ps.result.SwarmPlan = ps.plan
 	if ps.plan != nil {
@@ -768,7 +799,8 @@ func (discoverReentrySwarmStep) Run(ctx context.Context, ps *swarmPipelineState)
 	if len(urls) == 0 {
 		return nil
 	}
-	started := time.Now()
+	started := ps.startPhase(ctx, SwarmPhaseDiscoverReentry, false)
+	defer ps.recordPhaseFinish(SwarmPhaseDiscoverReentry, started)
 	pc := ps.cfg.probeConfig()
 	probed := discoverReentryProbe(ctx, urls, pc)
 	if len(probed) == 0 {
@@ -791,7 +823,6 @@ func (discoverReentrySwarmStep) Run(ctx context.Context, ps *swarmPipelineState)
 	ps.records = deduplicateRecords(append(ps.records, probed...))
 	ps.recordStats.Discovery += len(probed)
 	ps.result.TotalRecords = len(ps.records)
-	ps.phaseTimings[SwarmPhaseDiscoverReentry] = time.Since(started)
 	return nil
 }
 
@@ -801,12 +832,11 @@ func (extensionSwarmStep) Run(ctx context.Context, ps *swarmPipelineState) error
 	if ps.stop {
 		return nil
 	}
-	started := time.Now()
+	started := ps.startPhase(ctx, SwarmPhaseExtension, false)
 	allExtensions, renames := ps.runner.buildSwarmExtensions(ctx, ps.cfg, ps.targetURL, ps.plan, ps.sourceExtensions)
 	ps.extensionRenames = renames
 	ps.extensionDir = ps.runner.persistSwarmExtensions(ctx, ps.cfg, ps.agenticScan, ps.sessionDir, ps.sourceExtensions, allExtensions)
-	ps.phaseTimings[SwarmPhaseExtension] = time.Since(started)
-	ps.completedPhases = append(ps.completedPhases, SwarmPhaseExtension)
+	ps.finishPhase(SwarmPhaseExtension, started)
 	return nil
 }
 
@@ -872,7 +902,8 @@ func (replanOnEmptySwarmStep) Run(ctx context.Context, ps *swarmPipelineState) e
 	}
 
 	zap.L().Info("Scan produced zero findings but recon flagged real surface — running a business-logic-focused supplemental plan")
-	started := time.Now()
+	started := ps.startPhase(ctx, SwarmPhaseReplanOnEmpty, false)
+	defer ps.recordPhaseFinish(SwarmPhaseReplanOnEmpty, started)
 
 	cfg := ps.cfg
 	cfg.Focus = "behavioral and business-logic flaws — broken access control, race conditions, IDOR, privilege escalation, workflow tampering, mass assignment, authorization edge cases. Avoid duplicating signature-based modules already covered."
@@ -900,7 +931,6 @@ func (replanOnEmptySwarmStep) Run(ctx context.Context, ps *swarmPipelineState) e
 	if ps.runner.engine != nil {
 		ps.runner.engine.InvalidateContextCache()
 	}
-	ps.phaseTimings[SwarmPhaseReplanOnEmpty] = time.Since(started)
 	return nil
 }
 
@@ -943,7 +973,7 @@ func (triageSwarmStep) Run(ctx context.Context, ps *swarmPipelineState) error {
 		zap.L().Warn("Triage failed, continuing with scan results", zap.Error(err))
 		ps.runner.addWarning(ps.result, "triage failed: %v", err)
 	}
-	ps.phaseTimings[SwarmPhaseTriage] = time.Since(started)
+	ps.recordPhaseFinish(SwarmPhaseTriage, started)
 	fmt.Fprintf(os.Stderr, "%s %s  %s\n", terminal.Aqua(terminal.SymbolSuccess), terminal.Aqua("Triage"),
 		terminal.Muted(fmt.Sprintf("completed — %d confirmed, %d false positives, %d iterations in %s",
 			ps.result.Confirmed, ps.result.FalsePositives, ps.result.Iterations, ps.phaseTimings[SwarmPhaseTriage].Round(time.Second))))
@@ -1043,6 +1073,8 @@ func (s *SwarmRunner) buildSwarmExtensions(ctx context.Context, cfg SwarmConfig,
 	}
 	if len(allExtensions) == 0 && preValidationCount > 0 {
 		fmt.Fprintf(os.Stderr, "%s All %d generated extensions failed syntax validation — scanning without custom extensions\n", terminal.WarningSymbol(), preValidationCount)
+		_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", SwarmPhaseExtension, fmt.Sprintf(
+			"warning: all %d generated extensions failed syntax validation; scanning without custom extensions", preValidationCount))
 	}
 	return allExtensions, extensionRenames
 }
@@ -1051,12 +1083,13 @@ func (s *SwarmRunner) persistSwarmExtensions(ctx context.Context, cfg SwarmConfi
 	if len(allExtensions) == 0 {
 		return ""
 	}
-	s.emitPhase(cfg, SwarmPhaseExtension)
+	s.emitPhaseConsole(cfg, SwarmPhaseExtension)
 	agenticScan.CurrentPhase = SwarmPhaseExtension
 	s.persistPhase(ctx, agenticScan)
 	dir, err := writeExtensionsToDir(allExtensions, sessionDir)
 	if err != nil {
 		zap.L().Warn("Failed to write generated extensions", zap.Error(err))
+		_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", SwarmPhaseExtension, "warning: failed to write generated extensions; see run details")
 		return ""
 	}
 	sourceExtCount := len(sourceExtensions)

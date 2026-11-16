@@ -129,7 +129,7 @@ func (r *Runner) onLiveSessionEvent(ev authentication.LiveEvent) {
 	}
 	switch ev.Kind {
 	case authentication.LiveEventSuspect:
-		scanevents.Emit(scanevents.Event{
+		r.emitEvent(scanevents.Event{
 			Type:    scanevents.TypeAuthSessionSuspect,
 			Phase:   phase,
 			Session: ev.Session,
@@ -149,7 +149,7 @@ func (r *Runner) onLiveSessionEvent(ev authentication.LiveEvent) {
 		if ev.Err != nil {
 			e.Message = ev.Err.Error()
 		}
-		scanevents.Emit(e)
+		r.emitEvent(e)
 		if ok {
 			r.printPhaseDetail(fmt.Sprintf("session %s expired and was logged in again (credential generation %d)",
 				terminal.HiBlue(ev.Session), ev.Gen))
