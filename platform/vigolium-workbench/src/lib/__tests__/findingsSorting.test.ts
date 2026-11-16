@@ -21,10 +21,12 @@ const serverRows = [
 
 describe('findingSortParams', () => {
   it('only advertises fields supported by the server', () => {
-    expect([...FINDING_SORT_FIELDS]).toEqual(['severity', 'confidence', 'module_name', 'found_at']);
+    expect([...FINDING_SORT_FIELDS]).toEqual([
+      'severity', 'confidence', 'module_name', 'found_at', 'id', 'module_type', 'finding_source', 'status', 'url', 'scan_uuid', 'repo_name', 'source_file',
+    ]);
   });
 
-  for (const field of ['severity', 'confidence', 'module_name', 'found_at']) {
+  for (const field of ['severity', 'confidence', 'module_name', 'found_at', 'id', 'module_type', 'finding_source', 'status', 'url', 'scan_uuid', 'repo_name', 'source_file']) {
     it.each(['asc', 'desc'] as const)(`maps ${field} %s to server query parameters`, (order) => {
       expect(findingSortParams([{ colId: field, sort: order }])).toEqual({ sort: field, order });
     });
@@ -45,7 +47,7 @@ describe('findingSortParams', () => {
     ])).toEqual({ sort: 'module_name', order: 'asc' });
   });
 
-  it.each(['url', 'hostname', 'id', 'status', 'unsupported'])(
+  it.each(['hostname', 'record_kind', 'matched_at', 'tags', 'unsupported'])(
     'does not send unsupported field %s to the server',
     (field) => {
       expect(findingSortParams([{ colId: field, sort: 'asc' }])).toEqual({ sort: undefined, order: undefined });

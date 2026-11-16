@@ -5875,7 +5875,7 @@
     },
     "/api/findings": {
       "get": {
-        "description": "Returns a paginated list of vulnerability findings for the current project. Supports extensive filtering by severity, domain, module, scan, and text search. Results can be sorted by found_at (or found), created_at (or created), severity, module_name (or module), module_id, or confidence. Invalid sort and order values return HTTP 400.",
+        "description": "Returns a paginated list of vulnerability findings for the current project. Supports extensive filtering by severity, domain, module, scan, and text search. Results can be sorted by found_at (or found), created_at (or created), severity, module_name (or module), module_id, confidence, id, module_type, finding_source, status, url, scan_uuid, repo_name, or source_file. Invalid sort and order values return HTTP 400.",
         "operationId": "listFindings",
         "parameters": [
           {
@@ -5982,7 +5982,15 @@
                 "module_name",
                 "module",
                 "module_id",
-                "confidence"
+                "confidence",
+                "id",
+                "module_type",
+                "finding_source",
+                "status",
+                "url",
+                "scan_uuid",
+                "repo_name",
+                "source_file"
               ],
               "type": "string"
             }

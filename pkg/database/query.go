@@ -250,7 +250,10 @@ const confidenceSortRankExpr = "CASE f.confidence" +
 
 // FindingSortFields are the sort values accepted by the findings REST API,
 // including historical aliases also used by the query builder.
-var FindingSortFields = []string{"found_at", "found", "created_at", "created", "severity", "module_name", "module", "module_id", "confidence"}
+var FindingSortFields = []string{
+	"found_at", "found", "created_at", "created", "severity", "module_name", "module", "module_id", "confidence",
+	"id", "module_type", "finding_source", "status", "url", "scan_uuid", "repo_name", "source_file",
+}
 
 // ValidateFindingSort reports whether sortBy is an accepted public finding sort.
 // An empty value means the caller did not request an explicit sort.
@@ -1406,6 +1409,22 @@ func (fqb *FindingsQueryBuilder) mapFindingSortColumn(name string) string {
 		return "f.module_id"
 	case "confidence":
 		return confidenceSortRankExpr
+	case "id":
+		return "f.id"
+	case "module_type":
+		return "f.module_type"
+	case "finding_source":
+		return "f.finding_source"
+	case "status":
+		return "f.status"
+	case "url":
+		return "f.url"
+	case "scan_uuid":
+		return "f.scan_uuid"
+	case "repo_name":
+		return "f.repo_name"
+	case "source_file":
+		return "f.source_file"
 	default:
 		return "f.found_at"
 	}

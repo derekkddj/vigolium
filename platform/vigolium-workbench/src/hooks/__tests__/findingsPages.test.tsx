@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 import type { AgGridReactProps } from 'ag-grid-react';
 import type { Finding, FindingsQueryParams } from '@/api/types';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { FINDING_SORT_FIELDS } from '@/lib/findingsSorting';
 import DarkFindingsPage from '@/designs/dark/FindingsPage';
 import LightFindingsPage from '@/designs/light/FindingsPage';
 
@@ -136,11 +137,11 @@ describe.each([['dark', DarkFindingsPage], ['light', LightFindingsPage]] as cons
     expect(screen.getByText('Page 1 of 3')).toBeInTheDocument();
   });
 
-  it('hides previous-page rows while loading and does not offer unsupported local sorts', () => {
+  it('hides previous-page rows while loading and only offers server-backed sorts', () => {
     const { rerender } = render(<Page />);
     for (const column of mocks.grid.columnDefs || []) {
       if ('field' in column && column.field) {
-        expect(column.sortable).toBe(['severity', 'confidence', 'module_name', 'found_at'].includes(column.field));
+        expect(column.sortable).toBe(FINDING_SORT_FIELDS.has(column.field));
       }
     }
     mocks.placeholder = true; mocks.fetching = true;

@@ -3,7 +3,9 @@ import type { Finding, FindingsQueryParams } from '@/api/types';
 
 // These displayed columns are supported by FindingsQueryBuilder on the server.
 // Other headers must not offer misleading, page-local ordering.
-export const FINDING_SORT_FIELDS = new Set(['severity', 'confidence', 'module_name', 'found_at']);
+export const FINDING_SORT_FIELDS = new Set([
+  'severity', 'confidence', 'module_name', 'found_at', 'id', 'module_type', 'finding_source', 'status', 'url', 'scan_uuid', 'repo_name', 'source_file',
+]);
 
 export const FINDINGS_DEFAULT_COL_DEF: ColDef<Finding> = {
   sortable: false,
