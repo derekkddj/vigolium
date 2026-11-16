@@ -61,6 +61,33 @@ for (const theme of ['dark', 'light'] as const) {
       unmount(); expect(document.body.style.overflow).toBe(previous);
     });
 
+    it('closes with Escape even when a disabled action has dropped focus outside the dialog', async () => {
+      render(<AgentArtifactsPanel runUUID="run-a" theme={theme} />);
+      const opener = await screen.findByRole('button', { name: 'auth-config.yaml' });
+      opener.focus(); fireEvent.click(opener);
+      const close = screen.getByRole('button', { name: 'Close artifacts workspace' });
+      await screen.findByLabelText('Artifact content');
+      close.blur();
+      expect(document.activeElement).toBe(document.body);
+      fireEvent.keyDown(document.body, { key: 'Escape' });
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(opener).toHaveFocus();
+      expect(fireEvent.keyDown(document.body, { key: 'Escape' })).toBe(true);
+    });
+
+    it.each([false, true])('recovers Tab focus from outside the dialog (shift=%s) and removes its listener on unmount', async (shiftKey) => {
+      const { unmount } = render(<AgentArtifactsPanel runUUID="run-a" theme={theme} />);
+      fireEvent.click(await screen.findByRole('button', { name: 'auth-config.yaml' }));
+      const dialog = screen.getByRole('dialog');
+      await within(dialog).findByLabelText('Artifact content');
+      screen.getByRole('button', { name: 'Close artifacts workspace' }).blur();
+      expect(fireEvent.keyDown(document.body, { key: 'Tab', shiftKey })).toBe(false);
+      expect(dialog.contains(document.activeElement)).toBe(true);
+      if (!shiftKey) expect(within(dialog).getByRole('button', { name: 'Close artifacts workspace' })).toHaveFocus();
+      unmount();
+      expect(fireEvent.keyDown(document.body, { key: 'Tab', shiftKey })).toBe(true);
+    });
+
     it('keeps long notes collapsed and truncation/binary statuses outside the notes', async () => {
       vi.mocked(fetch).mockReset().mockResolvedValueOnce(listing()).mockResolvedValueOnce(new Response(Uint8Array.from([255, 0, 65, 10]), { headers: { 'X-Artifact-Total-Size': '8', 'X-Artifact-Offset': '0', 'X-Artifact-Returned-Bytes': '4', 'X-Artifact-Truncated': '1' } }));
       render(<AgentArtifactsPanel runUUID="run-a" theme={theme} />);
