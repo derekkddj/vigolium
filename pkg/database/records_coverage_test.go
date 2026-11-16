@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -500,13 +501,24 @@ func TestUpdateRecordResponse(t *testing.T) {
 		ResponseHash:          "abc123",
 		ResponseTimeMs:        15,
 	}
-	if err := repo.UpdateRecordResponse(ctx, u, update); err != nil {
-		t.Fatalf("UpdateRecordResponse: %v", err)
+	if err := repo.UpdateRecordResponse(ctx, u, update); !errors.Is(err, ErrImmutableRecordExchange) {
+		t.Fatalf("legacy response swap must reject changed raw: %v", err)
 	}
-
+	// Preserve the missing-response stub and store a complete observed version.
+	versionUUID, err := repo.SaveRecordVersion(ctx, u, rr.WithResponse(httpmsg.NewHttpResponse(update.RawResponse)))
+	if err != nil || versionUUID == u {
+		t.Fatalf("SaveRecordVersion: uuid=%q err=%v", versionUUID, err)
+	}
 	rec, _ := repo.GetRecordByUUID(ctx, u)
-	if rec.StatusCode != 201 || !rec.HasResponse {
-		t.Errorf("UpdateRecordResponse did not apply: status=%d hasResp=%v", rec.StatusCode, rec.HasResponse)
+	if rec.StatusCode != 0 || rec.HasResponse || len(rec.RawResponse) != 0 {
+		t.Errorf("original stub was mutated: status=%d hasResp=%v", rec.StatusCode, rec.HasResponse)
+	}
+	version, _ := repo.GetRecordByUUID(ctx, versionUUID)
+	if version.StatusCode != 201 || !version.HasResponse || version.ResponseHash == update.ResponseHash {
+		t.Errorf("version must derive metadata from exact raw bytes, got %+v", version)
+	}
+	if err := repo.UpdateRecordResponse(ctx, versionUUID, update); err != nil {
+		t.Fatalf("same response bytes should be a no-op: %v", err)
 	}
 
 	// Missing record errors.
@@ -531,14 +543,24 @@ func TestBackfillRecordResponse(t *testing.T) {
 		t.Fatalf("precondition: stub should have no response, got status=%d hasResp=%v", rec.StatusCode, rec.HasResponse)
 	}
 
-	// Backfill with a freshly fetched baseline (401 auth wall).
+	// A freshly fetched baseline is a new exchange, not a mutable stub fill.
 	withResp := stub.WithResponse(httpmsg.NewHttpResponse(
 		[]byte("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\r\n{\"error\":\"unauthorized\"}")))
-	if err := repo.BackfillRecordResponse(ctx, u, withResp); err != nil {
-		t.Fatalf("BackfillRecordResponse: %v", err)
+	if err := repo.BackfillRecordResponse(ctx, u, withResp); !errors.Is(err, ErrImmutableRecordExchange) {
+		t.Fatalf("BackfillRecordResponse must reject stub mutation: %v", err)
+	}
+	versionUUID, err := repo.SaveRecordVersion(ctx, u, withResp)
+	if err != nil || versionUUID == u {
+		t.Fatalf("SaveRecordVersion: uuid=%q err=%v", versionUUID, err)
+	}
+	if rec, _ := repo.GetRecordByUUID(ctx, u); rec.HasResponse || len(rec.RawResponse) != 0 {
+		t.Fatal("stored request-only stub must remain request-only")
+	}
+	if err := repo.BackfillRecordResponse(ctx, versionUUID, withResp); err != nil {
+		t.Fatalf("exact exchange is a no-op: %v", err)
 	}
 
-	rec, _ := repo.GetRecordByUUID(ctx, u)
+	rec, _ := repo.GetRecordByUUID(ctx, versionUUID)
 	if !rec.HasResponse || rec.StatusCode != 401 {
 		t.Errorf("backfill did not apply: status=%d hasResp=%v", rec.StatusCode, rec.HasResponse)
 	}
@@ -549,14 +571,14 @@ func TestBackfillRecordResponse(t *testing.T) {
 		t.Error("raw response not backfilled")
 	}
 
-	// Idempotent: a second backfill must NOT clobber an already-probed record
-	// (guarded on has_response = false), so the original 401 survives.
+	// A different answer must NOT clobber the already-observed version; the
+	// original 401 and the request-only stub both retain their identities.
 	second := stub.WithResponse(httpmsg.NewHttpResponse(
 		[]byte("HTTP/1.1 500 Internal Server Error\r\n\r\nboom")))
-	if err := repo.BackfillRecordResponse(ctx, u, second); err != nil {
-		t.Fatalf("BackfillRecordResponse (second): %v", err)
+	if err := repo.BackfillRecordResponse(ctx, versionUUID, second); !errors.Is(err, ErrImmutableRecordExchange) {
+		t.Fatalf("BackfillRecordResponse must reject a different response: %v", err)
 	}
-	if rec, _ := repo.GetRecordByUUID(ctx, u); rec.StatusCode != 401 {
+	if rec, _ := repo.GetRecordByUUID(ctx, versionUUID); rec.StatusCode != 401 {
 		t.Errorf("second backfill clobbered an existing response: status=%d, want 401", rec.StatusCode)
 	}
 

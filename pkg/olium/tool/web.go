@@ -1,19 +1,21 @@
 package tool
 
 import (
-	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"maps"
 	"net/http"
-	urlpkg "net/url"
 	"slices"
-	"sort"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
+	vhttp "github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/spitolas"
 )
@@ -33,14 +35,135 @@ import (
 // The tool keeps a single schema so the model doesn't have to choose two
 // different tools — it decides per-call via the `mode` parameter.
 
+// HTTPReceiptProvider selects exact captured bytes, never a URL/request-summary
+// fallback. Refs are local to the producing tool instance and may expire when
+// its bounded store evicts them. Selection returns an owned copy for evidence.Select.
+type HTTPReceiptProvider interface {
+	SelectHTTPReceipt(ref string) (*evidence.Exchange, error)
+}
+
+// HTTPReceiptManifest is deliberately byte-free so tool results remain bounded.
+// Available describes retention at return time, not durable DB persistence.
+type HTTPReceiptManifest struct {
+	ID            string              `json:"id,omitempty"`
+	Ref           string              `json:"ref,omitempty"`
+	Boundary      string              `json:"boundary"`
+	Available     bool                `json:"available"`
+	Availability  string              `json:"availability"`
+	RequestBytes  int                 `json:"request_bytes"`
+	ResponseBytes int                 `json:"response_bytes"`
+	RequestState  evidence.State      `json:"request_state"`
+	ResponseState evidence.State      `json:"response_state"`
+	Provenance    evidence.Provenance `json:"provenance,omitempty"`
+	ContentHash   string              `json:"content_hash,omitempty"`
+}
+
+// HTTPReceiptStore has no network/filesystem effects. Its zero value is ready
+// for use; bounded retention is shared by HTTP tools without a process-global
+// cross-run cache. Existing identities cannot be replaced with changed bytes.
+type HTTPReceiptStore struct {
+	mu       sync.Mutex
+	receipts map[string]*evidence.Exchange
+	order    []string
+	bytes    int
+}
+
+const httpReceiptMaxBytes = 32 * 1024 * 1024
+const httpReceiptMaxEntries = 256
+
+// The opaque ref binds identity, bytes/states, and capture time. If a caller
+// reintroduces an evicted ID with changed content, an old ref must still fail
+// selection rather than silently resolving to a different exchange.
+func httpReceiptRef(x *evidence.Exchange) string {
+	hash := sha256.Sum256([]byte(x.ID + "\x00" + x.ContentHash + "\x00" + x.CapturedAt.UTC().Format(time.RFC3339Nano)))
+	return "http-receipt:" + hex.EncodeToString(hash[:])
+}
+
+func (s *HTTPReceiptStore) RetainHTTPReceipt(x *evidence.Exchange, boundary string) (HTTPReceiptManifest, error) {
+	manifest := HTTPReceiptManifest{Boundary: boundary, Availability: "missing_capture", RequestState: evidence.StateMissing, ResponseState: evidence.StateMissing}
+	if x == nil {
+		return manifest, nil
+	}
+	manifest.ID, manifest.Ref = x.ID, httpReceiptRef(x)
+	manifest.RequestBytes, manifest.ResponseBytes = len(x.Request), len(x.Response)
+	manifest.RequestState, manifest.ResponseState = x.RequestState, x.ResponseState
+	manifest.Provenance, manifest.ContentHash = x.Provenance, x.ContentHash
+	if err := x.Validate(); err != nil {
+		manifest.Availability = "invalid_capture"
+		return manifest, err
+	}
+	size := len(x.Request) + len(x.Response)
+	if size > httpReceiptMaxBytes {
+		manifest.Availability = "retention_limit"
+		return manifest, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, existing := range s.receipts {
+		if existing.ID == x.ID && (existing.ContentHash != x.ContentHash || !existing.CapturedAt.Equal(x.CapturedAt)) {
+			manifest.Availability = "identity_conflict"
+			return manifest, fmt.Errorf("HTTP receipt identity changed")
+		}
+	}
+	if s.receipts[manifest.Ref] == nil {
+		if s.receipts == nil {
+			s.receipts = make(map[string]*evidence.Exchange)
+		}
+		for len(s.order) >= httpReceiptMaxEntries || s.bytes+size > httpReceiptMaxBytes {
+			id := s.order[0]
+			s.order = s.order[1:]
+			old := s.receipts[id]
+			s.bytes -= len(old.Request) + len(old.Response)
+			delete(s.receipts, id)
+		}
+		s.receipts[manifest.Ref] = x.Clone()
+		s.order = append(s.order, manifest.Ref)
+		s.bytes += size
+	}
+	manifest.Available, manifest.Availability = true, "execution_scoped"
+	return manifest, nil
+}
+
+func (s *HTTPReceiptStore) HTTPReceiptAvailable(ref string) bool {
+	if !strings.HasPrefix(ref, "http-receipt:") {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.receipts[ref] != nil
+}
+
+// RefreshHTTPReceiptAvailability updates a retained manifest after another
+// receipt may have evicted it. It does not turn a rejected capture into a ref to
+// different bytes with the same ID. Selection itself remains authoritative.
+func (s *HTTPReceiptStore) RefreshHTTPReceiptAvailability(manifest HTTPReceiptManifest) HTTPReceiptManifest {
+	if manifest.Available && !s.HTTPReceiptAvailable(manifest.Ref) {
+		manifest.Available, manifest.Availability = false, "expired"
+	}
+	return manifest
+}
+
+func (s *HTTPReceiptStore) SelectHTTPReceipt(ref string) (*evidence.Exchange, error) {
+	if !strings.HasPrefix(ref, "http-receipt:") {
+		return nil, fmt.Errorf("invalid HTTP receipt ref")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	x := s.receipts[ref]
+	if x == nil {
+		return nil, fmt.Errorf("HTTP receipt unavailable or expired in this tool instance")
+	}
+	return x.Clone(), nil
+}
+
 type webFetchTool struct {
+	HTTPReceiptStore
 	client *http.Client
 
-	// captureSink + captureProject, when both set, persist every successful
-	// fetch (HTTP and browser modes) as an http_record under source=
-	// "web-fetch" / "web-fetch-browser". Lets query_records / inspect_record /
-	// replay_request immediately act on whatever the agent just fetched
-	// without a separate ingest step. Nil sink disables capture.
+	// captureSink + captureProject enable record persistence under source=
+	// "web-fetch" / "web-fetch-browser". HTTP mode saves only complete captured
+	// exchanges; partial receipts stay execution-scoped. Nil sink disables
+	// persistence, not HTTP receipt capture.
 	captureSink    spitolas.CaptureSink
 	captureProject string
 
@@ -54,7 +177,7 @@ type webFetchTool struct {
 	readOnly bool
 }
 
-// NewWebFetch returns the no-capture variant. Used by TUI chat, tests, and
+// NewWebFetch returns the no-persistence variant. Used by TUI chat, tests, and
 // other callers that don't have a database wired. It still accepts mutating
 // methods and browser mode, so it is not read-only — see NewWebFetchReadOnly.
 func NewWebFetch() Tool {
@@ -62,17 +185,18 @@ func NewWebFetch() Tool {
 }
 
 // NewWebFetchReadOnly returns the genuinely read-only variant: GET/HEAD over
-// plain HTTP, no browser mode, no capture. Anything else is refused with an
+// plain HTTP, no browser mode, no persistence. Anything else is refused with an
 // error result naming the restriction. Registered by RegisterReadOnlyBuiltins
 // so strictly read-only contexts cannot issue state-changing requests.
 func NewWebFetchReadOnly() Tool {
 	return &webFetchTool{client: &http.Client{Timeout: 30 * time.Second}, readOnly: true}
 }
 
-// NewWebFetchWithCapture wires a CaptureSink so every successful fetch is
-// persisted to the project DB. Records appear in query_records under
-// source="web-fetch" (HTTP mode) or "web-fetch-browser" (rendered HTML).
-// Pass nil sink or empty projectUUID to fall back to the no-capture variant.
+// NewWebFetchWithCapture wires a CaptureSink to persist complete HTTP captures
+// and browser network traffic to the project DB. Records appear in query_records
+// under source="web-fetch" (HTTP mode) or "web-fetch-browser" (browser traffic).
+// Pass nil sink or empty projectUUID to disable persistence; HTTP receipts remain
+// available through HTTPReceiptProvider.
 func NewWebFetchWithCapture(sink spitolas.CaptureSink, projectUUID string) Tool {
 	if sink == nil || projectUUID == "" {
 		return NewWebFetch()
@@ -99,11 +223,11 @@ func (w *webFetchTool) Description() string {
 	if w.readOnly {
 		return "Fetch a URL with a read-only HTTP request (GET or HEAD only; no browser mode, nothing persisted). Returns the raw response."
 	}
-	return "Fetch a URL. Default mode is plain HTTP (fast, returns raw response, one record persisted). Set mode='browser' to render via headless Chromium (handles JS SPAs, client-side routing) — every XHR/fetch the page issues during render is also captured, so a single browser fetch typically produces many http_records. Use browser mode when the initial HTTP response is empty or missing content that clearly depends on JavaScript. HTTP-mode returns Details.record_uuid; browser-mode persists multiple records — call query_records with the target hostname to enumerate them."
+	return "Fetch a URL. Default mode is plain HTTP (fast, returns response and a selectable execution receipt). When persistence is enabled, only a complete captured exchange becomes a record; check Details.persisted, persistence_status and receipt availability. Details.record_uuid is returned only after a successful save. Set mode='browser' to render via headless Chromium (handles JS SPAs, client-side routing) — its XHR/fetch traffic can also be persisted as multiple http_records. Use browser mode when the initial HTTP response is empty or missing content that clearly depends on JavaScript; check its capture receipt and call query_records with the target hostname to enumerate saved records."
 }
 func (w *webFetchTool) Schema() map[string]any {
 	modes := []string{"http", "browser"}
-	modeDesc := "'http' = raw HTTP request (fast, one record); 'browser' = render with headless Chromium via CDP (also captures every XHR/fetch issued during render)."
+	modeDesc := "'http' = HTTP request with an execution receipt (fast, a record only when capture is complete and persistence succeeds); 'browser' = render with headless Chromium via CDP (also captures XHR/fetch issued during render)."
 	method := map[string]any{"type": "string", "default": "GET", "description": "HTTP method (http mode only)."}
 	if w.readOnly {
 		modes = []string{"http"}
@@ -199,7 +323,7 @@ func readOnlyViolation(mode string, args map[string]any) string {
 	return ""
 }
 
-func (w *webFetchTool) executeHTTP(ctx context.Context, url string, args map[string]any) (Result, error) {
+func (w *webFetchTool) executeHTTP(ctx context.Context, url string, args map[string]any) (result Result, err error) {
 	method, _ := args["method"].(string)
 	if method == "" {
 		method = "GET"
@@ -229,21 +353,52 @@ func (w *webFetchTool) executeHTTP(ctx context.Context, url string, args map[str
 		maxBytes = int64(v)
 	}
 
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return Result{Content: fmt.Sprintf("request failed: %v", err), IsError: true}, nil
+	// Preserve the existing one-byte sentinel read, but capture the transport's
+	// emitted request and decoded response before Close. No manual dump of an
+	// intended request can certify its defaults, body, authority or redirect hop.
+	chain, fetchErr := vhttp.DoCaptured(w.client, req, maxBytes+1)
+	var x *evidence.Exchange
+	if chain != nil {
+		defer chain.Close()
+		x = vhttp.CaptureEvidence(chain)
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	// Read one byte past the cap so a response landing exactly on maxBytes
-	// isn't misreported as truncated. Trim the sentinel byte back off when the
-	// body actually overflowed.
-	limited := io.LimitReader(resp.Body, maxBytes+1)
-	raw, err := io.ReadAll(limited)
-	if err != nil {
-		return Result{Content: fmt.Sprintf("read body: %v", err), IsError: true}, nil
+	manifest, receiptErr := w.RetainHTTPReceipt(x, "http_client_message")
+	details := map[string]any{"mode": "http", "receipt": manifest, "persisted": false,
+		"response_body_limit_bytes": maxBytes + 1, "display_body_limit_bytes": maxBytes}
+	defer func() {
+		details["receipt"] = w.RefreshHTTPReceiptAvailability(manifest)
+		// Details also serve the UI, but model history consumes Content. Keep the
+		// legacy response view and append only a byte-free execution manifest.
+		receiptJSON, _ := json.Marshal(details)
+		result.Content += "\n\n[HTTP execution receipt]\n" + string(receiptJSON)
+	}()
+	if chain != nil {
+		details["response_body_bytes_retained"] = len(chain.BodyBytes())
 	}
-
+	details["response_capture_state"] = manifest.ResponseState
+	details["response_body_complete"] = manifest.ResponseState == evidence.StateComplete
+	// Unknown/missing capture cannot certify whether any body was omitted.
+	switch manifest.ResponseState {
+	case evidence.StateComplete:
+		details["response_body_omitted"] = false
+	case evidence.StateTruncated:
+		details["response_body_omitted"] = true
+	}
+	if receiptErr != nil {
+		details["receipt_error"] = receiptErr.Error()
+	}
+	if fetchErr != nil {
+		details["execution_error"] = fetchErr.Error()
+		w.addHTTPPersistenceDetails(ctx, x, details)
+		return Result{Content: fmt.Sprintf("request failed: %v", fetchErr), IsError: true, Details: details}, nil
+	}
+	if chain == nil || chain.Response() == nil {
+		details["execution_error"] = "request completed without a captured response"
+		w.addHTTPPersistenceDetails(ctx, x, details)
+		return Result{Content: "request completed without a captured response", IsError: true, Details: details}, nil
+	}
+	resp := chain.Response()
+	raw := chain.BodyBytes()
 	truncated := int64(len(raw)) > maxBytes
 	if truncated {
 		raw = raw[:maxBytes]
@@ -259,13 +414,10 @@ func (w *webFetchTool) executeHTTP(ctx context.Context, url string, args map[str
 		fmt.Fprintf(&out, "\n\n[truncated at %d bytes]", maxBytes)
 	}
 
-	details := map[string]any{
-		"mode":         "http",
-		"status":       resp.StatusCode,
-		"content_type": resp.Header.Get("Content-Type"),
-		"bytes":        len(raw),
-		"truncated":    truncated,
-	}
+	details["status"] = resp.StatusCode
+	details["content_type"] = resp.Header.Get("Content-Type")
+	details["bytes"] = len(raw)
+	details["truncated"] = truncated
 
 	// The client follows redirects, so resp answers the LAST hop's request, not
 	// req. The record pairs the response with the request that produced it.
@@ -279,10 +431,8 @@ func (w *webFetchTool) executeHTTP(ctx context.Context, url string, args map[str
 			"original_url": req.URL.String(),
 			"final_url":    final.URL.String(),
 		}
-		if requestBodyUnreadable(final) {
-			// The hop re-sent a body this side cannot re-read, so the stored
-			// request would read as bodiless when it was not.
-			details["body_omitted"] = "redirect"
+		if x == nil || x.RequestState != evidence.StateComplete {
+			details["body_omitted"] = "capture_unavailable"
 		}
 	}
 
@@ -290,16 +440,7 @@ func (w *webFetchTool) executeHTTP(ctx context.Context, url string, args map[str
 	// replay_request). Capture failures are non-fatal — the model still
 	// gets the body even if persistence breaks — but they are reported, so
 	// the model is never told a record exists that does not.
-	if w.captureSink != nil && w.captureProject != "" {
-		recUUID, perr := w.persistHTTPFetch(ctx, final, resp, raw)
-		details["persisted"] = perr == nil && recUUID != ""
-		switch {
-		case perr != nil:
-			details["persist_error"] = perr.Error()
-		case recUUID != "":
-			details["record_uuid"] = recUUID
-		}
-	}
+	w.addHTTPPersistenceDetails(ctx, x, details)
 
 	return Result{
 		Content: out.String(),
@@ -317,115 +458,42 @@ func redirectHops(resp *http.Response) int {
 	return n
 }
 
-// requestBodyUnreadable reports a request that carried a body which cannot be
-// re-read for serialization (no GetBody).
-func requestBodyUnreadable(req *http.Request) bool {
-	return req.GetBody == nil && req.Body != nil && req.Body != http.NoBody
+// Partial/missing receipts remain selectable in the execution store, but must
+// not masquerade as complete HTTP records. A sink failure does not retry the
+// completed request and is surfaced independently from execution success.
+func (w *webFetchTool) addHTTPPersistenceDetails(ctx context.Context, x *evidence.Exchange, details map[string]any) {
+	details["persisted"] = false
+	if w.captureSink == nil || w.captureProject == "" {
+		details["persistence_status"] = "disabled"
+		return
+	}
+	id, err := w.persistHTTPFetch(ctx, x)
+	if err != nil {
+		details["persistence_status"] = "failed"
+		if x == nil || x.RequestState != evidence.StateComplete || x.ResponseState != evidence.StateComplete {
+			details["persistence_status"] = "capture_unavailable"
+		}
+		details["persist_error"] = err.Error()
+	} else {
+		details["persisted"] = true
+		details["persistence_status"] = "saved"
+		details["record_uuid"] = id
+	}
 }
 
-// persistHTTPFetch serialises the just-completed request/response pair into
-// raw HTTP bytes and hands it to the capture sink. req must be the request
-// that produced resp — resp.Request after redirects, not the original. Returns the new record's
-// UUID (or empty when capture is disabled or fails). All errors are
-// surfaced to the caller as a flag, not propagated — fetch already succeeded
-// and the model has the body, so a persistence hiccup shouldn't fail the
-// tool call.
-func (w *webFetchTool) persistHTTPFetch(ctx context.Context, req *http.Request, resp *http.Response, body []byte) (string, error) {
-	if w.captureSink == nil || w.captureProject == "" {
-		return "", nil
+func (w *webFetchTool) persistHTTPFetch(ctx context.Context, x *evidence.Exchange) (string, error) {
+	if x == nil || x.RequestState != evidence.StateComplete || x.ResponseState != evidence.StateComplete {
+		return "", fmt.Errorf("no complete captured HTTP exchange; partial receipt is execution-scoped only")
 	}
-
-	host, port := splitHostPort(req.URL)
-	scheme := req.URL.Scheme
-	svc, err := httpmsg.NewService(host, port, scheme)
+	rr, err := httpmsg.FromEvidenceExchange(x)
 	if err != nil {
 		return "", err
 	}
-
-	rawReq := buildRawRequest(req)
-	rawResp := buildRawResponse(resp, body)
-
-	rr := httpmsg.NewHttpRequestResponse(
-		httpmsg.NewHttpRequestWithService(svc, rawReq),
-		httpmsg.NewHttpResponse(rawResp),
-	)
-	return w.captureSink.SaveRecord(ctx, rr, "web-fetch", w.captureProject)
-}
-
-// buildRawRequest serialises a sent net/http.Request back to wire bytes
-// (request line + headers + body). Stable header ordering so the
-// request_hash stays deterministic across calls.
-func buildRawRequest(req *http.Request) []byte {
-	var b bytes.Buffer
-
-	path := req.URL.RequestURI()
-	if path == "" {
-		path = "/"
+	id, err := w.captureSink.SaveRecord(ctx, rr, "web-fetch", w.captureProject)
+	if err == nil && id == "" {
+		err = fmt.Errorf("capture sink returned no record UUID")
 	}
-	fmt.Fprintf(&b, "%s %s HTTP/1.1\r\n", req.Method, path)
-
-	// Host header up front (some servers care about ordering).
-	host := req.Host
-	if host == "" {
-		host = req.URL.Host
-	}
-	fmt.Fprintf(&b, "Host: %s\r\n", host)
-
-	keys := make([]string, 0, len(req.Header))
-	for k := range req.Header {
-		if strings.EqualFold(k, "Host") {
-			continue
-		}
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		for _, v := range req.Header.Values(k) {
-			fmt.Fprintf(&b, "%s: %s\r\n", k, v)
-		}
-	}
-	b.WriteString("\r\n")
-
-	if req.GetBody != nil {
-		if rc, err := req.GetBody(); err == nil {
-			if data, err := io.ReadAll(rc); err == nil {
-				b.Write(data)
-			}
-			_ = rc.Close()
-		}
-	}
-	return b.Bytes()
-}
-
-// buildRawResponse rebuilds the response wire bytes from a *http.Response +
-// already-read body. Used by capture paths where we've consumed resp.Body
-// into a buffer.
-func buildRawResponse(resp *http.Response, body []byte) []byte {
-	var b bytes.Buffer
-	proto := resp.Proto
-	if proto == "" {
-		proto = "HTTP/1.1"
-	}
-	fmt.Fprintf(&b, "%s %s\r\n", proto, resp.Status)
-
-	keys := make([]string, 0, len(resp.Header))
-	for k := range resp.Header {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		for _, v := range resp.Header.Values(k) {
-			fmt.Fprintf(&b, "%s: %s\r\n", k, v)
-		}
-	}
-	// Synthesize Content-Length when missing so downstream parsers don't
-	// have to guess where the body ends.
-	if resp.Header.Get("Content-Length") == "" && len(body) > 0 {
-		fmt.Fprintf(&b, "Content-Length: %d\r\n", len(body))
-	}
-	b.WriteString("\r\n")
-	b.Write(body)
-	return b.Bytes()
+	return id, err
 }
 
 // readinessDetails renders a probe's wait_selector outcome as tool-result
@@ -475,21 +543,6 @@ func captureSummary(rc spitolas.CaptureReceipt, source string) string {
 		msg += "; use query_records to enumerate"
 	}
 	return msg
-}
-
-// splitHostPort returns hostname + numeric port, defaulting to 80/443 per
-// scheme when the URL omits it.
-func splitHostPort(u *urlpkg.URL) (string, int) {
-	host := u.Hostname()
-	portStr := u.Port()
-	if portStr == "" {
-		if u.Scheme == "https" {
-			return host, 443
-		}
-		return host, 80
-	}
-	port, _ := strconv.Atoi(portStr)
-	return host, port
 }
 
 // executeBrowser drives spitolas (Chromium via CDP) for JS-rendered pages.

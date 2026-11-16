@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	evidencepkg "github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -24,6 +25,7 @@ type headerCapture struct {
 	fullResponse string
 	body         string
 	status       int
+	exchange     *evidencepkg.Exchange
 }
 
 // isAccessDenied returns true for status codes that indicate the request was
@@ -114,7 +116,7 @@ func (m *Module) ScanPerRequest(
 	// findings: each compares its spoofed-header probe (the attack pair) against the
 	// same GET / baseline. Capture before Close frees the buffer.
 	baselineEv := modkit.NewEvidenceCollector()
-	baselineEv.Add("baseline", string(baselineRaw), baselineResp.FullResponseString())
+	baselineEv.AddExchange(http.CaptureEvidence(baselineResp), evidencepkg.RoleBaseline, "baseline")
 	baselineEvidence := baselineEv.Entries()
 
 	urlx, err := ctx.URL()
@@ -138,6 +140,9 @@ func (m *Module) ScanPerRequest(
 		results = append(results, result)
 	}
 
+	for _, result := range results {
+		modkit.AppendEvidence(result, baselineEv)
+	}
 	return results, nil
 }
 
@@ -146,7 +151,7 @@ func (m *Module) testForwardedHost(
 	httpClient *http.Requester,
 	targetURL string,
 	baselineEvidence []string,
-) *output.ResultEvent {
+) (resultEvent *output.ResultEvent) {
 	modifiedRaw, ok := rootGetRaw(ctx, "X-Forwarded-Host", injectedHost)
 	if !ok {
 		return nil
@@ -166,6 +171,10 @@ func (m *Module) testForwardedHost(
 		return nil
 	}
 	defer resp.Close()
+	selectedExchange := http.CaptureEvidence(resp)
+	defer func() {
+		modkit.SetPrimaryEvidence(resultEvent, selectedExchange, evidencepkg.RoleAttack, "spoofed forwarding header")
+	}()
 
 	if resp.Response() == nil || infra.GetBlockDetectionValidator().Validate(resp) != nil {
 		return nil
@@ -212,7 +221,8 @@ func (m *Module) testForwardedHost(
 	// one-shot echo, a coincidental static string, or a query-parameter echo. A
 	// fresh random host must reflect as a URL authority every round. An incomplete
 	// confirmation cannot establish attacker control, so it is dropped.
-	if confirmed, err := m.confirmForwardedHostReflection(ctx, httpClient); err != nil || !confirmed {
+	confirmationEv := modkit.NewEvidenceCollector()
+	if confirmed, err := m.confirmForwardedHostReflection(ctx, httpClient, confirmationEv); err != nil || !confirmed {
 		return nil
 	}
 
@@ -223,7 +233,8 @@ func (m *Module) testForwardedHost(
 		URL:                targetURL,
 		Request:            string(modifiedRaw),
 		Response:           resp.FullResponseString(),
-		AdditionalEvidence: baselineEvidence,
+		AdditionalEvidence: append(append([]string{}, baselineEvidence...), confirmationEv.Entries()...),
+		Evidence:           confirmationEv.Evidence(),
 		ExtractedResults: []string{
 			"Header: X-Forwarded-Host: " + injectedHost,
 			"Finding: " + finding,
@@ -251,7 +262,7 @@ func (m *Module) testForwardedProto(
 	baselineStatus int,
 	targetURL string,
 	baselineEvidence []string,
-) *output.ResultEvent {
+) (resultEvent *output.ResultEvent) {
 	modifiedRaw, ok := rootGetRaw(ctx, "X-Forwarded-Proto", "https")
 	if !ok {
 		return nil
@@ -266,6 +277,10 @@ func (m *Module) testForwardedProto(
 		return nil
 	}
 	defer resp.Close()
+	selectedExchange := http.CaptureEvidence(resp)
+	defer func() {
+		modkit.SetPrimaryEvidence(resultEvent, selectedExchange, evidencepkg.RoleAttack, "spoofed forwarding header")
+	}()
 
 	if resp.Response() == nil || infra.GetBlockDetectionValidator().Validate(resp) != nil {
 		return nil
@@ -319,6 +334,7 @@ func (m *Module) testForwardedProto(
 		Request:            string(modifiedRaw),
 		Response:           resp.FullResponseString(),
 		AdditionalEvidence: evidence,
+		Evidence:           negControlEv.Evidence(),
 		ExtractedResults: []string{
 			"Header: X-Forwarded-Proto: https",
 			"Finding: " + finding,
@@ -347,7 +363,7 @@ func (m *Module) testForwardedFor(
 	baselineBody string,
 	targetURL string,
 	baselineEvidence []string,
-) *output.ResultEvent {
+) (resultEvent *output.ResultEvent) {
 	modifiedRaw, ok := rootGetRaw(ctx, "X-Forwarded-For", injectedIP)
 	if !ok {
 		return nil
@@ -362,6 +378,12 @@ func (m *Module) testForwardedFor(
 		return nil
 	}
 	defer resp.Close()
+	selectedExchange := http.CaptureEvidence(resp)
+	confirmationEv := modkit.NewEvidenceCollector()
+	defer func() {
+		modkit.SetPrimaryEvidence(resultEvent, selectedExchange, evidencepkg.RoleAttack, "spoofed forwarding header")
+		modkit.AppendEvidence(resultEvent, confirmationEv)
+	}()
 
 	if resp.Response() == nil || infra.GetBlockDetectionValidator().Validate(resp) != nil {
 		return nil
@@ -377,7 +399,7 @@ func (m *Module) testForwardedFor(
 	// cleared by the probe reads as a bypass), so confirm the split is reproducible
 	// and header-attributable before asserting an access-control bypass.
 	if isAccessDenied(baselineStatus) && probeStatus >= 200 && probeStatus < 300 {
-		confirmationEvidence, semanticAccess, confirmed := m.confirmForwardedForBypass(ctx, httpClient)
+		confirmationEvidence, semanticAccess, confirmed := m.confirmForwardedForBypass(ctx, httpClient, confirmationEv)
 		if !confirmed {
 			return nil
 		}
@@ -398,6 +420,7 @@ func (m *Module) testForwardedFor(
 			Request:            string(modifiedRaw),
 			Response:           resp.FullResponseString(),
 			AdditionalEvidence: evidence,
+			Evidence:           confirmationEv.Evidence(),
 			ExtractedResults: []string{
 				"Header: X-Forwarded-For: " + injectedIP,
 				"Finding: " + fmt.Sprintf("X-Forwarded-For IP spoofing bypassed access control (status %d → %d)", baselineStatus, probeStatus),
@@ -429,7 +452,7 @@ func (m *Module) testForwardedFor(
 	// Skip entirely when either side is a WAF/denied page — that size is noise, and
 	// a WAF reacting to the spoofed header is the opposite of trusting it.
 	if !isAccessDenied(baselineStatus) && !isAccessDenied(probeStatus) && len(baselineBody) > 0 {
-		if shift, confirmationEvidence, ok := m.confirmForwardedForSizeShift(ctx, httpClient, scanCtx, len(baselineBody), len(probeBody)); ok {
+		if shift, confirmationEvidence, ok := m.confirmForwardedForSizeShift(ctx, httpClient, scanCtx, len(baselineBody), len(probeBody), confirmationEv); ok {
 			evidence := append(append([]string{}, baselineEvidence...), confirmationEvidence...)
 			return &output.ResultEvent{
 				ModuleID:           ModuleID,
@@ -439,6 +462,7 @@ func (m *Module) testForwardedFor(
 				Request:            string(modifiedRaw),
 				Response:           resp.FullResponseString(),
 				AdditionalEvidence: evidence,
+				Evidence:           confirmationEv.Evidence(),
 				ExtractedResults: []string{
 					"Header: X-Forwarded-For: " + injectedIP,
 					"Finding: " + shift,
@@ -471,7 +495,7 @@ func (m *Module) testForwardedFor(
 // another URL's query parameter (the OAuth redirect_uri= case) will not satisfy
 // the authority check across the changing canary. Returns ConfirmReflection's
 // (confirmed, err); callers require a complete confirmation.
-func (m *Module) confirmForwardedHostReflection(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) (bool, error) {
+func (m *Module) confirmForwardedHostReflection(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, collectors ...*modkit.EvidenceCollector) (bool, error) {
 	return modkit.ConfirmReflection(2, func(canary string) (bool, error) {
 		host := canary + ".example"
 		raw, ok := rootGetRaw(ctx, "X-Forwarded-Host", host)
@@ -491,6 +515,10 @@ func (m *Module) confirmForwardedHostReflection(ctx *httpmsg.HttpRequestResponse
 		defer resp.Close()
 		if resp.Response() == nil || infra.GetBlockDetectionValidator().Validate(resp) != nil {
 			return false, nil
+		}
+		x := http.CaptureEvidence(resp)
+		for _, ev := range collectors {
+			ev.AddExchange(x, evidencepkg.RoleConfirmation, "fresh host reflection")
 		}
 		loc := resp.Response().Header.Get("Location")
 		return modkit.HostReflectedAsAuthority(loc, host) || modkit.HostReflectedAsAuthority(resp.Body().String(), host), nil
@@ -512,14 +540,18 @@ func (m *Module) confirmForwardedProtoChange(
 	negControl *modkit.EvidenceCollector,
 ) bool {
 	for range 2 {
-		_, bs, ok := m.headerFetch(ctx, httpClient, "X-Forwarded-Proto", "")
+		baseline, ok := m.captureFetch(ctx, httpClient, "X-Forwarded-Proto", "")
+		bs := baseline.status
+		negControl.AddExchange(baseline.exchange, evidencepkg.RoleControl, "no-header protocol control")
 		if !ok {
 			return false
 		}
 		if bs != baselineStatus {
 			return false // baseline not stable → change not attributable
 		}
-		_, ps, ok := m.headerFetch(ctx, httpClient, "X-Forwarded-Proto", "https")
+		probe, ok := m.captureFetch(ctx, httpClient, "X-Forwarded-Proto", "https")
+		ps := probe.status
+		negControl.AddExchange(probe.exchange, evidencepkg.RoleConfirmation, "https protocol replay")
 		if !ok {
 			return false
 		}
@@ -535,7 +567,7 @@ func (m *Module) confirmForwardedProtoChange(
 	if !ok {
 		return false
 	}
-	negControl.Add("negative control: X-Forwarded-Proto: http (benign value)", control.rawRequest, control.fullResponse)
+	negControl.AddExchange(control.exchange, evidencepkg.RoleControl, "negative control: X-Forwarded-Proto: http (benign value)")
 	return control.status == baselineStatus
 }
 
@@ -563,6 +595,7 @@ func (m *Module) captureFetch(ctx *httpmsg.HttpRequestResponse, httpClient *http
 		fullResponse: resp.FullResponseString(),
 		body:         resp.BodyString(),
 		status:       resp.Response().StatusCode,
+		exchange:     http.CaptureEvidence(resp),
 	}, true
 }
 
@@ -610,6 +643,7 @@ func (m *Module) confirmForwardedForSizeShift(
 	httpClient *http.Requester,
 	scanCtx *modkit.ScanContext,
 	baselineLen, probeLen int,
+	collectors ...*modkit.EvidenceCollector,
 ) (string, []string, bool) {
 	control, ok := m.captureFetch(ctx, httpClient, "", "")
 	if !ok || isAccessDenied(control.status) {
@@ -630,7 +664,11 @@ func (m *Module) confirmForwardedForSizeShift(
 	// Those bands are two samples each, so they only describe natural variance on an
 	// endpoint that is a function of the request (see SizeShiftGap). Last gate, after
 	// the free band check has rejected the common case.
-	if modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+	var guardProof *modkit.EvidenceCollector
+	if len(collectors) > 0 {
+		guardProof = collectors[0]
+	}
+	if modkit.EndpointVolatileWithEvidence(scanCtx, ctx, httpClient, guardProof) {
 		return "", nil, false
 	}
 
@@ -643,6 +681,10 @@ func (m *Module) confirmForwardedForSizeShift(
 	evidence := []string{
 		output.BuildEvidence("fresh no-header variance control", control.rawRequest, control.fullResponse),
 		output.BuildEvidence("spoofed-IP size replay", probe2.rawRequest, probe2.fullResponse),
+	}
+	for _, ev := range collectors {
+		ev.AddExchange(control.exchange, evidencepkg.RoleControl, "fresh no-header variance control")
+		ev.AddExchange(probe2.exchange, evidencepkg.RoleConfirmation, "spoofed-IP size replay")
 	}
 	return shift, evidence, true
 }
@@ -662,6 +704,7 @@ func (m *Module) confirmForwardedForSizeShift(
 func (m *Module) confirmForwardedForBypass(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
+	collectors ...*modkit.EvidenceCollector,
 ) (evidence []string, semanticAccess, confirmed bool) {
 	const rounds = 2
 	var allowedBody string
@@ -680,6 +723,10 @@ func (m *Module) confirmForwardedForBypass(
 			output.BuildEvidence("no-header denial control", control.rawRequest, control.fullResponse),
 			output.BuildEvidence("trusted-IP replay", probe.rawRequest, probe.fullResponse),
 		)
+		for _, ev := range collectors {
+			ev.AddExchange(control.exchange, evidencepkg.RoleControl, "no-header denial control")
+			ev.AddExchange(probe.exchange, evidencepkg.RoleConfirmation, "trusted-IP replay")
+		}
 		denialBodies = append(denialBodies, control.body)
 		if !hasAllowedBody {
 			allowedBody = probe.body
@@ -694,6 +741,9 @@ func (m *Module) confirmForwardedForBypass(
 		return nil, false, false
 	}
 	evidence = append(evidence, output.BuildEvidence("untrusted-IP negative control", negative.rawRequest, negative.fullResponse))
+	for _, ev := range collectors {
+		ev.AddExchange(negative.exchange, evidencepkg.RoleControl, "untrusted-IP negative control")
+	}
 
 	semanticAccess = strings.TrimSpace(allowedBody) != "" && !modkit.BodiesSimilar(allowedBody, negative.body)
 	for _, deniedBody := range denialBodies {

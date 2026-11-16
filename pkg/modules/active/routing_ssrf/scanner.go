@@ -9,6 +9,7 @@ import (
 
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -129,11 +130,13 @@ func (m *Module) runInternalOracle(
 	service *httpmsg.Service,
 	victimHost string,
 ) *output.ResultEvent {
-	baselineBody := m.freshBaseline(httpClient, service, baseRaw)
+	var baselineExchange *evidence.Exchange
+	baselineBody := m.freshBaseline(httpClient, service, baseRaw, &baselineExchange)
 
 	for _, tgt := range infra.InternalSSRFTargets() {
 		for _, f := range infra.RoutingTargets(victimHost, tgt.Effective) {
-			status, body, fullResp, blocked, ok, fatal := m.fireTarget(httpClient, service, baseRaw, f.Target, tgt.ExtraHeaders)
+			var candidateExchange *evidence.Exchange
+			status, body, fullResp, blocked, ok, fatal := m.fireTarget(httpClient, service, baseRaw, f.Target, tgt.ExtraHeaders, &candidateExchange)
 			if fatal {
 				return nil
 			}
@@ -147,7 +150,7 @@ func (m *Module) runInternalOracle(
 			if !ok {
 				continue
 			}
-			if ev := m.confirmInternal(httpClient, service, baseRaw, baselineBody, urlx, victimHost, tgt, f, markers, fullResp); ev != nil {
+			if ev := m.confirmInternal(httpClient, service, baseRaw, baselineBody, urlx, victimHost, tgt, f, markers, fullResp, candidateExchange, baselineExchange); ev != nil {
 				return ev
 			}
 		}
@@ -171,33 +174,45 @@ func (m *Module) confirmInternal(
 	f infra.RoutingTarget,
 	markers []string,
 	candidateResp string,
-) *output.ResultEvent {
+	receipts ...*evidence.Exchange,
+) (finding *output.ResultEvent) {
 	ev := modkit.NewEvidenceCollector()
-	ev.Add("candidate", displayRequest(baseRaw, f.Target), candidateResp)
+	var primary, baseline *evidence.Exchange
+	if len(receipts) > 0 {
+		primary = receipts[0]
+	}
+	if len(receipts) > 1 {
+		baseline = receipts[1]
+	}
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, primary, evidence.RoleAttack, "routing metadata probe")
+	}()
 
 	// (1) Reproducible: the SAME multi-marker cluster must reappear on a 2xx,
 	// non-blocked, non-HTML response. Fails closed on any miss.
 	for i := 0; i < confirmRounds; i++ {
-		status, body, fullResp, blocked, ok, fatal := m.fireTarget(httpClient, service, baseRaw, f.Target, tgt.ExtraHeaders)
+		var replay *evidence.Exchange
+		status, body, _, blocked, ok, fatal := m.fireTarget(httpClient, service, baseRaw, f.Target, tgt.ExtraHeaders, &replay)
 		if fatal || !ok || blocked || !is2xx(status) || !infra.MetadataBodyReproduces(body, markers) {
 			return nil // fail closed
 		}
-		ev.Add(fmt.Sprintf("reproduce-%d", i+1), displayRequest(baseRaw, f.Target), fullResp)
+		ev.AddExchange(replay, evidence.RoleConfirmation, fmt.Sprintf("reproduce-%d", i+1))
 	}
 
 	// (2) Decoy-negative: the SAME request-line quirk around an unrelated TEST-NET
 	// host must NOT yield the markers. If it does, the proxy serves this content for
 	// any absolute target (a catch-all / canned error page) — not a reached endpoint.
 	if decoy := decoyTargetLike(f, victimHost); decoy != "" {
-		status, body, fullResp, blocked, ok, _ := m.fireTarget(httpClient, service, baseRaw, decoy, tgt.ExtraHeaders)
+		var decoyExchange *evidence.Exchange
+		status, body, _, blocked, ok, _ := m.fireTarget(httpClient, service, baseRaw, decoy, tgt.ExtraHeaders, &decoyExchange)
 		if ok && !blocked && is2xx(status) && infra.BodyContainsAllMarkers(body, markers) {
 			return nil // catch-all → false positive
 		}
-		ev.Add("decoy-negative", displayRequest(baseRaw, decoy), fullResp)
+		ev.AddExchange(decoyExchange, evidence.RoleControl, "decoy-negative")
 	}
 
 	// (3) Baseline-absence was established before reporting; record it as evidence.
-	ev.Add("baseline (original request)", string(baseRaw), baselineBody)
+	ev.AddExchange(baseline, evidence.RoleBaseline, "baseline (original request)")
 
 	markerList := strings.Join(markers, ", ")
 	desc := fmt.Sprintf(
@@ -211,6 +226,7 @@ func (m *Module) confirmInternal(
 		FuzzingParameter:   "request-line",
 		ExtractedResults:   []string{f.Target, tgt.Label, "markers=" + markerList, f.Label},
 		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
 		Info: output.Info{
 			Name:        "Routing-Based SSRF (Internal Metadata Reached)",
 			Description: desc,
@@ -229,6 +245,7 @@ func (m *Module) fireTarget(
 	baseRaw []byte,
 	target string,
 	extraHeaders map[string]string,
+	exchanges ...**evidence.Exchange,
 ) (status int, body, fullResp string, blocked, ok, fatal bool) {
 	raw, err := httpmsg.AddOrReplaceHeader(baseRaw, "Cache-Control", "no-transform")
 	if err != nil {
@@ -258,6 +275,12 @@ func (m *Module) fireTarget(
 		return 0, "", "", false, false, false
 	}
 	defer resp.Close()
+	x := http.CaptureEvidence(resp)
+	for _, selected := range exchanges {
+		if selected != nil {
+			*selected = x.Clone()
+		}
+	}
 	if resp.Response() == nil {
 		return 0, "", "", false, false, false
 	}
@@ -267,7 +290,7 @@ func (m *Module) fireTarget(
 // freshBaseline fetches the original origin-form request once, for marker-absence
 // comparison and evidence. Returns "" on any error (callers treat that as "no
 // baseline content", which only makes the marker-absence check stricter).
-func (m *Module) freshBaseline(httpClient *http.Requester, service *httpmsg.Service, baseRaw []byte) string {
+func (m *Module) freshBaseline(httpClient *http.Requester, service *httpmsg.Service, baseRaw []byte, exchanges ...**evidence.Exchange) string {
 	// baseRaw is already well-formed, so wrap directly instead of
 	// re-parsing on this hot path.
 	req := httpmsg.NewRequestResponseRaw(baseRaw, service)
@@ -276,6 +299,12 @@ func (m *Module) freshBaseline(httpClient *http.Requester, service *httpmsg.Serv
 		return ""
 	}
 	defer resp.Close()
+	x := http.CaptureEvidence(resp)
+	for _, selected := range exchanges {
+		if selected != nil {
+			*selected = x.Clone()
+		}
+	}
 	if resp.Response() == nil {
 		return ""
 	}

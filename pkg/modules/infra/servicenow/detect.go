@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra/saasprobe"
@@ -72,8 +73,9 @@ var ckTokenRe = regexp.MustCompile(`(?:g_ck\s*=\s*|["']sysparm_ck["'][^>]*value\
 // Session carries the guest session cookies and CSRF token needed to call a
 // widget API as an unauthenticated user.
 type Session struct {
-	Token  string // X-UserToken (g_ck)
-	Cookie string // Cookie header value (name=value; name=value)
+	Token    string             // X-UserToken (g_ck)
+	Cookie   string             // Cookie header value (name=value; name=value)
+	Exchange *evidence.Exchange // selected token/cookie acquisition operation
 }
 
 // AcquireSession GETs a Service Portal landing page, scraping the g_ck CSRF token
@@ -94,14 +96,14 @@ func AcquireSession(ctx *httpmsg.HttpRequestResponse, client *http.Requester) (S
 		if token == "" {
 			continue
 		}
-		return Session{Token: token, Cookie: cookieHeaderFrom(res)}, true
+		return Session{Token: token, Cookie: cookieHeaderFrom(res), Exchange: res.Exchange}, true
 	}
 	// Fallback: the devstudio processor returns the ck token as JSON on all
 	// instances, independent of HTML scraping.
 	res := saasprobe.GetFollow(ctx, client, "/sn_devstudio_/v1/get_publish_info", nil)
 	if res.OK {
 		if m := ckTokenRe.FindStringSubmatch(res.Body); m != nil {
-			return Session{Token: m[1], Cookie: cookieHeaderFrom(res)}, true
+			return Session{Token: m[1], Cookie: cookieHeaderFrom(res), Exchange: res.Exchange}, true
 		}
 	}
 	return Session{}, false

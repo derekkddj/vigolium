@@ -72,8 +72,8 @@ func TestWriteMarkdownFindingsTruncatesSymmetrically(t *testing.T) {
 	}}, newMarkdownFindingOptions(HTMLReportMeta{MaxBodyBytes: 1001}))
 	got := w.String()
 	assert.True(t, utf8.ValidString(got), "a cut must never split a multibyte rune")
-	assert.Contains(t, got, "… [truncated, 1000 of 6020 bytes; full: vigolium traffic body --uuid rec-1 --request]")
-	assert.Contains(t, got, "… [truncated, 1001 of 6019 bytes; full: vigolium traffic body --uuid rec-1]")
+	assert.Contains(t, got, "… [truncated, 1000 of 6020 bytes; full: vigolium finding --id 9 --markdown --full-body]")
+	assert.Contains(t, got, "… [truncated, 1001 of 6019 bytes; full: vigolium finding --id 9 --markdown --full-body]")
 }
 
 func TestWriteMarkdownFindingsTruncationFallsBackToFinding(t *testing.T) {

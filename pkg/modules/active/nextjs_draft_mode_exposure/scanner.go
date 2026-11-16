@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -144,7 +145,8 @@ func (m *Module) ScanPerHost(
 					tokenDesc = fmt.Sprintf("weak token: %q", token)
 				}
 
-				confirmed, verification := verifyDraftContent(ctx, httpClient, previewCookie.name, previewCookie.value, location)
+				support := modkit.NewEvidenceCollector()
+				confirmed, verification := verifyDraftContent(ctx, httpClient, previewCookie.name, previewCookie.value, location, support)
 				kind := output.RecordKindCandidate
 				grade := output.EvidenceGradeCandidate
 				name := "Next.js Draft Mode Activation Candidate"
@@ -191,6 +193,8 @@ func (m *Module) ScanPerHost(
 						"content_differential": confirmed,
 					},
 				}
+				modkit.SetPrimaryEvidence(event, http.CaptureEvidence(resp), evidence.RoleAttack, "draft-mode activation probe")
+				modkit.AppendEvidence(event, support)
 				resp.Close()
 				if confirmed {
 					return []*output.ResultEvent{event}, nil
@@ -253,6 +257,7 @@ func verifyDraftContent(
 	ctx *httpmsg.HttpRequestResponse,
 	client *http.Requester,
 	cookieName, cookieValue, location string,
+	collectors ...*modkit.EvidenceCollector,
 ) (bool, []string) {
 	raw := verificationRequestRaw(ctx, location)
 	withoutCookie, err := httpmsg.RemoveHeader(raw, "Cookie")
@@ -264,10 +269,19 @@ func verifyDraftContent(
 		return false, nil
 	}
 
-	anon1 := fetchContentProbe(ctx, client, withoutCookie)
-	anon2 := fetchContentProbe(ctx, client, withoutCookie)
-	draft1 := fetchContentProbe(ctx, client, withCookie)
-	draft2 := fetchContentProbe(ctx, client, withCookie)
+	anon1, ax1 := fetchContentProbe(ctx, client, withoutCookie)
+	anon2, ax2 := fetchContentProbe(ctx, client, withoutCookie)
+	draft1, dx1 := fetchContentProbe(ctx, client, withCookie)
+	draft2, dx2 := fetchContentProbe(ctx, client, withCookie)
+	for _, proof := range collectors {
+		for i, x := range []*evidence.Exchange{ax1, ax2, dx1, dx2} {
+			role, label := evidence.RoleControl, fmt.Sprintf("cookie-free content sample %d", i+1)
+			if i >= 2 {
+				role, label = evidence.RoleConfirmation, fmt.Sprintf("draft content sample %d", i-1)
+			}
+			proof.AddExchange(x, role, label)
+		}
+	}
 	if anon1 == nil || anon2 == nil || draft1 == nil || draft2 == nil {
 		return false, nil
 	}
@@ -317,20 +331,23 @@ func verificationRequestRaw(ctx *httpmsg.HttpRequestResponse, location string) [
 	return modified
 }
 
-func fetchContentProbe(ctx *httpmsg.HttpRequestResponse, client *http.Requester, raw []byte) *contentProbe {
+func fetchContentProbe(ctx *httpmsg.HttpRequestResponse, client *http.Requester, raw []byte) (*contentProbe, *evidence.Exchange) {
 	request := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
-	resp, _, err := client.Execute(request, http.Options{NoRedirects: true, NoClustering: true, RawRequest: true})
+	// Use the same verification message as the verbatim sender input, so the
+	// receipt records emitted bytes rather than rawhttp's unobservable rebuild.
+	resp, _, err := client.Execute(request, http.Options{NoRedirects: true, NoClustering: true, RawRequest: true, RawBytes: raw})
 	if err != nil {
-		return nil
+		return nil, http.CaptureFailureEvidence(err)
 	}
 	defer resp.Close()
+	x := http.CaptureEvidence(resp)
 	if resp.Response() == nil {
-		return nil
+		return nil, x
 	}
 	return &contentProbe{
 		status:   resp.Response().StatusCode,
 		body:     resp.Body().String(),
 		request:  string(raw),
 		response: resp.FullResponseString(),
-	}
+	}, x
 }

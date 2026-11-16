@@ -6,6 +6,9 @@ package replay
 import (
 	"context"
 	gohttp "net/http"
+
+	"github.com/vigolium/vigolium/pkg/evidence"
+	"github.com/vigolium/vigolium/pkg/httpmsg"
 )
 
 // DefaultExcerptCap clips response/request excerpts emitted in JSON. The
@@ -67,6 +70,10 @@ type Options struct {
 
 	NoRedirects bool
 
+	// CaptureExchange retains an owned receipt for immutable record versioning.
+	// Ordinary diff/fuzz calls do not pay for full request/response copies.
+	CaptureExchange bool
+
 	// Client is required unless Sender is set.
 	Client *gohttp.Client
 
@@ -89,10 +96,10 @@ type Options struct {
 
 // Summary describes the response side of a single HTTP exchange.
 //
-// RawBody holds the full response body (capped by the engine's read
-// limit) for callers that need to persist the bytes back somewhere —
-// json:"-" keeps it out of agent-facing payloads since Excerpt covers
-// the model's needs and RawBody can be megabytes.
+// RawBody holds the retained response bytes, which may be a prefix on read
+// errors or at the engine's limit. Error and Exchange states describe execution
+// and capture completeness; Truncated describes only excerpt clipping.
+// json:"-" keeps potentially megabyte bodies out of agent-facing payloads.
 type Summary struct {
 	Status         int           `json:"status"`
 	ResponseLen    int           `json:"response_length"`
@@ -108,6 +115,13 @@ type Summary struct {
 	FinalURL  string `json:"final_url,omitempty"`
 	Redirects int    `json:"redirects,omitempty"`
 	RawBody   []byte `json:"-"`
+	// Exchange owns the final available capture, including on execution errors.
+	// Request-only and partial-response receipts retain their explicit states;
+	// absence means no capture, not permission to pair intended bytes.
+	Exchange *evidence.Exchange `json:"-"`
+	// Native absolute-form normalization is explicit and is not exact proof
+	// reproduction. External Senders must describe their own representation.
+	RequestTargetPolicy *httpmsg.RequestTargetPolicy `json:"request_target_policy,omitempty"`
 }
 
 // Diff captures the comparison between baseline and replay.
@@ -137,8 +151,9 @@ type Result struct {
 	Diff             *Diff    `json:"diff"`
 	AdditionalGroups int      `json:"additional_payload_groups,omitempty"`
 	Unmatched        []string `json:"unmatched_mutations,omitempty"`
-	// RawMutatedRequest is the complete request actually sent. It is retained
-	// for local integrations such as saving the exchange to Burp, but omitted
-	// from JSON where MutatedRequest remains the bounded preview.
+	// RawMutatedRequest is the complete intended request supplied to the sender.
+	// Native transport defaults/redirects may change it; Replay.Exchange, when
+	// available, owns the final sent request. Retained for integrations such as
+	// Burp staging, but omitted from JSON's bounded MutatedRequest preview.
 	RawMutatedRequest []byte `json:"-"`
 }

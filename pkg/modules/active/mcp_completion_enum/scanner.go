@@ -93,12 +93,12 @@ func (m *Module) ScanPerHost(
 			}
 			for ai := 0; ai < argLimit; ai++ {
 				arg := p.Arguments[ai]
-				res, _, err := client.CompletePrompt(3000+i*100+ai, p.Name, arg.Name, "")
+				res, _, exchange, err := client.CompletePromptEvidence(3000+i*100+ai, p.Name, arg.Name, "")
 				if err != nil || res == nil || len(res.Completion.Values) == 0 {
 					continue
 				}
 				kind, grade, sev, reason := classifyCompletionValues(res.Completion.Values)
-				findings = append(findings, &output.ResultEvent{
+				findings = append(findings, mcpinfra.NewProof(exchange).Observation(&output.ResultEvent{
 					ModuleID:      ModuleID,
 					RecordKind:    kind,
 					EvidenceGrade: grade,
@@ -120,7 +120,7 @@ func (m *Module) ScanPerHost(
 						Reference:  []string{"https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/completion"},
 					},
 					Metadata: map[string]any{"identity": identity, "anonymous": identity == "anonymous", "value_count": len(res.Completion.Values), "authorization_compared": false},
-				})
+				}))
 			}
 		}
 	}
@@ -135,12 +135,12 @@ func (m *Module) ScanPerHost(
 			tpl := templates.ResourceTemplates[ti]
 			placeholders := extractPlaceholders(tpl.URITemplate)
 			for pi, ph := range placeholders {
-				res, _, err := client.CompleteResource(4000+ti*100+pi, tpl.URITemplate, ph, "")
+				res, _, exchange, err := client.CompleteResourceEvidence(4000+ti*100+pi, tpl.URITemplate, ph, "")
 				if err != nil || res == nil || len(res.Completion.Values) == 0 {
 					continue
 				}
 				kind, grade, sev, reason := classifyCompletionValues(res.Completion.Values)
-				findings = append(findings, &output.ResultEvent{
+				findings = append(findings, mcpinfra.NewProof(exchange).Observation(&output.ResultEvent{
 					ModuleID:      ModuleID,
 					RecordKind:    kind,
 					EvidenceGrade: grade,
@@ -162,7 +162,7 @@ func (m *Module) ScanPerHost(
 						Reference:  []string{"https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/completion"},
 					},
 					Metadata: map[string]any{"identity": identity, "anonymous": identity == "anonymous", "value_count": len(res.Completion.Values), "authorization_compared": false},
-				})
+				}))
 			}
 		}
 	}

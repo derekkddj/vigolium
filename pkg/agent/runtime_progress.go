@@ -33,6 +33,15 @@ func (w *synchronizedWriter) Write(p []byte) (int, error) {
 	return w.writer.Write(p)
 }
 
+// WriteBlock lets a streaming log renderer write one complete tool result
+// without other producers interleaving between chunks. The callback receives
+// the underlying writer and must not call back into this wrapper.
+func (w *synchronizedWriter) WriteBlock(write func(io.Writer) error) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return write(w.writer)
+}
+
 // runtimeANSI matches CSI (including colors/cursor controls), OSC (including
 // hyperlinks), and other escape sequences (e.g. charset selection/reset).
 // Only metadata is cleaned; raw AI chunks are never reformatted.

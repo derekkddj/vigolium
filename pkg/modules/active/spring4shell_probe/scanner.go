@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -78,6 +79,7 @@ type probeResult struct {
 	status   int
 	request  string
 	response string
+	receipt  *evidence.Exchange
 }
 
 // errStop aborts the probe sequence; the caller returns no finding.
@@ -121,19 +123,25 @@ func (m *Module) ScanPerRequest(
 			if err != nil || control.status != tru.status {
 				return nil, nil
 			}
-			ev.Add("control (random parameter, non-boolean value)", control.request, control.response)
+			ev.AddExchange(control.receipt, evidence.RoleControl, "control (random parameter, non-boolean value)")
 		}
-		ev.Add(fmt.Sprintf("round %d: %s=true", round, propertyPath), tru.request, tru.response)
-		ev.Add(fmt.Sprintf("round %d: %s=false", round, propertyPath), fls.request, fls.response)
+		role := evidence.RoleAttack
+		if round > 1 {
+			role = evidence.RoleConfirmation
+			ev.AddExchange(nonBool.receipt, evidence.RoleConfirmation, "non-boolean binding replay")
+		}
+		ev.AddExchange(tru.receipt, role, fmt.Sprintf("round %d: %s=true", round, propertyPath))
+		ev.AddExchange(fls.receipt, role, fmt.Sprintf("round %d: %s=false", round, propertyPath))
 	}
 
 	urlStr := urlx.String()
-	return []*output.ResultEvent{{
+	result := &output.ResultEvent{
 		URL:                urlStr,
 		Matched:            urlStr,
 		Request:            first[0].request,
 		Response:           first[0].response,
 		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
 		FuzzingParameter:   propertyPath,
 		RecordKind:         output.RecordKindFinding,
 		EvidenceGrade:      output.EvidenceGradeDifferential,
@@ -150,7 +158,9 @@ func (m *Module) ScanPerRequest(
 			Confidence:  ModuleConfidence,
 			Tags:        ModuleTags,
 		},
-	}}, nil
+	}
+	modkit.SetPrimaryEvidence(result, first[0].receipt, evidence.RoleAttack, "non-boolean ClassLoader binding payload")
+	return []*output.ResultEvent{result}, nil
 }
 
 // round sends the non-boolean value first (the cheap negative exit: anything
@@ -216,5 +226,6 @@ func (m *Module) send(
 		status:   r.StatusCode,
 		request:  string(raw),
 		response: resp.FullResponseString(),
+		receipt:  http.CaptureEvidence(resp),
 	}, nil
 }

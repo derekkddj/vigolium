@@ -84,7 +84,7 @@ func (r *Runner) reportExtensionFailures(engine *jsext.Engine) error {
 // persistExtensionFailures records the extensions that failed to load on the
 // scan row (scans.extensions_failed), which scan.finished and `scan status`
 // read back. Paths, in load order.
-func (r *Runner) persistExtensionFailures(ctx context.Context, infra *phaseInfra) {
+func (r *Runner) persistExtensionFailures(ctx context.Context, infra *phaseInfra, scope nativeScanScope) {
 	if r.repository == nil || infra == nil || infra.jsEngine == nil {
 		return
 	}
@@ -96,7 +96,7 @@ func (r *Runner) persistExtensionFailures(ctx context.Context, infra *phaseInfra
 	for _, f := range failures {
 		paths = append(paths, f.Path)
 	}
-	if err := r.repository.UpdateScanPartial(ctx, &database.Scan{
+	if err := scope.updateMetadata(ctx, &database.Scan{
 		UUID:             infra.scanUUID,
 		ExtensionsFailed: paths,
 	}); err != nil {

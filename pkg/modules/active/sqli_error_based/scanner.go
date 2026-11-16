@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -129,8 +130,9 @@ func (m *Module) ScanPerInsertionPoint(
 		// A DBMS error already present in the unfuzzed baseline is static page
 		// content, not injection: suppress it.
 		var originalResponseBody string
+		var baselineReceipt *evidence.Exchange
 		if ctx.Response() == nil {
-			originalResponseBody = getResponseBodyIfNotResponsive(ctx, httpClient)
+			originalResponseBody = getResponseBodyIfNotResponsive(ctx, httpClient, &baselineReceipt)
 		} else {
 			originalResponseBody = ctx.Response().BodyToString()
 		}
@@ -140,6 +142,7 @@ func (m *Module) ScanPerInsertionPoint(
 		}
 
 		fullResp := resp.FullResponseString()
+		attackReceipt := http.CaptureEvidence(resp)
 		resp.Close()
 
 		// Confirm the error is genuinely introduced by the broken-syntax payload:
@@ -148,7 +151,14 @@ func (m *Module) ScanPerInsertionPoint(
 		// page that returns the pattern for ANY input — a static error string, or
 		// one a stale baseline missed — is rejected). Fails open on a transport
 		// error so a transient failure never suppresses a true positive.
-		if !modkit.ConfirmMatchReproduces(ctx, ip, httpClient, fuzzedRaw, regExp) {
+		ev := modkit.NewEvidenceCollector()
+		if baselineReceipt != nil {
+			ev.AddExchange(baselineReceipt, evidence.RoleBaseline, "unmodified SQL value")
+		} else {
+			ev.AddBaseline("input baseline", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
+		}
+		guardProof := modkit.NewEvidenceCollector()
+		if !modkit.ConfirmMatchReproducesWithEvidence(ctx, ip, httpClient, fuzzedRaw, regExp, guardProof) {
 			continue
 		}
 
@@ -158,21 +168,29 @@ func (m *Module) ScanPerInsertionPoint(
 			scanCtx.MarkTech(urlx.Host, infra.DBMSTechTag(dbType))
 		}
 
-		results = append(results, &output.ResultEvent{
-			URL:              urlx.String(),
-			Request:          string(fuzzedRaw),
-			Response:         fullResp,
-			FuzzingParameter: ip.Name(),
+		result := &output.ResultEvent{
+			Evidence:           ev.Evidence(),
+			AdditionalEvidence: ev.Entries(),
+			URL:                urlx.String(),
+			Request:            string(fuzzedRaw),
+			Response:           fullResp,
+			FuzzingParameter:   ip.Name(),
 			Info: output.Info{
 				Description: fmt.Sprintf("DBMS: %s", dbms),
 			},
-		})
+		}
+		modkit.SetPrimaryEvidence(result, attackReceipt, evidence.RoleAttack, "syntax-breaking SQL payload")
+		modkit.AppendEvidence(result, guardProof)
+		results = append(results, result)
 	}
 
 	return results, nil
 }
 
-func getResponseBodyIfNotResponsive(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) string {
+func getResponseBodyIfNotResponsive(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, receiptOut ...**evidence.Exchange) string {
+	if len(receiptOut) > 0 && receiptOut[0] != nil {
+		*receiptOut[0] = nil
+	}
 	if ctx.Response() != nil {
 		return ctx.Response().BodyToString()
 	}
@@ -181,5 +199,8 @@ func getResponseBodyIfNotResponsive(ctx *httpmsg.HttpRequestResponse, httpClient
 		return ""
 	}
 	defer resp.Close()
+	if len(receiptOut) > 0 && receiptOut[0] != nil {
+		*receiptOut[0] = http.CaptureEvidence(resp)
+	}
 	return resp.Body().String()
 }

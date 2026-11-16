@@ -98,11 +98,13 @@ func sendLogTail(c fiber.Ctx, path string, strip bool) error {
 	// reintroduce the allocation the tail read just avoided. An escape sequence
 	// straddling the cut is the one casualty, and it is a few stray bytes on the
 	// first line.
+	// Measure omission before formatting: removing ANSI bytes is not a tail cut.
+	truncated := int64(len(data)) < size
 	if strip {
 		data = stripANSIBytes(data)
 	}
 	c.Set("X-Log-Size", strconv.FormatInt(size, 10))
-	c.Set("X-Log-Truncated", strconv.FormatBool(int64(len(data)) < size))
+	c.Set("X-Log-Truncated", strconv.FormatBool(truncated))
 	c.Set("Content-Type", "text/plain; charset=utf-8")
 	return c.Send(data)
 }

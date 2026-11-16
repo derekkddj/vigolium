@@ -6,6 +6,7 @@ import (
 	"github.com/pkg/errors"
 	urlutil "github.com/projectdiscovery/utils/url"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -122,6 +123,7 @@ func (m *Module) ScanPerRequest(
 }
 
 type safeMethodResponse struct {
+	exchange    *evidence.Exchange
 	status      int
 	body        string
 	contentType string
@@ -155,6 +157,7 @@ func (m *Module) fetchSafeMethodResponse(ctx *httpmsg.HttpRequestResponse, clien
 		return safeMethodResponse{}, false
 	}
 	return safeMethodResponse{
+		exchange:    http.CaptureEvidence(resp),
 		status:      resp.Response().StatusCode,
 		body:        resp.BodyString(),
 		contentType: resp.Response().Header.Get("Content-Type"),
@@ -195,7 +198,10 @@ func safeResponsesSimilar(left, right safeMethodResponse) bool {
 	return modkit.RatioSimilar(leftSig, rightSig)
 }
 
-func safeMethodObservation(urlx *urlutil.URL, name, description, fuzzingParameter string, response safeMethodResponse, extracted []string) *output.ResultEvent {
+func safeMethodObservation(urlx *urlutil.URL, name, description, fuzzingParameter string, response safeMethodResponse, extracted []string) (finding *output.ResultEvent) {
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, response.exchange, evidence.RoleObservation, "safe method observation")
+	}()
 	return &output.ResultEvent{
 		ModuleID:         ModuleID,
 		RecordKind:       output.RecordKindObservation,

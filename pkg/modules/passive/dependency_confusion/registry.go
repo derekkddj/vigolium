@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/vigolium/vigolium/pkg/evidence"
+	gohttp "github.com/vigolium/vigolium/pkg/http"
 )
 
 // defaultRegistryBase is the public npm registry. A referenced package name that
@@ -63,29 +66,34 @@ const (
 // status code is all we need, so no packument body is transferred (a 200 for a
 // popular scoped package can be many MB). Scoped names have their "/"
 // percent-encoded (registry.npmjs.org expects "@scope%2fname").
-func (c *registryClient) lookup(ctx context.Context, name string) resolution {
+func (c *registryClient) lookup(ctx context.Context, name string) (resolution, *evidence.Exchange) {
 	escaped := strings.ReplaceAll(name, "/", "%2f")
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.baseURL+"/"+escaped, nil)
 	if err != nil {
-		return resolutionIndeterminate
+		return resolutionIndeterminate, nil
 	}
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return resolutionIndeterminate
+	// Capture this existing HEAD execution, not a reconstructed target request
+	// or a second registry query. The final service belongs to the registry.
+	chain, err := gohttp.DoCaptured(c.client, req, 1)
+	if chain != nil {
+		defer chain.Close()
 	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
+	// Error chains still need releasing, but errors remain indeterminate:
+	// partial receipts do not change package declaration classification.
+	if err != nil || chain == nil || chain.Response() == nil {
+		return resolutionIndeterminate, nil
+	}
+	receipt := gohttp.CaptureEvidence(chain)
 
-	switch resp.StatusCode {
+	switch chain.Response().StatusCode {
 	case http.StatusOK:
-		return resolutionClaimed
+		return resolutionClaimed, receipt
 	case http.StatusNotFound:
-		return resolutionUnclaimed
+		return resolutionUnclaimed, receipt
 	default:
 		// 429/5xx and anything else: treat as unknown, do not accuse.
-		return resolutionIndeterminate
+		return resolutionIndeterminate, receipt
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/core/services"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/input/source"
@@ -48,10 +49,11 @@ type Result struct {
 
 	// Results counts what the re-run module reported; Matched how many of
 	// those are this finding.
-	Results    int   `json:"results"`
-	Matched    int   `json:"matched"`
-	Requests   int64 `json:"requests"`
-	DurationMs int64 `json:"duration_ms"`
+	Results             int   `json:"results"`
+	Matched             int   `json:"matched"`
+	UnclassifiedMatched int   `json:"unclassified_matched,omitempty"`
+	Requests            int64 `json:"requests"`
+	DurationMs          int64 `json:"duration_ms"`
 
 	// Written is true once the verdict is stored on the finding; Status is the
 	// status change --mark made, when it made one.
@@ -73,6 +75,11 @@ func Run(ctx context.Context, p *Plan, opts RunOptions) *Result {
 	item := p.item
 	passive := p.ModuleType == database.ModuleTypePassive
 	skipBaseline := passive && !opts.Refetch
+	if skipBaseline && (p.Baseline == nil || p.Baseline.Source != BaselineSelectedExchange || p.Baseline.Role != evidence.RoleObservation) {
+		res.Verdict = database.VerdictInconclusive
+		res.Reason = "stored legacy / baseline response has unknown observation role; it does not prove a vulnerability. Select an explicit observation or pass --refetch for a fresh assessment"
+		return res
+	}
 	if skipBaseline && !item.HasResponse() {
 		res.Verdict = database.VerdictInconclusive
 		res.Reason = "the stored record has no response to analyze; pass --refetch to fetch one"
@@ -152,7 +159,11 @@ func Run(ctx context.Context, p *Plan, opts RunOptions) *Result {
 	res.Results = len(collected)
 	for _, r := range collected {
 		if p.matches(r) {
-			res.Matched++
+			if usableSelectedResult(r.Evidence) && r.IsFinding() {
+				res.Matched++
+			} else {
+				res.UnclassifiedMatched++
+			}
 		}
 	}
 
@@ -160,6 +171,9 @@ func Run(ctx context.Context, p *Plan, opts RunOptions) *Result {
 	case res.Matched > 0:
 		res.Verdict = database.VerdictConfirmed
 		res.Reason = fmt.Sprintf("%s reported the finding again", p.ModuleID)
+	case res.UnclassifiedMatched > 0:
+		res.Verdict = database.VerdictInconclusive
+		res.Reason = "module reported matching unclassified / context data without explicitly selected evidence; baseline or unknown bytes do not prove a vulnerability"
 	case runCtx.Err() != nil:
 		res.Verdict = database.VerdictInconclusive
 		res.Reason = "timed out before the module finished"
@@ -227,7 +241,12 @@ func (p *Plan) matches(r *output.ResultEvent) bool {
 		return false
 	}
 	if kind := f.RecordKind; kind != "" && string(r.EffectiveRecordKind()) != kind {
-		return false
+		// A rerun downgraded to candidate/observation at the same location is
+		// matching context, not clean non-reproduction and never confirmation.
+		got := string(r.EffectiveRecordKind())
+		if got != database.RecordKindCandidate && got != database.RecordKindObservation {
+			return false
+		}
 	}
 	if r.ID() == f.FindingHash {
 		return true

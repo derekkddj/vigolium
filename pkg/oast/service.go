@@ -16,6 +16,7 @@ import (
 	"github.com/projectdiscovery/interactsh/pkg/server"
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/oast/oastclass"
 	"github.com/vigolium/vigolium/pkg/output"
@@ -44,8 +45,9 @@ type PayloadContext struct {
 	// Payload is the literal value the planting module placed at the injection
 	// point (e.g. ";nslookup <host>" for command injection, "for=<host>" for an
 	// RFC 7239 Forwarded probe, the bare "<host>" for an IP-routing header). It is
-	// what was actually sent on the wire, so the finding can reconstruct the
-	// planting request faithfully instead of guessing an http://<host> shape.
+	// planting intent, NOT proof of bytes sent. Any reconstruction from it is
+	// an explicitly non-captured replay hint; only a sender receipt proves the
+	// retained planting exchange.
 	// Modules that mint a unique callback host per payload variant (e.g. the
 	// command-injection modules now plant one OAST host per breakout shape) record
 	// the exact variant here, so a callback pinpoints the precise payload that fired.
@@ -53,6 +55,12 @@ type PayloadContext struct {
 	// record it (reconstruction then falls back to the http://<host> / bare-host
 	// shape).
 	Payload string
+	// Small in-memory seal survives receipt-body cache eviction. A nonce must
+	// not silently move to a later execution while its context is still owned.
+	plantingID    string
+	plantingHash  string
+	plantingAt    time.Time
+	plantingOwned bool // minted here; restored context cannot authorize new sends
 }
 
 // oastTrackerCacheSize bounds the nonce → PayloadContext tracker. A plain
@@ -90,6 +98,14 @@ type Service struct {
 
 	trackerOnce        sync.Once
 	tracker            *lru.Cache[string, PayloadContext] // nonce → PayloadContext (bounded LRU)
+	contextMu          sync.Mutex                         // serializes context updates and persistence
+	plantingMu         sync.Mutex
+	plantingCache      *lru.Cache[string, *evidence.Exchange]
+	plantingJobs       chan plantingJob
+	plantingDone       chan struct{}
+	plantingCancel     context.CancelFunc
+	plantingStopped    bool
+	plantingWriteMu    sync.Mutex
 	emitResult         func(*output.ResultEvent)
 	resolveRequestUUID func(requestHash string) string // resolves request hash → DB record UUID
 	repo               *database.Repository
@@ -239,7 +255,7 @@ func (s *Service) GenerateURLFor(cls Class, targetURL, paramName, label, moduleI
 	// We use the full subdomain (before first dot) as the tracker key.
 	nonce := extractNonce(url)
 	if nonce != "" {
-		pctx := PayloadContext{
+		s.trackPayload(nonce, PayloadContext{
 			TargetURL:     targetURL,
 			ParameterName: paramName,
 			InjectionType: label,
@@ -247,52 +263,20 @@ func (s *Service) GenerateURLFor(cls Class, targetURL, paramName, label, moduleI
 			ModuleID:      moduleID,
 			RequestHash:   requestHash,
 			CallbackURL:   url,
-		}
-		s.trackerCache().Add(nonce, pctx)
-		// Persisted (batch-written) so a callback that outlives the tracker
-		// or this process still correlates (see session.go).
-		s.queuePayload(&database.OASTPayload{
-			Nonce:       nonce,
-			ProjectUUID: s.projectUUID,
-			ScanUUID:    s.scanUUID,
-			Class:       string(pctx.class()),
-			ModuleID:    moduleID,
-			TargetURL:   targetURL,
-			Param:       paramName,
-			RequestHash: requestHash,
 		})
 	}
 
 	return url
 }
 
-// RecordPayload attaches the literal value a module planted at its injection
-// point to the tracked context for callbackURL, so the resulting finding can
-// reconstruct the planting request faithfully (see PayloadContext.Payload).
-// callbackURL is the URL returned by GenerateURL; payload is the exact value
-// written at the injection point (header value, parameter value, …). A no-op
-// when OAST is in fixed-URL mode or the context has already been evicted.
+// RecordPayload records literal planting intent for trace/replay context. It
+// does not capture an emitted request or select evidence. Works in interactsh
+// and fixed-template modes; plain fixed URLs remain uncorrelated.
 func (s *Service) RecordPayload(callbackURL, payload string) {
 	if s == nil || callbackURL == "" || payload == "" {
 		return
 	}
-	if s.template != nil {
-		s.recordFixedPayload(callbackURL, payload)
-		return
-	}
-	if s.client.Load() == nil {
-		return
-	}
-	nonce := extractNonce(callbackURL)
-	if nonce == "" {
-		return
-	}
-	cache := s.trackerCache()
-	if pctx, ok := cache.Get(nonce); ok {
-		pctx.Payload = payload
-		cache.Add(nonce, pctx)
-	}
-	s.recordStoredPayload(nonce, payload)
+	s.recordFixedPayload(callbackURL, payload)
 }
 
 // BlindXSSSrc returns the configured blind XSS script src URL.
@@ -336,7 +320,7 @@ func (s *Service) handleInteractionCorrelated(interaction *server.Interaction) b
 	// first, then the persisted payload contexts (evicted, or planted by an
 	// earlier process whose session a poll resumed).
 	nonce := interaction.UniqueID
-	pctx, found := s.trackerCache().Get(nonce)
+	pctx, found := s.payloadContextForNonce(nonce)
 	if !found {
 		pctx, found = s.lookupStoredPayload(nonce, interaction.FullId)
 	}
@@ -427,10 +411,9 @@ func (s *Service) reportCorrelated(interaction *server.Interaction, nonce string
 		return nil
 	}
 
-	// Recover the request that planted the payload so both the finding's trace
-	// anchors and its DB link resolve without a manual join. Done only after the
-	// emit gate: this loads up to two full request/response blobs, and only one
-	// of a payload's ~5-6 callbacks ever reaches here.
+	// Recover ONLY the original scan input as baseline context. The request
+	// hash never identifies the mutated planting exchange. Load only after the
+	// emit gate, then resolve the exact sender receipt independently by nonce.
 	originUUID, origin := s.originRecord(pctx.RequestHash)
 
 	// Second annotation seam (the first being refineOASTCallback, which runs pre-emit
@@ -473,9 +456,11 @@ func (s *Service) reportCorrelated(interaction *server.Interaction, nonce string
 	}
 	result.SetSignal(output.SignalOAST)
 
-	// Attach the originating request and human-readable trace anchors so the
-	// finding answers "which request caused this callback?" on its own.
+	// Retain baseline/replay context separately, then select only the exact
+	// nonce-bound sender receipt, if available, as the planting exchange.
 	enrichOASTResult(result, interaction, pctx, origin)
+	s.attachPlantingReceipt(result, nonce)
+	attributeOASTEvidence(result, s.scanUUID)
 
 	// A coalesced Info finding stands in for every equivalent URL on the host, so
 	// make the aggregation explicit — otherwise the single entry (and its one linked
@@ -486,18 +471,17 @@ func (s *Service) reportCorrelated(interaction *server.Interaction, nonce string
 			"scope=host-aggregated (Info OAST interactions coalesced per host + injection point; see oast_interactions for every callback)")
 	}
 
-	// On an upgrade (e.g. the HTTP-fetch confirmation arriving after a DNS lead) the
-	// stronger finding shares the weaker one's nonce-scoped hash, so INSERT-ON-
-	// CONFLICT would keep the weaker row. Drop it first so the stronger one replaces
-	// it and the payload still yields exactly one finding.
-	if upgrade && s.repo != nil {
-		if err := s.repo.DeleteFindingByHash(context.Background(), s.projectUUID, result.ID()); err != nil {
-			zap.L().Warn("OAST: failed to replace weaker finding on upgrade", zap.Error(err))
+	// Append this occurrence through the shared evidence store BEFORE updating
+	// classification. Never delete the weaker finding: that would lose earlier
+	// associations, planting correlation and user triage if the new save failed.
+	if err := s.saveFinding(result, originUUID); err != nil {
+		s.releaseEmission(emitKey, interaction.Protocol, upgrade)
+	} else if upgrade && s.repo != nil {
+		if err := s.updateFindingClassification(result); err != nil {
+			s.releaseEmission(emitKey, interaction.Protocol, upgrade)
+			zap.L().Warn("OAST: failed to upgrade classification; evidence retained", zap.Error(err))
 		}
 	}
-
-	// Save finding to database, linked to the originating HTTP record
-	s.saveFinding(result, originUUID)
 
 	if s.emitResult != nil {
 		s.emitResult(result)
@@ -584,11 +568,9 @@ func oastHost(target string) string {
 	return strings.ToLower(strings.TrimSpace(target))
 }
 
-// originRecord resolves the HTTP record that planted an OAST payload. It prefers
-// the executor's in-memory hash→UUID resolver, then loads the record from the
-// database; if the resolver is empty (a late callback after the executor is gone)
-// it falls back to a request-hash lookup. Returns the record UUID — which may be
-// non-empty even when the body could not be loaded — and the record (may be nil).
+// originRecord resolves the ORIGINAL scan input as baseline/replay context,
+// never the planting execution. Any resolver result is checked against this
+// service's project. Missing/foreign rows do not become finding record links.
 func (s *Service) originRecord(requestHash string) (string, *database.HTTPRecord) {
 	if requestHash == "" {
 		return "", nil
@@ -601,25 +583,28 @@ func (s *Service) originRecord(requestHash string) (string, *database.HTTPRecord
 		uuid = resolver(requestHash)
 	}
 	if s.repo == nil {
-		return uuid, nil
+		return "", nil
 	}
 	ctx := context.Background()
 	if uuid != "" {
-		if rec, err := s.repo.GetRecordByUUID(ctx, uuid); err == nil && rec != nil {
+		if rec, err := s.repo.GetRecordByUUID(ctx, uuid); err == nil && rec != nil && rec.ProjectUUID == oastProject(s.projectUUID) && rec.RequestHash == requestHash {
 			return uuid, rec
 		}
 	}
 	// Fallback: recover by request hash (the in-memory resolver may be gone).
-	if rec, err := s.repo.GetRecordByRequestHash(ctx, s.projectUUID, requestHash); err == nil && rec != nil {
+	if rec, err := s.repo.GetRecordByRequestHash(ctx, oastProject(s.projectUUID), requestHash); err == nil && rec != nil && rec.ProjectUUID == oastProject(s.projectUUID) {
 		return rec.UUID, rec
 	}
-	return uuid, nil
+	return "", nil
 }
 
-// enrichOASTResult embeds the originating request/response and trace anchors into
-// an out-of-band finding so it can be traced back to the request that planted the
-// payload without a manual database join. origin may be nil.
+// enrichOASTResult separates baseline context, non-captured planting intent and
+// the collaborator's HTTP observation. It never reconstructs a primary pair.
 func enrichOASTResult(result *output.ResultEvent, interaction *server.Interaction, pctx PayloadContext, origin *database.HTTPRecord) {
+	result.EvidenceStatus = "missing"
+	result.Request, result.Response = "", ""
+	result.Payload = pctx.Payload
+	result.ExtractedResults = append(result.ExtractedResults, "planting_intent=not captured (payload context / replay hint only)")
 	if pctx.CallbackURL != "" {
 		result.ExtractedResults = append(result.ExtractedResults, "callback_url="+pctx.CallbackURL)
 		// State the planted payload and its injection point explicitly, so plain-text
@@ -637,21 +622,19 @@ func enrichOASTResult(result *output.ResultEvent, interaction *server.Interactio
 		if originLine != "" {
 			result.ExtractedResults = append(result.ExtractedResults, "origin_request="+originLine)
 		}
-		// Embed the planting request with the OAST payload re-applied at its
-		// injection point, so the Request panel shows where the callback URL was
-		// planted. The raw modified request that fired the callback is not retained
-		// (correlation is keyed by the original request's hash); payloadRequest
-		// reconstructs it from the original request plus the payload context.
+		result.OriginRecordUUID = origin.UUID
+		attachOASTBaseline(result, origin)
 		if len(origin.RawRequest) > 0 {
-			result.Request = payloadRequest(origin.RawRequest, pctx, interaction.Protocol)
-		}
-		if len(origin.RawResponse) > 0 {
-			result.Response = string(origin.RawResponse)
+			// Prose only: a replay hint is never a captured exchange and never
+			// carries the crawl response. Preserve the full intended request.
+			result.AdditionalEvidence = append(result.AdditionalEvidence,
+				"Planting replay hint (reconstructed intent; NOT captured; no target response):\n"+
+					strconv.Quote(payloadRequest(origin.RawRequest, pctx, interaction.Protocol)))
 		}
 		// Fold the same anchors into the description so plain-text outputs
 		// (console, JSONL) are self-describing too.
 		if originLine != "" {
-			result.Info.Description += " Originating request: " + originLine
+			result.Info.Description += " Original scan input (baseline context, not planting proof): " + originLine
 			if origin.UUID != "" {
 				result.Info.Description += " (http_record " + origin.UUID + ")"
 			}
@@ -664,28 +647,13 @@ func enrichOASTResult(result *output.ResultEvent, interaction *server.Interactio
 			"interacted_at="+interaction.Timestamp.UTC().Format(time.RFC3339))
 	}
 
-	// The raw out-of-band request the target's infrastructure sent to the
-	// collaborator — direct, unforgeable proof of the callback — kept as evidence.
-	if cb := strings.TrimSpace(interaction.RawRequest); cb != "" {
-		label := "oast-callback (" + interaction.Protocol
-		if interaction.RemoteAddress != "" {
-			label += " from " + interaction.RemoteAddress
-		}
-		label += ")"
-		if ev := output.BuildEvidence(label, interaction.RawRequest, interaction.RawResponse); ev != "" {
-			result.AdditionalEvidence = append(result.AdditionalEvidence, ev)
-		}
-	}
+	attachOASTCallback(result, interaction, pctx)
 }
 
-// payloadRequest re-applies the OAST payload onto a copy of the original request
-// at its injection point, so the finding's Request panel shows where the callback
-// URL was planted rather than the bare original. It reconstructs the two
-// deterministic injection forms faithfully — request-line targets (routing-based
-// SSRF, written verbatim on the request line while the Host header stays the
-// victim) and header injections — and otherwise returns the original request
-// unchanged (the injected_payload / callback_url anchors still record the
-// payload). proto is the callback protocol (http/https).
+// payloadRequest constructs replay INTENT only. It cannot establish emitted
+// bytes, headers/cookies, the actual service, or a target response. Its output
+// must never be stored as an Exchange or a selected primary Request/Response.
+// Ambiguous insertion points and unknown payloads may leave the input unchanged.
 func payloadRequest(raw []byte, pctx PayloadContext, proto string) string {
 	host := callbackHost(pctx.CallbackURL)
 	if len(raw) == 0 || host == "" {
@@ -696,10 +664,9 @@ func payloadRequest(raw []byte, pctx PayloadContext, proto string) string {
 	case strings.EqualFold(pctx.ParameterName, "request-line"):
 		return rewriteRequestTarget(raw, callbackScheme(proto)+"://"+host+"/")
 	case isHeaderInjection(pctx):
-		// Prefer the exact value the module planted (e.g. ";nslookup <host>",
-		// "for=<host>", a bare "<host>") so the Request panel shows what really
-		// went on the wire; fall back to the http://<host> shape only when the
-		// module did not record a payload.
+		// Prefer recorded intent (e.g. ";nslookup <host>", "for=<host>",
+		// a bare "<host>") for the non-captured replay hint. The fallback is
+		// only a guess; neither form establishes what the transport sent.
 		value := pctx.Payload
 		if value == "" {
 			value = "http://" + host
@@ -708,14 +675,9 @@ func payloadRequest(raw []byte, pctx PayloadContext, proto string) string {
 			return string(out)
 		}
 	case pctx.ParameterName != "" && pctx.Payload != "":
-		// Query / body / cookie / JSON parameter injection. Re-apply the recorded
-		// payload at the named insertion point using the SAME builder the planting
-		// module used, so the Request panel shows the exact wire form the target
-		// received — the smuggle payload's literal CR/LF query-encoded (%0D%0A), the
-		// original crawl value replaced — instead of the untouched crawl request.
-		// Without this, a parameter-based OAST finding (e.g. SSRF protocol-smuggling
-		// on a refURL parameter) rendered the original request whose parameter still
-		// held its benign value, so the panel never showed what was injected.
+		// Use the normal insertion builder to encode recorded parameter intent
+		// in the replay hint, including CR/LF query encoding. This describes
+		// a possible replay, not the request received by the target.
 		if out := rebuildParamRequest(raw, pctx.ParameterName, pctx.Payload); out != "" {
 			return out
 		}
@@ -761,9 +723,8 @@ func paramInsertionPointsByName(raw []byte, name string) []httpmsg.InsertionPoin
 // rebuildParamRequest re-applies payload at the named parameter insertion point of
 // raw and returns the reconstructed request, or "" when raw has no matching
 // query/body/cookie parameter (the caller then keeps the original request). It uses
-// the same InsertionPoint.BuildRequest path the planting module used, so the wire
-// encoding — including the query-encoding of a smuggling payload's literal CR/LF —
-// is byte-identical to the request that fired the callback.
+// the normal InsertionPoint.BuildRequest encoding path, including query encoding
+// of literal CR/LF. It cannot reproduce or certify an earlier sent exchange.
 func rebuildParamRequest(raw []byte, name, payload string) string {
 	for _, ip := range paramInsertionPointsByName(raw, name) {
 		if built := ip.BuildRequest([]byte(payload)); len(built) > 0 {
@@ -859,8 +820,8 @@ func payloadOr(payload, fallback, suffix string) string {
 var oneLineReplacer = strings.NewReplacer("\r", `\r`, "\n", `\n`, "\t", `\t`)
 
 // maxAnchorPayloadLen caps how many runes of a recorded payload the injected_payload
-// anchor renders on its single line. The FULL payload is still used to reconstruct
-// the Request panel (payloadRequest / rebuildParamRequest); this only bounds the
+// anchor renders on its single line. The FULL intent is retained in the quoted
+// replay hint (payloadRequest / rebuildParamRequest); this only bounds the
 // one-line summary so a large recorded payload — e.g. a re-encoded SAML assertion
 // carrying an XXE DTD — cannot expand the anchor to kilobytes of base64.
 const maxAnchorPayloadLen = 300
@@ -941,9 +902,9 @@ func rewriteRequestTarget(raw []byte, target string) string {
 // saveFinding persists a Finding to the database, linked to the originating HTTP
 // record when one was resolved (recordUUID may be empty — the finding is still
 // saved so out-of-band hits are never silently dropped).
-func (s *Service) saveFinding(result *output.ResultEvent, recordUUID string) {
+func (s *Service) saveFinding(result *output.ResultEvent, recordUUID string) error {
 	if s.repo == nil || result == nil {
-		return
+		return nil
 	}
 
 	var recordUUIDs []string
@@ -953,7 +914,35 @@ func (s *Service) saveFinding(result *output.ResultEvent, recordUUID string) {
 
 	if err := s.repo.SaveFinding(context.Background(), result, recordUUIDs, s.scanUUID, s.projectUUID); err != nil {
 		zap.L().Warn("OAST: failed to save finding to database", zap.Error(err))
+		return err
 	}
+	return nil
+}
+
+// releaseEmission allows a failed save/upgrade to be retried by a later
+// callback, without discarding a stronger concurrent claim.
+func (s *Service) releaseEmission(key, proto string, upgrade bool) {
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
+	if s.emittedRank[key] != oastProtocolRank(proto) {
+		return
+	}
+	if upgrade {
+		s.emittedRank[key] = oastProtocolRank(proto) - 1
+	} else {
+		delete(s.emittedRank, key)
+	}
+}
+
+func (s *Service) updateFindingClassification(result *output.ResultEvent) error {
+	_, err := s.repo.DB().NewUpdate().Model((*database.Finding)(nil)).
+		Set("severity = ?", result.Info.Severity.String()).
+		Set("confidence = ?", result.Info.Confidence.String()).
+		Set("description = ?", result.Info.Description).
+		Set("evidence_status = ?", result.EvidenceStatus).
+		Where("project_uuid = ?", oastProject(s.projectUUID)).Where("finding_hash = ?", result.ID()).
+		Exec(context.Background())
+	return err
 }
 
 // classifyInteraction determines severity, confidence, and description based on

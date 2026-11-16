@@ -218,7 +218,10 @@ func (m *Module) ScanPerHost(
 		meta["resolved_ip"] = resolvedIP
 	}
 
+	// Certificate/handshake artifacts are non-HTTP observations. Neither the
+	// triggering request nor an invented response is evidence of this TLS dial.
 	return []*output.ResultEvent{{
+		EvidenceStatus:   "missing",
 		ModuleID:         ModuleID,
 		Host:             host,
 		URL:              target,

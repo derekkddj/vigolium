@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -117,8 +118,8 @@ type LaunchResult struct {
 // returns (success, failure, or ctx cancellation).
 //
 // The scan UUID is generated up-front so callers can correlate post-hoc
-// even if the run errors before any work is recorded — the UUID is real
-// and queryable from the moment LaunchScan is invoked.
+// even if the run errors before any work is recorded. On identity rejection
+// it is diagnostic only; callers must not reconcile it as an initialized scan.
 func LaunchScan(ctx context.Context, params LaunchParams) (*LaunchResult, error) {
 	if len(params.Targets) == 0 {
 		return nil, fmt.Errorf("LaunchScan: at least one target is required")
@@ -163,40 +164,52 @@ func LaunchScan(ctx context.Context, params LaunchParams) (*LaunchResult, error)
 		}
 	}()
 
+	// Capture receipt ownership before the run, rather than adopting any row
+	// or options value changed during callbacks/finalization.
+	scope := nativeScanScope{repo: params.Repository, scanUUID: opts.ScanUUID, projectUUID: params.ProjectUUID}
+	if scope.projectUUID == "" {
+		scope.projectUUID = database.DefaultProjectUUID
+	}
 	started := time.Now()
 	runErr := r.RunNativeScan()
 	elapsed := time.Since(started)
 
 	res := &LaunchResult{
-		ScanUUID:   opts.ScanUUID,
+		ScanUUID:   scope.scanUUID,
 		DurationMs: elapsed.Milliseconds(),
 	}
+	return res, reconcileLaunchResult(ctx, scope, res, runErr)
+}
 
-	if params.Repository != nil {
-		// CompleteScan runs in a defer inside RunNativeScan so by the time
-		// we get here the scan row should reflect final state. A read
-		// failure isn't fatal — surface what we have.
-		//
-		// Detach from ctx: when the caller's deadline is what stopped the
-		// scan, a readback on the dead ctx fails and the caller gets a
-		// summary of all zeros — indistinguishable from "scanned fine, found
-		// nothing". The row is already written; read it regardless.
-		readCtx, readCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		defer readCancel()
-		if scan, getErr := params.Repository.GetScanByUUID(readCtx, opts.ScanUUID); getErr == nil && scan != nil {
-			res.Status = scan.Status
-			res.FindingCount = scan.TotalFindings
-			res.TotalRequests = scan.TotalRequests
-			res.Critical = scan.CriticalCount
-			res.High = scan.HighCount
-			res.Medium = scan.MediumCount
-			res.Low = scan.LowCount
-			res.Info = scan.InfoCount
-			res.Suspect = scan.SuspectCount
-		}
+// reconcileLaunchResult never reads back a rejected identity or copies metadata
+// from a row reassigned after finalization. Ordinary read failures keep the
+// existing best-effort receipt contract and the original run error.
+func reconcileLaunchResult(ctx context.Context, scope nativeScanScope, res *LaunchResult, runErr error) error {
+	var identityErr *NativeScanIdentityError
+	if scope.repo == nil || errors.As(runErr, &identityErr) || errors.Is(runErr, database.ErrScanProjectMismatch) {
+		return runErr
 	}
-
-	return res, runErr
+	// Finalization uses a detached context; receipt reads must survive the
+	// caller's deadline too, or cancelled scans lose their persisted summary.
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	scan, getErr := scope.repo.GetScanByUUID(readCtx, scope.scanUUID)
+	if getErr != nil || scan == nil {
+		return runErr
+	}
+	if scan.ProjectUUID != scope.projectUUID {
+		return errors.Join(runErr, scope.identityError(database.ErrScanProjectMismatch))
+	}
+	res.Status = scan.Status
+	res.FindingCount = scan.TotalFindings
+	res.TotalRequests = scan.TotalRequests
+	res.Critical = scan.CriticalCount
+	res.High = scan.HighCount
+	res.Medium = scan.MediumCount
+	res.Low = scan.LowCount
+	res.Info = scan.InfoCount
+	res.Suspect = scan.SuspectCount
+	return runErr
 }
 
 // loadLaunchSettings resolves the settings the runner will use, with the same

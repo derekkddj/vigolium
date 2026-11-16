@@ -42,6 +42,7 @@ not to these independently obtained tools.
 | [ProjectDiscovery interactsh](https://github.com/projectdiscovery/interactsh) | OAST callback correlation for blind vulnerability testing. |
 | [ProjectDiscovery retryablehttp-go](https://github.com/projectdiscovery/retryablehttp-go) | Retrying HTTP client behavior used by scanner/network tooling. |
 | [ProjectDiscovery rawhttp](https://github.com/projectdiscovery/rawhttp) | Raw HTTP request handling for lower-level scanner requests. |
+| [ProjectDiscovery fastdialer](https://github.com/projectdiscovery/fastdialer) (MIT) | DNS and socket dialing; a source-compatible v0.5.25 copy in `third_party/fastdialer` repairs first-connection error replay. See its `VIGOLIUM_PATCH.md` and original `LICENSE.md`. |
 | [wasilibs/go-re2](https://github.com/wasilibs/go-re2) (MIT) | Google RE2 (BSD-3-Clause) compiled to WebAssembly; the in-process regex engine backing `pkg/secretscan` native secret detection. |
 | [coregx/ahocorasick](https://github.com/coregx/ahocorasick) (MIT) | Aho-Corasick multi-string matcher used as the keyword prefilter for `pkg/secretscan`. |
 | [Semgrep](https://github.com/semgrep/semgrep) | Optional SAST engine invoked by vigolium-audit agents. |

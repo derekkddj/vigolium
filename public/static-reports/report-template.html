@@ -511,14 +511,30 @@ pre.evidence {
     {{if .FoundAt}}<dt>Found</dt><dd>{{.FoundAt}}</dd>{{end}}
     {{if .SourceFile}}<dt>Source File</dt><dd>{{.SourceFile}}</dd>{{end}}
     {{if .RepoName}}<dt>Repository</dt><dd>{{.RepoName}}</dd>{{end}}
+    {{if .ScanUUID}}<dt>Scan</dt><dd>{{.ScanUUID}}</dd>{{end}}
+    {{if .RecordUUIDs}}<dt>Legacy Traffic References</dt><dd>{{range .RecordUUIDs}}<code>{{.}}</code> {{end}}(role unknown; not selected proof)</dd>{{end}}
   </dl>
   {{if .Tags}}<div class="tags">{{range .Tags}}<span class="tag">{{.}}</span>{{end}}</div>{{end}}
   {{if .MatchedAt}}<div class="evidence-label">Matched At</div>{{range .MatchedAt}}<code style="font-size:12px;display:block;margin:2px 0;word-break:break-all">{{.}}</code>{{end}}{{end}}
   {{if .ExtractedResults}}<div class="evidence-label">Extracted Results</div><ul style="font-size:12px;padding-left:20px;color:var(--charcoal-light)">{{range .ExtractedResults}}<li style="word-break:break-all">{{.}}</li>{{end}}</ul>{{end}}
   {{if .Remediation}}<div class="remediation"><div class="remediation-label">Remediation</div>{{.Remediation}}</div>{{end}}
-  {{if .Request}}<div class="evidence-label">Request</div><pre class="evidence">{{.Request}}</pre>{{end}}
-  {{if .Response}}<div class="evidence-label">Response</div><pre class="evidence">{{.Response}}</pre>{{end}}
-  {{if .AdditionalEvidence}}{{range $i, $e := .AdditionalEvidence}}<div class="evidence-label">Additional Evidence #{{inc $i}}</div><pre class="evidence">{{$e}}</pre>{{end}}{{end}}
+  <div class="evidence-label">Stored Finding Evidence Status: {{if .EvidenceStatus}}{{.EvidenceStatus}}{{else}}missing / unclassified{{end}}</div>
+  <p style="font-size:12px">Original finding metadata; each occurrence retains its own role and primary flag. Baseline, control and unknown roles are not proof. No occurrence is selected automatically.</p>
+  {{range .Evidence}}
+  <div class="evidence-label">Selected Exchange: {{.ExchangeID}}</div>
+  <dl class="finding-meta">
+    <dt>Role</dt><dd>{{.Role}}</dd>
+    <dt>Primary</dt><dd>{{.Primary}}</dd>
+    <dt>Occurrence</dt><dd>{{if .OccurrenceID}}{{.OccurrenceID}}{{else}}unspecified{{end}}</dd>
+    {{if .Label}}<dt>Label</dt><dd>{{.Label}}</dd>{{end}}
+    {{if .Exchange}}<dt>Capture</dt><dd>request={{.Exchange.RequestState}} response={{.Exchange.ResponseState}} provenance={{.Exchange.Provenance}}</dd>{{end}}
+  </dl>
+  {{if .Exchange}}<p style="font-size:12px">Stored receipt JSON below preserves the original service, hash, capture states and base64 request/response bytes. It is not a reconstructed HTTP message.</p>{{else}}<p style="font-size:12px">Selected bytes unavailable; no fallback substituted.</p>{{end}}
+  <details open><summary>Selected receipt / manifest JSON (message bytes are base64)</summary><pre class="evidence selected-receipt-json">{{receiptJSON .}}</pre></details>
+  {{else}}<p style="font-size:12px">Missing / unclassified selected evidence. Legacy inline text and traffic links are not proof.</p>{{end}}
+  {{if .Request}}<div class="evidence-label">Legacy Request — role unknown (not proof)</div><pre class="evidence">{{.Request}}</pre>{{end}}
+  {{if .Response}}<div class="evidence-label">Legacy Response — role unknown (not proof)</div><pre class="evidence">{{.Response}}</pre>{{end}}
+  {{if .AdditionalEvidence}}{{range $i, $e := .AdditionalEvidence}}<div class="evidence-label">Additional Legacy Evidence #{{inc $i}} — role unknown (not proof)</div><pre class="evidence">{{$e}}</pre>{{end}}{{end}}
 </div>
 {{end}}
 

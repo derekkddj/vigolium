@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra/saasprobe"
@@ -32,9 +33,10 @@ var SimpleListEndpoints = []string{
 // data). Status is surfaced so callers can treat 401 as a token failure rather
 // than evidence.
 type WidgetResult struct {
-	Status int
-	OK     bool
-	Data   *SimpleListData
+	Status   int
+	OK       bool
+	Data     *SimpleListData
+	Exchange *evidence.Exchange // this widget POST, not the session harvest
 }
 
 // SimpleListData is the widget's returned record set. Only the fields consulted
@@ -79,9 +81,9 @@ func PostSimpleList(ctx *httpmsg.HttpRequestResponse, client *http.Requester, en
 	}
 	res := saasprobe.Post(ctx, client, path, "{}", widgetHeaders(s))
 	if !res.OK {
-		return WidgetResult{}
+		return WidgetResult{Exchange: res.Exchange}
 	}
-	out := WidgetResult{Status: res.Status, OK: true}
+	out := WidgetResult{Status: res.Status, OK: true, Exchange: res.Exchange}
 	if env, ok := parseWidget(res.Body); ok {
 		out.Data = env
 	}
@@ -115,9 +117,10 @@ func (k kbEnvelope) article() *KBData {
 
 // KBResult is the KB widget POST result.
 type KBResult struct {
-	Status int
-	OK     bool
-	Data   *KBData
+	Status   int
+	OK       bool
+	Data     *KBData
+	Exchange *evidence.Exchange // this article POST, not another widget call
 }
 
 // PostKBArticle calls the KB Article Page widget for one article id (a KB number
@@ -126,9 +129,9 @@ func PostKBArticle(ctx *httpmsg.HttpRequestResponse, client *http.Requester, art
 	path := WidgetBase + KBArticlePageSysID + "?sys_id=" + articleID
 	res := saasprobe.Post(ctx, client, path, "{}", widgetHeaders(s))
 	if !res.OK {
-		return KBResult{}
+		return KBResult{Exchange: res.Exchange}
 	}
-	out := KBResult{Status: res.Status, OK: true}
+	out := KBResult{Status: res.Status, OK: true, Exchange: res.Exchange}
 	var env kbEnvelope
 	if err := json.Unmarshal([]byte(strings.TrimSpace(res.Body)), &env); err == nil {
 		out.Data = env.article()

@@ -687,9 +687,9 @@ func (t *phaseTracker) markSkipped(code string) {
 	addCode(&t.reasons, code)
 }
 
-// addPersistence folds a writer-shutdown outcome into the phase, and marks the
-// phase partial when the writer could not account for every write it accepted.
-// Several writers per phase merge into one figure (see PersistenceOutcome.Merge).
+// addPersistence folds a persistence outcome into the phase, and marks it partial
+// when a write was rejected, failed or still pending at shutdown. Writer drains
+// and direct executor save failures merge into one figure (see PersistenceOutcome.Merge).
 func (t *phaseTracker) addPersistence(o database.PersistenceOutcome) {
 	if t == nil {
 		return
@@ -722,6 +722,15 @@ func (t *phaseTracker) noteExecution(rep core.ExecutionReport) {
 	}
 	if rep.DeferredFlushSkipped {
 		t.markPartial(database.ReasonDeferredFlushSkipped)
+	}
+	if rep.FindingStoreFailed > 0 {
+		// Only failed direct saves are reported here, not a tally of all direct
+		// saves. They were accepted attempts, unlike writer admission rejections.
+		t.addPersistence(database.PersistenceOutcome{
+			Writer:   database.PersistenceWriterFindings,
+			Accepted: rep.FindingStoreFailed,
+			Failed:   rep.FindingStoreFailed,
+		})
 	}
 	if rep.FeedbackDropped > 0 {
 		t.markPartial(database.ReasonFeedbackDropped)

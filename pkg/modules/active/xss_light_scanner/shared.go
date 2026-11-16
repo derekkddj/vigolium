@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	httpUtils "github.com/projectdiscovery/utils/http"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 )
@@ -59,7 +60,11 @@ func sendAndValidateRawPayload(
 	ip httpmsg.InsertionPoint,
 	payloadStr string,
 	httpClient *http.Requester,
+	receiptOut ...**evidence.Exchange,
 ) ([]byte, error) {
+	if len(receiptOut) > 0 && receiptOut[0] != nil {
+		*receiptOut[0] = nil
+	}
 	resp, err := sendRawPayload(ctx, ip, payloadStr, httpClient)
 	if err != nil {
 		return nil, err
@@ -85,6 +90,9 @@ func sendAndValidateRawPayload(
 		return nil, nil
 	}
 
+	if len(receiptOut) > 0 && receiptOut[0] != nil {
+		*receiptOut[0] = http.CaptureEvidence(resp)
+	}
 	// The body aliases a pooled buffer that resp.Close() hands back for the
 	// next request; the caller keeps analysing it, so return a copy.
 	return bytes.Clone(body), nil
@@ -96,8 +104,9 @@ func sendAndValidatePayload(
 	ip httpmsg.InsertionPoint,
 	payload *CanaryPayload,
 	httpClient *http.Requester,
+	receiptOut ...**evidence.Exchange,
 ) ([]byte, error) {
-	return sendAndValidateRawPayload(ctx, ip, payload.FullPayload, httpClient)
+	return sendAndValidateRawPayload(ctx, ip, payload.FullPayload, httpClient, receiptOut...)
 }
 
 // canExecuteJSContentType checks Content-Type header for JavaScript execution.

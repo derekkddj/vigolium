@@ -13,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/modules/modtest"
 	"github.com/vigolium/vigolium/pkg/output"
@@ -181,7 +182,31 @@ func TestCL0_DetectsBackendIgnoringContentLength(t *testing.T) {
 		"the fake 404 page echoes the path, so the canary must be visible in the follow-up")
 	assert.Contains(t, f.Request, "POST /favicon.ico HTTP/1.1")
 	assert.Contains(t, f.Request, "GET /vgcl0")
-	assert.Contains(t, f.Response, "404")
+	assert.Contains(t, f.Response, "200 OK", "the POST must keep its own response, not the follow-up's 404")
+	assert.NotContains(t, f.Response, "not found: /vgcl0")
+	require.NotEmpty(t, f.Evidence)
+	primary := f.Evidence[0]
+	assert.True(t, primary.Primary)
+	assert.Equal(t, evidence.RoleAttack, primary.Role)
+	require.NotNil(t, primary.Exchange)
+	assert.Equal(t, evidence.ProvenanceSupplied, primary.Exchange.Provenance)
+	assert.Equal(t, evidence.StateUnknown, primary.Exchange.ResponseState)
+	assert.Equal(t, string(primary.Exchange.Request), f.Request)
+	assert.Equal(t, string(primary.Exchange.Response), f.Response)
+	assert.NotContains(t, f.Request, "GET /favicon.ico HTTP/1.1", "legacy primary contains only the emitted POST, not the later GET")
+	var followup bool
+	for _, entry := range f.Evidence[1:] {
+		require.NotNil(t, entry.Exchange)
+		assert.NoError(t, entry.Exchange.Validate())
+		assert.NotEqual(t, primary.ExchangeID, entry.ExchangeID)
+		if entry.Role == evidence.RoleObservation {
+			followup = true
+			assert.Contains(t, string(entry.Exchange.Request), "GET /favicon.ico HTTP/1.1")
+			assert.NotContains(t, string(entry.Exchange.Request), "POST /favicon.ico")
+			assert.Contains(t, string(entry.Exchange.Response), "404 Not Found")
+		}
+	}
+	assert.True(t, followup, "same-connection effects must be separate observation receipts")
 
 	// The smuggled request must actually have been parsed by the server: its
 	// request line arrives as a request of its own.

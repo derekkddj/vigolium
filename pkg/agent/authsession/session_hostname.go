@@ -1,12 +1,11 @@
 package authsession
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -17,6 +16,8 @@ import (
 	"github.com/vigolium/vigolium/pkg/agent/agenttypes"
 	"github.com/vigolium/vigolium/pkg/authentication"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
+	vhttp "github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/terminal"
 	"go.uber.org/zap"
@@ -329,22 +330,28 @@ func ReplaceAuthHeadersInHTTPRR(records []*httpmsg.HttpRequestResponse, sessionH
 	}
 }
 
-// ReprobeUnprobedRecords queries the database for HTTP records that have no response
-// (has_response=false) for the given source and hostname, then probes them concurrently
-// to populate status codes and response bodies.
-func ReprobeUnprobedRecords(ctx context.Context, repo *database.Repository, projectUUID, hostname string, authHeaders map[string]string, source string) {
+// ReprobeUnprobedRecords probes request-only records and saves complete immutable
+// versions. The returned map is old UUID -> observed exchange UUID: downstream
+// consumers must adopt it rather than treating the historical seed as refreshed.
+// Failed/incomplete captures leave the old row untouched and return an error.
+// Optional onSaved callbacks receive an owned copy of the actual captured pair
+// together with its old and saved UUIDs. They run concurrently, only after a
+// successful save; all callbacks complete before this function returns.
+func ReprobeUnprobedRecords(ctx context.Context, repo *database.Repository, projectUUID, hostname string, authHeaders map[string]string, source string, onSaved ...func(oldUUID, versionUUID string, observed *httpmsg.HttpRequestResponse)) (map[string]string, error) {
 	if repo == nil {
-		return
+		return nil, nil
 	}
 
 	unprobed, err := repo.GetUnprobedRecordsBySource(ctx, projectUUID, source, hostname, 200)
 	if err != nil {
-		zap.L().Debug("Failed to query unprobed records", zap.String("source", source), zap.Error(err))
-		return
+		return nil, fmt.Errorf("query unprobed records: %w", err)
 	}
 	if len(unprobed) == 0 {
-		return
+		return nil, nil
 	}
+	versions := make(map[string]string, len(unprobed))
+	var resultMu sync.Mutex
+	var failures []error
 
 	printPhaseLine("source-analysis", fmt.Sprintf("re-probing unprobed records  source=%s count=%d", source, len(unprobed)))
 
@@ -376,64 +383,34 @@ func ReprobeUnprobedRecords(ctx context.Context, repo *database.Repository, proj
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			httpReq, reqErr := http.NewRequestWithContext(ctx, rec.Method, rec.URL, nil)
-			if reqErr != nil {
-				return
-			}
-
-			// Apply auth headers to re-probe requests.
-			for k, v := range authHeaders {
-				httpReq.Header.Set(k, v)
-			}
-
-			resp, doErr := client.Do(httpReq)
-			if doErr != nil {
-				return
-			}
-			defer func() { _ = resp.Body.Close() }()
-
-			const maxBody = 2 * 1024 * 1024
-			body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBody))
-			if readErr != nil {
-				return
-			}
-
-			// Build raw HTTP response.
-			var rawResp bytes.Buffer
-			fmt.Fprintf(&rawResp, "%s %s\r\n", resp.Proto, resp.Status)
-			for k, vals := range resp.Header {
-				for _, v := range vals {
-					fmt.Fprintf(&rawResp, "%s: %s\r\n", k, v)
+			versionUUID, status, probeErr := reprobeRecord(ctx, repo, client, rec, authHeaders, func(versionUUID string, observed *httpmsg.HttpRequestResponse) {
+				for _, callback := range onSaved {
+					if callback != nil {
+						callback(rec.UUID, versionUUID, observed.Clone())
+					}
 				}
+			})
+			resultMu.Lock()
+			if probeErr != nil {
+				failures = append(failures, fmt.Errorf("reprobe %s: %w", rec.UUID, probeErr))
+			} else {
+				versions[rec.UUID] = versionUUID
 			}
-			rawResp.WriteString("\r\n")
-			rawResp.Write(body)
-
-			contentType := resp.Header.Get("Content-Type")
-
-			update := &database.RecordResponseUpdate{
-				StatusCode:            resp.StatusCode,
-				StatusPhrase:          resp.Status,
-				ResponseHTTPVersion:   resp.Proto,
-				ResponseContentType:   contentType,
-				ResponseContentLength: int64(len(body)),
-				RawResponse:           rawResp.Bytes(),
-			}
-
-			if updateErr := repo.UpdateRecordResponse(ctx, rec.UUID, update); updateErr != nil {
-				zap.L().Debug("Failed to update re-probed record", zap.Error(updateErr))
+			resultMu.Unlock()
+			if probeErr != nil {
+				zap.L().Warn("Failed to save re-probed exchange", zap.String("record_uuid", rec.UUID), zap.Error(probeErr))
 				return
 			}
 
 			updated.Add(1)
 			switch {
-			case resp.StatusCode >= 200 && resp.StatusCode < 300:
+			case status >= 200 && status < 300:
 				s2xx.Add(1)
-			case resp.StatusCode >= 300 && resp.StatusCode < 400:
+			case status >= 300 && status < 400:
 				s3xx.Add(1)
-			case resp.StatusCode >= 400 && resp.StatusCode < 500:
+			case status >= 400 && status < 500:
 				s4xx.Add(1)
-			case resp.StatusCode >= 500:
+			case status >= 500:
 				s5xx.Add(1)
 			}
 		}(rec)
@@ -442,9 +419,50 @@ func ReprobeUnprobedRecords(ctx context.Context, repo *database.Repository, proj
 	wg.Wait()
 	if n := updated.Load(); n > 0 {
 		noResp := int64(len(unprobed)) - n
-		printPhaseLine("source-analysis", fmt.Sprintf("re-probed records  source=%s updated=%d total=%d  %s",
+		printPhaseLine("source-analysis", fmt.Sprintf("re-probed records  source=%s saved-versions=%d total=%d  %s",
 			source, n, len(unprobed), formatStatusSummary(s2xx.Load(), s3xx.Load(), s4xx.Load(), s5xx.Load(), noResp)))
 	}
+	return versions, errors.Join(failures...)
+}
+
+func reprobeRecord(ctx context.Context, repo *database.Repository, client *http.Client, rec *database.HTTPRecord, authHeaders map[string]string, onSaved ...func(versionUUID string, observed *httpmsg.HttpRequestResponse)) (string, int, error) {
+	req, err := http.NewRequestWithContext(ctx, rec.Method, rec.URL, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	for name, value := range authHeaders {
+		req.Header.Set(name, value)
+	}
+	start := time.Now()
+	const maxBody = 2 * 1024 * 1024
+	chain, err := vhttp.DoCaptured(client, req, maxBody)
+	if chain != nil {
+		defer chain.Close()
+	}
+	// Error chains may contain partial receipts, but this API returns only
+	// complete saved versions. Close them without publishing a UUID or status.
+	if err != nil {
+		return "", 0, err
+	}
+	x := vhttp.CaptureEvidence(chain)
+	if x == nil || x.RequestState != evidence.StateComplete || x.ResponseState != evidence.StateComplete {
+		return "", 0, fmt.Errorf("reprobe has no complete captured exchange; historical record unchanged")
+	}
+	sent, err := httpmsg.FromEvidenceExchange(x)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid reprobe capture: %w", err)
+	}
+	sent = sent.WithResponse(httpmsg.NewHttpResponseWithDuration(x.Response, time.Since(start))).WithEvidence(x)
+	versionUUID, err := repo.SaveRecordVersion(ctx, rec.UUID, sent)
+	if err != nil {
+		return "", 0, err
+	}
+	for _, callback := range onSaved {
+		if callback != nil {
+			callback(versionUUID, sent.Clone())
+		}
+	}
+	return versionUUID, sent.Response().StatusCode(), nil
 }
 
 // printPhaseLine prints a console line in the standard scanning output style.

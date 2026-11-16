@@ -1,6 +1,7 @@
 package jsext
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/grafana/sobek"
@@ -93,7 +94,10 @@ func (h *PreHook) Execute(req *httpmsg.HttpRequestResponse) (*httpmsg.HttpReques
 	if rawVal != nil && !sobek.IsUndefined(rawVal) {
 		// Reconstruct request from modified raw, preserving the original service
 		newReq := httpmsg.NewHttpRequestWithService(req.Service(), []byte(rawVal.String()))
-		return httpmsg.NewHttpRequestResponse(newReq, req.Response()), nil
+		if bytes.Equal(newReq.Raw(), req.Request().Raw()) {
+			return req, nil
+		}
+		return httpmsg.NewHttpRequestResponse(newReq, nil), nil
 	}
 
 	// Check if headers were modified
@@ -129,7 +133,10 @@ func (h *PreHook) Execute(req *httpmsg.HttpRequestResponse) (*httpmsg.HttpReques
 		}
 
 		newReq := httpmsg.NewHttpRequestWithService(req.Service(), raw)
-		return httpmsg.NewHttpRequestResponse(newReq, req.Response()), nil
+		if bytes.Equal(newReq.Raw(), req.Request().Raw()) {
+			return req, nil
+		}
+		return httpmsg.NewHttpRequestResponse(newReq, nil), nil
 	}
 
 	return req, nil

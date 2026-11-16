@@ -55,6 +55,7 @@ func (m *Module) phaseDoS(
 	}
 	body := graphqlx.QueryBody(probe)
 
+	proof := &gqlProof{}
 	unlimited := confirmRounds(defaultConfirmRounds, func() (bool, error) {
 		r, err := m.send(ctx, httpClient, "POST", endpointPath, "application/json", body)
 		if err != nil {
@@ -68,13 +69,14 @@ func (m *Module) phaseDoS(
 		if hasDepthLimitMarker(r.body) {
 			return false, nil
 		}
+		proof.attack(r, body)
 		return strings.Contains(r.body, `"data"`), nil
 	})
 	if !unlimited {
 		return nil
 	}
 
-	return &output.ResultEvent{
+	return proof.observation(&output.ResultEvent{
 		ModuleID:      ModuleID,
 		RecordKind:    output.RecordKindCandidate,
 		EvidenceGrade: output.EvidenceGradeCandidate,
@@ -101,5 +103,5 @@ func (m *Module) phaseDoS(
 			"resource_impact":      false,
 			"higher_limit_unknown": true,
 		},
-	}
+	})
 }

@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -299,7 +300,7 @@ func (m *Module) probeFile(
 	p probe,
 	probePath string,
 	fp *notFoundFingerprint,
-) *output.ResultEvent {
+) (finding *output.ResultEvent) {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
@@ -379,18 +380,20 @@ func (m *Module) probeFile(
 		if matchedMarkers == nil {
 			return nil
 		}
-		return m.buildResult(ctx, p, probePath, string(modifiedRaw), resp.FullResponseString(), matchedMarkers)
+		return m.buildResult(ctx, p, probePath, string(modifiedRaw), resp.FullResponseString(), matchedMarkers, http.CaptureEvidence(resp))
 	}
 
 	// Require the full co-occurrence marker set (AND across groups).
 	// MatchAndConfirmSibling also drops the finding when a guaranteed-nonexistent
 	// sibling under the same parent returns the same markers — a sub-directory
 	// catch-all the root soft-404 fingerprint cannot see.
-	matchedMarkers, ok := modkit.MatchAndConfirmSibling(ctx, httpClient, probePath, body, p.markers)
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(finding, guardProof) }()
+	matchedMarkers, ok := modkit.MatchAndConfirmSiblingWithEvidence(ctx, httpClient, probePath, body, p.markers, guardProof)
 	if !ok {
 		return nil
 	}
-	return m.buildResult(ctx, p, probePath, string(modifiedRaw), resp.FullResponseString(), matchedMarkers)
+	return m.buildResult(ctx, p, probePath, string(modifiedRaw), resp.FullResponseString(), matchedMarkers, http.CaptureEvidence(resp))
 }
 
 // matchMarkerless validates a markerless probe structurally, returning the
@@ -414,7 +417,13 @@ func (m *Module) buildResult(
 	p probe,
 	probePath, requestRaw, responseRaw string,
 	matchedMarkers []string,
-) *output.ResultEvent {
+	exchanges ...*evidence.Exchange,
+) (finding *output.ResultEvent) {
+	defer func() {
+		if len(exchanges) > 0 {
+			modkit.SetPrimaryEvidence(finding, exchanges[0], evidence.RoleObservation, "matched Magento endpoint")
+		}
+	}()
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 

@@ -175,13 +175,13 @@ func (r *Runner) ModuleErrors() map[string]int64 {
 // (which reads the row) carry the totals.
 //
 // It writes the module ledger onto scans.module_stats in the same update.
-func (r *Runner) persistModuleErrors(ctx context.Context, scanUUID string) {
+func (r *Runner) persistModuleErrors(ctx context.Context, scanUUID string, scope nativeScanScope) {
 	counts := r.ModuleErrors()
 	ledger := r.ModuleStats()
 	if r.repository == nil || (len(counts) == 0 && len(ledger) == 0) {
 		return
 	}
-	if err := r.repository.UpdateScanPartial(ctx, &database.Scan{UUID: scanUUID, ModuleErrors: counts, ModuleStats: ledger}); err != nil {
+	if err := scope.updateMetadata(ctx, &database.Scan{UUID: scanUUID, ModuleErrors: counts, ModuleStats: ledger}); err != nil {
 		zap.L().Warn("Failed to record module errors on scan", zap.Error(err))
 	}
 }

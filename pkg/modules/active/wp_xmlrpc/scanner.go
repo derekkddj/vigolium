@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -176,5 +177,9 @@ func (m *Module) ScanPerRequest(
 		})
 	}
 
+	receipt := http.CaptureEvidence(resp)
+	for _, result := range results {
+		modkit.SetPrimaryEvidence(result, receipt, evidence.RoleObservation, "XML-RPC method listing")
+	}
 	return results, nil
 }

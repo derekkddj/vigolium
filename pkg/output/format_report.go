@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/utils/textutil"
 	"github.com/vigolium/vigolium/public"
 	"github.com/yuin/goldmark"
@@ -37,6 +38,8 @@ type ReportFinding struct {
 	Request            string
 	Response           string
 	AdditionalEvidence []string
+	Evidence           []evidence.Entry
+	EvidenceStatus     string
 	Tags               []string
 	FoundAt            string
 	FindingHash        string
@@ -102,9 +105,7 @@ func GenerateDocumentReport(items []any, outputPath string, meta HTMLReportMeta)
 		return err
 	}
 
-	funcMap := template.FuncMap{
-		"inc": func(i int) int { return i + 1 },
-	}
+	funcMap := documentTemplateFuncs()
 
 	tmpl, err := template.New("report").Funcs(funcMap).Parse(string(tmplBytes))
 	if err != nil {
@@ -120,6 +121,20 @@ func GenerateDocumentReport(items []any, outputPath string, meta HTMLReportMeta)
 	defer func() { _ = f.Close() }()
 
 	return tmpl.Execute(f, data)
+}
+
+// documentTemplateFuncs is shared by the small-input and disk-backed document
+// paths. Selected receipts are serialized as JSON (base64 message bytes), never
+// converted into legacy text or repaired by an HTTP parser. html/template escapes
+// the JSON as text; no scanned content is promoted to trusted HTML here.
+func documentTemplateFuncs() template.FuncMap {
+	return template.FuncMap{
+		"inc": func(i int) int { return i + 1 },
+		"receiptJSON": func(entry evidence.Entry) (string, error) {
+			raw, err := json.Marshal(entry)
+			return string(raw), err
+		},
+	}
 }
 
 func buildReportData(items []any, title string, meta HTMLReportMeta) ReportData {
@@ -225,32 +240,34 @@ func buildReportData(items []any, title string, meta HTMLReportMeta) ReportData 
 
 func parseFinding(data json.RawMessage, md goldmark.Markdown) ReportFinding {
 	var f struct {
-		ID                 int      `json:"id"`
-		ModuleID           string   `json:"module_id"`
-		ModuleName         string   `json:"module_name"`
-		ModuleShort        string   `json:"module_short"`
-		Description        string   `json:"description"`
-		Severity           string   `json:"severity"`
-		Confidence         string   `json:"confidence"`
-		CWE                string   `json:"cwe_id"`
-		CVSSScore          float64  `json:"cvss_score"`
-		Remediation        string   `json:"remediation"`
-		URL                string   `json:"url"`
-		MatchedAt          []string `json:"matched_at"`
-		ExtractedResults   []string `json:"extracted_results"`
-		Request            string   `json:"request"`
-		Response           string   `json:"response"`
-		AdditionalEvidence []string `json:"additional_evidence"`
-		Tags               []string `json:"tags"`
-		FoundAt            string   `json:"found_at"`
-		FindingHash        string   `json:"finding_hash"`
-		SourceFile         string   `json:"source_file"`
-		RepoName           string   `json:"repo_name"`
-		ScanUUID           string   `json:"scan_uuid"`
-		RecordUUIDs        []string `json:"http_record_uuids"`
-		Hostname           string   `json:"hostname"`
-		Status             string   `json:"status"`
-		CreatedAt          string   `json:"created_at"`
+		ID                 int              `json:"id"`
+		ModuleID           string           `json:"module_id"`
+		ModuleName         string           `json:"module_name"`
+		ModuleShort        string           `json:"module_short"`
+		Description        string           `json:"description"`
+		Severity           string           `json:"severity"`
+		Confidence         string           `json:"confidence"`
+		CWE                string           `json:"cwe_id"`
+		CVSSScore          float64          `json:"cvss_score"`
+		Remediation        string           `json:"remediation"`
+		URL                string           `json:"url"`
+		MatchedAt          []string         `json:"matched_at"`
+		ExtractedResults   []string         `json:"extracted_results"`
+		Request            string           `json:"request"`
+		Response           string           `json:"response"`
+		AdditionalEvidence []string         `json:"additional_evidence"`
+		Evidence           []evidence.Entry `json:"evidence"`
+		EvidenceStatus     string           `json:"evidence_status"`
+		Tags               []string         `json:"tags"`
+		FoundAt            string           `json:"found_at"`
+		FindingHash        string           `json:"finding_hash"`
+		SourceFile         string           `json:"source_file"`
+		RepoName           string           `json:"repo_name"`
+		ScanUUID           string           `json:"scan_uuid"`
+		RecordUUIDs        []string         `json:"http_record_uuids"`
+		Hostname           string           `json:"hostname"`
+		Status             string           `json:"status"`
+		CreatedAt          string           `json:"created_at"`
 	}
 	// best-effort: render whatever fields decode; a malformed finding yields a sparse row.
 	_ = json.Unmarshal(data, &f)
@@ -292,6 +309,8 @@ func parseFinding(data json.RawMessage, md goldmark.Markdown) ReportFinding {
 		Request:            f.Request,
 		Response:           f.Response,
 		AdditionalEvidence: f.AdditionalEvidence,
+		Evidence:           evidence.CloneEntries(f.Evidence),
+		EvidenceStatus:     f.EvidenceStatus,
 		Tags:               f.Tags,
 		FoundAt:            f.FoundAt,
 		FindingHash:        f.FindingHash,

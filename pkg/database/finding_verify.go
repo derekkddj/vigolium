@@ -39,6 +39,9 @@ func (r *Repository) ResolveFindings(ctx context.Context, projectUUID string, id
 		out = append(out, part...)
 	}
 	slices.SortFunc(out, func(a, b *Finding) int { return int(a.ID - b.ID) })
+	if err := r.HydrateFindingEvidenceManifest(ctx, out); err != nil {
+		return nil, nil, err
+	}
 	return out, notFound, nil
 }
 
@@ -61,6 +64,9 @@ func (r *Repository) FindingsInScan(ctx context.Context, projectUUID, scanUUID s
 	}
 	if err := q.Scan(ctx); err != nil {
 		return nil, fmt.Errorf("load scan findings: %w", err)
+	}
+	if err := r.HydrateFindingEvidenceManifest(ctx, out); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

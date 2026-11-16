@@ -1,11 +1,13 @@
 package database
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -186,6 +188,7 @@ type DBInputSource struct {
 	readCursorAt   time.Time
 	readCursorUUID string
 	startAt        time.Time // the durable cursor this source started from
+	startUUID      string    // its UUID tie-break
 	nextSeq        uint64
 	nextAckSeq     uint64
 	pendingBySeq   map[uint64]*cursorAck
@@ -401,16 +404,15 @@ func (s *DBInputSource) fetchNextBatch(ctx context.Context) ([]*HTTPRecord, erro
 		}
 		s.readCursorAt = scan.CursorAt
 		s.readCursorUUID = scan.CursorUUID
-		s.startAt = scan.CursorAt
+		s.startAt, s.startUUID = scan.CursorAt, scan.CursorUUID
 		s.ackMaxAt, s.ackMaxUUID = scan.CursorAt, scan.CursorUUID
 		s.projectUUID = scan.ProjectUUID
 		s.readCursorInit = true
 		s.captureCount(ctx)
 	}
 
-	// Select next records after cursor.
-	// Format cursor as plain string to match SQLite's CURRENT_TIMESTAMP format —
-	// bun serializes time.Time with timezone suffix that breaks text comparison.
+	// Select and order by the same normalized cursor key, so mixed SQLite
+	// timestamp encodings cannot replay history or skip UUID ties.
 	var records []*HTTPRecord
 	// Project only scanRecordColumns — the columns the scan feed consumes —
 	// avoiding the parameters/technology/remarks jsonb columns and ~25 unused
@@ -424,7 +426,7 @@ func (s *DBInputSource) fetchNextBatch(ctx context.Context) ([]*HTTPRecord, erro
 	if limit <= 0 {
 		limit = 128
 	}
-	if err := q.OrderExpr("created_at ASC, uuid ASC").Limit(int64(limit)).Scan(ctx); err != nil {
+	if err := q.OrderExpr(dbCursorTimeExpr(s.db.Driver(), "created_at") + " ASC, uuid ASC").Limit(int64(limit)).Scan(ctx); err != nil {
 		return nil, err
 	}
 	if !s.oneShot {
@@ -517,8 +519,19 @@ func (s *DBInputSource) lookbackLocked(ctx context.Context) ([]*HTTPRecord, erro
 // servedSince reports whether r could have been missed by this source: it was
 // created after the cursor this source started from, minus the lookback.
 // Records older than that belong to a previous run's committed range.
+//
+// A record at or before the starting cursor's own key is inside that committed
+// range too: the durable cursor (a resumed run's, or the high-water mark a
+// scan-on-receive row starts from) already accounts for it, so the lookback
+// must not replay it.
 func (s *DBInputSource) servedSince(r *HTTPRecord) bool {
-	return s.startAt.IsZero() || !r.CreatedAt.Before(s.startAt.Add(-pollLookback))
+	if s.startAt.IsZero() {
+		return true
+	}
+	if r.CreatedAt.Before(s.startAt) || (r.CreatedAt.Equal(s.startAt) && r.UUID <= s.startUUID) {
+		return false
+	}
+	return true
 }
 
 // pruneServedLocked forgets served records the lookback can no longer reach.
@@ -544,11 +557,7 @@ func (s *DBInputSource) pruneServedLocked() {
 // so the count is over exactly the rows iteration walks. Caller holds s.mu (it
 // reads the cursor).
 func (s *DBInputSource) applyEligibility(q *bun.SelectQuery) *bun.SelectQuery {
-	if !s.readCursorAt.IsZero() {
-		cursorAt := dbTimestampString(s.db.Driver(), s.readCursorAt)
-		q = q.Where("(created_at > ? OR (created_at = ? AND uuid > ?))",
-			cursorAt, cursorAt, s.readCursorUUID)
-	}
+	q = applyRecordsAfterCursor(q, s.db.Driver(), s.readCursorAt, s.readCursorUUID)
 
 	q = applyHostScopeFilter(q, s.hostScopes)
 	q = applyProjectFilter(q, s.projectUUID)
@@ -666,33 +675,61 @@ func RecordToHttpRequestResponse(record *HTTPRecord) (*httpmsg.HttpRequestRespon
 	return recordToHttpRequestResponse(record)
 }
 
-// recordToHttpRequestResponse converts an HTTPRecord back to HttpRequestResponse.
-// The record's stored URL (which carries the original scheme) is preferred over
-// re-parsing the raw request bytes, since origin-form HTTP requests on the wire
-// don't encode the scheme and would otherwise default to http.
+// recordToHttpRequestResponse restores stored bytes without body reconciliation.
+// Destination columns take precedence over the request URL/Host: absolute-form
+// traffic can name an authority different from the service it was sent to.
 func recordToHttpRequestResponse(record *HTTPRecord) (*httpmsg.HttpRequestResponse, error) {
-	// Prefer raw request if available
+	if record == nil {
+		return nil, io.EOF
+	}
+	if record.hasCaptureStates() {
+		return recordWithSuppliedFidelity(record)
+	}
 	if len(record.RawRequest) > 0 {
-		var rr *httpmsg.HttpRequestResponse
+		var service *httpmsg.Service
 		var err error
-		if record.URL != "" {
-			rr, err = httpmsg.ParseRawRequestWithURL(string(record.RawRequest), record.URL)
+		if record.Hostname != "" && record.Scheme != "" {
+			service, err = httpmsg.NewService(record.Hostname, record.Port, record.Scheme)
+		} else if record.URL != "" {
+			// Legacy rows may lack destination columns. The URL can locate those
+			// rows, but must never override a known stored destination.
+			legacy, parseErr := httpmsg.GetRawRequestFromURL(record.URL)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			service = legacy.Service()
 		} else {
-			rr, err = httpmsg.ParseRawRequest(string(record.RawRequest))
+			legacy, parseErr := httpmsg.ParseRawRequest(string(record.RawRequest))
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			service = legacy.Service()
 		}
 		if err != nil {
 			return nil, err
 		}
-		// Attach response if present
+		rr := httpmsg.NewHttpRequestResponse(httpmsg.NewHttpRequestWithService(service, bytes.Clone(record.RawRequest)), nil)
 		if resp := record.ParsedResponse(); resp != nil {
 			rr = rr.WithResponse(resp)
 		}
 		return rr, nil
 	}
 
-	// Fallback: construct from URL
+	// Request-only legacy URL seeds still need a constructed GET, but its
+	// destination must honor known columns just as the raw-exchange path does.
 	if record.URL != "" {
-		return httpmsg.GetRawRequestFromURL(record.URL)
+		rr, err := httpmsg.GetRawRequestFromURL(record.URL)
+		if err != nil {
+			return nil, err
+		}
+		if record.Hostname != "" && record.Scheme != "" {
+			service, err := httpmsg.NewService(record.Hostname, record.Port, record.Scheme)
+			if err != nil {
+				return nil, err
+			}
+			rr = rr.WithService(service)
+		}
+		return rr, nil
 	}
 
 	return nil, io.EOF
@@ -723,6 +760,37 @@ func applyProjectFilter(q *bun.SelectQuery, projectUUID string) *bun.SelectQuery
 // per-item DB read+parse would otherwise be the throughput ceiling for large scans).
 const riskPrefetchBatchSize = 128
 
+// These are stored-byte limits, not Content-Length limits or a bound on worker
+// memory. A page normally owns at most 16 MiB of raw exchanges plus coalescing
+// descriptors. One larger record can own a page alone, up to the hard 64 MiB
+// individual limit. Metadata is sized before any bodies/parameter values load.
+const (
+	riskDefaultPageBytes      int64 = 16 << 20
+	riskDefaultMaxRecordBytes int64 = 64 << 20
+)
+
+// RiskRecordMemoryLimitError stops the round without skipping/acknowledging the
+// offending record or checkpointing past it. StoredBytes counts database bytes,
+// including HTTP heads, not the untrusted Content-Length metadata. Kind also
+// identifies oversized coalescing descriptors or growth since the preflight.
+type RiskRecordMemoryLimitError struct {
+	RecordUUID  string
+	StoredBytes int64
+	LimitBytes  int64
+	Kind        string
+}
+
+func (e *RiskRecordMemoryLimitError) Error() string {
+	return fmt.Sprintf("risk-prioritized record %s: %s uses %d stored bytes, exceeds memory limit %d bytes", e.RecordUUID, e.Kind, e.StoredBytes, e.LimitBytes)
+}
+
+// FatalSourceError lets the executor stop and report a partial round rather than
+// retrying this deterministic boundary forever. Structural to avoid an import
+// cycle with input/source; the original typed error remains available via As.
+func (e *RiskRecordMemoryLimitError) FatalSourceError() bool {
+	return true
+}
+
 // RiskPrioritizedDBInputSource processes high-risk records first, then falls back
 // to normal cursor-based order. It implements source.InputSource.
 //
@@ -751,9 +819,12 @@ type RiskPrioritizedDBInputSource struct {
 	// runFilter, when set, keeps only the records this run produced or seeded
 	// (see RunRecordFilter).
 	runFilter            *RunRecordFilter
-	maxParamShapeSamples int // when > 0, coalesce same-shape GET records to this many value-distinct samples
+	maxParamShapeSamples int                 // when > 0, coalesce same-shape GET records to this many value-distinct samples
+	excludedRecordUUIDs  map[string]struct{} // explicit caller-owned admission exclusions, not inferred supersession
+	excludedRecords      int
 	closed               atomic.Bool
 	mu                   sync.Mutex
+	nextMu               sync.Mutex // serializes Next while mu is released for fetch/ACK
 
 	loaded      bool   // snapshot upper bound captured on first Next
 	hasBound    bool   // false → no eligible records (empty snapshot); Next returns EOF
@@ -785,8 +856,10 @@ type RiskPrioritizedDBInputSource struct {
 	lastPageInBucket bool
 	everStarted      bool // any page has been served
 
-	buffer  []*HTTPRecord // full records for the current page's coalescing survivors
-	bufHead int           // read cursor into buffer; lets refill reuse the backing array
+	buffer         []*HTTPRecord // full records for the current page's coalescing survivors
+	bufHead        int           // read cursor into buffer; lets refill reuse the backing array
+	pageBytes      int64         // zero uses riskDefaultPageBytes
+	maxRecordBytes int64         // zero uses riskDefaultMaxRecordBytes
 
 	coalescer *paramShapeCoalescer // nil when coalescing is disabled
 
@@ -902,6 +975,34 @@ func (s *RiskPrioritizedDBInputSource) applyScope(q *bun.SelectQuery) *bun.Selec
 	return s.runFilter.Apply(applyHostScopeFilter(q, s.hostScopes))
 }
 
+// WithMemoryLimits configures before Next the stored-byte page budget and the
+// individual record/descriptor limit. Non-positive values use the finite defaults
+// (16 MiB / 64 MiB); larger values are capped at those same hard ceilings. A record
+// larger than the page budget is served alone if it fits the individual limit.
+// The preflight conservatively budgets all admitted rows before coalescing, so
+// dropped rows can make a page smaller, never larger, than this budget.
+func (s *RiskPrioritizedDBInputSource) WithMemoryLimits(pageBytes, maxRecordBytes int64) *RiskPrioritizedDBInputSource {
+	if pageBytes <= 0 || pageBytes > riskDefaultPageBytes {
+		pageBytes = riskDefaultPageBytes
+	}
+	if maxRecordBytes <= 0 || maxRecordBytes > riskDefaultMaxRecordBytes {
+		maxRecordBytes = riskDefaultMaxRecordBytes
+	}
+	s.pageBytes, s.maxRecordBytes = pageBytes, maxRecordBytes
+	return s
+}
+
+func (s *RiskPrioritizedDBInputSource) memoryLimits() (int64, int64) {
+	pageBytes, maxRecordBytes := s.pageBytes, s.maxRecordBytes
+	if pageBytes <= 0 || pageBytes > riskDefaultPageBytes {
+		pageBytes = riskDefaultPageBytes
+	}
+	if maxRecordBytes <= 0 || maxRecordBytes > riskDefaultMaxRecordBytes {
+		maxRecordBytes = riskDefaultMaxRecordBytes
+	}
+	return pageBytes, maxRecordBytes
+}
+
 // WithParamShapeCoalescing enables param-shape coalescing of the snapshot:
 // records that share a param shape (host + path shape + method +
 // query/form/JSON param-name-set; see paramShapeRepresentative) are reduced to
@@ -916,6 +1017,29 @@ func (s *RiskPrioritizedDBInputSource) WithParamShapeCoalescing(maxSamples int) 
 	return s
 }
 
+// WithExcludedRecordUUIDs excludes explicitly identified historical inputs from
+// this source only. Configure before Next. Exclusions precede shape selection so
+// a substituted seed cannot consume its observed version's representative slot.
+// Page/cursor boundaries still cover excluded rows; no stored row is changed and
+// no relationship is inferred from URLs, timestamps, hashes or lineage fields.
+func (s *RiskPrioritizedDBInputSource) WithExcludedRecordUUIDs(ids []string) *RiskPrioritizedDBInputSource {
+	s.excludedRecordUUIDs = make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			s.excludedRecordUUIDs[id] = struct{}{}
+		}
+	}
+	return s
+}
+
+// ExcludedRecords reports explicit admission exclusions committed by this source,
+// separately from shape coalescing and failed/unavailable work.
+func (s *RiskPrioritizedDBInputSource) ExcludedRecords() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.excludedRecords
+}
+
 // CoalescedDropped returns how many records the param-shape coalescing pass
 // removed from this scan's iteration list. Valid after the snapshot loads (i.e.
 // after the first Next / after Execute). Zero when coalescing is disabled.
@@ -928,13 +1052,15 @@ func (s *RiskPrioritizedDBInputSource) CoalescedDropped() int {
 	return 0
 }
 
-// riskPageRow is the per-record projection each lane page selects: identity +
-// ordering columns, plus the coalescing columns only when coalescing is enabled.
+// riskPageRow first loads only identity, ordering and SQL byte lengths. The
+// descriptor fields are fetched separately, only for a byte-bounded prefix.
 type riskPageRow struct {
 	UUID                 string          `bun:"uuid"`
 	CreatedAt            time.Time       `bun:"created_at"`
 	RiskScore            int             `bun:"risk_score"`
 	SurfaceScore         int             `bun:"surface_score"`
+	StoredBytes          int64           `bun:"stored_bytes"`
+	DescriptorBytes      int64           `bun:"descriptor_bytes"`
 	Method               string          `bun:"method"`
 	URL                  string          `bun:"url"`
 	RequestContentType   string          `bun:"request_content_type"`
@@ -952,14 +1078,20 @@ func (r riskPageRow) desc() recordURLDesc {
 	}
 }
 
-// Next streams records high-risk-first then chronologically, via bounded keyset
-// pages, so memory scales with the page size (not the whole eligible table).
+// Next streams records high-risk-first then chronologically, via keyset pages
+// bounded by stored bytes before hydration (not just a count of full body rows).
 func (s *RiskPrioritizedDBInputSource) Next(ctx context.Context) (*work.WorkItem, error) {
+	s.nextMu.Lock()
+	defer s.nextMu.Unlock()
 	if s.closed.Load() {
 		return nil, io.EOF
 	}
 
 	s.mu.Lock()
+	if s.closed.Load() {
+		s.mu.Unlock()
+		return nil, io.EOF
+	}
 	if !s.loaded {
 		if err := s.captureBoundLocked(ctx); err != nil {
 			s.mu.Unlock()
@@ -973,11 +1105,15 @@ func (s *RiskPrioritizedDBInputSource) Next(ctx context.Context) (*work.WorkItem
 	}
 
 	for {
-		// Serve from the current page buffer first. Advancing a read cursor (rather
-		// than re-slicing) keeps buffer pointing at the full backing array so the
-		// buffer[:0] reset on refill reuses it.
+		if s.closed.Load() {
+			s.mu.Unlock()
+			return nil, io.EOF
+		}
+		// Keep the backing array for reuse, but release each consumed record
+		// immediately: workers own the converted exchange, not this raw page.
 		if s.bufHead < len(s.buffer) {
 			record := s.buffer[s.bufHead]
+			s.buffer[s.bufHead] = nil
 			s.bufHead++
 			s.mu.Unlock()
 
@@ -1051,10 +1187,7 @@ func (s *RiskPrioritizedDBInputSource) captureBoundLocked(ctx context.Context) e
 		UUID      string    `bun:"uuid"`
 	}
 	q := s.db.NewSelect().Model((*HTTPRecord)(nil)).Column("created_at", "uuid")
-	if !s.resumeAt.IsZero() {
-		at := dbTimestampString(s.db.Driver(), s.resumeAt)
-		q = q.Where("(created_at > ? OR (created_at = ? AND uuid > ?))", at, at, s.resumeID)
-	}
+	q = applyRecordsAfterCursor(q, s.db.Driver(), s.resumeAt, s.resumeID)
 	q = s.applyScope(q)
 	q = applyProjectFilter(q, s.projectUUID)
 	q = applyEvidenceExclusion(q)
@@ -1063,7 +1196,7 @@ func (s *RiskPrioritizedDBInputSource) captureBoundLocked(ctx context.Context) e
 	var rows []boundRow
 	if s.presetBound {
 		rows = []boundRow{{CreatedAt: s.presetAt, UUID: s.presetID}}
-	} else if err := q.OrderExpr("created_at DESC, uuid DESC").Limit(1).Scan(ctx, &rows); err != nil {
+	} else if err := q.OrderExpr(dbCursorTimeExpr(s.db.Driver(), "created_at")+" DESC, uuid DESC").Limit(1).Scan(ctx, &rows); err != nil {
 		return err
 	}
 	if len(rows) == 0 {
@@ -1094,25 +1227,44 @@ func (s *RiskPrioritizedDBInputSource) Count() int64 {
 	return s.count.Load()
 }
 
-// pageColumns is the projection each lane page selects — coalescing columns are
-// included only when coalescing is enabled (they cost a JSONB decode per row).
+// pageColumns deliberately excludes raw bodies and parameter values. Even the
+// latter can contain large JSON/form payloads, so only their lengths load here.
 func (s *RiskPrioritizedDBInputSource) pageColumns() []string {
-	cols := []string{"uuid", "created_at", "risk_score", "surface_score", "method", "url"}
-	if s.coalescer != nil {
-		cols = append(cols, "request_content_type", "request_content_length", "parameters")
+	return []string{"uuid", "created_at", "risk_score", "surface_score"}
+}
+
+func (s *RiskPrioritizedDBInputSource) storedLengthExpr(column string) string {
+	if s.db.Driver() == driverPostgres {
+		return "COALESCE(OCTET_LENGTH(" + column + "), 0)"
 	}
-	return cols
+	// SQLite LENGTH(TEXT) counts characters and stops at NUL. Cast to BLOB so
+	// binary captures and multibyte text are measured as their stored bytes.
+	return "COALESCE(LENGTH(CAST(" + column + " AS BLOB)), 0)"
+}
+
+func (s *RiskPrioritizedDBInputSource) storedExchangeBytesExpr() string {
+	return s.storedLengthExpr("raw_request") + " + " + s.storedLengthExpr("raw_response")
+}
+
+func (s *RiskPrioritizedDBInputSource) descriptorBytesExpr() string {
+	if s.coalescer == nil {
+		return "0"
+	}
+	params := "parameters"
+	if s.db.Driver() == driverPostgres {
+		params = "CAST(parameters AS TEXT)"
+	}
+	return s.storedLengthExpr("method") + " + " + s.storedLengthExpr("url") + " + " +
+		s.storedLengthExpr("request_content_type") + " + " + s.storedLengthExpr(params)
 }
 
 // applyResumeAndBound restricts a page query to the eligible window: strictly
 // after the durable resume cursor and at/before the captured snapshot bound.
 func (s *RiskPrioritizedDBInputSource) applyResumeAndBound(q *bun.SelectQuery) *bun.SelectQuery {
-	if !s.resumeAt.IsZero() {
-		at := dbTimestampString(s.db.Driver(), s.resumeAt)
-		q = q.Where("(created_at > ? OR (created_at = ? AND uuid > ?))", at, at, s.resumeID)
-	}
-	boundAt := dbTimestampString(s.db.Driver(), s.boundAt)
-	q = q.Where("(created_at < ? OR (created_at = ? AND uuid <= ?))", boundAt, boundAt, s.boundID)
+	q = applyRecordsAfterCursor(q, s.db.Driver(), s.resumeAt, s.resumeID)
+	boundAt := dbCursorTimeValue(s.db.Driver(), s.boundAt)
+	key := dbCursorTimeExpr(s.db.Driver(), "created_at")
+	q = q.Where("("+key+" < ? OR ("+key+" = ? AND uuid <= ?))", boundAt, boundAt, s.boundID)
 	return s.applyRecordFilter(applyEvidenceExclusion(applyProjectFilter(q, s.projectUUID)))
 }
 
@@ -1156,14 +1308,21 @@ func (s *RiskPrioritizedDBInputSource) nextPageRowsLocked(ctx context.Context) (
 
 // bucketPageQueryLocked is the page query inside the current bucket.
 func (s *RiskPrioritizedDBInputSource) bucketPageQueryLocked() *bun.SelectQuery {
-	q := s.db.NewSelect().Model((*HTTPRecord)(nil)).Column(s.pageColumns()...)
+	q := s.db.NewSelect().Model((*HTTPRecord)(nil)).Column(s.pageColumns()...).
+		ColumnExpr(s.storedExchangeBytesExpr() + " AS stored_bytes").
+		ColumnExpr(s.descriptorBytesExpr() + " AS descriptor_bytes")
 	q = s.applyResumeAndBound(q)
 	q = q.Where("risk_score = ?", s.bucketRisk).Where("surface_score = ?", s.bucketSurface)
 	if s.started {
-		at := dbTimestampString(s.db.Driver(), s.keyAt)
-		q = q.Where("(created_at > ? OR (created_at = ? AND uuid > ?))", at, at, s.keyID)
+		at := dbCursorTimeValue(s.db.Driver(), s.keyAt)
+		key := dbCursorTimeExpr(s.db.Driver(), "created_at")
+		q = q.Where("("+key+" > ? OR ("+key+" = ? AND uuid > ?))", at, at, s.keyID)
 	}
 	q = s.applyScope(q)
+	// Order by the stored column, not the normalised cursor key: the bucket
+	// index (project, risk, surface, created_at, uuid) then serves the page in
+	// order without a temp b-tree. Both orders agree for the representations
+	// SQLite stores (a whole second sorts before its fractions either way).
 	return q.OrderExpr("created_at ASC, uuid ASC").Limit(riskPrefetchBatchSize)
 }
 
@@ -1204,13 +1363,179 @@ func (s *RiskPrioritizedDBInputSource) advanceKeyLocked(last riskPageRow) {
 	}
 }
 
+// boundedPageRows chooses a prefix BEFORE descriptor/body hydration. Exclusions
+// cost no body budget, but remain covered by last. A byte cut never consumes the
+// row at the cut, so the next keyset query sees it again. Oversized eligible rows
+// stop explicitly; earlier small records may be served first, never the big row.
+func (s *RiskPrioritizedDBInputSource) boundedPageRows(rows []riskPageRow) ([]riskPageRow, riskPageRow, int, error) {
+	pageBytes, maxRecordBytes := s.memoryLimits()
+	admitted := make([]riskPageRow, 0, len(rows))
+	var last riskPageRow
+	var used int64
+	excluded := 0
+	for _, row := range rows {
+		if _, skip := s.excludedRecordUUIDs[row.UUID]; skip {
+			excluded++
+			last = row
+			continue
+		}
+		kind, size := "stored exchange", row.StoredBytes
+		if size <= maxRecordBytes && row.DescriptorBytes > maxRecordBytes-size {
+			kind = "exchange and coalescing descriptors"
+			// SQL lengths are non-negative and the limits are small, so this sum
+			// is safe for any physically storable record.
+			size = row.StoredBytes + row.DescriptorBytes
+		}
+		if size > maxRecordBytes {
+			if len(admitted) > 0 {
+				break
+			}
+			return nil, riskPageRow{}, 0, &RiskRecordMemoryLimitError{
+				RecordUUID: row.UUID, StoredBytes: size, LimitBytes: maxRecordBytes, Kind: kind,
+			}
+		}
+		cost := row.StoredBytes + row.DescriptorBytes
+		if len(admitted) > 0 && cost > pageBytes-used {
+			break
+		}
+		admitted = append(admitted, row)
+		used += cost
+		last = row
+	}
+	return admitted, last, excluded, nil
+}
+
+// riskExpectedPageBytes builds a bounded per-UUID CASE, used inside SELECT so a row
+// growing between metadata and hydration cannot allocate more than its budget.
+func riskExpectedPageBytes(rows []riskPageRow, descriptors bool) (string, []any) {
+	var expr strings.Builder
+	expr.WriteString("CASE uuid")
+	args := make([]any, 0, len(rows)*2)
+	for _, row := range rows {
+		expr.WriteString(" WHEN ? THEN ?")
+		n := row.StoredBytes
+		if descriptors {
+			n = row.DescriptorBytes
+		}
+		args = append(args, row.UUID, n)
+	}
+	expr.WriteString(" ELSE 0 END")
+	return expr.String(), args
+}
+
+// loadPageDescriptorsLocked preserves body-bearing coalescing's existing input
+// columns without decoding a count-sized page of potentially huge parameters.
+// SQL guards suppress grown values before they cross into Go; growth is an error,
+// not a missing-record skip or a representative slot committed by accident.
+func (s *RiskPrioritizedDBInputSource) loadPageDescriptorsLocked(ctx context.Context, rows []riskPageRow) error {
+	if s.coalescer == nil || len(rows) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(rows))
+	byUUID := make(map[string]int, len(rows))
+	for i, row := range rows {
+		ids = append(ids, row.UUID)
+		byUUID[row.UUID] = i
+	}
+	expected, args := riskExpectedPageBytes(rows, true)
+	guard := "(" + s.descriptorBytesExpr() + ") <= (" + expected + ")"
+	q := s.db.NewSelect().Model((*HTTPRecord)(nil)).Column("uuid", "request_content_length").
+		ColumnExpr(s.storedExchangeBytesExpr()+" AS stored_bytes").
+		ColumnExpr(s.descriptorBytesExpr()+" AS descriptor_bytes").
+		Where("uuid IN (?)", bun.List(ids))
+	q = applyProjectFilter(q, s.projectUUID)
+	for _, column := range []string{"method", "url", "request_content_type", "parameters"} {
+		q = q.ColumnExpr("CASE WHEN "+guard+" THEN "+column+" END AS "+column, args...)
+	}
+	var descriptors []riskPageRow
+	if err := q.Scan(ctx, &descriptors); err != nil {
+		return err
+	}
+	for _, row := range descriptors {
+		i := byUUID[row.UUID]
+		if row.StoredBytes > rows[i].StoredBytes {
+			return &RiskRecordMemoryLimitError{RecordUUID: row.UUID, StoredBytes: row.StoredBytes,
+				LimitBytes: rows[i].StoredBytes, Kind: "stored exchange grew after preflight"}
+		}
+		if row.DescriptorBytes > rows[i].DescriptorBytes {
+			return &RiskRecordMemoryLimitError{RecordUUID: row.UUID, StoredBytes: row.DescriptorBytes,
+				LimitBytes: rows[i].DescriptorBytes, Kind: "coalescing descriptors grew after preflight"}
+		}
+		rows[i].Method, rows[i].URL = row.Method, row.URL
+		rows[i].RequestContentType, rows[i].RequestContentLength = row.RequestContentType, row.RequestContentLength
+		rows[i].Parameters = row.Parameters
+	}
+	return nil
+}
+
+func (s *RiskPrioritizedDBInputSource) fetchBoundedPageRecords(ctx context.Context, rows []riskPageRow) ([]*HTTPRecord, error) {
+	ids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.UUID)
+	}
+	expected, args := riskExpectedPageBytes(rows, false)
+	guard := "(" + s.storedExchangeBytesExpr() + ") <= (" + expected + ")"
+	q := s.db.NewSelect().Model((*HTTPRecord)(nil)).Where("uuid IN (?)", bun.List(ids))
+	q = applyProjectFilter(q, s.projectUUID)
+	// Keep the shared scan projection's fidelity fields, substituting guarded
+	// raw columns rather than changing the repository's other read paths.
+	for _, column := range scanRecordColumns {
+		if column == "raw_request" || column == "raw_response" {
+			q = q.ColumnExpr("CASE WHEN "+guard+" THEN "+column+" END AS "+column, args...)
+		} else {
+			q = q.Column(column)
+		}
+	}
+	type hydratedRow struct {
+		HTTPRecord
+		StoredBytes int64 `bun:"stored_bytes"`
+	}
+	q = q.ColumnExpr(s.storedExchangeBytesExpr() + " AS stored_bytes")
+	var hydrated []hydratedRow
+	if err := q.Scan(ctx, &hydrated); err != nil {
+		return nil, err
+	}
+	limits := make(map[string]int64, len(rows))
+	for _, row := range rows {
+		limits[row.UUID] = row.StoredBytes
+	}
+	records := make([]*HTTPRecord, 0, len(hydrated))
+	for i := range hydrated {
+		row := &hydrated[i]
+		if row.StoredBytes > limits[row.UUID] {
+			return nil, &RiskRecordMemoryLimitError{RecordUUID: row.UUID, StoredBytes: row.StoredBytes,
+				LimitBytes: limits[row.UUID], Kind: "stored exchange grew after preflight"}
+		}
+		// Individual allocations matter: a pointer into hydrated's struct slice
+		// would pin every row's raw bytes until the last worker released it.
+		record := row.HTTPRecord
+		records = append(records, &record)
+	}
+	return records, nil
+}
+
+// clearPageLocked clears the entire backing array, including a shorter refill's
+// hidden tail. Close additionally releases the array itself. Caller holds s.mu.
+func (s *RiskPrioritizedDBInputSource) clearPageLocked() {
+	clear(s.buffer[:cap(s.buffer)])
+	s.buffer = s.buffer[:0]
+	s.bufHead = 0
+}
+
 // fillNextPageLocked pulls keyset pages (applying coalescing) until it has a
 // non-empty buffer of full records, or the stream is drained. Returns false when
 // there is nothing left to serve. Caller holds s.mu; the lock is briefly released
 // only across the bulk record fetch so ack callbacks aren't blocked.
 func (s *RiskPrioritizedDBInputSource) fillNextPageLocked(ctx context.Context) (bool, error) {
+	s.clearPageLocked()
 	for {
+		if s.closed.Load() {
+			return false, io.EOF
+		}
 		rows, err := s.nextPageRowsLocked(ctx)
+		if s.closed.Load() {
+			return false, io.EOF
+		}
 		if err != nil {
 			return false, err
 		}
@@ -1218,16 +1543,33 @@ func (s *RiskPrioritizedDBInputSource) fillNextPageLocked(ctx context.Context) (
 			return false, nil // stream drained
 		}
 
-		last := rows[len(rows)-1]
+		pageTail := rows[len(rows)-1].UUID
+		rows, last, excluded, err := s.boundedPageRows(rows)
+		if err != nil {
+			return false, err
+		}
+		// A byte cut leaves rows of this bucket unread: the bucket is not
+		// finished however short the listed page was.
+		if last.UUID != pageTail {
+			s.lastPageInBucket = false
+		}
+		if err := s.loadPageDescriptorsLocked(ctx, rows); err != nil {
+			return false, err
+		}
 
 		// Coalesce the page in priority order; survivors are the UUIDs to scan.
 		// Selection does not mutate the coalescer — choosing survivors consumes
 		// per-shape sample slots, and the fetch below can still fail, so the plan is
 		// only committed once this page is actually served. See keepPlan.
 		surviving, plan := s.coalescer.selectKeepers(rows)
+		if s.closed.Load() {
+			return false, io.EOF
+		}
 		if len(surviving) == 0 {
-			// Whole page coalesced away — nothing to fetch, so it's safe to step the
-			// keyset past it and pull the next page.
+			// Whole page coalesced/excluded away — nothing to fetch, so it's
+			// safe to commit its drop count and step past the admitted prefix.
+			s.coalescer.commit(plan)
+			s.excludedRecords += excluded
 			s.advanceKeyLocked(last)
 			continue
 		}
@@ -1262,17 +1604,41 @@ func (s *RiskPrioritizedDBInputSource) fillNextPageLocked(ctx context.Context) (
 		// Fetch full records for the survivors, with a bounded retry so a transient
 		// DB error (SQLITE_BUSY, a brief failover) doesn't drop the page. Release the
 		// lock across each attempt so worker ack callbacks (ackSnapshotItem) aren't
-		// blocked. Next() has a single caller, so no other goroutine advances the
-		// lane state meanwhile.
+		// blocked. nextMu serializes Next callers independently of ACK/Close,
+		// so no other goroutine advances the keyset meanwhile.
+		keeperIDs := make(map[string]struct{}, len(toFetch))
+		for _, id := range toFetch {
+			keeperIDs[id] = struct{}{}
+		}
+		keeperRows := make([]riskPageRow, 0, len(toFetch))
+		for _, row := range rows {
+			if _, keep := keeperIDs[row.UUID]; keep {
+				keeperRows = append(keeperRows, row)
+			}
+		}
+		// Close can clear coalescer state while the fetch/wait releases s.mu.
+		// Do not retry a closed source or a deterministic byte-limit error.
+		policy := s.pageRetryPolicy(ctx, "risk-prioritized page fetch")
+		policy.Retryable = func(err error) bool {
+			var limitErr *RiskRecordMemoryLimitError
+			return ctx.Err() == nil && !s.closed.Load() && !errors.As(err, &limitErr)
+		}
 		var records []*HTTPRecord
-		if len(toFetch) > 0 {
+		if len(keeperRows) > 0 {
 			ferr := RetryBusy(ctx, func() error {
+				if s.closed.Load() {
+					return io.EOF
+				}
 				s.mu.Unlock()
 				defer s.mu.Lock()
 				var err error
-				records, err = s.repo.GetScanRecordsByUUIDs(ctx, toFetch)
+				records, err = s.fetchBoundedPageRecords(ctx, keeperRows)
 				return err
-			}, s.pageRetryPolicy(ctx, "risk-prioritized page fetch"))
+			}, policy)
+			if s.closed.Load() {
+				clear(records)
+				return false, io.EOF
+			}
 			if ferr != nil {
 				// The keyset was NOT advanced, so re-pulling this page after the error is
 				// surfaced retries the exact same survivors — a transient failure becomes
@@ -1290,6 +1656,7 @@ func (s *RiskPrioritizedDBInputSource) fillNextPageLocked(ctx context.Context) (
 		// is safe to advance the keyset and count survivors. Ledger-finished
 		// records are resolved as skipped without being served.
 		s.coalescer.commit(plan)
+		s.excludedRecords += excluded
 		s.advanceKeyLocked(last)
 		s.total += len(surviving)
 		s.skipped += finished
@@ -1309,7 +1676,7 @@ func (s *RiskPrioritizedDBInputSource) fillNextPageLocked(ctx context.Context) (
 		if s.buffer == nil {
 			s.buffer = make([]*HTTPRecord, 0, riskPrefetchBatchSize)
 		} else {
-			s.buffer = s.buffer[:0]
+			s.clearPageLocked()
 		}
 		s.bufHead = 0
 		for _, uuid := range surviving {
@@ -1466,9 +1833,19 @@ func (s *RiskPrioritizedDBInputSource) Unresolved() int {
 	return 0
 }
 
-// Close stops the source.
+// Close releases the current page and shape signatures. Counters/checkpoint
+// state remain available to final reporting and acknowledgements still in flight.
 func (s *RiskPrioritizedDBInputSource) Close() error {
 	s.closed.Store(true)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clearPageLocked()
+	s.buffer = nil
+	if s.coalescer != nil {
+		// ACK/FlushCursor use only accounting, never these sample signatures.
+		// Keep dropped observable, and fence any uncommitted fetch in fill.
+		s.coalescer.seenByShape = nil
+	}
 	return nil
 }
 

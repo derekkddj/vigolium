@@ -6,6 +6,10 @@ const nextConfig: NextConfig = {
   distDir: 'dist',
   trailingSlash: true,
   skipTrailingSlashRedirect: false,
+  // Keep static-export workers bounded on high-core development hosts.
+  experimental: {
+    cpus: 2,
+  },
   images: {
     unoptimized: true,
   },

@@ -760,7 +760,30 @@ func executeDirectScan(ctx context.Context, sess *directScanSession, rr *httpmsg
 		return nil, err
 	}
 
-	// Set up HTTP stack
+	// Get modules
+	active, passive := getFilteredModules(resolvedModules, scanURLNoPassive)
+	if len(active)+len(passive) == 0 {
+		if err := emptyModuleSelectionError(); err != nil {
+			return nil, err
+		}
+	}
+
+	// Storage. Acquired BEFORE any request goes out, so a pinned store that
+	// cannot be opened fails the command instead of costing a whole scan.
+	repo, scanProjectUUID, dbErr := acquireDirectScanDB(getDB)
+	if dbErr != nil {
+		return nil, dbErr
+	}
+	if repo != nil {
+		// Closed by the session once every input is done, not here: the
+		// handle is process-cached and later inputs of the batch reuse it.
+		sess.noteStore()
+	}
+	if err := sess.begin(ctx, repo, scanProjectUUID, scanUUID, target, method, len(active), len(passive)); err != nil {
+		return nil, err
+	}
+
+	// Build the HTTP stack only after the store and scan identity are valid.
 	stack, err := setupScanHTTPStack(sess.budget)
 	if err != nil {
 		return nil, err
@@ -782,27 +805,6 @@ func executeDirectScan(ctx context.Context, sess *directScanSession, rr *httpmsg
 			fmt.Fprint(os.Stderr, runner.FormatBlockNoticeLine(n))
 		})
 	}
-
-	// Get modules
-	active, passive := getFilteredModules(resolvedModules, scanURLNoPassive)
-	if len(active)+len(passive) == 0 {
-		if err := emptyModuleSelectionError(); err != nil {
-			return nil, err
-		}
-	}
-
-	// Storage. Acquired BEFORE any request goes out, so a pinned store that
-	// cannot be opened fails the command instead of costing a whole scan.
-	repo, scanProjectUUID, dbErr := acquireDirectScanDB(getDB)
-	if dbErr != nil {
-		return nil, dbErr
-	}
-	if repo != nil {
-		// Closed by the session once every input is done, not here: the
-		// handle is process-cached and later inputs of the batch reuse it.
-		sess.noteStore()
-	}
-	sess.begin(ctx, repo, scanProjectUUID, scanUUID, target, method, len(active), len(passive))
 
 	// Create source
 	src := source.NewSingleSource(rr, resolvedModules)
@@ -945,7 +947,9 @@ func executeDirectScan(ctx context.Context, sess *directScanSession, rr *httpmsg
 	mu.Lock()
 	findingCount := len(findings)
 	mu.Unlock()
-	sess.end(ctx, repo, scanUUID, target, executor, interrupted, execErr, findingCount)
+	if finalizeErr := sess.end(ctx, repo, scanUUID, target, executor, interrupted, execErr, findingCount); finalizeErr != nil {
+		execErr = errors.Join(execErr, finalizeErr)
+	}
 
 	duration := time.Since(startTime)
 

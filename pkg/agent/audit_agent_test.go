@@ -200,7 +200,9 @@ func TestCopyDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	copyDir(srcDir, destDir)
+	if err := copyDir(srcDir, destDir); err != nil {
+		t.Fatal(err)
+	}
 
 	// Verify
 	data1, err := os.ReadFile(filepath.Join(destDir, "file1.md"))

@@ -35,7 +35,8 @@ module.exports = {
         url: ctx.request.url,
         matched: "evidence string",
         severity: "high",
-        description: "Explanation with source code reference (file:line)"
+        description: "Explanation with source code reference (file:line)",
+        evidence: [{exchange: resp.exchange, role: "attack", primary: true}]
       }];
     }
     return [];
@@ -48,7 +49,9 @@ Available vigolium extension APIs:
 - `vigolium.http.post(url, body, options)` — HTTP POST; `body` is a string (use `JSON.stringify(...)` for JSON)
 - `vigolium.http.request({method, url, headers, body})` — any method; single options object
 - Options (get/post): `{headers: {}}`
-- Response: `{status, body, headers, raw, elapsed_ms}`
+- Response: `{status, body, headers, raw, elapsed_ms, request, url, exchange}`. `request` is the actual final sent request; `exchange` owns base64-safe request/response bytes after auth, cookies and interceptors.
+- Every emitted finding must explicitly select its proving receipt: `evidence: [{exchange: resp.exchange, role: "attack", primary: true}]`. Add control/confirmation receipts with those roles; baseline context is `ctx.exchange` with role `baseline`, not primary. Passive disclosure checks select `ctx.exchange` as primary `observation`.
+- Keep receipt objects within the same invocation. Cloned/serialized/forged or prior-invocation handles are rejected. Do not use a URL match, the last HTTP call, `method + " " + url`, or the pre-auth constructed request as proof. Legacy prose goes in `additional_evidence`; it does not select exchanges.
 
 ## Output Format
 

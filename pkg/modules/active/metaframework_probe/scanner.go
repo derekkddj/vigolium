@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -180,7 +181,8 @@ func (m *Module) ScanPerHost(
 	// 2xx shell, it's a single-page-app / wildcard reverse proxy that returns
 	// the same body for every URL — so a 200 on any framework path proves
 	// nothing and must be rejected below.
-	wildcard, _ := scanCtx.WildcardProbe(ctx, httpClient)
+	guardProof := modkit.NewEvidenceCollector()
+	wildcard, _ := scanCtx.WildcardProbeWithEvidence(ctx, httpClient, guardProof)
 
 	var results []*output.ResultEvent
 	target := ctx.Target()
@@ -240,6 +242,8 @@ func (m *Module) ScanPerHost(
 					Description: fmt.Sprintf("The %s framework endpoint at %s is accessible in production. %s.", p.framework, p.path, p.description),
 				},
 			})
+			modkit.SetPrimaryEvidence(results[len(results)-1], http.CaptureEvidence(resp), evidence.RoleObservation, "matched framework endpoint")
+			modkit.AppendEvidence(results[len(results)-1], guardProof)
 		}
 		resp.Close()
 	}

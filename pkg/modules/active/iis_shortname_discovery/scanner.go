@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/iisgate"
@@ -120,7 +121,11 @@ func (m *Module) ScanPerHost(
 		zap.Int("requests", reqBudget.count),
 	)
 
-	return m.buildResult(scanCtx, host, targetURL, o, resolved, reqBudget), nil
+	results := m.buildResult(scanCtx, host, targetURL, o, resolved, reqBudget)
+	for _, result := range results {
+		modkit.AppendEvidence(result, res.context)
+	}
+	return results, nil
 }
 
 // buildResult feeds confirmed URLs back into the scan pipeline and assembles the
@@ -198,7 +203,7 @@ func (m *Module) buildResult(
 	fmt.Fprintf(&b, "**Requests sent:** %d", reqBudget.count)
 	description := b.String()
 
-	return []*output.ResultEvent{{
+	result := &output.ResultEvent{
 		ModuleID:         ModuleID,
 		URL:              targetURL,
 		Host:             host,
@@ -215,7 +220,10 @@ func (m *Module) buildResult(
 				"https://github.com/bitquark/shortscan",
 			},
 		},
-	}}
+	}
+	modkit.SetPrimaryEvidence(result, o.primary, evidence.RoleAttack, "Positive shortname tilde oracle")
+	modkit.AppendEvidence(result, o.context)
+	return []*output.ResultEvent{result}
 }
 
 // feedURL injects a confirmed URL into the scan pipeline. Returns true if accepted.

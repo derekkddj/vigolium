@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -123,9 +124,10 @@ func (m *Module) ScanPerRequest(
 	// Retain the no-header baseline request/response so each finding can carry the
 	// differential it was judged against (the spoofed-header probe is the attack
 	// pair; this is what it's compared to). Capture before Close frees the buffer.
-	baselineReqStr := string(ctx.Request().Raw())
+
 	baselineRespStr := baselineResp.FullResponseString()
 
+	baselineExchange := http.CaptureEvidence(baselineResp)
 	baselineResp.Close()
 
 	var results []*output.ResultEvent
@@ -153,6 +155,8 @@ func (m *Module) ScanPerRequest(
 			probeLocation = resp.Response().Header.Get("Location")
 		}
 
+		ev := modkit.NewEvidenceCollector()
+		ev.AddExchange(baselineExchange, evidence.RoleBaseline, "no-header baseline")
 		var finding string
 
 		switch probe.headerName {
@@ -167,7 +171,7 @@ func (m *Module) ScanPerRequest(
 			finding = checkHostInjection(probeBody, probeHeaders, probeLocation)
 
 		case "X-Forwarded-For":
-			finding = m.checkIPBypass(ctx, httpClient, scanCtx, modifiedRaw, baselineStatus, probeStatus, baselineBody, probeBody)
+			finding = m.checkIPBypass(ctx, httpClient, scanCtx, modifiedRaw, baselineStatus, probeStatus, baselineBody, probeBody, ev)
 
 		case "X-Forwarded-Port":
 			finding = checkPortInjection(probeBody, probeLocation)
@@ -185,17 +189,17 @@ func (m *Module) ScanPerRequest(
 			confidence := severity.ConfidenceUndefined // → module default (Firm)
 			switch probe.headerName {
 			case "X-Forwarded-Host":
-				if !m.confirmHostReflection(ctx, httpClient) {
+				if !m.confirmHostReflection(ctx, httpClient, ev) {
 					resp.Close()
 					continue
 				}
 			case "X-Forwarded-Port":
-				if !m.confirmPortReflection(ctx, httpClient, baselineRespStr) {
+				if !m.confirmPortReflection(ctx, httpClient, baselineRespStr, ev) {
 					resp.Close()
 					continue
 				}
 			case "X-Forwarded-Proto":
-				if !m.confirmProtoEffect(ctx, httpClient) {
+				if !m.confirmProtoEffect(ctx, httpClient, ev) {
 					resp.Close()
 					continue
 				}
@@ -211,14 +215,12 @@ func (m *Module) ScanPerRequest(
 				fmt.Sprintf("Finding: %s", finding),
 			}
 
-			ev := modkit.NewEvidenceCollector()
-			ev.Add("baseline", baselineReqStr, baselineRespStr)
-
-			results = append(results, &output.ResultEvent{
+			result := &output.ResultEvent{
 				URL:                urlx.String(),
 				Request:            string(modifiedRaw),
 				Response:           resp.FullResponseString(),
 				AdditionalEvidence: ev.Entries(),
+				Evidence:           ev.Evidence(),
 				ExtractedResults:   extracted,
 				Info: output.Info{
 					Name:        fmt.Sprintf("Express Trust Proxy Misconfiguration: %s", probe.headerName),
@@ -226,7 +228,9 @@ func (m *Module) ScanPerRequest(
 					Severity:    severity.Medium,
 					Confidence:  confidence,
 				},
-			})
+			}
+			modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleAttack, "selected probe")
+			results = append(results, result)
 			resp.Close()
 			return results, nil
 		}
@@ -344,18 +348,18 @@ func cookieHasSecure(setCookieValue string) bool {
 // probe, interleaved, and requires checkProtocolConfusion to fire on the same
 // effect every round. Drops on any miss or fetch error so an unverifiable diff is
 // never reported.
-func (m *Module) confirmProtoEffect(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) bool {
+func (m *Module) confirmProtoEffect(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, collectors ...*modkit.EvidenceCollector) bool {
 	raw, err := httpmsg.AddOrReplaceHeader(ctx.Request().Raw(), "X-Forwarded-Proto", "http")
 	if err != nil {
 		return false
 	}
 	const rounds = 2
 	for range rounds {
-		ctrlHeaders, ctrlStatus, ctrlLoc, ok := fetchHeadStatusLoc(ctx, httpClient, ctx.Request().Raw())
+		ctrlHeaders, ctrlStatus, ctrlLoc, ok := fetchHeadStatusLoc(ctx, httpClient, ctx.Request().Raw(), proxySelection(collectors, evidence.RoleControl))
 		if !ok {
 			return false
 		}
-		probeHeaders, probeStatus, probeLoc, ok := fetchHeadStatusLoc(ctx, httpClient, raw)
+		probeHeaders, probeStatus, probeLoc, ok := fetchHeadStatusLoc(ctx, httpClient, raw, proxySelection(collectors, evidence.RoleConfirmation))
 		if !ok {
 			return false
 		}
@@ -370,7 +374,7 @@ func (m *Module) confirmProtoEffect(ctx *httpmsg.HttpRequestResponse, httpClient
 // so each confirmation sample is a genuinely fresh render, returning the raw
 // header block, status code, and Location header. ok is false on a build/parse/
 // transport error or nil response.
-func fetchHeadStatusLoc(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte) (headers string, status int, location string, ok bool) {
+func fetchHeadStatusLoc(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte, selections ...proxyReceiptSelection) (headers string, status int, location string, ok bool) {
 	// raw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
 	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
 	resp, _, err := httpClient.Execute(req, http.Options{NoClustering: true})
@@ -380,6 +384,9 @@ func fetchHeadStatusLoc(ctx *httpmsg.HttpRequestResponse, httpClient *http.Reque
 	defer resp.Close()
 	if resp.Response() == nil {
 		return "", 0, "", false
+	}
+	if len(selections) > 0 {
+		selections[0].collector.AddExchange(http.CaptureEvidence(resp), selections[0].role, "proxy differential probe")
 	}
 	return resp.Headers().String(), resp.Response().StatusCode, resp.Response().Header.Get("Location"), true
 }
@@ -391,14 +398,14 @@ func fetchHeadStatusLoc(ctx *httpmsg.HttpRequestResponse, httpClient *http.Reque
 // content, does not — and a fresh canary is by construction absent from the
 // no-header baseline. Fails OPEN on a fetch error so a transient failure never
 // suppresses a real finding.
-func (m *Module) confirmHostReflection(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) bool {
+func (m *Module) confirmHostReflection(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, collectors ...*modkit.EvidenceCollector) bool {
 	confirmed, err := modkit.ConfirmReflection(2, func(canary string) (bool, error) {
 		host := canary + ".vigolium-trust.example"
 		raw, herr := httpmsg.AddOrReplaceHeader(ctx.Request().Raw(), "X-Forwarded-Host", host)
 		if herr != nil {
 			return false, herr
 		}
-		full, ok := doFetchFull(ctx, httpClient, raw)
+		full, ok := doFetchFull(ctx, httpClient, raw, proxySelection(collectors, evidence.RoleConfirmation))
 		if !ok {
 			return false, fmt.Errorf("x-forwarded-host confirmation fetch failed")
 		}
@@ -418,7 +425,7 @@ func (m *Module) confirmHostReflection(ctx *httpmsg.HttpRequestResponse, httpCli
 // (so its appearance is attributable to the header, not pre-existing content)
 // AND must reproducibly reflect when the header is re-sent. Fails OPEN on a
 // fetch error.
-func (m *Module) confirmPortReflection(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, baselineResp string) bool {
+func (m *Module) confirmPortReflection(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, baselineResp string, collectors ...*modkit.EvidenceCollector) bool {
 	portPattern := ":" + injectedPort
 	// If the port already appears in the clean baseline, the reflection is not
 	// introduced by our header — it is pre-existing (or volatile) content.
@@ -429,7 +436,7 @@ func (m *Module) confirmPortReflection(ctx *httpmsg.HttpRequestResponse, httpCli
 	if err != nil {
 		return true // fail open
 	}
-	full, ok := doFetchFull(ctx, httpClient, raw)
+	full, ok := doFetchFull(ctx, httpClient, raw, proxySelection(collectors, evidence.RoleConfirmation))
 	if !ok {
 		return true // fail open
 	}
@@ -440,7 +447,7 @@ func (m *Module) confirmPortReflection(ctx *httpmsg.HttpRequestResponse, httpCli
 // returns the full raw response string (status line + headers + body) so a
 // reflected value is visible wherever it lands. ok is false on a build/parse/
 // transport error or a nil response.
-func doFetchFull(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte) (string, bool) {
+func doFetchFull(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte, selections ...proxyReceiptSelection) (string, bool) {
 	// raw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
 	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
 	resp, _, err := httpClient.Execute(req, http.Options{NoClustering: true})
@@ -450,6 +457,9 @@ func doFetchFull(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, r
 	defer resp.Close()
 	if resp.Response() == nil {
 		return "", false
+	}
+	if len(selections) > 0 {
+		selections[0].collector.AddExchange(http.CaptureEvidence(resp), selections[0].role, "proxy differential probe")
 	}
 	return resp.FullResponseString(), true
 }
@@ -495,12 +505,12 @@ func (m *Module) checkIPBypass(
 	modifiedRaw []byte,
 	baselineStatus, probeStatus int,
 	baselineBody, probeBody string,
-) string {
+	collectors ...*modkit.EvidenceCollector) string {
 	// A real bypass goes blocked→allowed (the spoofed IP was trusted). The reverse
 	// (200→429/403/503) is the WAF rejecting the spoofed header — not trust. Confirm
 	// the split is reproducible and header-attributable before asserting it.
 	if isAccessDenied(baselineStatus) && probeStatus >= 200 && probeStatus < 300 {
-		if m.confirmIPBypass(ctx, httpClient, modifiedRaw) {
+		if m.confirmIPBypass(ctx, httpClient, modifiedRaw, collectors...) {
 			return fmt.Sprintf("IP spoofing bypassed access control (status %d → %d)", baselineStatus, probeStatus)
 		}
 		return ""
@@ -510,7 +520,7 @@ func (m *Module) checkIPBypass(
 	// only when it reproducibly exceeds the page's natural jitter. Skip when either
 	// side is a WAF/denied page (that size is noise, not the app's content).
 	if !isAccessDenied(baselineStatus) && !isAccessDenied(probeStatus) && len(baselineBody) > 0 {
-		if shift, ok := m.confirmSizeShift(ctx, httpClient, scanCtx, modifiedRaw, len(baselineBody), len(probeBody)); ok {
+		if shift, ok := m.confirmSizeShift(ctx, httpClient, scanCtx, modifiedRaw, len(baselineBody), len(probeBody), collectors...); ok {
 			return shift
 		}
 	}
@@ -524,13 +534,13 @@ func (m *Module) checkIPBypass(
 // spoofed header as the only variable: each round the unmodified control must
 // STILL be denied and the spoofed-IP probe must STILL be allowed. Drops on any
 // miss or fetch error so an unverifiable transition is never reported.
-func (m *Module) confirmIPBypass(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, modifiedRaw []byte) bool {
+func (m *Module) confirmIPBypass(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, modifiedRaw []byte, collectors ...*modkit.EvidenceCollector) bool {
 	const rounds = 2
 	for range rounds {
-		if _, status, ok := doFetch(ctx, httpClient, ctx.Request().Raw()); !ok || !isAccessDenied(status) {
+		if _, status, ok := doFetch(ctx, httpClient, ctx.Request().Raw(), proxySelection(collectors, evidence.RoleControl)); !ok || !isAccessDenied(status) {
 			return false // not denied WITHOUT the header → the block isn't header-attributable
 		}
-		if _, status, ok := doFetch(ctx, httpClient, modifiedRaw); !ok || status < 200 || status >= 300 {
+		if _, status, ok := doFetch(ctx, httpClient, modifiedRaw, proxySelection(collectors, evidence.RoleConfirmation)); !ok || status < 200 || status >= 300 {
 			return false // not allowed WITH the header → not a reproducible bypass
 		}
 	}
@@ -549,12 +559,12 @@ func (m *Module) confirmSizeShift(
 	scanCtx *modkit.ScanContext,
 	modifiedRaw []byte,
 	baselineLen, probeLen int,
-) (string, bool) {
-	controlLen, ok := fetchBodyLen(ctx, httpClient, ctx.Request().Raw())
+	collectors ...*modkit.EvidenceCollector) (string, bool) {
+	controlLen, ok := fetchBodyLen(ctx, httpClient, ctx.Request().Raw(), proxySelection(collectors, evidence.RoleControl))
 	if !ok {
 		return "", false
 	}
-	probe2Len, ok := fetchBodyLen(ctx, httpClient, modifiedRaw)
+	probe2Len, ok := fetchBodyLen(ctx, httpClient, modifiedRaw, proxySelection(collectors, evidence.RoleConfirmation))
 	if !ok {
 		return "", false
 	}
@@ -568,7 +578,7 @@ func (m *Module) confirmSizeShift(
 	// Those bands are two samples each, so they only describe natural variance on an
 	// endpoint that is a function of the request (see SizeShiftGap). Last gate, after
 	// the free band check has rejected the common case.
-	if modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+	if modkit.EndpointVolatileWithEvidence(scanCtx, ctx, httpClient, proxySelection(collectors, evidence.RoleControl).collector) {
 		return "", false
 	}
 
@@ -582,8 +592,8 @@ func (m *Module) confirmSizeShift(
 
 // fetchBodyLen returns the body length of a clean (non-denied) fresh sample of
 // raw; ok is false on transport error, nil response, or a WAF/denied status.
-func fetchBodyLen(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte) (int, bool) {
-	bodyLen, status, ok := doFetch(ctx, httpClient, raw)
+func fetchBodyLen(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte, selections ...proxyReceiptSelection) (int, bool) {
+	bodyLen, status, ok := doFetch(ctx, httpClient, raw, selections...)
 	if !ok || isAccessDenied(status) {
 		return 0, false
 	}
@@ -593,7 +603,7 @@ func fetchBodyLen(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, 
 // doFetch re-issues raw with the response cache bypassed (NoClustering) so each
 // confirmation sample is a genuinely fresh render, and returns the body length
 // and status. ok is false only on a build/parse/transport error or nil response.
-func doFetch(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte) (bodyLen, status int, ok bool) {
+func doFetch(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte, selections ...proxyReceiptSelection) (bodyLen, status int, ok bool) {
 	// raw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
 	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
 	resp, _, err := httpClient.Execute(req, http.Options{NoClustering: true})
@@ -603,6 +613,9 @@ func doFetch(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw [
 	defer resp.Close()
 	if resp.Response() == nil {
 		return 0, 0, false
+	}
+	if len(selections) > 0 {
+		selections[0].collector.AddExchange(http.CaptureEvidence(resp), selections[0].role, "proxy differential probe")
 	}
 	return len(resp.Body().String()), resp.Response().StatusCode, true
 }
@@ -624,4 +637,17 @@ func checkPortInjection(
 	}
 
 	return ""
+}
+
+type proxyReceiptSelection struct {
+	collector *modkit.EvidenceCollector
+	role      evidence.Role
+}
+
+func proxySelection(collectors []*modkit.EvidenceCollector, role evidence.Role) proxyReceiptSelection {
+	var collector *modkit.EvidenceCollector
+	if len(collectors) > 0 {
+		collector = collectors[0]
+	}
+	return proxyReceiptSelection{collector: collector, role: role}
 }

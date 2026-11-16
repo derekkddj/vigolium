@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/output"
@@ -71,10 +72,12 @@ var (
 
 // wireResponse is one response read off a reused connection.
 type wireResponse struct {
-	status int
-	closes bool
-	raw    string // status line, headers and a truncated body, for evidence
-	body   string
+	exchange  *evidence.Exchange
+	truncated bool
+	status    int
+	closes    bool
+	raw       string // status line, headers and a truncated body, for evidence
+	body      string
 }
 
 // cl0Baseline is what a candidate path answers when nothing is smuggled.
@@ -88,7 +91,8 @@ type cl0Baseline struct {
 // follow-up that rode the same connection.
 type cl0Attempt struct {
 	canary   string
-	request  string // both requests, in wire order
+	request  string       // both requests, in wire order (legacy description only)
+	probe    wireResponse // POST's own response, never the follow-up paired with it
 	followUp wireResponse
 }
 
@@ -235,6 +239,7 @@ func cl0Pair(ctx *httpmsg.HttpRequestResponse, svc *httpmsg.Service, path, body 
 		// connection there is no follow-up to read, and nothing to conclude.
 		return att, false
 	}
+	att.probe = resps[0]
 	att.followUp = resps[1]
 	return att, true
 }
@@ -309,13 +314,25 @@ func cl0Exchange(svc *httpmsg.Service, reqs [][]byte, methods []string) ([]wireR
 	br := bufio.NewReader(conn)
 	out := make([]wireResponse, 0, len(reqs))
 	for i, raw := range reqs {
-		if _, err := conn.Write(raw); err != nil {
+		n, err := conn.Write(raw)
+		if err != nil {
 			return out, err
+		}
+		if n != len(raw) {
+			return out, io.ErrShortWrite
 		}
 		resp, err := readWireResponse(br, methods[i])
 		if err != nil {
 			return out, err
 		}
+		// Request bytes were actually written; the response is a parsed rendering
+		// from this same read, not a wire/Requester capture and not another send.
+		resp.exchange = evidence.NewExchange(cl0URL(svc, ""), cl0URL(svc, ""), raw, []byte(resp.raw), evidence.ProvenanceSupplied)
+		resp.exchange.ResponseState = evidence.StateUnknown
+		if resp.truncated {
+			resp.exchange.ResponseState = evidence.StateTruncated
+		}
+		resp.exchange.ContentHash = resp.exchange.Hash()
 		out = append(out, resp)
 		if resp.closes && i < len(reqs)-1 {
 			return out, errCL0ConnClosing
@@ -366,23 +383,30 @@ func readWireResponse(br *bufio.Reader, method string) (wireResponse, error) {
 		kept = kept[:cl0EvidenceBody]
 	}
 	return wireResponse{
-		status: resp.StatusCode,
-		closes: resp.Close,
-		raw:    head.String() + string(kept),
-		body:   string(body),
+		status:    resp.StatusCode,
+		closes:    resp.Close,
+		truncated: len(body) > cl0EvidenceBody,
+		raw:       head.String() + string(kept),
+		body:      string(body),
 	}, nil
 }
 
-func buildCL0Result(svc *httpmsg.Service, base cl0Baseline, first, second, control cl0Attempt) *output.ResultEvent {
+func buildCL0Result(svc *httpmsg.Service, base cl0Baseline, first, second, control cl0Attempt) (finding *output.ResultEvent) {
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, first.probe.exchange, evidence.RoleAttack, "CL.0 POST with its own response")
+	}()
 	target := cl0URL(svc, base.path)
 	reflected := strings.Contains(first.followUp.body, first.canary) ||
 		strings.Contains(second.followUp.body, second.canary)
 
 	collector := modkit.NewEvidenceCollector()
-	collector.Add("second attack pair (reproduced with a fresh canary)", second.request, second.followUp.raw)
-	collector.Add("control pair (same-length benign body; follow-up answered normally)", control.request, control.followUp.raw)
-	collector.Add("baseline: the follow-up's own response on a reused connection", "GET "+base.path, base.own.raw)
-	collector.Add("baseline: a random path's response", "GET /<random canary>", base.canary.raw)
+	collector.AddExchange(first.followUp.exchange, evidence.RoleObservation, "first same-connection follow-up effect")
+	collector.AddExchange(second.probe.exchange, evidence.RoleConfirmation, "fresh-canary POST reproduction")
+	collector.AddExchange(second.followUp.exchange, evidence.RoleObservation, "second same-connection follow-up effect")
+	collector.AddExchange(control.probe.exchange, evidence.RoleControl, "same-length benign POST")
+	collector.AddExchange(control.followUp.exchange, evidence.RoleControl, "benign pair follow-up")
+	collector.AddExchange(base.own.exchange, evidence.RoleBaseline, "fresh reused-connection baseline")
+	collector.AddExchange(base.canary.exchange, evidence.RoleControl, "random-path comparison")
 
 	extracted := []string{
 		"Probe: CL.0",
@@ -401,6 +425,7 @@ func buildCL0Result(svc *httpmsg.Service, base cl0Baseline, first, second, contr
 		Request:            first.request,
 		Response:           first.followUp.raw,
 		AdditionalEvidence: collector.Entries(),
+		Evidence:           collector.Evidence(),
 		ExtractedResults:   extracted,
 		Metadata: map[string]any{
 			"variant":          "CL.0",

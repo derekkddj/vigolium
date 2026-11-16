@@ -39,6 +39,11 @@ func TestScanPerHost_FlagsVulnerableVersion(t *testing.T) {
 	require.NotEmpty(t, res, "expected at least one advisory finding for Next.js 15.0.0")
 	assert.Equal(t, ModuleID, res[0].ModuleID)
 	assert.Equal(t, output.RecordKindCandidate, res[0].RecordKind, "feature-conditioned advisories require applicability confirmation")
+	for _, result := range res {
+		require.True(t, result.BaselineEvidence, "the version came from this input, not a chunk probe")
+		require.Empty(t, result.Request)
+		require.Empty(t, result.Response)
+	}
 }
 
 // TestScanPerHost_PatchedVersionNoFinding ensures a Next.js host running a

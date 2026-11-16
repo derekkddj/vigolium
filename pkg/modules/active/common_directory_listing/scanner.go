@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -84,13 +85,15 @@ func (m *Module) ScanPerRequest(
 	}
 
 	// Fingerprint 404 response body hash
-	notFoundHash := get404Hash(ctx, httpClient)
+	var notFoundReceipt *evidence.Exchange
+	notFoundHash := get404Hash(ctx, httpClient, &notFoundReceipt)
 
 	// Host-wide catch-all guard: a real autoindex server 404s a non-existent
 	// directory, so if a random guaranteed-nonexistent dir already renders a
 	// listing-shaped body the host templates that body for any path (SPA shell,
 	// wildcard rewrite, soft-404) and every per-directory finding is spurious.
-	if modkit.RandomDirCatchAll(scanCtx, ctx, httpClient, func(b string) bool { return modkit.DetectDirectoryListingServer(b) != "" }) {
+	guardProof := modkit.NewEvidenceCollector()
+	if modkit.RandomDirCatchAllWithEvidence(scanCtx, ctx, httpClient, func(b string) bool { return modkit.DetectDirectoryListingServer(b) != "" }, guardProof) {
 		return nil, nil
 	}
 
@@ -136,17 +139,25 @@ func (m *Module) ScanPerRequest(
 
 		// Check for directory listing indicators
 		if serverType := modkit.DetectDirectoryListingServer(body); serverType != "" {
-			results = append(results, buildResult(base, host, probe, serverType, string(probeRaw), resp.FullResponseString()))
+			result := buildResult(base, host, probe, serverType, string(probeRaw), resp.FullResponseString(), http.CaptureEvidence(resp))
+			ev := modkit.NewEvidenceCollector()
+			ev.AddExchange(notFoundReceipt, evidence.RoleControl, "known-missing path fingerprint")
+			result.Evidence = append(result.Evidence, ev.Evidence()...)
+			result.AdditionalEvidence = ev.Entries()
+			results = append(results, result)
 		}
 
 		resp.Close()
 	}
 
+	for _, result := range results {
+		modkit.AppendEvidence(result, guardProof)
+	}
 	return results, nil
 }
 
 // get404Hash fetches a known-missing path to fingerprint the 404 page.
-func get404Hash(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) string {
+func get404Hash(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, receipts ...**evidence.Exchange) string {
 	notFoundPath := "/vigolium-nonexistent-path-404-check"
 	raw, err := httpmsg.SetPath(ctx.Request().Raw(), notFoundPath)
 	if err != nil {
@@ -164,12 +175,15 @@ func get404Hash(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) st
 	}
 	defer resp.Close()
 
+	if len(receipts) > 0 {
+		*receipts[0] = http.CaptureEvidence(resp)
+	}
 	return utils.Sha1(resp.Body().String())
 }
 
-func buildResult(base, host string, probe probePath, serverType, request, response string) *output.ResultEvent {
+func buildResult(base, host string, probe probePath, serverType, request, response string, receipts ...*evidence.Exchange) *output.ResultEvent {
 	matched := fmt.Sprintf("%s%s", base, probe.path)
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		ModuleID: ModuleID,
 		Host:     host,
 		URL:      matched,
@@ -191,4 +205,13 @@ func buildResult(base, host string, probe probePath, serverType, request, respon
 			},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, firstReceipt(receipts), evidence.RoleObservation, "selected observation")
+	return result
+}
+
+func firstReceipt(receipts []*evidence.Exchange) *evidence.Exchange {
+	if len(receipts) > 0 {
+		return receipts[0]
+	}
+	return nil
 }

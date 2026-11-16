@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -139,7 +140,7 @@ func (m *Module) executeAndCheck(
 	desc string,
 	payload string,
 	checkCatchAll bool,
-) (*output.ResultEvent, error) {
+) (finding *output.ResultEvent, err error) {
 	// modifiedRaw is internally built (well-formed), so wrap directly instead
 	// of re-parsing on this hot path.
 	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
@@ -164,17 +165,19 @@ func (m *Module) executeAndCheck(
 	// Capture the bypass (attack) response before it is consumed/closed by the
 	// confirmation rounds below; it stays the finding's primary Response.
 	attackResp := resp.FullResponseString()
+	selectedExchange := http.CaptureEvidence(resp)
 
 	// Each finding gets its own evidence collector. Record the ORIGINAL,
 	// pre-bypass 401/403 pair (the baseline that proves middleware enforcement
 	// was in place) and let confirmBypass append the reproduction rounds.
 	ev := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(finding, ev) }()
 	if origReq := ctx.Request(); origReq != nil {
 		var origRespStr string
 		if origResp := ctx.Response(); origResp != nil {
 			origRespStr = string(origResp.Raw())
 		}
-		ev.Add(fmt.Sprintf("original-%d", origStatus), string(origReq.Raw()), origRespStr)
+		ev.AddBaseline(fmt.Sprintf("original-%d", origStatus), string(origReq.Raw()), origRespStr)
 	}
 
 	// Confirm the bypass is real and reproducible, not a transient flap: the
@@ -190,11 +193,14 @@ func (m *Module) executeAndCheck(
 	// indistinguishable from the host's response to a random nonexistent path, the
 	// rewrite reached the catch-all shell, not the protected resource — not a
 	// middleware bypass.
-	if checkCatchAll && !m.bypassDistinctFromCatchAll(ctx, httpClient, scanCtx, body) {
+	if checkCatchAll && !m.bypassDistinctFromCatchAll(ctx, httpClient, scanCtx, body, ev) {
 		return nil, nil
 	}
 
 	target := ctx.Target()
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, selectedExchange, evidence.RoleAttack, "middleware bypass probe")
+	}()
 	return &output.ResultEvent{
 		ModuleID:           ModuleID,
 		URL:                target,
@@ -202,6 +208,7 @@ func (m *Module) executeAndCheck(
 		Request:            string(modifiedRaw),
 		Response:           attackResp,
 		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
 		ExtractedResults: []string{
 			fmt.Sprintf("Bypass: %s", desc),
 			fmt.Sprintf("Payload: %s", payload),
@@ -234,17 +241,19 @@ func (m *Module) confirmBypass(
 	const rounds = 2
 	origRaw := ctx.Request().Raw()
 	for round := 1; round <= rounds; round++ {
-		status, _, fullResp, ok := m.freshProbe(ctx, httpClient, origRaw)
+		var controlExchange *evidence.Exchange
+		status, _, _, ok := m.freshProbe(ctx, httpClient, origRaw, &controlExchange)
 		if !ok || (status != 401 && status != 403) {
 			return false // original request not denied → the 401/403 wasn't stable
 		}
-		ev.Add(fmt.Sprintf("confirm round %d (original denied)", round), string(origRaw), fullResp)
+		ev.AddExchange(controlExchange, evidence.RoleControl, fmt.Sprintf("confirm round %d (original denied)", round))
 
-		status, body, fullResp, ok := m.freshProbe(ctx, httpClient, modifiedRaw)
+		var replayExchange *evidence.Exchange
+		status, body, _, ok := m.freshProbe(ctx, httpClient, modifiedRaw, &replayExchange)
 		if !ok || status != 200 || isLoginOrErrorPage(strings.ToLower(body)) {
 			return false // bypass not reproducibly allowed with real content
 		}
-		ev.Add(fmt.Sprintf("confirm round %d (bypass allowed)", round), string(modifiedRaw), fullResp)
+		ev.AddExchange(replayExchange, evidence.RoleConfirmation, fmt.Sprintf("confirm round %d (bypass allowed)", round))
 	}
 	return true
 }
@@ -276,6 +285,7 @@ func (m *Module) bypassDistinctFromCatchAll(
 	httpClient *http.Requester,
 	scanCtx *modkit.ScanContext,
 	bypassBody string,
+	guardProof *modkit.EvidenceCollector,
 ) bool {
 	bypassSig := modkit.BodySignature(bypassBody)
 	shellMatch := func(b string) bool { return modkit.BodiesSimilarSig(bypassSig, b) }
@@ -283,15 +293,18 @@ func (m *Module) bypassDistinctFromCatchAll(
 	// Control 1: a random nonexistent path via the clean original request
 	// template (keeps the method and auth headers the protected request carried).
 	if raw, err := httpmsg.SetPath(ctx.Request().Raw(), "/"+modkit.FreshCanary()+"-vigolium404"); err == nil {
-		if status, body, _, ok := m.freshProbe(ctx, httpClient, raw); ok && status == 200 && shellMatch(body) {
+		var controlExchange *evidence.Exchange
+		status, body, _, ok := m.freshProbe(ctx, httpClient, raw, &controlExchange)
+		guardProof.AddExchange(controlExchange, evidence.RoleControl, "random nonexistent path shell")
+		if ok && status == 200 && shellMatch(body) {
 			return false // matches the catch-all shell → not a bypass
 		}
 	}
 
 	// Controls 2 & 3: independent web-root directory and site-root shell samples.
 	// Distinct (keep) only when the bypass body matches neither.
-	return !modkit.RandomDirCatchAll(scanCtx, ctx, httpClient, shellMatch) &&
-		!modkit.RootPageCatchAll(scanCtx, ctx, httpClient, shellMatch)
+	return !modkit.RandomDirCatchAllWithEvidence(scanCtx, ctx, httpClient, shellMatch, guardProof) &&
+		!modkit.RootPageCatchAllWithEvidence(scanCtx, ctx, httpClient, shellMatch, guardProof)
 }
 
 // freshProbe issues raw with redirects disabled and the response cache bypassed,
@@ -302,6 +315,7 @@ func (m *Module) freshProbe(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	raw []byte,
+	exchanges ...**evidence.Exchange,
 ) (int, string, string, bool) {
 	// raw is internally built (well-formed), so wrap directly instead of
 	// re-parsing on this hot path.
@@ -311,6 +325,11 @@ func (m *Module) freshProbe(
 		return 0, "", "", false
 	}
 	defer resp.Close()
+	for _, selected := range exchanges {
+		if selected != nil {
+			*selected = http.CaptureEvidence(resp)
+		}
+	}
 	if resp.Response() == nil {
 		return 0, "", "", false
 	}

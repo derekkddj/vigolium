@@ -9,6 +9,7 @@ import (
 
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -118,14 +119,15 @@ func (m *Module) probeShells(
 	urlx *urlutil.URL,
 	baseRaw []byte,
 	ep restrictedEndpoint,
-) (*output.ResultEvent, bool) {
+) (finding *output.ResultEvent, fatalResult bool) {
 	for _, sh := range confusionShells {
 		realPath := sh.build(ep.path)
 		realRaw, err := httpmsg.SetPath(baseRaw, realPath)
 		if err != nil {
 			continue
 		}
-		status, body, ok, fatal := m.fetch(httpClient, service, realRaw)
+		var primary *evidence.Exchange
+		status, body, ok, fatal := m.fetch(httpClient, service, realRaw, &primary)
 		if fatal {
 			return nil, true
 		}
@@ -134,16 +136,23 @@ func (m *Module) probeShells(
 		}
 
 		// Candidate — run the strengthened confirmation gate.
-		if !m.confirm(ctx, httpClient, service, scanCtx, baseRaw, ep, sh, realRaw, body) {
+		ev := modkit.NewEvidenceCollector()
+		if !m.confirm(ctx, httpClient, service, scanCtx, baseRaw, ep, sh, realRaw, body, ev) {
 			continue
 		}
 
+		defer func() {
+			modkit.SetPrimaryEvidence(finding, primary, evidence.RoleAttack, "path-confusion shell")
+			modkit.AppendEvidence(finding, ev)
+		}()
 		return &output.ResultEvent{
-			URL:              urlx.Scheme + "://" + urlx.Host + realPath,
-			Request:          string(realRaw),
-			Response:         body,
-			FuzzingParameter: "path",
-			ExtractedResults: []string{realPath, ep.label, sh.label},
+			AdditionalEvidence: ev.Entries(),
+			Evidence:           ev.Evidence(),
+			URL:                urlx.Scheme + "://" + urlx.Host + realPath,
+			Request:            string(realRaw),
+			Response:           body,
+			FuzzingParameter:   "path",
+			ExtractedResults:   []string{realPath, ep.label, sh.label},
 			Info: output.Info{
 				Description: fmt.Sprintf(
 					"Reverse-proxy path confusion: reached restricted endpoint %q (%s) via %s shell %q — blocked when requested directly.",
@@ -172,6 +181,7 @@ func (m *Module) confirm(
 	sh confusionShell,
 	realRaw []byte,
 	candidateBody string,
+	collectors ...*modkit.EvidenceCollector,
 ) bool {
 	// (2) Decoy-target negative: the SAME shell around a non-existent target must
 	// NOT yield the fingerprint. This proves the fingerprint comes from the real
@@ -180,7 +190,11 @@ func (m *Module) confirm(
 	if err != nil {
 		return false
 	}
-	ds, db, ok, _ := m.fetch(httpClient, service, decoyRaw)
+	var decoyExchange *evidence.Exchange
+	ds, db, ok, _ := m.fetch(httpClient, service, decoyRaw, &decoyExchange)
+	for _, ev := range collectors {
+		ev.AddExchange(decoyExchange, evidence.RoleControl, "nonexistent target shell")
+	}
 	if !ok {
 		return false // cannot run the decoy-negative → fail closed
 	}
@@ -195,7 +209,11 @@ func (m *Module) confirm(
 		return false
 	}
 	for i := 0; i < baselineRounds; i++ {
-		s, b, ok, _ := m.fetch(httpClient, service, directRaw)
+		var x *evidence.Exchange
+		s, b, ok, _ := m.fetch(httpClient, service, directRaw, &x)
+		for _, ev := range collectors {
+			ev.AddExchange(x, evidence.RoleControl, "direct restricted-path control")
+		}
 		if !ok {
 			return false
 		}
@@ -210,16 +228,20 @@ func (m *Module) confirm(
 	// payload PayloadRounds times and diffs against a fresh baseline), giving the
 	// "more rounds + compare with vs without payload" gate. Fails closed only on a
 	// clean negative; fails open (Ran=false) on transient transport errors.
+	var collector *modkit.EvidenceCollector
+	if len(collectors) > 0 {
+		collector = collectors[0]
+	}
 	diff := modkit.ConfirmBodyDifferential(
 		httpClient, service, realRaw, directRaw, "", 0,
-		modkit.ReconfirmConfig{PayloadRounds: confirmRounds, NoRedirects: true},
+		modkit.ReconfirmConfig{PayloadRounds: confirmRounds, NoRedirects: true, Evidence: collector},
 	)
 	if diff.Ran && !diff.Confirmed {
 		return false
 	}
 
 	// (5) Soft-404 / SPA wildcard rejection.
-	return modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, 200, []byte(candidateBody), "")
+	return modkit.ConfirmNotSoft404WithEvidence(scanCtx, httpClient, ctx, 200, []byte(candidateBody), "", collector)
 }
 
 // fetch issues the request and returns its status and body. The requester
@@ -227,7 +249,7 @@ func (m *Module) confirm(
 // default client is used (which also keeps replay consistent with ConfirmNotSoft404
 // and avoids the raw client's separate transport). ok is false on any
 // parse/HTTP/empty-response error; fatal is true only when the host is unresponsive.
-func (m *Module) fetch(httpClient *http.Requester, service *httpmsg.Service, raw []byte) (status int, body string, ok bool, fatal bool) {
+func (m *Module) fetch(httpClient *http.Requester, service *httpmsg.Service, raw []byte, exchanges ...**evidence.Exchange) (status int, body string, ok bool, fatal bool) {
 	// SetMethod/SetPath produce well-formed raw, so wrap directly instead
 	// of re-parsing on this hot path.
 	req := httpmsg.NewRequestResponseRaw(raw, service)
@@ -246,6 +268,12 @@ func (m *Module) fetch(httpClient *http.Requester, service *httpmsg.Service, raw
 		return 0, "", false, false
 	}
 	defer resp.Close()
+	x := http.CaptureEvidence(resp)
+	for _, selected := range exchanges {
+		if selected != nil {
+			*selected = x.Clone()
+		}
+	}
 	if resp.Response() == nil {
 		return 0, "", false, false
 	}

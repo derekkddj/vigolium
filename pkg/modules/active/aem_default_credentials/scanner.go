@@ -107,27 +107,34 @@ func (m *Module) ScanPerHost(
 // authenticated session cookie is present on the observed request), the check
 // fails closed so a cookie is never mistaken for a default credential.
 func (m *Module) checkLoginStatus(ctx *httpmsg.HttpRequestResponse, client *http.Requester, baseURL string) *output.ResultEvent {
-	if loginStatusSucceeds(ctx, client, modkit.FreshCanary(), modkit.FreshCanary()) {
+	control, ok := loginStatusSucceeds(ctx, client, modkit.FreshCanary(), modkit.FreshCanary())
+	if ok {
 		return nil
 	}
 	for _, c := range creds {
-		if !loginStatusSucceeds(ctx, client, c.user, c.pass) {
+		attack, ok := loginStatusSucceeds(ctx, client, c.user, c.pass)
+		if !ok {
 			continue
 		}
-		if !loginStatusSucceeds(ctx, client, c.user, c.pass) {
+		confirmation, ok := loginStatusSucceeds(ctx, client, c.user, c.pass)
+		if !ok {
 			continue
 		}
-		return m.build("Sling LoginStatus (Basic auth)", loginStatusPath, c, baseURL)
+		proof := aem.NewProof(attack)
+		proof.Control(control)
+		proof.Confirmation(confirmation)
+		proof.Payload = c.user + ":" + c.pass
+		return m.build("Sling LoginStatus (Basic auth)", loginStatusPath, c, baseURL, proof)
 	}
 	return nil
 }
 
-func loginStatusSucceeds(ctx *httpmsg.HttpRequestResponse, client *http.Requester, user, pass string) bool {
+func loginStatusSucceeds(ctx *httpmsg.HttpRequestResponse, client *http.Requester, user, pass string) (aem.ProbeResult, bool) {
 	res := basicAuthGet(ctx, client, loginStatusPath, user, pass)
 	if !res.OK || res.Status != 200 {
-		return false
+		return res, false
 	}
-	return aem.HasAny(res.Body, "authenticated=true", `"authenticated":true`)
+	return res, aem.HasAny(res.Body, "authenticated=true", `"authenticated":true`)
 }
 
 // checkGranite tries the Sling/Granite j_security_check login. It first confirms
@@ -136,23 +143,30 @@ func loginStatusSucceeds(ctx *httpmsg.HttpRequestResponse, client *http.Requeste
 // re-confirms the winner.
 func (m *Module) checkGranite(ctx *httpmsg.HttpRequestResponse, client *http.Requester, baseURL string) *output.ResultEvent {
 	// Negative control — a random credential must NOT authenticate.
-	if graniteLoginSucceeds(ctx, client, baseURL, modkit.FreshCanary(), modkit.FreshCanary()) {
+	control, ok := graniteLoginSucceeds(ctx, client, baseURL, modkit.FreshCanary(), modkit.FreshCanary())
+	if ok {
 		return nil
 	}
 	for _, c := range creds {
-		if !graniteLoginSucceeds(ctx, client, baseURL, c.user, c.pass) {
+		attack, ok := graniteLoginSucceeds(ctx, client, baseURL, c.user, c.pass)
+		if !ok {
 			continue
 		}
 		// Reproduce the successful login before reporting.
-		if !graniteLoginSucceeds(ctx, client, baseURL, c.user, c.pass) {
+		confirmation, ok := graniteLoginSucceeds(ctx, client, baseURL, c.user, c.pass)
+		if !ok {
 			continue
 		}
-		return m.build("Granite login (j_security_check)", granitePath, c, baseURL)
+		proof := aem.NewProof(attack)
+		proof.Control(control)
+		proof.Confirmation(confirmation)
+		proof.Payload = c.user + ":" + c.pass
+		return m.build("Granite login (j_security_check)", granitePath, c, baseURL, proof)
 	}
 	return nil
 }
 
-func graniteLoginSucceeds(ctx *httpmsg.HttpRequestResponse, client *http.Requester, baseURL, user, pass string) bool {
+func graniteLoginSucceeds(ctx *httpmsg.HttpRequestResponse, client *http.Requester, baseURL, user, pass string) (aem.ProbeResult, bool) {
 	body := "_charset_=utf-8&j_username=" + url.QueryEscape(user) +
 		"&j_password=" + url.QueryEscape(pass) + "&j_validate=true"
 	headers := map[string]string{
@@ -162,7 +176,7 @@ func graniteLoginSucceeds(ctx *httpmsg.HttpRequestResponse, client *http.Request
 	}
 	res := aem.Post(ctx, client, granitePath, body, headers)
 	if !res.OK {
-		return false
+		return res, false
 	}
 	// AEM issues a login-token (Set-Cookie and echoed in the body) on success and
 	// returns invalid_login / session_timed_out on failure.
@@ -172,24 +186,31 @@ func graniteLoginSucceeds(ctx *httpmsg.HttpRequestResponse, client *http.Request
 	}
 	hasToken := strings.Contains(setCookie, "login-token=") || strings.Contains(res.Body, "login-token=")
 	failed := strings.Contains(res.Body, "invalid_login") || strings.Contains(res.Body, "session_timed_out")
-	return hasToken && !failed && (res.Status == 200 || res.Status == 302)
+	return res, hasToken && !failed && (res.Status == 200 || res.Status == 302)
 }
 
 // checkFelix tries the Felix/OSGi Web Console with HTTP Basic. The negative
 // control must return the 401 challenge (an unauthenticated 200 console is an
 // exposure the console module reports, not a default-credential finding).
 func (m *Module) checkFelix(ctx *httpmsg.HttpRequestResponse, client *http.Requester, baseURL string) *output.ResultEvent {
-	if felixLoginSucceeds(ctx, client, modkit.FreshCanary(), modkit.FreshCanary()) {
+	control, ok := felixLoginSucceeds(ctx, client, modkit.FreshCanary(), modkit.FreshCanary())
+	if ok {
 		return nil
 	}
 	for _, c := range creds {
-		if !felixLoginSucceeds(ctx, client, c.user, c.pass) {
+		attack, ok := felixLoginSucceeds(ctx, client, c.user, c.pass)
+		if !ok {
 			continue
 		}
-		if !felixLoginSucceeds(ctx, client, c.user, c.pass) {
+		confirmation, ok := felixLoginSucceeds(ctx, client, c.user, c.pass)
+		if !ok {
 			continue
 		}
-		return m.build("Felix/OSGi Web Console", felixPath, c, baseURL)
+		proof := aem.NewProof(attack)
+		proof.Control(control)
+		proof.Confirmation(confirmation)
+		proof.Payload = c.user + ":" + c.pass
+		return m.build("Felix/OSGi Web Console", felixPath, c, baseURL, proof)
 	}
 	return nil
 }
@@ -201,22 +222,22 @@ func basicAuthGet(ctx *httpmsg.HttpRequestResponse, client *http.Requester, path
 	return aem.Get(ctx, client, path, map[string]string{"Authorization": "Basic " + basic})
 }
 
-func felixLoginSucceeds(ctx *httpmsg.HttpRequestResponse, client *http.Requester, user, pass string) bool {
+func felixLoginSucceeds(ctx *httpmsg.HttpRequestResponse, client *http.Requester, user, pass string) (aem.ProbeResult, bool) {
 	res := basicAuthGet(ctx, client, felixPath, user, pass)
 	if !res.OK || res.Status != 200 {
-		return false
+		return res, false
 	}
-	return strings.Contains(res.Body, "Web Console") &&
+	return res, strings.Contains(res.Body, "Web Console") &&
 		(strings.Contains(res.Body, "Adobe Experience Manager") || strings.Contains(res.Body, "Bundles"))
 }
 
-func (m *Module) build(endpoint, path string, c cred, baseURL string) *output.ResultEvent {
+func (m *Module) build(endpoint, path string, c cred, baseURL string, proof *aem.Proof) *output.ResultEvent {
 	matchedURL := baseURL + path
 	desc := fmt.Sprintf(
 		"AEM %s accepts the default credential %s:%s (a deliberately-wrong credential was rejected first, and the login reproduced).",
 		endpoint, c.user, c.pass,
 	)
-	return &output.ResultEvent{
+	return proof.Attack(&output.ResultEvent{
 		ModuleID:      ModuleID,
 		Host:          aem.HostFromBase(baseURL),
 		URL:           matchedURL,
@@ -236,5 +257,5 @@ func (m *Module) build(endpoint, path string, c cred, baseURL string) *output.Re
 				"https://helpx.adobe.com/experience-manager/6-5/sites/administering/using/security-checklist.html",
 			},
 		},
-	}
+	})
 }

@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/vigolium/vigolium/pkg/evidence"
 )
 
 // ProtocolVersion is the MCP protocol version vigolium negotiates by default.
@@ -101,10 +103,11 @@ type ClientInfo struct {
 }
 
 type InitializeResult struct {
-	ProtocolVersion string         `json:"protocolVersion"`
-	Capabilities    map[string]any `json:"capabilities"`
-	ServerInfo      *ServerInfo    `json:"serverInfo,omitempty"`
-	Instructions    string         `json:"instructions,omitempty"`
+	Exchange        *evidence.Exchange `json:"-"`
+	ProtocolVersion string             `json:"protocolVersion"`
+	Capabilities    map[string]any     `json:"capabilities"`
+	ServerInfo      *ServerInfo        `json:"serverInfo,omitempty"`
+	Instructions    string             `json:"instructions,omitempty"`
 }
 
 type ServerInfo struct {
@@ -115,8 +118,9 @@ type ServerInfo struct {
 // Tools ---------------------------------------------------------------------
 
 type ToolsListResult struct {
-	Tools      []Tool `json:"tools"`
-	NextCursor string `json:"nextCursor,omitempty"`
+	Exchange   *evidence.Exchange `json:"-"`
+	Tools      []Tool             `json:"tools"`
+	NextCursor string             `json:"nextCursor,omitempty"`
 }
 
 type Tool struct {
@@ -131,8 +135,9 @@ type ToolsCallParams struct {
 }
 
 type ToolsCallResult struct {
-	Content []ContentBlock `json:"content"`
-	IsError bool           `json:"isError"`
+	Exchange *evidence.Exchange `json:"-"`
+	Content  []ContentBlock     `json:"content"`
+	IsError  bool               `json:"isError"`
 }
 
 type ContentBlock struct {
@@ -144,8 +149,9 @@ type ContentBlock struct {
 // Resources -----------------------------------------------------------------
 
 type ResourcesListResult struct {
-	Resources  []Resource `json:"resources"`
-	NextCursor string     `json:"nextCursor,omitempty"`
+	Exchange   *evidence.Exchange `json:"-"`
+	Resources  []Resource         `json:"resources"`
+	NextCursor string             `json:"nextCursor,omitempty"`
 }
 
 type Resource struct {
@@ -156,6 +162,7 @@ type Resource struct {
 }
 
 type ResourceTemplatesListResult struct {
+	Exchange          *evidence.Exchange `json:"-"`
 	ResourceTemplates []ResourceTemplate `json:"resourceTemplates"`
 }
 
@@ -171,7 +178,8 @@ type ResourcesReadParams struct {
 }
 
 type ResourcesReadResult struct {
-	Contents []ResourceContent `json:"contents"`
+	Exchange *evidence.Exchange `json:"-"`
+	Contents []ResourceContent  `json:"contents"`
 }
 
 type ResourceContent struct {
@@ -184,8 +192,9 @@ type ResourceContent struct {
 // Prompts -------------------------------------------------------------------
 
 type PromptsListResult struct {
-	Prompts    []Prompt `json:"prompts"`
-	NextCursor string   `json:"nextCursor,omitempty"`
+	Exchange   *evidence.Exchange `json:"-"`
+	Prompts    []Prompt           `json:"prompts"`
+	NextCursor string             `json:"nextCursor,omitempty"`
 }
 
 type Prompt struct {
@@ -206,8 +215,9 @@ type PromptsGetParams struct {
 }
 
 type PromptsGetResult struct {
-	Description string          `json:"description,omitempty"`
-	Messages    []PromptMessage `json:"messages"`
+	Exchange    *evidence.Exchange `json:"-"`
+	Description string             `json:"description,omitempty"`
+	Messages    []PromptMessage    `json:"messages"`
 }
 
 type PromptMessage struct {
@@ -234,7 +244,8 @@ type CompleteArgument struct {
 }
 
 type CompleteResult struct {
-	Completion CompletionPayload `json:"completion"`
+	Exchange   *evidence.Exchange `json:"-"`
+	Completion CompletionPayload  `json:"completion"`
 }
 
 type CompletionPayload struct {

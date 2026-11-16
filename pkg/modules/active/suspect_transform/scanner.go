@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -179,6 +180,8 @@ func (m *Module) runCheck(
 	check Check,
 	initialResponse string,
 ) *output.ResultEvent {
+	ev := modkit.NewEvidenceCollector()
+	ev.AddBaseline("input baseline", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
 	for attempt := range confirmCount {
 		probe, expects := check.GetProbe()
 
@@ -198,6 +201,7 @@ func (m *Module) runCheck(
 
 		attackResponse := resp.Body().String()
 		fullResponse := resp.FullResponseString()
+		receipt := http.CaptureEvidence(resp)
 		resp.Close()
 
 		// Check if any expected value is found in response but not in initial response
@@ -223,16 +227,21 @@ func (m *Module) runCheck(
 				description += " | References: " + strings.Join(check.Links, ", ")
 			}
 
-			return &output.ResultEvent{
-				Request:          string(fuzzedRaw),
-				Response:         fullResponse,
-				ExtractedResults: []string{probe, matchedExpect},
+			result := &output.ResultEvent{
+				AdditionalEvidence: ev.Entries(),
+				Evidence:           ev.Evidence(),
+				Request:            string(fuzzedRaw),
+				Response:           fullResponse,
+				ExtractedResults:   []string{probe, matchedExpect},
 				Info: output.Info{
 					Description: description,
 					Reference:   check.Links,
 				},
 			}
+			modkit.SetPrimaryEvidence(result, receipt, evidence.RoleAttack, "matched transformation payload")
+			return result
 		}
+		ev.AddExchange(receipt, evidence.RoleConfirmation, "matched transformation round")
 	}
 
 	return nil

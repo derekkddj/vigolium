@@ -473,7 +473,7 @@ func runAgentSwarm(cmd *cobra.Command, args []string) (err error) {
 		if gcsErr != nil {
 			return fmt.Errorf("failed to resolve gs:// source: %w", gcsErr)
 		}
-		defer cleanup()
+		defer func() { agent.CleanupAuditSource(extractedPath, cleanup, os.Stderr) }()
 		swarmSource = extractedPath
 	}
 

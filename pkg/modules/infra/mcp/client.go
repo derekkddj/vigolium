@@ -56,17 +56,19 @@ func (c *Client) SetExtraHeaders(h map[string]string) { c.extraHeaders = h }
 // Initialize negotiates protocol version and captures the session ID.
 func (c *Client) Initialize() (*InitializeResult, error) {
 	c.issuedSessionID = ""
-	body, resp, err := c.PostJSONRPC(BuildInitializeRequest())
+	op, err := c.PostRawEvidence(BuildInitializeRequest())
 	if err != nil {
 		return nil, err
 	}
-	if resp != nil && resp.Response() != nil {
-		if sid := resp.Response().Header.Get("Mcp-Session-Id"); sid != "" {
-			c.issuedSessionID = sid
-			c.sessionID = sid
-		}
+	if sid := op.Header.Get("Mcp-Session-Id"); sid != "" {
+		c.issuedSessionID = sid
+		c.sessionID = sid
 	}
-	return ParseInitializeResponse(body)
+	res, err := ParseInitializeResponse(op.Body)
+	if res != nil {
+		res.Exchange = op.Exchange
+	}
+	return res, err
 }
 
 // SendInitializedNotification sends notifications/initialized post-handshake.
@@ -77,88 +79,84 @@ func (c *Client) SendInitializedNotification() error {
 
 // ListTools enumerates tools.
 func (c *Client) ListTools() (*ToolsListResult, error) {
-	body, _, err := c.PostJSONRPC(BuildToolsListRequest())
+	op, err := c.PostRawEvidence(BuildToolsListRequest())
 	if err != nil {
 		return nil, err
 	}
-	return ParseToolsListResponse(body)
+	res, err := ParseToolsListResponse(op.Body)
+	if res != nil {
+		res.Exchange = op.Exchange
+	}
+	return res, err
 }
 
 // CallTool invokes a tool with the supplied arguments.
 func (c *Client) CallTool(id int, name string, args map[string]any) (*ToolsCallResult, string, error) {
-	body, _, err := c.PostJSONRPC(BuildToolsCallRequest(id, name, args))
-	if err != nil {
-		return nil, body, err
-	}
-	res, perr := ParseToolsCallResponse(body)
-	return res, body, perr
+	res, body, _, err := c.CallToolEvidence(id, name, args)
+	return res, body, err
 }
 
 // ListResources enumerates resources.
 func (c *Client) ListResources() (*ResourcesListResult, error) {
-	body, _, err := c.PostJSONRPC(BuildResourcesListRequest())
+	op, err := c.PostRawEvidence(BuildResourcesListRequest())
 	if err != nil {
 		return nil, err
 	}
-	return ParseResourcesListResponse(body)
+	res, err := ParseResourcesListResponse(op.Body)
+	if res != nil {
+		res.Exchange = op.Exchange
+	}
+	return res, err
 }
 
 // ListResourceTemplates enumerates resource templates.
 func (c *Client) ListResourceTemplates() (*ResourceTemplatesListResult, error) {
-	body, _, err := c.PostJSONRPC(BuildResourceTemplatesListRequest())
+	op, err := c.PostRawEvidence(BuildResourceTemplatesListRequest())
 	if err != nil {
 		return nil, err
 	}
-	return ParseResourceTemplatesListResponse(body)
+	res, err := ParseResourceTemplatesListResponse(op.Body)
+	if res != nil {
+		res.Exchange = op.Exchange
+	}
+	return res, err
 }
 
 // ReadResource fetches a single resource by URI.
 func (c *Client) ReadResource(id int, uri string) (*ResourcesReadResult, string, error) {
-	body, _, err := c.PostJSONRPC(BuildResourcesReadRequest(id, uri))
-	if err != nil {
-		return nil, body, err
-	}
-	res, perr := ParseResourcesReadResponse(body)
-	return res, body, perr
+	res, body, _, err := c.ReadResourceEvidence(id, uri)
+	return res, body, err
 }
 
 // ListPrompts enumerates prompts.
 func (c *Client) ListPrompts() (*PromptsListResult, error) {
-	body, _, err := c.PostJSONRPC(BuildPromptsListRequest())
+	op, err := c.PostRawEvidence(BuildPromptsListRequest())
 	if err != nil {
 		return nil, err
 	}
-	return ParsePromptsListResponse(body)
+	res, err := ParsePromptsListResponse(op.Body)
+	if res != nil {
+		res.Exchange = op.Exchange
+	}
+	return res, err
 }
 
 // GetPrompt invokes a prompt with arguments.
 func (c *Client) GetPrompt(id int, name string, args map[string]string) (*PromptsGetResult, string, error) {
-	body, _, err := c.PostJSONRPC(BuildPromptsGetRequest(id, name, args))
-	if err != nil {
-		return nil, body, err
-	}
-	res, perr := ParsePromptsGetResponse(body)
-	return res, body, perr
+	res, body, _, err := c.GetPromptEvidence(id, name, args)
+	return res, body, err
 }
 
 // CompletePrompt asks completion/complete for a prompt argument value.
 func (c *Client) CompletePrompt(id int, promptName, argName, partial string) (*CompleteResult, string, error) {
-	body, _, err := c.PostJSONRPC(BuildCompletePromptRequest(id, promptName, argName, partial))
-	if err != nil {
-		return nil, body, err
-	}
-	res, perr := ParseCompleteResponse(body)
-	return res, body, perr
+	res, body, _, err := c.CompletePromptEvidence(id, promptName, argName, partial)
+	return res, body, err
 }
 
 // CompleteResource asks completion/complete for a resource URI argument.
 func (c *Client) CompleteResource(id int, uri, argName, partial string) (*CompleteResult, string, error) {
-	body, _, err := c.PostJSONRPC(BuildCompleteResourceRequest(id, uri, argName, partial))
-	if err != nil {
-		return nil, body, err
-	}
-	res, perr := ParseCompleteResponse(body)
-	return res, body, perr
+	res, body, _, err := c.CompleteResourceEvidence(id, uri, argName, partial)
+	return res, body, err
 }
 
 // PostRaw sends an arbitrary JSON-RPC body (allowing custom methods, batches,

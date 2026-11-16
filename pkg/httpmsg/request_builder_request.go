@@ -2,6 +2,7 @@ package httpmsg
 
 import (
 	"fmt"
+	"net"
 	"strings"
 
 	urlutil "github.com/projectdiscovery/utils/url"
@@ -119,6 +120,8 @@ func GetPathOnly(request []byte) (string, error) {
 
 // GetURLFromService constructs a complete URL from raw request bytes and Service.
 // Extracts path from raw bytes using GetPath(), then combines with Service data.
+// Ordinary ingestion keeps absolute targets as URLs. Receipt-restored or explicit
+// envelope services are pinned: only the target path/query may supply URL parts.
 //
 // Algorithm:
 //  1. Extract path with query string from raw request
@@ -161,7 +164,20 @@ func GetURLFromService(request []byte, httpService *Service) (*urlutil.URL, erro
 		// downstream parser's scheme allow-list is case-sensitive and rejects an
 		// uppercase scheme ("HTTP://host/path" → "invalid scheme"), which would
 		// silently drop the whole request. Normalize the scheme first.
-		return urlutil.ParseAbsoluteURL(lowercaseScheme(path), false)
+		u, err := urlutil.ParseAbsoluteURL(lowercaseScheme(path), false)
+		if err != nil || !httpService.destinationPinned {
+			return u, err
+		}
+		// Receipt-backed/explicit services name the connection destination, not
+		// the authority in the request line or Host header. Keep the intended
+		// target in raw bytes; this URL is the native sender's network locator.
+		// net/http emits origin-form directly; proxy sends require a destination-
+		// aware transport when Host differs. Neither preserves the original
+		// absolute-target representation, so reproduction fidelity is unknown.
+		u.Scheme = httpService.Protocol()
+		u.Host = serviceAuthority(httpService)
+		u.User, u.Fragment, u.RawFragment = nil, "", ""
+		return u, nil
 	}
 
 	// If path is empty, default to "/"
@@ -170,8 +186,7 @@ func GetURLFromService(request []byte, httpService *Service) (*urlutil.URL, erro
 	}
 
 	scheme := httpService.Protocol()
-	host := httpService.Host()
-	port := httpService.Port()
+	host := serviceAuthority(httpService)
 
 	// Build "scheme://host[:port]path" with a strings.Builder rather than two
 	// fmt.Sprintf calls (reflection overhead per probe).
@@ -180,15 +195,22 @@ func GetURLFromService(request []byte, httpService *Service) (*urlutil.URL, erro
 	b.WriteString(scheme)
 	b.WriteString("://")
 	b.WriteString(host)
-	// Append :port only for non-default ports.
-	if (scheme == "http" && port != 80) || (scheme == "https" && port != 443) {
-		b.WriteByte(':')
-		b.WriteString(intToString(port))
-	}
 	b.WriteString(path)
 
 	// Parse into urlutil.URL to populate all fields (including Params)
 	return urlutil.ParseAbsoluteURL(b.String(), false)
+}
+
+// serviceAuthority brackets IPv6 and omits only the scheme's default port.
+func serviceAuthority(service *Service) string {
+	host := service.Host()
+	if service.Port() != GetDefaultPort(service.Protocol()) {
+		return net.JoinHostPort(host, intToString(service.Port()))
+	}
+	if strings.Contains(host, ":") {
+		return "[" + host + "]"
+	}
+	return host
 }
 
 // isAbsoluteFormTarget reports whether a request-line target is in absolute form

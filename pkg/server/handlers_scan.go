@@ -926,12 +926,20 @@ func (h *Handlers) runBackgroundScan(scanID string, scanRunner *runner.Runner, p
 	zap.L().Info("Background scan started", zap.String("scan_uuid", scanID))
 
 	var errMsg string
-	if err := scanRunner.RunNativeScan(); err != nil {
-		errMsg = err.Error()
-		zap.L().Error("Background scan failed", zap.String("scan_uuid", scanID), zap.Error(err))
+	runErr := scanRunner.RunNativeScan()
+	if runErr != nil {
+		errMsg = runErr.Error()
+		zap.L().Error("Background scan failed", zap.String("scan_uuid", scanID), zap.Error(runErr))
 	}
 
 	scanRunner.Close()
+
+	// A rejected UUID is diagnostic only, not an initialized scan. The
+	// safety net and its reports/uploads/webhook must not reconcile that row.
+	var identityErr *runner.NativeScanIdentityError
+	if errors.As(runErr, &identityErr) || errors.Is(runErr, database.ErrScanProjectMismatch) {
+		return
+	}
 
 	elapsed := time.Since(start)
 	zap.L().Info("Background scan completed",
@@ -949,9 +957,24 @@ func (h *Handlers) runBackgroundScan(scanID string, scanRunner *runner.Runner, p
 		// returned 202 long ago. Use a fresh context so finalizing the scan record
 		// can't be cancelled by a client disconnect.
 		ctx := context.Background()
-		if err := h.repo.CompleteScan(ctx, scanID, errMsg); err != nil {
+		if err := h.repo.CompleteScanWithOutcomeForProject(ctx, projectUUID, scanID, errMsg, database.ScanCompletion{}); err != nil {
 			zap.L().Error("Failed to complete scan record", zap.String("scan_uuid", scanID), zap.Error(err))
+			return
 		}
+	}
+
+	// Check receipt ownership too: a row changed after the runner returned
+	// cannot supply reports/uploads or a completion payload for this project.
+	expectedProject := projectUUID
+	if expectedProject == "" {
+		expectedProject = database.DefaultProjectUUID
+	}
+	readCtx, readCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	scan, readErr := h.repo.GetScanByUUID(readCtx, scanID)
+	readCancel()
+	if readErr != nil || scan == nil || scan.ProjectUUID != expectedProject {
+		zap.L().Warn("Background scan receipt identity unavailable", zap.String("scan_uuid", scanID), zap.Error(readErr))
+		return
 	}
 
 	h.renderScanReports(projectUUID, scanID, outputs)

@@ -78,10 +78,12 @@ func TestMirrorWritesTreeAndIndexes(t *testing.T) {
 	mds := string(md)
 	assert.Contains(t, mds, "# HIGH — Broken Authentication")
 	assert.Contains(t, mds, "../../traffic/api.example/0001.req")
-	assert.Contains(t, mds, "## Request")
+	assert.Contains(t, mds, "### Linked request — role unknown (not proof)")
+	assert.NotContains(t, mds, "\n## Request\n", "linked traffic is not promoted to main proof")
 	assert.Contains(t, mds, "GET /users HTTP/1.1", "raw request must be embedded inline")
 	assert.NotContains(t, mds, "@target", "the synthetic @target marker line must be stripped from the inline request")
-	assert.Contains(t, mds, "## Response")
+	assert.Contains(t, mds, "### Linked response — role unknown (not proof)")
+	assert.NotContains(t, mds, "\n## Response\n", "linked traffic is not promoted to main proof")
 	assert.Contains(t, mds, `{"ok":true}`, "decoded response body must be embedded inline")
 
 	// findings index.jsonl links to the traffic path.

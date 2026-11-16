@@ -1,10 +1,14 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +20,8 @@ import (
 	"github.com/vigolium/vigolium/pkg/agent/parsing"
 	agentprompt "github.com/vigolium/vigolium/pkg/agent/prompt"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
+	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/olium/skill"
 	"go.uber.org/zap"
 )
@@ -172,7 +178,14 @@ func (e *Engine) runOnSession(ctx context.Context, opts Options, sess AgentSessi
 	thinkingSink := openThinkingSink(opts)
 	defer thinkingSink.close()
 
+	var callUsage agenttypes.TokenUsage
+	var callTools int
+	var recordingError string
+	var lastAttemptOut oliumRunOutput
 	runOut, err := retryAgentCall(ctx, retryCfg, func(ctx context.Context, attempt int) (oliumRunOutput, error) {
+		if exhausted := e.BudgetExhausted(); exhausted != nil {
+			return lastAttemptOut, exhausted
+		}
 		runPrompt := prompt
 		if attempt > 0 {
 			runPrompt = "Please provide your full response.\n\n" + prompt
@@ -180,12 +193,38 @@ func (e *Engine) runOnSession(ctx context.Context, opts Options, sess AgentSessi
 
 		var out oliumRunOutput
 		var runErr error
+		defer func() {
+			// Failed attempts still consumed provider tokens and tool work.
+			// Charge each attempt once, before any retry can refill the runway.
+			lastAttemptOut = out
+			callUsage.InputTokens += out.Usage.InputTokens
+			callUsage.OutputTokens += out.Usage.OutputTokens
+			callTools += out.ToolCalls
+			if out.RecordingError != "" {
+				recordingError = out.RecordingError
+			}
+			e.addTokenUsage(out.Usage)
+			e.chargeRunBudget(out.Usage, out.ToolCalls)
+		}()
 		switch {
-		case sess != nil:
+		case sess != nil && !opts.PlanningOnly && !opts.OfflineTools:
 			// Session-reuse path: the recorder (if any) is attached to the
 			// session's engine and flushed by the caller's sess.Close().
 			out, runErr = e.rt().RunOnSession(ctx, oliumCfg, sess, runPrompt, opts.StreamWriter, thinkingSink.writer(), opts.Verbose)
-		case (skills != nil && skills.Len() > 0) || opts.EnableBurpBridgeTools:
+		case opts.PlanningOnly:
+			// Selecting skills is not permission to execute them. Planning uses
+			// only its supplied snapshot, even with source/bridge/tool flags.
+			planSess, sErr := e.rt().NewSessionWithSpec(oliumCfg, SessionSpec{
+				PlanningOnly: true,
+				Skills:       skills,
+				Record:       RecordSpec{SessionDir: opts.SessionDir, Template: opts.PromptTemplate},
+			})
+			if sErr != nil {
+				return oliumRunOutput{}, sErr
+			}
+			out, runErr = e.rt().RunOnSession(ctx, oliumCfg, planSess, runPrompt, opts.StreamWriter, thinkingSink.writer(), opts.Verbose)
+			closeAgentSessionWithWarning(planSess, opts.StreamWriter)
+		case !opts.OfflineTools && ((skills != nil && skills.Len() > 0) || opts.EnableBurpBridgeTools):
 			// Fresh-per-call path with skills and/or the live Burp bridge: build a
 			// per-call session carrying the requested tools, run on it, then
 			// flush its transcript via Close (the recorder buffers the final
@@ -214,7 +253,7 @@ func (e *Engine) runOnSession(ctx context.Context, opts Options, sess AgentSessi
 				return oliumRunOutput{}, sErr
 			}
 			out, runErr = e.rt().RunOnSession(ctx, oliumCfg, skillSess, runPrompt, opts.StreamWriter, thinkingSink.writer(), opts.Verbose)
-			_ = skillSess.Close()
+			closeAgentSessionWithWarning(skillSess, opts.StreamWriter)
 		case opts.OfflineTools:
 			// Offline path: a per-call session whose only tools read local
 			// files, so the agent cannot reach the target (no bash, no
@@ -230,7 +269,7 @@ func (e *Engine) runOnSession(ctx context.Context, opts Options, sess AgentSessi
 				return oliumRunOutput{}, sErr
 			}
 			out, runErr = e.rt().RunOnSession(ctx, oliumCfg, offSess, runPrompt, opts.StreamWriter, thinkingSink.writer(), opts.Verbose)
-			_ = offSess.Close()
+			closeAgentSessionWithWarning(offSess, opts.StreamWriter)
 		default:
 			// Fresh-per-call path: record a per-phase transcript when a session
 			// dir is wired, named by template so concurrent phases don't clash.
@@ -249,10 +288,9 @@ func (e *Engine) runOnSession(ctx context.Context, opts Options, sess AgentSessi
 	})
 
 	stdout := runOut.Text
-	// Accumulate usage even on error — partial token cost still counts toward
-	// the run's total spend.
-	e.addTokenUsage(runOut.Usage)
-	e.chargeRunBudget(runOut.Usage, runOut.ToolCalls)
+	// Keep the final deliverable/partial text separate from cumulative spend.
+	runOut.Usage = callUsage
+	runOut.ToolCalls = callTools
 
 	// Ensure streamed output ends with a newline so subsequent console lines
 	// (e.g. session dir, phase banners) don't start on the same line.
@@ -267,6 +305,7 @@ func (e *Engine) runOnSession(ctx context.Context, opts Options, sess AgentSessi
 			RawOutput:      stdout,
 			RenderedPrompt: prompt,
 			TokenUsage:     runOut.Usage,
+			RecordingError: recordingError,
 		}, fmt.Errorf("agent execution failed: %w", err)
 	}
 
@@ -286,6 +325,7 @@ func (e *Engine) runOnSession(ctx context.Context, opts Options, sess AgentSessi
 		RenderedPrompt: prompt,
 		OutputSchema:   outputSchema,
 		TokenUsage:     runOut.Usage,
+		RecordingError: recordingError,
 	}
 
 	// Parse and ingest results based on output schema
@@ -347,6 +387,16 @@ func (e *Engine) runOnSession(ctx context.Context, opts Options, sess AgentSessi
 	return result, nil
 }
 
+// closeAgentSessionWithWarning keeps transcript finalization failure nonfatal
+// without losing its signal in the run's stream. Do not return it as a provider
+// failure: retrying successful tool work to repair recording can repeat effects.
+// Close errors may contain private data; only fixed metadata reaches the stream.
+func closeAgentSessionWithWarning(sess AgentSession, writer io.Writer) {
+	if err := sess.Close(); err != nil {
+		_ = WriteRuntimeProgress(writer, "agent", "recording", "Evidence degraded: transcript finalization failed; transcript may be incomplete")
+	}
+}
+
 // RunWithExtra executes an agent run with additional extra template data injected.
 // This is used by swarm mode to pass request context and vuln type to the template.
 func (e *Engine) RunWithExtra(ctx context.Context, opts Options, extra map[string]string) (*Result, error) {
@@ -400,12 +450,111 @@ func (e *Engine) postProcessSourceAnalysisWithMerged(ctx context.Context, cfg So
 		}
 	}
 
-	// Probe records that were saved without responses to populate status codes and bodies.
+	// Adopt complete versions even on partial failure. The agent's route/body
+	// description remains input lineage, never the request half of a new response.
+	var reprobeErr error
 	if e.repo != nil && hostname != "" {
-		authsession.ReprobeUnprobedRecords(ctx, e.repo, cfg.ProjectUUID, hostname, sessionHeaders, "source-analysis")
+		versions, captures, probeErr := reprobeObservedRecordVersions(ctx, e.repo, cfg.ProjectUUID, hostname, sessionHeaders, "source-analysis")
+		adoptErr := adoptAgentRecordVersions(ctx, e.repo, cfg.ProjectUUID, merged.HTTPRecords, versions, captures)
+		reprobeErr = errors.Join(probeErr, adoptErr)
+		if reprobeErr != nil {
+			zap.L().Warn("Source-analysis reprobe incomplete", zap.Error(reprobeErr))
+		}
 	}
 
-	return merged, combinedRaw, combinedPrompt, nil
+	return merged, combinedRaw, combinedPrompt, reprobeErr
+}
+
+// reprobeObservedRecordVersions retains the live receipt alongside saved UUIDs.
+// Database row hydration restores bytes but cannot recover capture provenance;
+// never manufacture a captured receipt from those historical bytes.
+func reprobeObservedRecordVersions(ctx context.Context, repo *database.Repository, projectUUID, hostname string, authHeaders map[string]string, source string) (map[string]string, map[string]*httpmsg.HttpRequestResponse, error) {
+	// Prompt/session hostnames include the port; traffic rows store the service
+	// hostname and port separately. Normalize only this traffic lookup boundary.
+	if host, _, err := net.SplitHostPort(hostname); err == nil {
+		hostname = host
+	}
+	hostname = strings.Trim(hostname, "[]")
+	captures := make(map[string]*httpmsg.HttpRequestResponse)
+	var mu sync.Mutex
+	versions, err := authsession.ReprobeUnprobedRecords(ctx, repo, projectUUID, hostname, authHeaders, source,
+		func(oldUUID, _ string, observed *httpmsg.HttpRequestResponse) {
+			mu.Lock()
+			captures[oldUUID] = observed
+			mu.Unlock()
+		})
+	return versions, captures, err
+}
+
+// loadObservedRecordVersion hydrates both halves together. A failed read, foreign
+// project, or compacted/incomplete row must not cause UUID-only adoption. When a
+// live capture is supplied, it must match the saved bytes and destination; its
+// receipt is preserved rather than being lost during database reconstruction.
+func loadObservedRecordVersion(ctx context.Context, repo *database.Repository, projectUUID, versionUUID string, captured ...*httpmsg.HttpRequestResponse) (*httpmsg.HttpRequestResponse, error) {
+	record, err := repo.GetRecordByUUID(ctx, versionUUID)
+	if err != nil {
+		return nil, err
+	}
+	if projectUUID == "" {
+		projectUUID = database.DefaultProjectUUID
+	}
+	if record.ProjectUUID != projectUUID {
+		return nil, fmt.Errorf("record version %s belongs to another project", versionUUID)
+	}
+	if !record.HasResponse || record.BodyCompaction != nil || len(record.RawRequest) == 0 || len(record.RawResponse) == 0 ||
+		record.RequestHash != fmt.Sprintf("%x", sha256.Sum256(record.RawRequest)) ||
+		record.ResponseHash != fmt.Sprintf("%x", sha256.Sum256(record.RawResponse)) {
+		return nil, fmt.Errorf("record version %s has no complete stored exchange", versionUUID)
+	}
+	if len(captured) > 0 {
+		observed := captured[0]
+		if observed == nil || observed.Request() == nil || !observed.HasResponse() {
+			return nil, fmt.Errorf("record version %s has no complete live capture", versionUUID)
+		}
+		x := observed.Evidence()
+		if x == nil || x.Provenance != evidence.ProvenanceCaptured || x.RequestState != evidence.StateComplete || x.ResponseState != evidence.StateComplete || x.Validate() != nil {
+			return nil, fmt.Errorf("record version %s has no complete live capture", versionUUID)
+		}
+		if !bytes.Equal(record.RawRequest, x.Request) || !bytes.Equal(record.RawResponse, x.Response) ||
+			!bytes.Equal(observed.Request().Raw(), x.Request) || !bytes.Equal(observed.Response().Raw(), x.Response) {
+			return nil, fmt.Errorf("record version %s does not match the live captured exchange", versionUUID)
+		}
+		restored, err := httpmsg.FromEvidenceExchange(x)
+		if err != nil {
+			return nil, fmt.Errorf("record version %s has an invalid live capture: %w", versionUUID, err)
+		}
+		service, expected := observed.Service(), restored.Service()
+		if service == nil || service.Host() != expected.Host() || service.Port() != expected.Port() || service.Protocol() != expected.Protocol() ||
+			record.Hostname != expected.Host() || record.Port != expected.Port() || record.Scheme != expected.Protocol() {
+			return nil, fmt.Errorf("record version %s does not match the live captured destination", versionUUID)
+		}
+		return observed.Clone(), nil
+	}
+	// A historical raw-pair reload is not a recovered capture receipt. Keep its
+	// provenance absent/unknown rather than certifying it from storage hashes.
+	return database.RecordToHttpRequestResponse(record)
+}
+
+func adoptAgentRecordVersions(ctx context.Context, repo *database.Repository, projectUUID string, records []AgentHTTPRecord, versions map[string]string, captures ...map[string]*httpmsg.HttpRequestResponse) error {
+	var failures []error
+	for i := range records {
+		versionUUID, ok := versions[records[i].RecordUUID]
+		if !ok {
+			continue
+		}
+		var captured []*httpmsg.HttpRequestResponse
+		if len(captures) > 0 {
+			captured = append(captured, captures[0][records[i].RecordUUID])
+		}
+		observed, err := loadObservedRecordVersion(ctx, repo, projectUUID, versionUUID, captured...)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("adopt %s: %w", records[i].RecordUUID, err))
+			continue
+		}
+		records[i].ObservedExchange = observed
+		records[i].RecordUUID = versionUUID
+	}
+	return errors.Join(failures...)
 }
 
 // RunSourceAnalysisParallel executes consolidated source analysis in 4 LLM calls
@@ -952,7 +1101,14 @@ func (e *Engine) buildPrompt(ctx context.Context, opts Options) (prompt string, 
 	}
 
 	if opts.PromptTemplate != "" {
-		tmpl, loadErr := agentprompt.LoadTemplate(opts.PromptTemplate, e.settings.Agent.TemplatesDir)
+		// A directly constructed engine may omit optional settings (as the
+		// inline/file paths already allow). Use the loader's default search
+		// paths rather than panicking before runtime dispatch.
+		templatesDir := ""
+		if e.settings != nil {
+			templatesDir = e.settings.Agent.TemplatesDir
+		}
+		tmpl, loadErr := agentprompt.LoadTemplate(opts.PromptTemplate, templatesDir)
 		if loadErr != nil {
 			return "", "", "", loadErr
 		}

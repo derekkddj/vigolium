@@ -264,7 +264,7 @@ type ScanContext struct {
 	// sampling round-trips are paid once per observed record and reused by every
 	// differential module that gates on it. See EndpointVolatile.
 	stabilityOnce   sync.Once
-	stabilityCache  *lru.Cache[string, bool]
+	stabilityCache  *lru.Cache[string, *stabilityResult]
 	stabilityFlight singleflight.Group
 
 	// Named per-host artifacts a module derives once per host (a JWKS key set,

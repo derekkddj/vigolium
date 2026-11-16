@@ -317,7 +317,7 @@ func (h *Handlers) HandleScanAllRecords(c fiber.Ctx) error {
 	}
 
 	var matchingUUIDs []string
-	if err := qb.BuildRecordsQuery().Column("r.uuid").Scan(ctx, &matchingUUIDs); err != nil {
+	if err := qb.BuildRecordsQuery().ExcludeColumn("*").Column("r.uuid").Scan(ctx, &matchingUUIDs); err != nil {
 		return respondError(c, fiber.StatusInternalServerError, fmt.Errorf("failed to query records: %w", err))
 	}
 

@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -71,15 +72,18 @@ func (m *Module) CanProcess(ctx *httpmsg.HttpRequestResponse) bool {
 
 // probeResult captures the response signals a single probe needs.
 type probeResult struct {
-	status int
-	cache  infra.CacheInfo
-	rawReq string
-	resp   string
-	ok     bool // a usable response was received
+	exchange *evidence.Exchange
+	status   int
+	cache    infra.CacheInfo
+	rawReq   string
+	resp     string
+	ok       bool // a usable response was received
 }
 
 // confirmation describes a reproduced cached-error finding.
 type confirmation struct {
+	context  *modkit.EvidenceCollector
+	exchange *evidence.Exchange
 	status   int
 	evidence string
 	req      string
@@ -223,10 +227,10 @@ func (m *Module) confirmCachedError(
 	apply func([]byte) ([]byte, error),
 	isError func(int) bool,
 ) (bool, confirmation, error) {
-	var c confirmation
+	c := confirmation{context: modkit.NewEvidenceCollector()}
 	for round := 0; round < confirmRounds; round++ {
 		// 1. Control — without payload.
-		control, err := m.send(httpClient, ctx, busted(basePath, freshBuster()), nil, false)
+		control, err := m.send(httpClient, ctx, busted(basePath, freshBuster()), nil, round == confirmRounds-1)
 		if err != nil {
 			return false, c, err
 		}
@@ -236,7 +240,7 @@ func (m *Module) confirmCachedError(
 
 		// 2. Poison — with payload, on a separate fresh key.
 		target := busted(basePath, freshBuster())
-		poison, err := m.send(httpClient, ctx, target, apply, false)
+		poison, err := m.send(httpClient, ctx, target, apply, round == confirmRounds-1)
 		if err != nil {
 			return false, c, err
 		}
@@ -254,6 +258,11 @@ func (m *Module) confirmCachedError(
 			return false, c, nil
 		}
 
+		if round == confirmRounds-1 {
+			c.context.AddExchange(control.exchange, evidence.RoleControl, "fresh clean key")
+			c.context.AddExchange(poison.exchange, evidence.RoleAttack, "cache poison")
+		}
+		c.exchange = clean.exchange
 		c.status = clean.status
 		c.req = clean.rawReq
 		c.resp = clean.resp
@@ -314,6 +323,7 @@ func (m *Module) send(
 	}
 	if captureResp {
 		pr.resp = resp.FullResponseString()
+		pr.exchange = http.CaptureEvidence(resp)
 	}
 	return pr, nil
 }
@@ -323,11 +333,13 @@ func (m *Module) finding(ctx *httpmsg.HttpRequestResponse, variant, trigger stri
 	if urlx, err := ctx.URL(); err == nil && urlx != nil {
 		u = urlx.String()
 	}
-	return &output.ResultEvent{
-		URL:      u,
-		Matched:  u,
-		Request:  c.req,
-		Response: c.resp,
+	result := &output.ResultEvent{
+		URL:                u,
+		Matched:            u,
+		Request:            c.req,
+		Evidence:           c.context.Evidence(),
+		AdditionalEvidence: c.context.Entries(),
+		Response:           c.resp,
 		ExtractedResults: []string{
 			"variant=" + variant,
 			"trigger=" + trigger,
@@ -342,6 +354,8 @@ func (m *Module) finding(ctx *httpmsg.HttpRequestResponse, variant, trigger stri
 			),
 		},
 	}
+	modkit.SetPrimaryEvidence(result, c.exchange, evidence.RoleConfirmation, "selected probe")
+	return result
 }
 
 // busted appends the unique cache buster to a request target.

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	sf "github.com/vigolium/vigolium/pkg/modules/infra/salesforce"
@@ -65,7 +66,8 @@ func (m *Module) ScanPerHost(
 
 	// Tech gate: locating a live Aura gateway + harvesting its context IS the
 	// fail-closed presence check (a non-Salesforce host has no gateway).
-	endpoint, auraContext, ok := sf.Prepare(ctx, httpClient, scanCtx)
+	collector := modkit.NewEvidenceCollector()
+	endpoint, auraContext, ok := sf.Prepare(ctx, httpClient, scanCtx, collector)
 	if !ok {
 		return nil, nil
 	}
@@ -74,6 +76,7 @@ func (m *Module) ScanPerHost(
 	// SUCCESS envelope carrying apiNamesToKeyPrefixes. The map must be stable
 	// (same object set) so a one-off/echoed response can't confirm.
 	var objects map[string]string
+	var primary *evidence.Exchange
 	for i := 0; i <= confirmRounds; i++ {
 		resp := sf.InvokeAction(ctx, httpClient, endpoint, sf.BuildGetConfigData(), auraContext)
 		parsed, ok := sf.ParseAuraResponse(resp.Body)
@@ -93,6 +96,11 @@ func (m *Module) ScanPerHost(
 		} else if !sameKeys(objects, round) {
 			return nil, nil
 		}
+		if i == 0 {
+			primary = resp.Exchange
+		} else {
+			collector.AddExchange(resp.Exchange, evidence.RoleConfirmation, fmt.Sprintf("Object enumeration confirmation %d", i))
+		}
 	}
 
 	custom := customObjects(objects)
@@ -104,7 +112,11 @@ func (m *Module) ScanPerHost(
 		return nil, nil
 	}
 
-	return []*output.ResultEvent{m.build(host, urlx.Scheme+"://"+urlx.Host+endpoint, endpoint, objects, custom)}, nil
+	result := m.build(host, urlx.Scheme+"://"+urlx.Host+endpoint, endpoint, objects, custom)
+	result.AdditionalEvidence, result.Evidence = collector.Entries(), collector.Evidence()
+	result.EvidenceStatus = "missing"
+	modkit.SetPrimaryEvidence(result, primary, evidence.RoleAttack, "Guest getConfigData object enumeration")
+	return []*output.ResultEvent{result}, nil
 }
 
 func (m *Module) build(host, matchedURL, endpoint string, objects map[string]string, custom []string) *output.ResultEvent {

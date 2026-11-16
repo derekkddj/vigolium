@@ -7,6 +7,7 @@ import (
 	httputil "github.com/projectdiscovery/utils/http"
 	urlutil "github.com/projectdiscovery/utils/url"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -130,8 +131,10 @@ func (m *Module) probeEndpoint(
 	urlx *urlutil.URL,
 	base string,
 	ep debugEndpoint,
-) *output.ResultEvent {
+) (finding *output.ResultEvent) {
 	probePath := base + ep.path
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(finding, guardProof) }()
 
 	resp, rawReq, ok := m.fetch(ctx, httpClient, probePath, http.Options{})
 	if !ok {
@@ -160,7 +163,7 @@ func (m *Module) probeEndpoint(
 	// Baseline 1 — host-wide soft-404 / SPA shell: drop when this body is just the
 	// wildcard page a catch-all host returns for any path. Fails open on a probe
 	// error so a flaky wildcard fetch never suppresses a real finding.
-	if !modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, 200, []byte(body), "") {
+	if !modkit.ConfirmNotSoft404WithEvidence(scanCtx, httpClient, ctx, 200, []byte(body), "", guardProof) {
 		return nil
 	}
 
@@ -169,19 +172,23 @@ func (m *Module) probeEndpoint(
 	// answers an unknown profile with a 404 "Unknown profile", so the sibling fails
 	// the predicate and the finding survives; a wildcard handler echoes the same
 	// body for the sibling and is dropped.
-	if modkit.SiblingPathCatchAll(scanCtx, ctx, httpClient, probePath, ep.confirm) {
+	if modkit.SiblingPathCatchAllWithEvidence(scanCtx, ctx, httpClient, probePath, ep.confirm, guardProof) {
 		return nil
 	}
 
 	// Reproduce — re-fetch with the response cache bypassed and require the
 	// structural markers to hold again. Profiles change their numeric values
 	// between calls, so we re-run the marker predicate rather than compare bodies.
-	repStatus, repBody, repOK := modkit.FetchPath(ctx, httpClient, probePath)
+	repStatus, repBody, repOK := modkit.FetchPathWithEvidence(ctx, httpClient, probePath, guardProof)
 	if !repOK || repStatus != 200 || !ep.confirm(repBody) {
 		return nil
 	}
 
 	target := urlx.Scheme + "://" + urlx.Host + probePath
+	selectedExchange := http.CaptureEvidence(resp)
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, selectedExchange, evidence.RoleObservation, "selected debug endpoint")
+	}()
 	return &output.ResultEvent{
 		URL:              target,
 		Matched:          target,
@@ -200,9 +207,11 @@ func (m *Module) inferredFinding(
 	base string,
 	ep debugEndpoint,
 	indexResult *output.ResultEvent,
-) *output.ResultEvent {
+) (finding *output.ResultEvent) {
 	target := urlx.Scheme + "://" + urlx.Host + base + ep.path
 	return &output.ResultEvent{
+		Evidence:         evidence.CloneEntries(indexResult.Evidence), // same index observation, not an inferred handler send
+		EvidenceStatus:   indexResult.EvidenceStatus,
 		URL:              target,
 		Matched:          target,
 		Request:          indexResult.Request,

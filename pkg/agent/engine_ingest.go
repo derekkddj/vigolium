@@ -40,7 +40,8 @@ func (e *Engine) ingestFindings(ctx context.Context, findings []AgentFinding, op
 }
 
 // ingestHTTPRecords saves parsed HTTP records to the database.
-// Notes from agent records are preserved as remarks via AppendRemarks.
+// Notes from agent records are preserved as remarks via AppendRemarks. Successful
+// saves publish their UUID into the same caller slot for later version adoption.
 func (e *Engine) ingestHTTPRecords(ctx context.Context, records []AgentHTTPRecord, opts Options) (int, error) {
 	saved := 0
 	source := "agent"
@@ -50,7 +51,7 @@ func (e *Engine) ingestHTTPRecords(ctx context.Context, records []AgentHTTPRecor
 
 	remarksMap := make(map[string][]string)
 
-	for _, rec := range records {
+	for i, rec := range records {
 		httpRR, err := ToHTTPRequestResponse(rec)
 		if err != nil {
 			zap.L().Warn("Skipping invalid HTTP record",
@@ -66,6 +67,7 @@ func (e *Engine) ingestHTTPRecords(ctx context.Context, records []AgentHTTPRecor
 			continue
 		}
 		saved++
+		records[i].RecordUUID = savedUUID
 		if rec.Notes != "" && savedUUID != "" {
 			remarksMap[savedUUID] = []string{rec.Notes}
 		}
@@ -83,6 +85,9 @@ func (e *Engine) ingestHTTPRecords(ctx context.Context, records []AgentHTTPRecor
 
 // ToHTTPRequestResponse converts an AgentHTTPRecord to an httpmsg.HttpRequestResponse.
 func ToHTTPRequestResponse(rec AgentHTTPRecord) (*httpmsg.HttpRequestResponse, error) {
+	if rec.ObservedExchange != nil {
+		return rec.ObservedExchange.Clone(), nil
+	}
 	if rec.URL == "" {
 		return nil, fmt.Errorf("URL is required")
 	}

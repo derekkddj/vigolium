@@ -466,7 +466,7 @@ func (h *Handlers) runBackgroundAgentWithOpts(agenticScanUUID string, opts agent
 	var streamCloser io.Closer
 	if sessionDir != "" {
 		logPath := filepath.Join(sessionDir, config.RuntimeLogFilename)
-		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
 			opts.StreamWriter = f
 			streamCloser = f
 		} else {

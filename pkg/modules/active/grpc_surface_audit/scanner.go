@@ -31,6 +31,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra/grpcweb"
@@ -177,6 +178,7 @@ func looksGRPCWeb(ctx *httpmsg.HttpRequestResponse) bool {
 
 // replayResult captures the decoded outcome of a single gRPC-Web request replay.
 type replayResult struct {
+	exchange   *evidence.Exchange
 	httpCode   int    // HTTP status code of the transport response
 	grpcStatus string // decoded grpc-status ("" if none)
 	dataLen    int    // total bytes across all non-trailer (message) frames
@@ -222,6 +224,7 @@ func (m *Module) executeRaw(
 	}
 
 	rr := replayResult{
+		exchange: http.CaptureEvidence(resp),
 		httpCode: resp.Response().StatusCode,
 		rawReq:   string(raw),
 		rawResp:  resp.FullResponseString(),

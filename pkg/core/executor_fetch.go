@@ -98,6 +98,8 @@ func headRejectedStatus(status int) bool {
 // baselineFetch is the outcome of fetching (or reusing) the response the rest
 // of processItem scans.
 type baselineFetch struct {
+	// req may also carry the actual failed exchange for diagnostics. A partial
+	// response in its receipt is not a scan baseline: resp stays nil on failure.
 	req       *httpmsg.HttpRequestResponse
 	resp      *httpmsg.HttpResponse
 	pooledBuf []byte
@@ -119,6 +121,7 @@ type baselineFetch struct {
 
 func (e *Executor) fetchBaseline(ctx context.Context, req *httpmsg.HttpRequestResponse) (baselineFetch, bool) {
 	if e.cfg.SkipBaseline && req.Response() != nil {
+		req = suppliedInputSnapshot(req)
 		return baselineFetch{req: req, resp: req.Response()}, true
 	}
 
@@ -127,20 +130,25 @@ func (e *Executor) fetchBaseline(ctx context.Context, req *httpmsg.HttpRequestRe
 	// back to context.Background() and keep hitting the target after the phase
 	// asked every worker to stop.
 	opts := http.Options{
-		// The request clusterer serves repeats from a SNAPSHOT of the response,
-		// reconstructed as a fresh single-response chain — so the redirect
-		// linkage (resp.Request.Response) is gone and the hops would silently
-		// vanish for every request after the first. Clustering is a
-		// within-500ms duplicate-suppression optimization; hop recording is
-		// evidence. When both are asked for, evidence wins.
-		//
-		// It costs nothing where this matters: a host sweep sends one request
-		// per target, so there are no duplicates for the cache to collapse.
-		NoClustering: e.cfg.RecordRedirectChain,
+		// Baseline analysis needs an actual exchange, including the definitive
+		// request body and redirect chain. A normalized cluster-cache projection
+		// cannot supply that capture identity; don't present it as a new send.
+		NoClustering: true,
 		NoRedirects:  e.cfg.NoRedirects,
 	}
 	respChain, elapsed, err := e.httpClient.WithContext(ctx).Execute(req, opts)
 	if err != nil {
+		// Execute errors own their final-attempt receipt, not a live chain. Keep
+		// that exchange available without admitting a partial response to scanning
+		// or persistence. OnUnanswered can retrieve the same receipt from err with
+		// CaptureFailureEvidence. With no capture (e.g. dial failure), leave req nil
+		// rather than inheriting the input's old response or evidence.
+		out := baselineFetch{}
+		if capture := http.CaptureFailureEvidence(err); capture != nil {
+			if failed, restoreErr := httpmsg.FromEvidenceExchange(capture); restoreErr == nil {
+				out.req = failed
+			}
+		}
 		zap.L().Debug("Failed to fetch baseline response, skipping item",
 			zap.String("url", req.Target()),
 			zap.Error(err))
@@ -155,14 +163,17 @@ func (e *Executor) fetchBaseline(ctx context.Context, req *httpmsg.HttpRequestRe
 		switch {
 		case errors.Is(err, hosterrors.ErrUnresponsiveHost):
 			e.quarantine.add(httpmsg.HostPortKey(req))
-			return baselineFetch{drop: DropQuarantined, dropErr: err}, false
+			out.drop, out.dropErr = DropQuarantined, err
+			return out, false
 		case errors.Is(err, egress.ErrBudgetExhausted):
-			return baselineFetch{drop: DropBudget, dropErr: err}, false
+			out.drop, out.dropErr = DropBudget, err
+			return out, false
 		case ctx.Err() == nil:
 			e.recordBaselineFailure(req.Target(), err)
-			return baselineFetch{drop: DropFetchError, dropErr: err}, false
+			out.drop, out.dropErr = DropFetchError, err
+			return out, false
 		}
-		return baselineFetch{}, false
+		return out, false
 	}
 
 	var blockedRemark string
@@ -242,6 +253,15 @@ func (e *Executor) fetchBaseline(ctx context.Context, req *httpmsg.HttpRequestRe
 	// setting's whole purpose — the terminal row still names its submitted
 	// Target. Hop recording needs the real linkage rather than just a changed
 	// URL, which is the second value ChainRelocated returns.
+	// Preserve the transport receipt before redirect traversal rewinds the
+	// chain and before analysis truncates its live request/response buffers.
+	capture := http.CaptureEvidence(respChain)
+	if capture != nil && len(capture.Request) > 0 {
+		if sent, err := httpmsg.FromEvidenceExchange(capture); err == nil {
+			out.req = sent.WithResponse(httpResp)
+		}
+	}
+	out.req = out.req.WithEvidence(capture)
 	if e.cfg.RecordRedirectChain && linked {
 		out.hops = http.RedirectChainHops(respChain)
 	}

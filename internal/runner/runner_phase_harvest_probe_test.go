@@ -2,6 +2,7 @@ package runner
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"net"
 	"net/http"
@@ -15,9 +16,12 @@ import (
 	"github.com/vigolium/vigolium/pkg/core/network"
 	"github.com/vigolium/vigolium/pkg/core/services"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	vighttp "github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/types"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // pathLog records every request path a test server saw.
@@ -94,6 +98,7 @@ func newHarvestProbeRunner(t *testing.T) (*Runner, *phaseInfra, *database.Reposi
 	opts.Retries = 0
 	opts.Concurrency = 4
 	opts.ProjectUUID = database.DefaultProjectUUID
+	opts.ScanUUID = "harvest-probe-test"
 	if err := network.Init(opts); err != nil {
 		t.Fatalf("network.Init: %v", err)
 	}
@@ -103,6 +108,7 @@ func newHarvestProbeRunner(t *testing.T) (*Runner, *phaseInfra, *database.Reposi
 	}
 	repo, _ := newHarvestTestRepo(t)
 	r := &Runner{options: opts, repository: repo, settings: config.DefaultSettings()}
+	r.resetHarvestProbeState(opts.ScanUUID, opts.ProjectUUID)
 	tr := newLedger(string(PhaseHarvestProbe))
 	r.currentPhase.Store(tr)
 	return r, &phaseInfra{httpRequester: requester, scanUUID: "harvest-probe-test"}, repo, tr
@@ -128,10 +134,13 @@ func queueStubs(t *testing.T, r *Runner, repo *database.Repository, urls ...stri
 }
 
 // TestHarvestProbe_KeepsLiveDropsDeadAndNotFound: the probe fetches each
-// harvested URL on a live host exactly once, keeps what answers (completed in
-// place, still source=harvest), deletes 404/410/soft-404 stubs, and drops a dead
+// harvested URL on a live host exactly once, keeps what answers (new immutable
+// versions, still source=harvest), deletes 404/410/soft-404 stubs, and drops a dead
 // host's URLs wholesale after its single liveness request.
 func TestHarvestProbe_KeepsLiveDropsDeadAndNotFound(t *testing.T) {
+	logCore, logs := observer.New(zap.WarnLevel)
+	restoreLogger := zap.ReplaceGlobals(zap.New(logCore))
+	t.Cleanup(restoreLogger)
 	live := &pathLog{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		live.add(req.URL.Path)
@@ -161,9 +170,27 @@ func TestHarvestProbe_KeepsLiveDropsDeadAndNotFound(t *testing.T) {
 	ids := queueStubs(t, r, repo,
 		srv.URL+"/keep", srv.URL+"/old-login", srv.URL+"/gone", srv.URL+"/removed", srv.URL+"/soft",
 		dead+"/a", dead+"/b?id=1", dead+"/c", hangup+"/h1", hangup+"/h2")
+	seeds := make(map[string]*database.HTTPRecord, 2)
+	for _, u := range []string{srv.URL + "/keep", srv.URL + "/old-login"} {
+		seed, err := repo.GetRecordByUUID(context.Background(), ids[u])
+		if err != nil {
+			t.Fatal(err)
+		}
+		seeds[u] = seed
+	}
+	// Saves publish a new snapshot identity, not a rewritten seed. The phase's
+	// sole writer owns this map until runHarvestProbePhase has joined it.
+	versions := make(map[string]string)
+	repo.OnRecordSaved = func(rec *database.HTTPRecord) { versions[rec.URL] = rec.UUID }
 
 	if err := r.runHarvestProbePhase(context.Background(), infra); err != nil {
 		t.Fatalf("runHarvestProbePhase: %v", err)
+	}
+	for _, entry := range logs.FilterMessage("HarvestProbe: failed to store observed version").All() {
+		t.Errorf("harvest persistence error: %v", entry.ContextMap())
+	}
+	if len(versions) != 2 {
+		t.Errorf("saved %d versions, want 2: %v", len(versions), versions)
 	}
 
 	// Live host: one liveness request plus exactly one GET per harvested URL.
@@ -186,13 +213,42 @@ func TestHarvestProbe_KeepsLiveDropsDeadAndNotFound(t *testing.T) {
 		}
 	}
 	for u, want := range map[string]int{srv.URL + "/keep": 200, srv.URL + "/old-login": 302} {
-		rec, err := repo.GetRecordByUUID(ctx, ids[u])
+		versionUUID := versions[u]
+		if adopted := r.harvestVersions.versions[ids[u]]; adopted != versionUUID || adopted == "" {
+			t.Errorf("survivor %s: native handoff = %q, want saved version %q", u, adopted, versionUUID)
+		}
+		if versionUUID == "" || versionUUID == ids[u] {
+			t.Errorf("survivor %s: version UUID = %q, want a new UUID distinct from %s", u, versionUUID, ids[u])
+			continue
+		}
+		rec, err := repo.GetRecordByUUID(ctx, versionUUID)
 		if err != nil {
 			t.Fatalf("survivor %s: %v", u, err)
 		}
 		if !rec.HasResponse || rec.StatusCode != want || rec.Source != database.RecordSourceHarvest {
 			t.Errorf("survivor %s: has_response=%v status=%d source=%q, want true/%d/harvest",
 				u, rec.HasResponse, rec.StatusCode, rec.Source, want)
+		}
+		if rec.CaptureRequestState != evidence.StateComplete || rec.CaptureResponseState != evidence.StateComplete {
+			t.Errorf("survivor %s: capture states = %s/%s, want complete/complete", u, rec.CaptureRequestState, rec.CaptureResponseState)
+		}
+		if err := rec.ValidateCaptureStates(); err != nil {
+			t.Errorf("survivor %s: invalid capture metadata: %v", u, err)
+		}
+		history, err := repo.GetRecordByUUID(ctx, ids[u])
+		if err != nil {
+			t.Fatalf("historical stub %s: %v", u, err)
+		}
+		seed := seeds[u]
+		if history.HasResponse || history.StatusCode != 0 || !bytes.Equal(history.RawRequest, seed.RawRequest) || !bytes.Equal(history.RawResponse, seed.RawResponse) ||
+			history.CaptureRequestState != seed.CaptureRequestState || history.CaptureResponseState != seed.CaptureResponseState {
+			t.Errorf("historical stub %s was rewritten by the probe", u)
+		}
+		if want == 200 && string(rec.ParsedResponse().Body()) != `{"users":[{"id":1,"name":"alice"},{"id":2,"name":"bob"}]}` {
+			t.Errorf("survivor %s: wrong actual response body", u)
+		}
+		if want == 302 && rec.ResponseLocation != "/auth/sign-in" {
+			t.Errorf("survivor %s: Location = %q, want /auth/sign-in", u, rec.ResponseLocation)
 		}
 	}
 	for _, u := range []string{srv.URL + "/gone", srv.URL + "/removed", srv.URL + "/soft", dead + "/a", dead + "/b?id=1", dead + "/c"} {
@@ -203,16 +259,17 @@ func TestHarvestProbe_KeepsLiveDropsDeadAndNotFound(t *testing.T) {
 
 	out := tr.finish(ctx, nil)
 	want := map[string]int64{
-		harvestCountStubs:     10,
-		harvestCountHosts:     3,
-		harvestCountUnprobed:  2,
-		harvestCountHostsDead: 1,
-		harvestCountProbed:    5,
-		harvestCountKept:      2,
-		harvestCountDeadHost:  3,
-		harvestCountNotFound:  2,
-		harvestCountSoft404:   1,
-		harvestCountDeleted:   6,
+		harvestCountStubs:       10,
+		harvestCountHosts:       3,
+		harvestCountUnprobed:    2,
+		harvestCountHostsDead:   1,
+		harvestCountProbed:      5,
+		harvestCountKept:        2,
+		harvestCountDeadHost:    3,
+		harvestCountNotFound:    2,
+		harvestCountSoft404:     1,
+		harvestCountDeleted:     6,
+		harvestCountWriteFailed: 0,
 	}
 	for k, v := range want {
 		if out.Counts[k] != v {
@@ -221,6 +278,105 @@ func TestHarvestProbe_KeepsLiveDropsDeadAndNotFound(t *testing.T) {
 	}
 	if out.State != database.PhaseCompleted {
 		t.Errorf("state = %s, want completed", out.State)
+	}
+}
+
+func TestHarvestProbe_FetchOwnsFreshExchangeInsteadOfSeedSnapshot(t *testing.T) {
+	actual := make(chan *http.Request, 1)
+	body := []byte{'o', 'k', 0, 0xff}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		actual <- req.Clone(req.Context())
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	r, infra, repo, _ := newHarvestProbeRunner(t)
+	ctx := context.Background()
+	target := srv.URL + "/keep"
+	rr, err := httpmsg.GetRawRequestFromURL(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A supplied archive seed has unknown request fidelity and no response. It
+	// must not donate its metadata or intended bytes to the transport receipt.
+	seed := evidence.NewExchange(srv.URL, target, rr.Request().Raw(), nil, evidence.ProvenanceSupplied)
+	seed.RequestState = evidence.StateUnknown
+	seed.ContentHash = seed.Hash()
+	rr = rr.WithEvidence(seed)
+	oldUUID, err := repo.SaveRecord(ctx, rr, database.RecordSourceHarvest, r.options.ProjectUUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finding := &database.Finding{ProjectUUID: r.options.ProjectUUID, ModuleID: "history", FindingHash: "harvest-probe-history",
+		OriginRecordUUID: oldUUID, URL: target, Status: database.StatusTriaged}
+	if err := repo.SaveFindingDirect(ctx, finding); err != nil {
+		t.Fatal(err)
+	}
+
+	requester, err := infra.httpRequester.WithAdditionalHeaders([]string{"Authorization: Bearer fresh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, err := newHarvestProber(r, requester, 1).fetch(ctx, rr)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	capture := observed.Evidence()
+	if capture == nil {
+		t.Fatal("fetch returned no owned receipt")
+	}
+	if err := capture.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if capture.ID == seed.ID || capture.Provenance != evidence.ProvenanceCaptured ||
+		capture.RequestState != evidence.StateComplete || capture.ResponseState != evidence.StateComplete {
+		t.Fatalf("fetch reused or degraded the seed receipt: %+v", capture)
+	}
+	if !bytes.Equal(observed.Request().Raw(), capture.Request) || !bytes.Equal(observed.Response().Raw(), capture.Response) || !bytes.Equal(observed.Response().Body(), body) {
+		t.Fatal("closed transport chain changed the actual captured messages")
+	}
+	sent := <-actual
+	if sent.Header.Get("Authorization") != "Bearer fresh" {
+		t.Errorf("actual send lost fresh session authorization: %q", sent.Header.Get("Authorization"))
+	}
+	for _, name := range []string{"Host", "Authorization", "User-Agent", "Accept-Encoding"} {
+		want := sent.Header.Get(name)
+		if name == "Host" {
+			want = sent.Host
+		}
+		if got := observed.Request().Header(name); got != want {
+			t.Errorf("captured %s = %q, want actual sent %q", name, got, want)
+		}
+	}
+	versionUUID, err := repo.SaveRecordVersion(ctx, oldUUID, observed)
+	if err != nil {
+		t.Fatalf("save actual captured version: %v", err)
+	}
+	if versionUUID == oldUUID {
+		t.Fatal("observed exchange reused the request-only UUID")
+	}
+	version, err := repo.GetRecordByUUID(ctx, versionUUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(version.RawRequest, capture.Request) || !bytes.Equal(version.RawResponse, capture.Response) ||
+		version.CaptureRequestState != capture.RequestState || version.CaptureResponseState != capture.ResponseState {
+		t.Fatal("saved version does not describe the fresh captured exchange")
+	}
+	history, err := repo.GetRecordByUUID(ctx, oldUUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if history.HasResponse || !bytes.Equal(history.RawRequest, seed.Request) || len(history.RawResponse) != 0 ||
+		history.CaptureRequestState != evidence.StateUnknown || history.CaptureResponseState != evidence.StateMissing {
+		t.Fatal("probe changed the historical seed's bytes or capture states")
+	}
+	var linked string
+	if err := repo.DB().NewRaw("SELECT origin_record_uuid FROM findings WHERE finding_hash = ?", finding.FindingHash).Scan(ctx, &linked); err != nil {
+		t.Fatal(err)
+	}
+	if linked != oldUUID {
+		t.Errorf("historical finding now links %s, want original stub %s", linked, oldUUID)
 	}
 }
 

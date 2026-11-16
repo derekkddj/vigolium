@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -162,7 +163,7 @@ func (m *Module) testAnonymousAuth(
 		// Clean up: delete the test account
 		deleted := m.deleteTestAccount(httpClient, apiKey, idToken)
 
-		return &output.ResultEvent{
+		result := &output.ResultEvent{
 			ModuleID:      ModuleID,
 			RecordKind:    output.RecordKindObservation,
 			EvidenceGrade: output.EvidenceGradeObservation,
@@ -186,6 +187,8 @@ func (m *Module) testAnonymousAuth(
 				"test_account_deleted":         deleted,
 			},
 		}
+		modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+		return result
 	}
 
 	return nil
@@ -223,7 +226,7 @@ func (m *Module) testEmailEnumeration(
 	// is absent. Without a known-existing control, it does not prove a usable
 	// existing-vs-nonexisting enumeration differential.
 	if identityErrorMessage(respBody) == "EMAIL_NOT_FOUND" {
-		return &output.ResultEvent{
+		result := &output.ResultEvent{
 			ModuleID:      ModuleID,
 			RecordKind:    output.RecordKindObservation,
 			EvidenceGrade: output.EvidenceGradeObservation,
@@ -244,6 +247,8 @@ func (m *Module) testEmailEnumeration(
 				"existing_account_control": false,
 			},
 		}
+		modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+		return result
 	}
 
 	return nil
@@ -282,7 +287,7 @@ func (m *Module) testProviderDiscovery(
 	// one concrete provider/method.
 	providers, leaked := providerDiscoveryDetails(respBody)
 	if resp.Response().StatusCode == 200 && leaked {
-		return &output.ResultEvent{
+		result := &output.ResultEvent{
 			ModuleID:         ModuleID,
 			RecordKind:       output.RecordKindCandidate,
 			EvidenceGrade:    output.EvidenceGradeDifferential,
@@ -305,6 +310,8 @@ func (m *Module) testProviderDiscovery(
 				"providers":  providers,
 			},
 		}
+		modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+		return result
 	}
 
 	return nil

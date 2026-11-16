@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	sf "github.com/vigolium/vigolium/pkg/modules/infra/salesforce"
@@ -79,7 +80,8 @@ func (m *Module) ScanPerHost(
 	// Tech gate: a live Aura gateway proves this is a Salesforce Lightning host (a
 	// non-Salesforce host answers none of the gateway paths with a framework error).
 	// PrepareGateway marks the tech registry on presence, independent of any finding.
-	endpoint, ok := sf.PrepareGateway(ctx, httpClient, scanCtx)
+	collector := modkit.NewEvidenceCollector()
+	endpoint, ok := sf.PrepareGateway(ctx, httpClient, scanCtx, collector)
 	if !ok {
 		return nil, nil
 	}
@@ -89,8 +91,10 @@ func (m *Module) ScanPerHost(
 	// PROD/STATS mode, a disagreement, or a round with no mode marker all mean no
 	// finding.
 	var mode string
-	for range confirmRounds + 1 {
-		observed, ok := sf.HarvestAuraMode(ctx, httpClient)
+	var primary *evidence.Exchange
+	for i := range confirmRounds + 1 {
+		round := sf.HarvestAuraModeCapture(ctx, httpClient)
+		observed, ok := round.Value, round.OK
 		if !ok || !isDebugMode(observed) {
 			return nil, nil
 		}
@@ -99,10 +103,19 @@ func (m *Module) ScanPerHost(
 		} else if mode != observed {
 			return nil, nil
 		}
+		if i == 0 {
+			primary = round.Exchange
+		} else {
+			collector.AddExchange(round.Exchange, evidence.RoleConfirmation, fmt.Sprintf("Bootstrap mode confirmation %d", i))
+		}
 	}
 
 	matchedURL := urlx.Scheme + "://" + urlx.Host + endpoint
-	return []*output.ResultEvent{m.build(host, matchedURL, endpoint, mode)}, nil
+	result := m.build(host, matchedURL, endpoint, mode)
+	result.AdditionalEvidence, result.Evidence = collector.Entries(), collector.Evidence()
+	result.EvidenceStatus = "missing"
+	modkit.SetPrimaryEvidence(result, primary, evidence.RoleObservation, "Aura bootstrap debug mode")
+	return []*output.ResultEvent{result}, nil
 }
 
 func (m *Module) build(host, matchedURL, endpoint, mode string) *output.ResultEvent {

@@ -4,14 +4,19 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/vigolium/vigolium/pkg/agent/authsession"
+	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
+	vhttp "github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 
 	"go.uber.org/zap"
@@ -24,16 +29,20 @@ import (
 // validateProbeAndSave filters records with valid URLs, injects auth headers,
 // probes them for live responses, and saves them to the database.
 // Records that fail the first probe are retried once.
-// The optional notes slice (aligned 1:1 with records) is persisted as remarks.
-func (s *SwarmRunner) validateProbeAndSave(ctx context.Context, records []*httpmsg.HttpRequestResponse, notes []string, authHeaders map[string]string, source, projectUUID string, pc ProbeConfig) []string {
+// Notes and previousUUIDs are aligned 1:1 with records. Returned UUIDs have the
+// same alignment, with an empty slot on invalid input, incomplete probe or save
+// failure. Probed exchanges replace caller slots, not historical request objects.
+func (s *SwarmRunner) validateProbeAndSave(ctx context.Context, records []*httpmsg.HttpRequestResponse, notes []string, previousUUIDs []string, authHeaders map[string]string, source, projectUUID string, pc ProbeConfig) []string {
 	if len(records) == 0 {
 		return nil
 	}
 
+	savedUUIDs := make([]string, len(records))
 	var valid []*httpmsg.HttpRequestResponse
 	var validNotes []string
+	var validIndices []int
 	for i, rr := range records {
-		if rr.Request() == nil {
+		if rr == nil || rr.Request() == nil {
 			continue
 		}
 		if u, urlErr := rr.URL(); urlErr != nil || u == nil || u.Host == "" {
@@ -41,6 +50,7 @@ func (s *SwarmRunner) validateProbeAndSave(ctx context.Context, records []*httpm
 			continue
 		}
 		valid = append(valid, rr)
+		validIndices = append(validIndices, i)
 		if i < len(notes) {
 			validNotes = append(validNotes, notes[i])
 		} else {
@@ -48,9 +58,7 @@ func (s *SwarmRunner) validateProbeAndSave(ctx context.Context, records []*httpm
 		}
 	}
 
-	if len(authHeaders) > 0 {
-		injectAuthHeaders(valid, authHeaders)
-	}
+	refreshProbeAuth(valid, authHeaders)
 	if len(valid) > 0 {
 		probeRecordsWithConfig(ctx, valid, pc)
 
@@ -74,17 +82,38 @@ func (s *SwarmRunner) validateProbeAndSave(ctx context.Context, records []*httpm
 			}
 		}
 	}
+	// Probing/injection may replace objects in valid. Publish those exact
+	// exchanges back to the original slots before any downstream status/scan use.
+	for i, idx := range validIndices {
+		records[idx] = valid[i]
+	}
 	if s.repo != nil && len(valid) > 0 {
 		var savedCount int
-		var savedUUIDs []string
 		remarksMap := make(map[string][]string)
 		for i, rr := range valid {
-			savedUUID, saveErr := s.repo.SaveRecord(ctx, rr, source, projectUUID)
+			// Failed probes leave their request-only seed in the slot. Keep it
+			// available for retry, but never publish it as a saved success/version.
+			// Already observed legacy pairs remain eligible; explicit incomplete
+			// receipts cannot be promoted to complete records by this save loop.
+			if rr == nil || !rr.HasResponse() {
+				continue
+			}
+			if x := rr.Evidence(); x != nil && (x.RequestState != evidence.StateComplete || x.ResponseState != evidence.StateComplete) {
+				continue
+			}
+			idx := validIndices[i]
+			var savedUUID string
+			var saveErr error
+			if idx < len(previousUUIDs) && previousUUIDs[idx] != "" {
+				savedUUID, saveErr = s.repo.SaveRecordVersion(ctx, previousUUIDs[idx], rr)
+			} else {
+				savedUUID, saveErr = s.repo.SaveRecord(ctx, rr, source, projectUUID)
+			}
 			if saveErr != nil {
 				zap.L().Debug("Failed to save record", zap.String("source", source), zap.Error(saveErr))
 			} else {
 				savedCount++
-				savedUUIDs = append(savedUUIDs, savedUUID)
+				savedUUIDs[idx] = savedUUID
 				if i < len(validNotes) && validNotes[i] != "" && savedUUID != "" {
 					remarksMap[savedUUID] = []string{validNotes[i]}
 				}
@@ -98,9 +127,41 @@ func (s *SwarmRunner) validateProbeAndSave(ctx context.Context, records []*httpm
 				zap.L().Warn("Failed to append remarks from agent notes", zap.Error(err))
 			}
 		}
-		return savedUUIDs
 	}
-	return nil
+	return savedUUIDs
+}
+
+// swarmRecordUUIDsAfterProbe retains seed identities for fallback adoption when
+// a probe/save fails. These current UUIDs are not the success-only probe result.
+func swarmRecordUUIDsAfterProbe(previousUUIDs, savedUUIDs []string) []string {
+	currentUUIDs := make([]string, max(len(previousUUIDs), len(savedUUIDs)))
+	copy(currentUUIDs, previousUUIDs)
+	for i, savedUUID := range savedUUIDs {
+		if savedUUID != "" {
+			currentUUIDs[i] = savedUUID
+		}
+	}
+	return currentUUIDs
+}
+
+// refreshProbeAuth preserves already observed pairs when prepared bytes match.
+// Changing a request invalidates its response and receipt until a fresh probe
+// captures both halves; it never donates the old response to the new request.
+func refreshProbeAuth(records []*httpmsg.HttpRequestResponse, authHeaders map[string]string) {
+	if len(authHeaders) == 0 {
+		return
+	}
+	prepared := make([]*httpmsg.HttpRequestResponse, len(records))
+	for i, rr := range records {
+		prepared[i] = rr.Clone()
+	}
+	authsession.ReplaceAuthHeadersInHTTPRR(prepared, authHeaders)
+	injectAuthHeaders(prepared, authHeaders)
+	for i, rr := range prepared {
+		if !bytes.Equal(records[i].Request().Raw(), rr.Request().Raw()) {
+			records[i] = rr.WithResponse(nil)
+		}
+	}
 }
 
 // ProbeConfig holds tuning parameters for HTTP record probing.
@@ -215,46 +276,70 @@ func probeSingleRecordWithLimit(ctx context.Context, client *http.Client, rr *ht
 	// Copy headers from the original request
 	if rr.Request() != nil {
 		for _, h := range rr.Request().Headers() {
-			httpReq.Header.Add(h.Name, h.Value)
+			if strings.EqualFold(h.Name, "Host") {
+				httpReq.Host = h.Value
+			} else {
+				httpReq.Header.Add(h.Name, h.Value)
+			}
 		}
 	}
 
 	start := time.Now()
-	resp, err := client.Do(httpReq)
+	chain, err := vhttp.DoCaptured(client, httpReq, int64(maxBody))
+	if chain != nil {
+		defer chain.Close()
+	}
+	// A partial error chain is not a successful probed record. Do not adopt
+	// it or donate its response to the intended request/historical exchange.
 	if err != nil {
-		zap.L().Debug("Probe request failed", zap.String("url", targetURL), zap.Error(err))
+		zap.L().Warn("Probe exchange capture failed", zap.String("url", targetURL), zap.Error(err))
 		return nil
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	// Read response body (limit size to avoid memory issues)
-	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxBody)))
-	if err != nil {
-		zap.L().Debug("Failed to read probe response", zap.String("url", targetURL), zap.Error(err))
+	x := vhttp.CaptureEvidence(chain)
+	if x == nil || x.RequestState != evidence.StateComplete || x.ResponseState != evidence.StateComplete {
+		zap.L().Warn("Probe has no complete captured exchange", zap.String("url", targetURL))
 		return nil
 	}
-
-	// Build raw HTTP response
-	var rawResp bytes.Buffer
-	fmt.Fprintf(&rawResp, "%s %s\r\n", resp.Proto, resp.Status)
-	for k, vals := range resp.Header {
-		for _, v := range vals {
-			fmt.Fprintf(&rawResp, "%s: %s\r\n", k, v)
-		}
+	sent, err := httpmsg.FromEvidenceExchange(x)
+	if err != nil {
+		zap.L().Warn("Invalid probe capture", zap.String("url", targetURL), zap.Error(err))
+		return nil
 	}
-	rawResp.WriteString("\r\n")
-	rawResp.Write(body)
-
-	// Timed to the end of the body read, not to client.Do's return: Do returns
-	// on headers, and the body is read above. Stopping at Do would record a TTFB
-	// under a name that says whole-transaction.
-	httpResp := httpmsg.NewHttpResponseWithDuration(rawResp.Bytes(), time.Since(start))
-	return rr.WithResponse(httpResp)
+	// Include the full body read in transaction duration. The captured request
+	// (including redirect method/body changes and transport headers) is adopted,
+	// not the intended rr paired with a response from a different exchange.
+	return sent.WithResponse(httpmsg.NewHttpResponseWithDuration(x.Response, time.Since(start))).WithEvidence(x)
 }
 
 // reprobeUnprobedRecords queries records without responses from the DB and
 // probes them using a simple HTTP client. This acts as a fallback for records
 // that earlier probes failed to fetch.
-func (s *SwarmRunner) reprobeUnprobedRecords(ctx context.Context, projectUUID, hostname string, authHeaders map[string]string, source string) {
-	authsession.ReprobeUnprobedRecords(ctx, s.repo, projectUUID, hostname, authHeaders, source)
+func (s *SwarmRunner) reprobeUnprobedRecords(ctx context.Context, projectUUID, hostname string, authHeaders map[string]string, source string, records []*httpmsg.HttpRequestResponse, recordUUIDs []string) (map[string]string, error) {
+	versions, captures, probeErr := reprobeObservedRecordVersions(ctx, s.repo, projectUUID, hostname, authHeaders, source)
+	adoptErr := adoptSwarmRecordVersions(ctx, s.repo, projectUUID, records, recordUUIDs, versions, captures)
+	return versions, errors.Join(probeErr, adoptErr)
+}
+
+// adoptSwarmRecordVersions updates current slots and UUIDs together, leaving
+// unmapped/failed slots alone. Never rewrite old stored rows or finding links.
+func adoptSwarmRecordVersions(ctx context.Context, repo *database.Repository, projectUUID string, records []*httpmsg.HttpRequestResponse, recordUUIDs []string, versions map[string]string, captures ...map[string]*httpmsg.HttpRequestResponse) error {
+	var failures []error
+	for i, oldUUID := range recordUUIDs {
+		versionUUID, ok := versions[oldUUID]
+		if !ok || i >= len(records) {
+			continue
+		}
+		var captured []*httpmsg.HttpRequestResponse
+		if len(captures) > 0 {
+			captured = append(captured, captures[0][oldUUID])
+		}
+		observed, err := loadObservedRecordVersion(ctx, repo, projectUUID, versionUUID, captured...)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("adopt %s: %w", oldUUID, err))
+			continue
+		}
+		records[i] = observed
+		recordUUIDs[i] = versionUUID
+	}
+	return errors.Join(failures...)
 }

@@ -2,7 +2,6 @@ package vigtool
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -138,27 +137,13 @@ func (r *runModuleTool) Execute(ctx context.Context, args map[string]any, onUpda
 	r.count.Add(1)
 
 	res, err := runner.LaunchScan(ctx, params)
+	details := reconcileScanReceipt(ctx, r.ctx, res)
+	details["modules_used"] = len(resolved)
 	if err != nil {
-		uuid := ""
-		if res != nil {
-			uuid = res.ScanUUID
-		}
-		return tool.Result{Content: fmt.Sprintf("run_module failed (uuid=%s): %v", uuid, err), IsError: true}, nil
+		return failedScanReceipt("run_module", res, err, details), nil
 	}
 
-	// Attribute this child scan (and its findings) to the parent agentic scan.
-	r.ctx.attributeChildScan(ctx, res.ScanUUID)
-
-	body, _ := json.Marshal(res)
-	return tool.Result{
-		Content: string(body),
-		Details: map[string]any{
-			"scan_uuid":     res.ScanUUID,
-			"status":        res.Status,
-			"finding_count": res.FindingCount,
-			"modules_used":  len(resolved),
-		},
-	}, nil
+	return successfulScanReceipt(res, details), nil
 }
 
 // resolveModuleSet folds module-id patterns and tag patterns into one

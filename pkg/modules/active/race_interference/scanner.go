@@ -8,6 +8,7 @@ import (
 	"github.com/sourcegraph/conc"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -57,6 +58,7 @@ type ProbeResult struct {
 	HasWrongId bool
 	WrongIdVal string
 	Err        error
+	exchange   *evidence.Exchange
 }
 
 // ScanPerInsertionPoint tests a single insertion point for race condition vulnerabilities.
@@ -91,7 +93,8 @@ func (m *Module) ScanPerInsertionPoint(
 	anchor := utils.GenerateCanary()
 
 	// Phase 1: Baseline - check if input is reflected
-	baseline, reflected, baselineReq, baselineResp := m.buildBaseline(ctx, ip, httpClient, anchor)
+	var baselineExchange *evidence.Exchange
+	baseline, reflected, _, _ := m.buildBaseline(ctx, ip, httpClient, anchor, &baselineExchange)
 	if baseline == nil {
 		return nil, nil // Host error or no response
 	}
@@ -188,13 +191,16 @@ func (m *Module) ScanPerInsertionPoint(
 				Response:    result.Response,
 			}
 			ev := modkit.NewEvidenceCollector()
-			ev.Add("baseline", baselineReq, baselineResp)
-			ev.Add("sequential-probe", result.Request, result.Response)
+			ev.AddExchange(baselineExchange, evidence.RoleBaseline, "baseline")
+			ev.AddExchange(result.exchange, evidence.RoleAttack, "sequential-probe")
 			if clean := firstCleanProbe(sequentialResults, baseline, result); clean != nil {
-				ev.Add("sequential-control (clean sibling)", clean.Request, clean.Response)
+				ev.AddExchange(clean.exchange, evidence.RoleControl, "sequential-control (clean sibling)")
 			}
-			ev.Add("fresh-canary reproduction", confirmation.Request, confirmation.Response)
-			results = append(results, m.buildResult(finding, urlx.String(), ip.Name(), ev.Entries()))
+			ev.AddExchange(confirmation.exchange, evidence.RoleConfirmation, "fresh-canary reproduction")
+			event := m.buildResult(finding, urlx.String(), ip.Name(), ev.Entries())
+			event.Evidence = ev.Evidence()
+			modkit.SetPrimaryEvidence(event, result.exchange, evidence.RoleAttack, "wrong-ID probe")
+			results = append(results, event)
 		}
 	}
 
@@ -214,13 +220,16 @@ func (m *Module) ScanPerInsertionPoint(
 				Response:    result.Response,
 			}
 			ev := modkit.NewEvidenceCollector()
-			ev.Add("baseline", baselineReq, baselineResp)
-			ev.Add("parallel-probe", result.Request, result.Response)
+			ev.AddExchange(baselineExchange, evidence.RoleBaseline, "baseline")
+			ev.AddExchange(result.exchange, evidence.RoleAttack, "parallel-probe")
 			if clean := firstCleanProbe(parallelResults, baseline, result); clean != nil {
-				ev.Add("parallel-control (clean concurrent sibling)", clean.Request, clean.Response)
+				ev.AddExchange(clean.exchange, evidence.RoleControl, "parallel-control (clean concurrent sibling)")
 			}
-			ev.Add("fresh-canary reproduction", confirmation.Request, confirmation.Response)
-			results = append(results, m.buildResult(finding, urlx.String(), ip.Name(), ev.Entries()))
+			ev.AddExchange(confirmation.exchange, evidence.RoleConfirmation, "fresh-canary reproduction")
+			event := m.buildResult(finding, urlx.String(), ip.Name(), ev.Entries())
+			event.Evidence = ev.Evidence()
+			modkit.SetPrimaryEvidence(event, result.exchange, evidence.RoleAttack, "wrong-ID probe")
+			results = append(results, event)
 		}
 	}
 
@@ -244,12 +253,18 @@ func (m *Module) ScanPerInsertionPoint(
 			Response:  result.Response,
 		}
 		ev := modkit.NewEvidenceCollector()
-		ev.Add("baseline", baselineReq, baselineResp)
-		ev.Add("parallel-probe", result.Request, result.Response)
+		ev.AddExchange(baselineExchange, evidence.RoleBaseline, "baseline")
+		ev.AddExchange(result.exchange, evidence.RoleAttack, "parallel-probe")
 		if clean := firstCleanProbe(parallelResults, baseline, result); clean != nil {
-			ev.Add("parallel-control (baseline-matching sibling)", clean.Request, clean.Response)
+			ev.AddExchange(clean.exchange, evidence.RoleControl, "parallel-control (baseline-matching sibling)")
 		}
-		results = append(results, m.buildResult(finding, urlx.String(), ip.Name(), ev.Entries()))
+		if clean := firstCleanProbe(sequentialResults, baseline, nil); clean != nil {
+			ev.AddExchange(clean.exchange, evidence.RoleControl, "sequential determinism control")
+		}
+		event := m.buildResult(finding, urlx.String(), ip.Name(), ev.Entries())
+		event.Evidence = ev.Evidence()
+		modkit.SetPrimaryEvidence(event, result.exchange, evidence.RoleObservation, "parallel divergence")
+		results = append(results, event)
 	}
 
 	return results, nil
@@ -328,6 +343,7 @@ func (m *Module) buildBaseline(
 	ip httpmsg.InsertionPoint,
 	httpClient *http.Requester,
 	anchor string,
+	exchanges ...**evidence.Exchange,
 ) (*ResponseGroup, bool, string, string) {
 	var group *ResponseGroup
 	var reflected bool
@@ -358,6 +374,7 @@ func (m *Module) buildBaseline(
 		headers := resp.Response().Header.Clone()
 		// Capture the first valid baseline pair for evidence before Close().
 		fullResp := resp.FullResponseString()
+		x := http.CaptureEvidence(resp)
 		resp.Close()
 
 		// Check WAF blocking
@@ -372,6 +389,11 @@ func (m *Module) buildBaseline(
 		if baselineReq == "" {
 			baselineReq = string(fuzzedRaw)
 			baselineResp = fullResp
+			for _, selected := range exchanges {
+				if selected != nil {
+					*selected = x.Clone()
+				}
+			}
 		}
 
 		// Check reflection on first valid response
@@ -458,6 +480,7 @@ func (m *Module) sendProbe(
 	result.Headers = resp.Response().Header.Clone()
 	result.Request = string(fuzzedRaw)
 	result.Response = resp.FullResponseString()
+	result.exchange = http.CaptureEvidence(resp)
 	resp.Close()
 
 	// Check for wrong ID

@@ -734,8 +734,11 @@ func runServerCmd(cmd *cobra.Command, args []string) error {
 	if globalScanOnReceive && db != nil && repo != nil {
 		// Create a persistent scan record for the server session
 		serverScan := newScanOnReceiveRow(database.DefaultProjectUUID, strings.Join(globalTargets, ","), strings.Join(runnerOpts.Modules, ","), globalConcurrency)
-		if err := repo.CreateScanWithCursor(context.Background(), serverScan); err != nil {
-			zap.L().Warn("Failed to create server scan record", zap.Error(err))
+		// A service restart is not a request to replay old traffic. Continue the
+		// receive cursor even when shutdown marked its previous receipt failed
+		// or the passive-module metadata changed between binary versions.
+		if err := repo.CreateServerReceiveScan(context.Background(), serverScan); err != nil {
+			return fmt.Errorf("initialize server receive cursor: %w", err)
 		}
 
 		// Reuse the server scan UUID so the runner tracks cursor on the same record

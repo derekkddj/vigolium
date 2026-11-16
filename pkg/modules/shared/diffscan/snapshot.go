@@ -2,17 +2,22 @@ package diffscan
 
 import (
 	"bytes"
-	defaulthttputil "net/http/httputil"
 	"strings"
 
 	httputil "github.com/projectdiscovery/utils/http"
 	"github.com/vigolium/vigolium/pkg/anomaly"
+	"github.com/vigolium/vigolium/pkg/evidence"
+	"github.com/vigolium/vigolium/pkg/http"
+	"github.com/vigolium/vigolium/pkg/httpmsg"
 )
 
 // ResponseSnapshot contains extracted data from a ResponseChain.
 // It is designed to be created immediately after an HTTP request,
 // allowing the ResponseChain to be closed and its buffers returned to the pool.
 type ResponseSnapshot struct {
+	Exchange *evidence.Exchange
+	// Payload is the actual injected value, including prepend/append/canary.
+	Payload string
 	// Filtered response for keyword tracking and anchor reflection counting
 	FilteredResponse []byte
 
@@ -32,12 +37,15 @@ type ResponseSnapshot struct {
 // NewResponseSnapshot creates a snapshot from a ResponseChain.
 // IMPORTANT: This function closes the ResponseChain after extracting data.
 // The caller should NOT use the ResponseChain after calling this function.
-func NewResponseSnapshot(respChain *httputil.ResponseChain) *ResponseSnapshot {
+func NewResponseSnapshot(respChain *httputil.ResponseChain, capture ...bool) *ResponseSnapshot {
 	if respChain == nil || !respChain.Has() {
 		return nil
 	}
 
 	snap := &ResponseSnapshot{}
+	if len(capture) > 0 && capture[0] {
+		snap.Exchange = http.CaptureEvidence(respChain)
+	}
 
 	// 1. WAF detection metadata
 	resp := respChain.Response()
@@ -47,8 +55,10 @@ func NewResponseSnapshot(respChain *httputil.ResponseChain) *ResponseSnapshot {
 	if req := respChain.Request(); req != nil {
 		snap.URL = req.URL.String()
 		snap.Method = req.Method
-		if rawReq, err := defaulthttputil.DumpRequest(req, true); err == nil {
-			snap.RequestDump = string(rawReq)
+		if snap.Exchange != nil {
+			snap.RequestDump = string(snap.Exchange.Request)
+		} else if rr, err := httpmsg.FromSentRequest(req); err == nil {
+			snap.RequestDump = string(rr.Request().Raw())
 		}
 	}
 	snap.ContentLength = respChain.Body().Len()

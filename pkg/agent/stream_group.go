@@ -49,53 +49,107 @@ type prefixedStreamWriter struct {
 
 	mu  sync.Mutex
 	buf bytes.Buffer
+	err error // sticky narrative failure; never retry a possibly partial line
 }
 
-// Write appends bytes to the per-writer buffer and flushes any complete
-// lines. Always reports the full input length as written (we never drop).
+// Write appends narrative bytes to the per-writer buffer and flushes complete
+// prefixed lines. Successful writes accept the full input, including its tail.
 func (w *prefixedStreamWriter) Write(p []byte) (int, error) {
 	if w == nil || w.group == nil {
 		return len(p), nil
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.err != nil {
+		return 0, w.err
+	}
 	w.buf.Write(p)
-	w.flushCompleteLinesLocked()
-	return len(p), nil
+	w.err = w.flushCompleteLinesLocked()
+	return len(p), w.err
+}
+
+// WriteBlock flushes pending narrative before streaming an unmodified payload.
+// Raw bytes bypass the line buffer and prefixes, even for huge lines or binary
+// streams. Lock order is writer -> group -> shared sink, as for narrative writes.
+// The callback must use its supplied writer, not re-enter this writer/group/sink.
+func (w *prefixedStreamWriter) WriteBlock(write func(io.Writer) error) error {
+	if w == nil || w.group == nil {
+		return write(io.Discard)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.err != nil {
+		return w.err
+	}
+	w.group.mu.Lock()
+	defer w.group.mu.Unlock()
+
+	render := func(out io.Writer) error {
+		if err := w.flushPendingLocked(out); err != nil {
+			return err
+		}
+		return write(out)
+	}
+	if out, ok := w.group.out.(interface {
+		WriteBlock(func(io.Writer) error) error
+	}); ok {
+		// Share the session lock with producers outside this group (e.g. audit).
+		return out.WriteBlock(render)
+	}
+	return render(w.group.out)
 }
 
 // Flush drains any trailing partial line. Call after the producer goroutine
-// finishes so the last incomplete chunk reaches the user's terminal.
+// finishes so the last incomplete chunk reaches the user's terminal. Failures
+// remain sticky and are returned by subsequent Write/WriteBlock calls.
 func (w *prefixedStreamWriter) Flush() {
 	if w == nil || w.group == nil {
 		return
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.buf.Len() == 0 {
+	if w.err != nil || w.buf.Len() == 0 {
 		return
 	}
 	w.group.mu.Lock()
-	_, _ = fmt.Fprintf(w.group.out, "[%s] %s\n", w.prefix, w.buf.String())
-	w.group.mu.Unlock()
+	defer w.group.mu.Unlock()
+	_ = w.flushPendingLocked(w.group.out)
+}
+
+// flushPendingLocked is called with both writer and group locks held. out may
+// already be inside the shared sink's block; never write via the outer wrapper.
+func (w *prefixedStreamWriter) flushPendingLocked(out io.Writer) error {
+	if w.buf.Len() == 0 {
+		return nil
+	}
+	n, err := fmt.Fprintf(out, "[%s] %s\n", w.prefix, w.buf.Bytes())
+	if err == nil && n != len(w.prefix)+3+w.buf.Len()+1 {
+		err = io.ErrShortWrite
+	}
 	w.buf.Reset()
+	w.err = err
+	return err
 }
 
 // flushCompleteLinesLocked emits every \n-terminated chunk currently in the
 // buffer. Caller must hold w.mu.
-func (w *prefixedStreamWriter) flushCompleteLinesLocked() {
+func (w *prefixedStreamWriter) flushCompleteLinesLocked() error {
 	for {
 		data := w.buf.Bytes()
 		idx := bytes.IndexByte(data, '\n')
 		if idx < 0 {
-			return
+			return nil
 		}
-		line := make([]byte, idx+1)
-		copy(line, data[:idx+1])
-		w.buf.Next(idx + 1)
-
+		line := data[:idx+1]
 		w.group.mu.Lock()
-		_, _ = fmt.Fprintf(w.group.out, "[%s] %s", w.prefix, line)
+		n, err := fmt.Fprintf(w.group.out, "[%s] %s", w.prefix, line)
 		w.group.mu.Unlock()
+		w.buf.Next(idx + 1)
+		if err == nil && n != len(w.prefix)+3+len(line) {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			return err
+		}
 	}
 }

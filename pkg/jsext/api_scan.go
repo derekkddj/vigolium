@@ -12,7 +12,6 @@ import (
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules"
-	"github.com/vigolium/vigolium/pkg/output"
 	"go.uber.org/zap"
 )
 
@@ -217,47 +216,8 @@ func scanFuncDefs() []JSFuncDef {
 						return vm.ToValue(false)
 					}
 
-					obj := arg.ToObject(vm)
-					result := &output.ResultEvent{
-						Type: "http",
-					}
-
-					if v := obj.Get("url"); v != nil && !sobek.IsUndefined(v) {
-						result.URL = v.String()
-					}
-					if v := obj.Get("matched"); v != nil && !sobek.IsUndefined(v) {
-						result.Matched = v.String()
-					}
-					if v := obj.Get("name"); v != nil && !sobek.IsUndefined(v) {
-						result.Info.Name = v.String()
-					}
-					if v := obj.Get("description"); v != nil && !sobek.IsUndefined(v) {
-						result.Info.Description = v.String()
-					}
-					if v := obj.Get("severity"); v != nil && !sobek.IsUndefined(v) {
-						result.Info.Severity = ParseSeverity(v.String())
-					}
-					if v := obj.Get("request"); v != nil && !sobek.IsUndefined(v) {
-						result.Request = v.String()
-					}
-					if v := obj.Get("response"); v != nil && !sobek.IsUndefined(v) {
-						result.Response = v.String()
-					}
-					if v := obj.Get("additional_evidence"); v != nil && !sobek.IsUndefined(v) {
-						if exported := v.Export(); exported != nil {
-							if arr, ok := exported.([]interface{}); ok {
-								for _, item := range arr {
-									if s, ok := item.(string); ok {
-										result.AdditionalEvidence = append(result.AdditionalEvidence, s)
-									}
-								}
-							}
-						}
-					}
-
-					if result.Matched == "" {
-						result.Matched = result.URL
-					}
+					// Use the same result/receipt contract as returned module findings.
+					result := parseSingleJSResult(vm, arg.ToObject(vm), nil)[0]
 
 					if opts.FindingEmitter != nil {
 						opts.FindingEmitter(result)

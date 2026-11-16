@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -103,12 +104,14 @@ func (m *Module) ScanPerInsertionPoint(
 		zap.String("param", paramName),
 		zap.String("baseValue", baseValue))
 
+	diffOptions := *m.options.DiffScanOptions
+	diffOptions.CaptureEvidence = true
 	payloadInjector := diffscan.NewPayloadInjector(
 		ctx.Request().Raw(),
 		ip,
 		httpService,
 		httpClient,
-		m.options.DiffScanOptions,
+		&diffOptions,
 	)
 
 	softBase, crudeFuzz, hardBase, err := m.buildBaselines(payloadInjector, baseValue)
@@ -172,7 +175,8 @@ func (m *Module) ScanPerInsertionPoint(
 	// 5.9 KB or an 11.3 KB Apache default page) makes the break and escape probes
 	// diverge on every metric the differ tracks. Checked only once a report exists,
 	// and memoized per record, so the probing above is unaffected.
-	if modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+	guardProof := modkit.NewEvidenceCollector()
+	if modkit.EndpointVolatileWithEvidence(scanCtx, ctx, httpClient, guardProof) {
 		return nil, nil
 	}
 
@@ -186,15 +190,55 @@ func (m *Module) ScanPerInsertionPoint(
 	// different payloads), so it is surfaced as an informational lead for a
 	// human to confirm rather than an actionable issue. The per-probe
 	// break/escape payloads and response metrics remain in the report body.
-	return []*output.ResultEvent{{
-		URL:              urlx.String(),
-		Request:          string(ctx.Request().Raw()),
-		FuzzingParameter: paramName,
+	ev := modkit.NewEvidenceCollector()
+	// Reserve four stability controls (or all available when fewer) without
+	// displacing the primary or letting a large report exhaust the context cap.
+	producerBudget := modkit.MaxEvidencePairs - min(4, guardProof.Len())
+	addContext := func(x *evidence.Exchange, role evidence.Role, label string) {
+		if ev.Len() < producerBudget {
+			ev.AddExchange(x, role, label)
+		}
+	}
+	// Reserve comparison context before the report's many probe pairs fill the cap.
+	if softBase.FirstSnapshot != nil {
+		addContext(softBase.FirstSnapshot.Exchange, evidence.RoleBaseline, "unmodified value baseline")
+	}
+	var primary *evidence.Exchange
+	for i := 0; i+1 < len(results); i += 2 {
+		attack, control := results[i], results[i+1]
+		if attack == nil || control == nil {
+			continue
+		}
+		if first := attack.FirstSnapshot; first != nil {
+			if primary == nil {
+				primary = first.Exchange
+			} else {
+				addContext(first.Exchange, evidence.RoleAttack, "reported behavior probe")
+			}
+		}
+		if first := control.FirstSnapshot; first != nil {
+			addContext(first.Exchange, evidence.RoleControl, "behavior escape control")
+		}
+		for _, probe := range []*diffscan.Attack{attack, control} {
+			if last := probe.LastSnapshot; last != nil && last != probe.FirstSnapshot {
+				addContext(last.Exchange, evidence.RoleConfirmation, "behavior final confirmation")
+			}
+		}
+	}
+	result := &output.ResultEvent{
+		Evidence:           ev.Evidence(),
+		AdditionalEvidence: ev.Entries(),
+		URL:                urlx.String(),
+		Request:            string(ctx.Request().Raw()),
+		FuzzingParameter:   paramName,
 		Info: output.Info{
 			Severity:    severity.Info,
 			Description: report,
 		},
-	}}, nil
+	}
+	modkit.SetPrimaryEvidence(result, primary, evidence.RoleAttack, "selected behavior probe")
+	modkit.AppendEvidence(result, guardProof)
+	return []*output.ResultEvent{result}, nil
 }
 
 // buildBaselines creates soft, crude, and hard baselines.

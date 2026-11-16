@@ -15,7 +15,7 @@ import (
 // leaves the phase partial with targets_failed and browser_unavailable, rather
 // than "completed, 0 records".
 func TestSpideringLaunchFailureIsPartial(t *testing.T) {
-	r := &Runner{options: &types.Options{Silent: true}, scanLogger: database.NewScanLogger(nil, "")}
+	r := &Runner{options: &types.Options{Silent: true}, scanLogger: database.NewScanLogger(nil, "", "")}
 	tracker := r.beginPhase(context.Background(), string(PhaseSpidering), nil)
 	r.currentPhase.Store(tracker)
 

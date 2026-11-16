@@ -6,8 +6,10 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
+	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"go.uber.org/zap"
 )
 
@@ -18,6 +20,8 @@ type oracle struct {
 	statusPos int // status code when a tilde pattern matches
 	statusNeg int // status code when it doesn't match
 	tildes    []int
+	primary   *evidence.Exchange
+	context   *modkit.EvidenceCollector
 }
 
 // httpMethods to test during vulnerability detection, ordered by likelihood of success.
@@ -41,6 +45,7 @@ func sendProbe(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	method, path string,
+	receiptOut ...**evidence.Exchange,
 ) (int, error) {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), method)
 	if err != nil {
@@ -64,6 +69,9 @@ func sendProbe(
 		return 0, fmt.Errorf("nil response")
 	}
 
+	if len(receiptOut) > 0 && receiptOut[0] != nil {
+		*receiptOut[0] = http.CaptureEvidence(resp)
+	}
 	return resp.Response().StatusCode, nil
 }
 
@@ -100,7 +108,10 @@ func testMethodSuffix(
 	// Negative probe: tilde level 5+ should never exist
 	negPath := basePath + pathEscape(fmt.Sprintf("*%d*~5*", rand.Intn(90000)+10000)) + suffix
 	reqBudget.inc()
-	statusNeg, err := sendProbe(ctx, httpClient, method, negPath)
+	context := modkit.NewEvidenceCollector()
+	var negative *evidence.Exchange
+	statusNeg, err := sendProbe(ctx, httpClient, method, negPath, &negative)
+	context.AddExchange(negative, evidence.RoleControl, "Nonexistent tilde-level negative")
 	if err != nil {
 		return nil
 	}
@@ -112,7 +123,9 @@ func testMethodSuffix(
 		}
 		checkPath := basePath + pathEscape(fmt.Sprintf("*%d*~5*", rand.Intn(90000)+10000)) + suffix
 		reqBudget.inc()
-		checkStatus, err := sendProbe(ctx, httpClient, method, checkPath)
+		var stability *evidence.Exchange
+		checkStatus, err := sendProbe(ctx, httpClient, method, checkPath, &stability)
+		context.AddExchange(stability, evidence.RoleControl, fmt.Sprintf("Negative stability round %d", i+1))
 		if err != nil || checkStatus != statusNeg {
 			return nil // unstable
 		}
@@ -121,6 +134,7 @@ func testMethodSuffix(
 	// Positive probes: test tilde levels 1-4
 	var activeTildes []int
 	var statusPos int
+	var primary *evidence.Exchange
 
 	for tildeLevel := 1; tildeLevel <= 4; tildeLevel++ {
 		if reqBudget.exhausted() {
@@ -129,7 +143,8 @@ func testMethodSuffix(
 
 		posPath := basePath + pathEscape(fmt.Sprintf("*~%d*", tildeLevel)) + suffix
 		reqBudget.inc()
-		status, err := sendProbe(ctx, httpClient, method, posPath)
+		var positive *evidence.Exchange
+		status, err := sendProbe(ctx, httpClient, method, posPath, &positive)
 		if err != nil {
 			continue
 		}
@@ -137,6 +152,11 @@ func testMethodSuffix(
 		if status != statusNeg {
 			activeTildes = append(activeTildes, tildeLevel)
 			statusPos = status
+			if primary == nil {
+				primary = positive
+			} else {
+				context.AddExchange(positive, evidence.RoleAttack, "Additional positive tilde level")
+			}
 		}
 	}
 
@@ -158,5 +178,7 @@ func testMethodSuffix(
 		statusPos: statusPos,
 		statusNeg: statusNeg,
 		tildes:    activeTildes,
+		primary:   primary,
+		context:   context,
 	}
 }

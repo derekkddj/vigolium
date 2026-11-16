@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -136,7 +137,9 @@ func (m *Module) probeEndpoint(
 	p probe,
 	probePath string,
 	fp *notFoundFingerprint,
-) *output.ResultEvent {
+) (guardResult *output.ResultEvent) {
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(guardResult, guardProof) }()
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
@@ -228,14 +231,14 @@ func (m *Module) probeEndpoint(
 	// ResemblesCatchAllShell confirms the shell POSITIVELY from independent samples
 	// (site root + a random directory) via body similarity; a genuinely exposed
 	// dashboard is never ~equal to the homepage, so it costs no true positives.
-	if modkit.ResemblesCatchAllShell(scanCtx, ctx, httpClient, body) {
+	if modkit.ResemblesCatchAllShellWithEvidence(scanCtx, ctx, httpClient, body, guardProof) {
 		return nil
 	}
 
 	// Sub-directory catch-all guard: now that we probe under context-path prefixes,
 	// drop the finding if a nonexistent sibling under the same parent returns the
 	// same markers (a handler that 200s every child path).
-	if modkit.SiblingServesAnyMarker(scanCtx, ctx, httpClient, probePath, p.markers) {
+	if modkit.SiblingServesAnyMarkerWithEvidence(scanCtx, ctx, httpClient, probePath, p.markers, guardProof) {
 		return nil
 	}
 
@@ -245,14 +248,14 @@ func (m *Module) probeEndpoint(
 	// a canary at the probe's base directory (the web root for these single-segment
 	// paths) and drops only when the whole match is the reflected slug — the residual
 	// reflecting host that the shell guard above misses (e.g. a 302 root). See its doc.
-	if modkit.SlugReflectionFP(ctx, httpClient, probePath, matchedMarkers) {
+	if modkit.SlugReflectionFPWithEvidence(ctx, httpClient, probePath, matchedMarkers, guardProof) {
 		return nil
 	}
 
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,
 		Request:          string(modifiedRaw),
@@ -267,4 +270,6 @@ func (m *Module) probeEndpoint(
 			Reference:   []string{"https://learn.microsoft.com/en-us/aspnet/core/host-and-deploy/health-checks"},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+	return result
 }

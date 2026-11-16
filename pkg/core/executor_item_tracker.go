@@ -44,6 +44,10 @@ type itemTracker struct {
 	// re-served on every later run and freezes the durable cursor behind it.
 	panicked atomic.Bool
 	once     sync.Once
+	// runPending belongs to the Execute that admitted this item. Only the worker
+	// path attaches it; synchronous processItem and raw worker test fixtures do
+	// not have admission accounting to release.
+	runPending *atomic.Int64
 	// holdsSlot is true when the item was dequeued under an outstanding-item
 	// slot (the worker path) that complete() must give back.
 	holdsSlot bool
@@ -65,7 +69,7 @@ func (e *Executor) newItemTracker(ctx context.Context, item *work.WorkItem, hold
 		holdsSlot:  holdsSlot,
 		finished:   make(chan struct{}),
 	}
-	t.ctx = withResponseBufferGuard(ctx, &t.guard)
+	t.ctx = withResponseBufferGuard(withItemTracker(ctx, t), &t.guard)
 	if e.ledger != nil && item != nil && item.RecordUUID != "" {
 		t.prog = newItemProgress(e.ledger.size)
 	}
@@ -103,5 +107,10 @@ func (t *itemTracker) complete() {
 			<-e.pool.itemSlots
 		}
 		close(t.finished)
+		// Release admission last: zero means acknowledgement, stats, detached
+		// tasks and their feedback, and slot/buffer cleanup are all finished.
+		if t.runPending != nil {
+			t.runPending.Add(-1)
+		}
 	})
 }

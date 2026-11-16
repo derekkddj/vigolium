@@ -100,13 +100,15 @@ func (m *Module) ScanPerHost(
 	// wordlist entry. `unknownCode` is the error code this server uses for methods
 	// it doesn't implement; matching it means "not found", same as -32601.
 	var unknownCode int
+	controlProof := &mcpinfra.Proof{}
 	{
 		controlMethod := "vigolium-nonexistent-" + utils.RandomString(12)
-		body, _, err := client.PostRaw(mcpinfra.MarshalRequest(4999, controlMethod, map[string]any{}))
-		if err != nil || body == "" {
+		op, err := client.PostRawEvidence(mcpinfra.MarshalRequest(4999, controlMethod, map[string]any{}))
+		if err != nil || op.Body == "" {
 			return nil, nil
 		}
-		resp, perr := mcpinfra.ParseResponse(body)
+		controlProof.Control(op.Exchange)
+		resp, perr := mcpinfra.ParseResponse(op.Body)
 		if perr != nil || resp == nil {
 			return nil, nil
 		}
@@ -123,10 +125,11 @@ func (m *Module) ScanPerHost(
 
 	var findings []*output.ResultEvent
 	for i, method := range methodWordlist {
-		body, _, err := client.PostRaw(mcpinfra.MarshalRequest(5000+i, method, map[string]any{}))
-		if err != nil || body == "" {
+		op, err := client.PostRawEvidence(mcpinfra.MarshalRequest(5000+i, method, map[string]any{}))
+		if err != nil || op.Body == "" {
 			continue
 		}
+		body := op.Body
 		resp, err := mcpinfra.ParseResponse(body)
 		if err != nil || resp == nil {
 			continue
@@ -152,7 +155,10 @@ func (m *Module) ScanPerHost(
 			grade = output.EvidenceGradeObservation
 		}
 
-		findings = append(findings, &output.ResultEvent{
+		proof := mcpinfra.NewProof(op.Exchange)
+		proof.Context = controlProof.Context
+		proof.Payload = method
+		findings = append(findings, proof.Observation(&output.ResultEvent{
 			ModuleID:         ModuleID,
 			RecordKind:       kind,
 			EvidenceGrade:    grade,
@@ -169,7 +175,7 @@ func (m *Module) ScanPerHost(
 				Reference:   []string{"https://modelcontextprotocol.io/specification/2025-11-25"},
 			},
 			Metadata: map[string]any{"method": method, "negative_control_code": unknownCode, "method_invoked": !isError, "impact_confirmed": false},
-		})
+		}))
 	}
 	return findings, nil
 }

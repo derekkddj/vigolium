@@ -5,6 +5,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/vigolium/vigolium/pkg/evidence"
 )
 
 // FindingView is one finding as the tabular renderers (csv, junit, github)
@@ -19,23 +21,25 @@ import (
 // pkg/database imports this package, so the stored model cannot be named
 // directly; a pkg/cli test keeps these keys a subset of compactFindingView's.
 type FindingView struct {
-	ID              int64    `json:"id"`
-	FindingHash     string   `json:"finding_hash"`
-	Severity        string   `json:"severity"`
-	Confidence      string   `json:"confidence"`
-	ModuleID        string   `json:"module_id"`
-	ModuleName      string   `json:"module_name"`
-	Short           string   `json:"short"`
-	URL             string   `json:"url"`
-	Hostname        string   `json:"hostname"`
-	MatchedAt       []string `json:"matched_at"`
-	ScanUUID        string   `json:"scan_uuid"`
-	HTTPRecordUUIDs []string `json:"http_record_uuids"`
-	Status          string   `json:"status"`
-	CWEID           string   `json:"cwe_id"`
-	SourceFile      string   `json:"source_file"`
-	RepoName        string   `json:"repo_name"`
-	FoundAt         string   `json:"found_at"`
+	ID              int64            `json:"id"`
+	FindingHash     string           `json:"finding_hash"`
+	Severity        string           `json:"severity"`
+	Confidence      string           `json:"confidence"`
+	ModuleID        string           `json:"module_id"`
+	ModuleName      string           `json:"module_name"`
+	Short           string           `json:"short"`
+	URL             string           `json:"url"`
+	Hostname        string           `json:"hostname"`
+	MatchedAt       []string         `json:"matched_at"`
+	ScanUUID        string           `json:"scan_uuid"`
+	HTTPRecordUUIDs []string         `json:"http_record_uuids"`
+	Status          string           `json:"status"`
+	CWEID           string           `json:"cwe_id"`
+	SourceFile      string           `json:"source_file"`
+	RepoName        string           `json:"repo_name"`
+	FoundAt         string           `json:"found_at"`
+	Evidence        []evidence.Entry `json:"evidence"`
+	EvidenceStatus  string           `json:"evidence_status"`
 }
 
 // decodeFindingView reads one finding envelope's data. The stored row names

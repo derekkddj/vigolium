@@ -11,6 +11,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -100,7 +101,8 @@ func (m *Module) ScanPerInsertionPoint(
 	// HTML-breakout payload first and, only if the value persists and reflects but
 	// doesn't execute, retries with operator-chaining JS-string breakouts.
 	targets := retrieveCandidates(ctx, scanCtx.IsScanTarget)
-	dialog, probeURL, bodyUsed := m.confirmStored(ctx, ip, httpClient, payload, targets)
+	var receipts storedReceipts
+	dialog, probeURL, bodyUsed := m.confirmStored(ctx, ip, httpClient, payload, targets, &receipts)
 	if dialog == nil {
 		return nil, nil
 	}
@@ -109,7 +111,18 @@ func (m *Module) ScanPerInsertionPoint(
 	// executor's post-emit mark lands on a different key; mark the item's too.
 	scanCtx.MarkParamFound(ctx, ip.Name(), vulnClass)
 
-	return []*output.ResultEvent{m.buildResult(ctx, ip, payload, bodyUsed, probeURL, *dialog)}, nil
+	result := m.buildResult(ctx, ip, payload, bodyUsed, probeURL, *dialog)
+	ev := modkit.NewEvidenceCollector()
+	ev.AddExchange(receipts.retrieval, evidence.RoleConfirmation, "clean retrieval with persisted payload (not browser navigation)")
+	result.Evidence, result.AdditionalEvidence = ev.Evidence(), ev.Entries()
+	modkit.SetPrimaryEvidence(result, receipts.write, evidence.RoleAttack, "stored payload write")
+	return []*output.ResultEvent{result}, nil
+}
+
+// storedReceipts owns only the write/retrieval pair for one selected attempt.
+// Browser ProbeResult does not expose the later navigation's HTTP exchange.
+type storedReceipts struct {
+	write, retrieval *evidence.Exchange
 }
 
 // confirmStored stores an executable payload through ip, reloads the page, and
@@ -128,8 +141,9 @@ func (m *Module) confirmStored(
 	httpClient *http.Requester,
 	payload *Payload,
 	targets []string,
+	receiptOut ...*storedReceipts,
 ) (*spitolas.DialogEvent, string, string) {
-	dialog, probeURL, stored := m.injectAndConfirm(ctx, ip, httpClient, payload.Body, payload.Canary, targets)
+	dialog, probeURL, stored := m.injectAndConfirm(ctx, ip, httpClient, payload.Body, payload.Canary, targets, receiptOut...)
 	if !stored {
 		return nil, "", "" // nothing persisted/reflected — stop before extra writes
 	}
@@ -140,7 +154,7 @@ func (m *Module) confirmStored(
 	alert := "alert(`" + payload.Canary + "`)"
 	for _, q := range []byte{'\'', '"'} {
 		for _, body := range xssbreakout.JSStringPayloads(q, alert) {
-			d, pu, ok := m.injectAndConfirm(ctx, ip, httpClient, body, payload.Canary, targets)
+			d, pu, ok := m.injectAndConfirm(ctx, ip, httpClient, body, payload.Canary, targets, receiptOut...)
 			if ok && d != nil {
 				return d, pu, body
 			}
@@ -159,8 +173,13 @@ func (m *Module) injectAndConfirm(
 	httpClient *http.Requester,
 	bodyPayload, canary string,
 	targets []string,
+	receiptOut ...*storedReceipts,
 ) (*spitolas.DialogEvent, string, bool) {
-	if err := m.inject(ctx, ip, bodyPayload, httpClient); err != nil {
+	var receipts storedReceipts
+	if len(receiptOut) > 0 && receiptOut[0] != nil {
+		*receiptOut[0] = storedReceipts{}
+	}
+	if err := m.inject(ctx, ip, bodyPayload, httpClient, &receipts.write); err != nil {
 		return nil, "", false
 	}
 	// The stored value may render on a page other than the one that took the
@@ -168,11 +187,14 @@ func (m *Module) injectAndConfirm(
 	// each candidate (at most maxRetrieveCandidates) and confirm on the first
 	// that carries the canary.
 	for _, target := range targets {
-		body, err := m.retrieve(ctx, httpClient, target)
+		body, err := m.retrieve(ctx, httpClient, target, &receipts.retrieval)
 		if err != nil || !strings.Contains(body, canary) {
 			continue
 		}
 		dialog, probeURL := m.confirm(ctx, target, canary)
+		if dialog != nil && len(receiptOut) > 0 && receiptOut[0] != nil {
+			*receiptOut[0] = receipts
+		}
 		return dialog, probeURL, true
 	}
 	return nil, "", false
@@ -232,6 +254,7 @@ func (m *Module) inject(
 	ip httpmsg.InsertionPoint,
 	bodyPayload string,
 	httpClient *http.Requester,
+	receiptOut ...**evidence.Exchange,
 ) error {
 	raw := ip.BuildRequest([]byte(bodyPayload))
 	// BuildRequest produces well-formed raw, so wrap directly instead
@@ -242,6 +265,9 @@ func (m *Module) inject(
 		return err
 	}
 	if resp != nil {
+		if len(receiptOut) > 0 && receiptOut[0] != nil {
+			*receiptOut[0] = http.CaptureEvidence(resp)
+		}
 		resp.Close()
 	}
 	return nil
@@ -249,7 +275,7 @@ func (m *Module) inject(
 
 // retrieve performs a clean GET of target (an absolute URL), reusing the
 // original request's auth headers, and returns the response body.
-func (m *Module) retrieve(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, target string) (string, error) {
+func (m *Module) retrieve(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, target string, receiptOut ...**evidence.Exchange) (string, error) {
 	req := ctx.Request().Clone().
 		WithMethod("GET").
 		WithBody(nil).
@@ -278,6 +304,9 @@ func (m *Module) retrieve(ctx *httpmsg.HttpRequestResponse, httpClient *http.Req
 		return "", err
 	}
 	defer resp.Close()
+	if len(receiptOut) > 0 && receiptOut[0] != nil {
+		*receiptOut[0] = http.CaptureEvidence(resp)
+	}
 	return resp.Body().String(), nil
 }
 

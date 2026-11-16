@@ -176,9 +176,9 @@ func TestScanPerHost_AffectedDecoder(t *testing.T) {
 	assert.Contains(t, joined, "the route answered the tiny valid control as before")
 }
 
-// The evidence must never carry the probe body: a finding travels through the
-// database, the JSON envelope and the report.
-func TestEvidenceElidesTheProbeBody(t *testing.T) {
+// Explicit proof receipts retain the actual sent bytes. The prober's elided
+// comparison/display string must not replace or certify that receipt.
+func TestEvidenceRetainsCapturedProbeBody(t *testing.T) {
 	t.Parallel()
 	srv := modtest.Serve(t, brotliApp(serverOpts{affected: true, global: true}))
 
@@ -187,12 +187,19 @@ func TestEvidenceElidesTheProbeBody(t *testing.T) {
 	require.Len(t, res, 1)
 
 	r := res[0]
-	assert.Less(t, len(r.Request), 4096, "the 22 MiB probe body must be elided from the request evidence")
-	assert.Contains(t, r.Request, "more bytes of the probe body elided")
-	assert.Contains(t, r.Request, "Content-Length: 23068764", "the framing a reader needs is kept")
+	require.NotEmpty(t, r.Evidence)
+	primary := r.Evidence[0]
+	require.NotNil(t, primary.Exchange)
+	assert.True(t, primary.Primary)
+	assert.NoError(t, primary.Exchange.Validate())
+	assert.GreaterOrEqual(t, len(primary.Exchange.Request), node2shellinfra.ProbeBytes)
+	assert.Equal(t, string(primary.Exchange.Request), r.Request)
+	assert.NotContains(t, r.Request, "more bytes of the probe body elided")
+	assert.Contains(t, r.Request, "Content-Length: 23068764", "the emitted framing is kept")
 	assert.Contains(t, r.Request, "Expect: 100-continue")
-	for _, ev := range r.AdditionalEvidence {
-		assert.Less(t, len(ev), 8192)
+	for _, entry := range r.Evidence[1:] {
+		require.NotNil(t, entry.Exchange)
+		assert.NoError(t, entry.Exchange.Validate())
 	}
 }
 

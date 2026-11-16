@@ -8,8 +8,8 @@ import (
 	"sync"
 
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
-	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
@@ -57,6 +57,13 @@ func (e *Executor) observeProbeResponse(obs http.ObservedResponse) {
 	if pattern.Match(obs.RequestRaw) {
 		return
 	}
+	var receipt *evidence.Exchange
+	if obs.CaptureEvidence != nil {
+		receipt = obs.CaptureEvidence()
+		if receipt != nil && pattern.Match(receipt.Request) {
+			return
+		}
+	}
 
 	host := obs.Host
 	path := obs.URL
@@ -76,21 +83,19 @@ func (e *Executor) observeProbeResponse(obs http.ObservedResponse) {
 	}
 	e.corroboration.seen[key] = struct{}{}
 
-	evidence := strings.TrimSpace(pattern.FindString(body))
-	rawResp := httpmsg.BuildRawResponse(obs.Status, map[string]string{"Content-Type": obs.ContentType}, truncateForRecord(body))
+	matchedEvidence := strings.TrimSpace(pattern.FindString(body))
 
-	e.corroboration.hits = append(e.corroboration.hits, &output.ResultEvent{
-		ModuleID:      corroborationModuleID,
-		RecordKind:    output.RecordKindObservation,
-		EvidenceGrade: output.EvidenceGradeObservation,
-		Host:          host,
-		URL:           obs.URL,
-		Matched:       obs.URL,
-		Request:       string(obs.RequestRaw),
-		Response:      string(rawResp),
+	result := &output.ResultEvent{
+		ModuleID:       corroborationModuleID,
+		RecordKind:     output.RecordKindObservation,
+		EvidenceGrade:  output.EvidenceGradeObservation,
+		Host:           host,
+		URL:            obs.URL,
+		Matched:        obs.URL,
+		EvidenceStatus: "missing",
 		ExtractedResults: []string{
 			fmt.Sprintf("DBMS: %s", dbms),
-			"Matched: " + modkit.Truncate(evidence, 200),
+			"Matched: " + modkit.Truncate(matchedEvidence, 200),
 			fmt.Sprintf("HTTP status: %d", obs.Status),
 		},
 		Info: output.Info{
@@ -100,8 +105,14 @@ func (e *Executor) observeProbeResponse(obs http.ObservedResponse) {
 			Confidence:  severity.Tentative,
 			Tags:        []string{"injection", "sqli", "corroboration", "information-disclosure", "database-error"},
 		},
-		Metadata: map[string]any{"dbms": dbms, "status_code": obs.Status, "source": "active-probe-corroboration"},
-	})
+		Metadata: map[string]any{"dbms": dbms, "status_code": obs.Status, "source": "active-probe-corroboration", "response_preview": truncateForRecord(body)},
+	}
+	// The preview cap is presentation only. Without a real receipt, leave the
+	// HTTP proof missing instead of building a convincing synthetic 5xx pair.
+	if receipt != nil {
+		modkit.SetPrimaryEvidence(result, receipt, evidence.RoleObservation, "Observed probe response")
+	}
+	e.corroboration.hits = append(e.corroboration.hits, result)
 }
 
 // drainProbeCorroboration emits the collected corroboration observations. Called at

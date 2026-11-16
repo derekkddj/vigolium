@@ -2,10 +2,13 @@
 
 import { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import { AgGridReact } from 'ag-grid-react';
-import type { ColDef, RowClickedEvent, SelectionChangedEvent } from 'ag-grid-community';
+import type { ColDef, RowClickedEvent, SelectionChangedEvent, SortChangedEvent } from 'ag-grid-community';
 import { Shield, Globe, Box, Search, RefreshCw, List, Layers, ChevronRight, ChevronDown, X } from 'lucide-react';
 import { useFindings, useDeleteFinding } from '@/api/hooks';
-import { withDemoKey } from '@/api/client';
+import { useDetailSelection } from '@/hooks/useDetailSelection';
+import { DETAIL_LINK_CONTEXT } from '@/lib/detailSelection';
+import FindingsPagination from '@/components/shared/FindingsPagination';
+import { FINDING_SORT_FIELDS, FINDINGS_DEFAULT_COL_DEF, findingSortParams, preserveFindingResponseOrder } from '@/lib/findingsSorting';
 import { useToast } from '@/contexts/ToastContext';
 import type { Finding, FindingsQueryParams } from '@/api/types';
 import { FINDING_STATUSES } from '@/api/types';
@@ -199,7 +202,7 @@ export default function FindingsPage({ initialId }: { initialId?: number | null 
   const [moduleTypeFilter, setModuleTypeFilter] = useState('');
   const [findingSourceFilter, setFindingSourceFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
-  const [selectedFindingId, setSelectedFindingId] = useState<number | null>(initialId ?? null);
+  const { selectedId: selectedFindingId, selectDetail: navigateToFinding, projectKey } = useDetailSelection('finding', initialId);
   const [selectedRows, setSelectedRows] = useState<Finding[]>([]);
   const gridRef = useRef<AgGridReact<Finding>>(null);
   const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set(['scan_uuid']));
@@ -208,14 +211,21 @@ export default function FindingsPage({ initialId }: { initialId?: number | null 
   const deleteFinding = useDeleteFinding();
   const { toast } = useToast();
 
-  useEffect(() => {
-    setSelectedFindingId(initialId ?? null);
-  }, [initialId]);
+  const [paramsProject, setParamsProject] = useState(projectKey);
+  const projectChanged = paramsProject !== projectKey;
 
-  const navigateToFinding = useCallback((id: number | null) => {
-    setSelectedFindingId(id);
-    window.history.pushState(null, '', withDemoKey(id !== null ? `/findings/${id}` : '/findings'));
-  }, []);
+  useEffect(() => {
+    if (!projectChanged) return;
+    setParamsProject(projectKey);
+    setParams({ limit: PAGE_SIZE, offset: 0 });
+    setSearchInput('');
+    setSeverityFilter('');
+    setDomainFilter('');
+    setModuleFilter('');
+    setModuleTypeFilter('');
+    setFindingSourceFilter('');
+    setStatusFilter('');
+  }, [projectKey, projectChanged]);
 
   const handleDeleteSelected = useCallback(async () => {
     const ids = selectedRows.map((r) => r.id);
@@ -232,7 +242,7 @@ export default function FindingsPage({ initialId }: { initialId?: number | null 
   }, [selectedRows, deleteFinding, toast]);
 
   const queryParams = useMemo(
-    () => ({
+    () => projectChanged ? { limit: PAGE_SIZE, offset: 0 } : ({
       ...params,
       severity: severityFilter || undefined,
       search: searchInput || undefined,
@@ -242,10 +252,26 @@ export default function FindingsPage({ initialId }: { initialId?: number | null 
       finding_source: findingSourceFilter || undefined,
       status: statusFilter || undefined,
     }),
-    [params, severityFilter, searchInput, domainFilter, moduleFilter, moduleTypeFilter, findingSourceFilter, statusFilter]
+    [params, severityFilter, searchInput, domainFilter, moduleFilter, moduleTypeFilter, findingSourceFilter, statusFilter, projectChanged]
   );
 
-  const { data, isLoading, refetch, isFetching } = useFindings(queryParams);
+  const { data, isLoading, refetch, isFetching, isPlaceholderData, isError } = useFindings(queryParams);
+  const pageLoading = isLoading || isPlaceholderData || projectChanged;
+  const rows = useMemo(() => pageLoading ? [] : data?.data || [], [pageLoading, data]);
+  const postSortRows = useMemo(() => preserveFindingResponseOrder(rows), [rows]);
+
+  useEffect(() => {
+    setSelectedRows([]);
+    gridRef.current?.api?.deselectAll();
+  }, [queryParams, projectKey]);
+
+  const onSortChanged = useCallback((event: SortChangedEvent<Finding>) => {
+    if (projectChanged) return;
+    const { sort, order } = findingSortParams(event.api.getColumnState());
+    setParams((previous) => previous.sort === sort && previous.order === order
+      ? previous
+      : { ...previous, sort, order, offset: 0 });
+  }, [projectChanged]);
 
   const columnDefs = useMemo<ColDef<Finding>[]>(
     () => [
@@ -284,17 +310,21 @@ export default function FindingsPage({ initialId }: { initialId?: number | null 
     [columnDefs]
   );
 
-  const effectiveColumnDefs = useMemo(
-    () => columnDefs.map((c) => (!c.field ? c : { ...c, hide: hiddenColumns.has(c.field) })),
-    [columnDefs, hiddenColumns]
+  const effectiveColumnDefs = useMemo<ColDef<Finding>[]>(
+    () => columnDefs.map((c) => (!c.field ? c : {
+      ...c,
+      hide: hiddenColumns.has(c.field),
+      sortable: FINDING_SORT_FIELDS.has(c.field),
+      headerTooltip: FINDING_SORT_FIELDS.has(c.field) ? 'Order all matching findings across pages' : undefined,
+      sort: !projectChanged && c.field === params.sort && (params.order === 'asc' || params.order === 'desc') ? params.order : null,
+    })),
+    [columnDefs, hiddenColumns, params.sort, params.order, projectChanged]
   );
 
-  const currentPage = Math.floor((params.offset || 0) / PAGE_SIZE) + 1;
-  const totalPages = Math.ceil((data?.total || 0) / PAGE_SIZE);
-
   const goToPage = useCallback((page: number) => {
+    if (isFetching || pageLoading || page < 1) return;
     setParams((prev) => ({ ...prev, offset: (page - 1) * PAGE_SIZE }));
-  }, []);
+  }, [isFetching, pageLoading]);
 
   const resetOffset = () => setParams((p) => ({ ...p, offset: 0 }));
 
@@ -465,15 +495,21 @@ export default function FindingsPage({ initialId }: { initialId?: number | null 
             </div>
           )}
 
+          {isError && <p role="alert" className="px-3 py-2 text-xs" style={{ color: 'var(--v-accent)' }}>Could not load findings. Use Refresh to retry.</p>}
+
           {/* Table view */}
           {viewTab === 'table' && (
             <>
               <div className={`${AG_GRID_THEME} w-full flex-1`}>
                 <AgGridReact<Finding>
                   ref={gridRef}
-                  rowData={data?.data || []}
+                  rowData={rows}
                   columnDefs={effectiveColumnDefs}
-                  loading={isLoading}
+                  defaultColDef={FINDINGS_DEFAULT_COL_DEF}
+                  suppressMultiSort
+                  onSortChanged={onSortChanged}
+                  postSortRows={postSortRows}
+                  loading={pageLoading}
                   suppressCellFocus
                   animateRows
                   domLayout="normal"
@@ -484,17 +520,16 @@ export default function FindingsPage({ initialId }: { initialId?: number | null 
                 />
               </div>
 
-              {(data?.total || 0) > 0 && (
-                <div className="flex items-center justify-between px-3 py-1 border-t border-[#2e2b26] text-xs text-[#918175]">
-                  <span>
-                    {(params.offset || 0) + 1}-{Math.min((params.offset || 0) + PAGE_SIZE, data?.total || 0)}/{data?.total || 0}
-                  </span>
-                  <div className="flex items-center gap-1">
-                    <button onClick={() => goToPage(currentPage - 1)} disabled={currentPage <= 1} className="hover:text-[#7fd962] disabled:opacity-30 px-1">{'<'}</button>
-                    <span className="px-1">{currentPage}/{totalPages}</span>
-                    <button onClick={() => goToPage(currentPage + 1)} disabled={currentPage >= totalPages} className="hover:text-[#7fd962] disabled:opacity-30 px-1">{'>'}</button>
-                  </div>
-                </div>
+              {data && (data.total > 0 || data.has_more) && (
+                <FindingsPagination
+                  offset={queryParams.offset || 0}
+                  pageSize={PAGE_SIZE}
+                  returned={rows.length}
+                  total={data.total}
+                  hasMore={data.has_more}
+                  busy={isFetching || pageLoading}
+                  onPageChange={goToPage}
+                />
               )}
             </>
           )}
@@ -502,26 +537,25 @@ export default function FindingsPage({ initialId }: { initialId?: number | null 
           {/* Grouped by host view */}
           {viewTab === 'by-host' && (
             <>
-              {isLoading ? (
+              {pageLoading ? (
                 <div className="p-3 text-xs text-[#918175]">loading...</div>
               ) : (
                 <GroupedByHostView
-                  findings={data?.data || []}
+                  findings={rows}
                   onSelectFinding={(id) => navigateToFinding(selectedFindingId === id ? null : id)}
                   selectedFindingId={selectedFindingId}
                 />
               )}
-              {(data?.total || 0) > 0 && (
-                <div className="flex items-center justify-between px-3 py-1 border-t border-[#2e2b26] text-xs text-[#918175]">
-                  <span>
-                    {(params.offset || 0) + 1}-{Math.min((params.offset || 0) + PAGE_SIZE, data?.total || 0)}/{data?.total || 0}
-                  </span>
-                  <div className="flex items-center gap-1">
-                    <button onClick={() => goToPage(currentPage - 1)} disabled={currentPage <= 1} className="hover:text-[#7fd962] disabled:opacity-30 px-1">{'<'}</button>
-                    <span className="px-1">{currentPage}/{totalPages}</span>
-                    <button onClick={() => goToPage(currentPage + 1)} disabled={currentPage >= totalPages} className="hover:text-[#7fd962] disabled:opacity-30 px-1">{'>'}</button>
-                  </div>
-                </div>
+              {data && (data.total > 0 || data.has_more) && (
+                <FindingsPagination
+                  offset={queryParams.offset || 0}
+                  pageSize={PAGE_SIZE}
+                  returned={rows.length}
+                  total={data.total}
+                  hasMore={data.has_more}
+                  busy={isFetching || pageLoading}
+                  onPageChange={goToPage}
+                />
               )}
             </>
           )}
@@ -529,7 +563,8 @@ export default function FindingsPage({ initialId }: { initialId?: number | null 
 
         {/* Detail panel */}
         {selectedFindingId !== null && (
-          <div className="w-1/2">
+          <div className="w-1/2 flex flex-col min-h-0">
+            <p role="note" className="px-3 py-1 text-xs text-[#918175] border-b border-[#2e2b26]">{DETAIL_LINK_CONTEXT}</p>
             <FindingDetailPanel
               findingId={selectedFindingId}
               onClose={() => navigateToFinding(null)}

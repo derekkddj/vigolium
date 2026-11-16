@@ -238,17 +238,10 @@ func TestRedirectChainHopsNilOnPlainResponse(t *testing.T) {
 	}
 }
 
-// TestClusteringDropsRedirectLinkage pins the reason the executor sets
-// NoClustering whenever RecordRedirectChain is on.
-//
-// The clusterer caches a flattened SNAPSHOT of the response and rebuilds a
-// fresh single-response chain from it, so resp.Request.Response — the only
-// thing linking a response to the hop before it — is gone. Without the opt-out,
-// hop recording would work for the first request to a URL and silently produce
-// nothing for every repeat inside the cache TTL, which is far worse than not
-// working at all. If this test ever starts failing because the cache learned to
-// carry the chain, the executor's NoClustering can be reconsidered.
-func TestClusteringDropsRedirectLinkage(t *testing.T) {
+// The sending caller retains its actual chain and receipt. Cache hits remain
+// flattened observations, not another execution; baseline hop recording still
+// disables clustering so repeated scans do not silently lose redirect context.
+func TestClusteringOnlyCacheHitsDropRedirectLinkage(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/one", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/end", http.StatusFound)
@@ -270,12 +263,22 @@ func TestClusteringDropsRedirectLinkage(t *testing.T) {
 	}
 	defer chain.Close()
 
-	// The final response still arrives intact — only the linkage is lost.
 	if got := chain.Response().StatusCode; got != http.StatusOK {
 		t.Errorf("status = %d, want 200", got)
 	}
-	if WasRedirected(chain) {
-		t.Error("clustered chain reports redirect linkage; the executor's NoClustering opt-out may no longer be needed")
+	if !WasRedirected(chain) {
+		t.Error("sending caller lost the actual redirect linkage")
+	}
+	cached, _, err := r.Execute(makeTestRR(t, srv.URL+"/one"), Options{})
+	if err != nil {
+		t.Fatalf("cached Execute: %v", err)
+	}
+	defer cached.Close()
+	if got := cached.Response().StatusCode; got != http.StatusOK {
+		t.Errorf("cached status = %d, want 200", got)
+	}
+	if WasRedirected(cached) {
+		t.Error("cache observation fabricated a new redirect chain")
 	}
 }
 

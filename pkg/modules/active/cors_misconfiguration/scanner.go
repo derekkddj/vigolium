@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -299,14 +300,15 @@ func (m *Module) ScanPerHost(
 	return m.ScanPerRequest(ctx, httpClient, scanCtx)
 }
 
-// corsHeaders sends a request carrying the given Origin and returns the response
-// status and the two CORS headers. NoClustering bypasses the requester's
-// short-lived response cache so confirmation replays actually re-hit the server.
+// corsHeaders sends a request carrying the given Origin and returns the CORS
+// signal together with an owned receipt selected before closing the chain. The
+// clean baseline cannot prove a mutated Origin.
+// NoClustering bypasses caching so confirmation replays re-hit the server.
 func corsHeaders(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	origin string,
-) (status int, acao, acac string, rawReq []byte, ok bool) {
+) (status int, acao, acac string, exchange *evidence.Exchange, ok bool) {
 	raw, err := httpmsg.AddOrReplaceHeader(ctx.Request().Raw(), "Origin", origin)
 	if err != nil {
 		return 0, "", "", nil, false
@@ -316,16 +318,16 @@ func corsHeaders(
 	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
 	resp, _, err := httpClient.Execute(req, http.Options{NoClustering: true})
 	if err != nil {
-		return 0, "", "", raw, false
+		return 0, "", "", nil, false
 	}
 	defer resp.Close()
 	if resp.Response() == nil {
-		return 0, "", "", raw, false
+		return 0, "", "", nil, false
 	}
 	return resp.Response().StatusCode,
 		resp.Response().Header.Get("Access-Control-Allow-Origin"),
 		resp.Response().Header.Get("Access-Control-Allow-Credentials"),
-		raw,
+		http.CaptureEvidence(resp),
 		true
 }
 
@@ -341,7 +343,7 @@ func (m *Module) runProbe(
 	probe corsProbe,
 	origin string,
 ) (*output.ResultEvent, error) {
-	status, acao, acac, modifiedRaw, ok := corsHeaders(ctx, httpClient, origin)
+	status, acao, acac, matchedExchange, ok := corsHeaders(ctx, httpClient, origin)
 	if !ok {
 		return nil, nil
 	}
@@ -365,6 +367,10 @@ func (m *Module) runProbe(
 		return nil, nil
 	}
 
+	ev := modkit.NewEvidenceCollector()
+	// Stored input strings are context, not a newly captured probe receipt.
+	ev.AddSupplied(evidence.RoleBaseline, "baseline (unmodified Origin)", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
+
 	// Negative control for selective probes: a wholly-unrelated origin must NOT be
 	// reflected. If it is, the server reflects arbitrary origins (reported by the
 	// Reflected Origin probe), and this narrower structural signal would be a
@@ -372,8 +378,12 @@ func (m *Module) runProbe(
 	// of the control; an inconclusive fetch leaves the primary match standing.
 	if probe.selective {
 		control := "https://" + utils.RandomString(12) + ".com"
-		if _, ca, _, _, cok := corsHeaders(ctx, httpClient, control); cok && ca == control {
-			return nil, nil
+		_, ca, _, controlExchange, cok := corsHeaders(ctx, httpClient, control)
+		if cok {
+			ev.AddExchange(controlExchange, evidence.RoleControl, "unrelated-Origin negative control")
+			if ca == control {
+				return nil, nil
+			}
 		}
 	}
 
@@ -387,10 +397,11 @@ func (m *Module) runProbe(
 		host := ctx.Service().Host()
 		confirmed, err := modkit.ConfirmReflection(2, func(canary string) (bool, error) {
 			o := probe.canaryOrigin(host, canary)
-			st, a, _, _, fok := corsHeaders(ctx, httpClient, o)
+			st, a, _, confirmExchange, fok := corsHeaders(ctx, httpClient, o)
 			if !fok {
 				return false, fmt.Errorf("cors confirm fetch failed")
 			}
+			ev.AddExchange(confirmExchange, evidence.RoleConfirmation, "fresh-Origin confirmation")
 			return st >= 200 && st < 300 && a == o, nil
 		})
 		if err == nil && !confirmed {
@@ -400,7 +411,8 @@ func (m *Module) runProbe(
 		// Fixed-value (null / wildcard+creds): re-issue the same origin and require
 		// the signal to reproduce identically. Drop only on a clean, completed
 		// re-check that no longer matches.
-		if st2, a2, c2, _, ok2 := corsHeaders(ctx, httpClient, origin); ok2 {
+		if st2, a2, c2, confirmExchange, ok2 := corsHeaders(ctx, httpClient, origin); ok2 {
+			ev.AddExchange(confirmExchange, evidence.RoleConfirmation, "same-Origin reproducibility confirmation")
 			reproduces := st2 >= 200 && st2 < 300 && a2 == acao && c2 == acac
 			if !reproduces {
 				return nil, nil
@@ -410,10 +422,11 @@ func (m *Module) runProbe(
 
 	target := ctx.Target()
 
-	return &output.ResultEvent{
-		URL:     target,
-		Matched: target,
-		Request: string(modifiedRaw),
+	result := &output.ResultEvent{
+		URL:                target,
+		Matched:            target,
+		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
 		ExtractedResults: []string{
 			fmt.Sprintf("ACAO: %s", acao),
 			fmt.Sprintf("ACAC: %s", acac),
@@ -426,5 +439,7 @@ func (m *Module) runProbe(
 			Confidence:  severity.Certain,
 			Reference:   []string{"https://portswigger.net/web-security/cors"},
 		},
-	}, nil
+	}
+	modkit.SetPrimaryEvidence(result, matchedExchange, evidence.RoleAttack, "matched Origin probe")
+	return result, nil
 }

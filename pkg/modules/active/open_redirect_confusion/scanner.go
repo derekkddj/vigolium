@@ -10,6 +10,7 @@ import (
 
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/active/open_redirect"
@@ -129,7 +130,7 @@ func (m *Module) scanParam(
 	urlx *urlutil.URL,
 	decoy string,
 	httpClient *http.Requester,
-) ([]*output.ResultEvent, bool) {
+) (results []*output.ResultEvent, fatalResult bool) {
 	hit, idx, ok, fatal := m.runLadder(ctx, ip, decoy, probeEffective, httpClient)
 	if fatal {
 		return nil, true
@@ -144,8 +145,9 @@ func (m *Module) scanParam(
 	// coincidental match does not. Replaying just the winner (instead of re-running
 	// the whole ladder) confirms the same quirk reproducibly and avoids ~ladder×rounds
 	// wasted requests.
+	ev := modkit.NewEvidenceCollector()
 	confirmed, cerr := modkit.ConfirmReflection(confirmRounds, func(canary string) (bool, error) {
-		matched, fatal := m.replayPayload(ctx, ip, decoy, canary+".com", idx, httpClient)
+		matched, fatal := m.replayPayload(ctx, ip, decoy, canary+".com", idx, httpClient, ev)
 		if fatal {
 			return false, hosterrors.ErrUnresponsiveHost
 		}
@@ -157,12 +159,19 @@ func (m *Module) scanParam(
 		return nil, false
 	}
 
+	defer func() {
+		if len(results) > 0 {
+			modkit.SetPrimaryEvidence(results[0], hit.exchange, evidence.RoleAttack, "authority-confusion redirect")
+		}
+	}()
 	return []*output.ResultEvent{{
-		URL:              urlx.String(),
-		Request:          hit.request,
-		Response:         hit.responseHeaders,
-		FuzzingParameter: ip.Name(),
-		ExtractedResults: []string{hit.payload, hit.label},
+		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
+		URL:                urlx.String(),
+		Request:            hit.request,
+		Response:           hit.responseHeaders,
+		FuzzingParameter:   ip.Name(),
+		ExtractedResults:   []string{hit.payload, hit.label},
 		Info: output.Info{
 			Description: fmt.Sprintf(
 				"Open redirect via URL-parser authority confusion (%s): a validator that trusts %q is bypassed and the redirect target is attacker-controlled.",
@@ -180,6 +189,7 @@ type ladderHit struct {
 	label           string
 	request         string
 	responseHeaders string
+	exchange        *evidence.Exchange
 }
 
 // runLadder injects each authority-confusion payload (decoy vs effective) and
@@ -194,12 +204,13 @@ func (m *Module) runLadder(
 ) (ladderHit, int, bool, bool) {
 	re := open_redirect.DomainRedirectRegex(effective)
 	for i, p := range infra.AuthorityConfusionPayloads(decoy, effective) {
-		matched, raw, headers, fatal := m.sendAndMatch(ctx, ip, p.Value, re, httpClient)
+		var x *evidence.Exchange
+		matched, raw, headers, fatal := m.sendAndMatch(ctx, ip, p.Value, re, httpClient, &x)
 		if fatal {
 			return ladderHit{}, 0, false, true
 		}
 		if matched {
-			return ladderHit{payload: p.Value, label: p.Label, request: raw, responseHeaders: headers}, i, true, false
+			return ladderHit{payload: p.Value, label: p.Label, request: raw, responseHeaders: headers, exchange: x}, i, true, false
 		}
 	}
 	return ladderHit{}, 0, false, false
@@ -215,13 +226,18 @@ func (m *Module) replayPayload(
 	decoy, effective string,
 	idx int,
 	httpClient *http.Requester,
+	collectors ...*modkit.EvidenceCollector,
 ) (matched bool, fatal bool) {
 	payloads := infra.AuthorityConfusionPayloads(decoy, effective)
 	if idx < 0 || idx >= len(payloads) {
 		return false, false
 	}
 	re := open_redirect.DomainRedirectRegex(effective)
-	matched, _, _, fatal = m.sendAndMatch(ctx, ip, payloads[idx].Value, re, httpClient)
+	var x *evidence.Exchange
+	matched, _, _, fatal = m.sendAndMatch(ctx, ip, payloads[idx].Value, re, httpClient, &x)
+	for _, ev := range collectors {
+		ev.AddExchange(x, evidence.RoleConfirmation, "fresh-domain redirect reproduction")
+	}
 	return matched, fatal
 }
 
@@ -235,6 +251,7 @@ func (m *Module) sendAndMatch(
 	payload string,
 	re *regexp.Regexp,
 	httpClient *http.Requester,
+	exchanges ...**evidence.Exchange,
 ) (matched bool, request string, headers string, fatal bool) {
 	fuzzedRaw := ip.BuildRequest([]byte(payload))
 	// BuildRequest produces well-formed raw, so wrap directly instead
@@ -249,6 +266,12 @@ func (m *Module) sendAndMatch(
 		return false, "", "", false
 	}
 	defer resp.Close()
+	x := http.CaptureEvidence(resp)
+	for _, selected := range exchanges {
+		if selected != nil {
+			*selected = x.Clone()
+		}
+	}
 
 	open_redirect.CheckRedirectOutput(resp, func(nextLoc string) bool {
 		if re.MatchString(nextLoc) {

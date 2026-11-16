@@ -2,6 +2,7 @@ package http
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"strconv"
@@ -111,15 +112,19 @@ func snapshotResponse(resp *httpUtils.ResponseChain, duration time.Duration) *Ca
 		cr.Header.Del("Content-Encoding")
 		cr.Header.Del("Content-Length")
 		cr.Header.Del("Transfer-Encoding")
-		// Retain a shallow copy of the request with Body and Response nilled: the
+		// Retain owned request metadata with Body and Response nilled: the
 		// response dump only reads Method/URL/Proto, while the original request's
 		// .Response pins the entire redirect chain (each prior response + body) for
 		// the cache entry's lifetime, and .Body can pin a sent request body.
 		if r.Request != nil {
-			reqCopy := *r.Request
+			// Request headers/URL must not alias the leader's live chain, nor
+			// retain the request's cancellation/trace context for the cache TTL.
+			reqCopy := r.Request.Clone(context.Background())
 			reqCopy.Body = nil
+			reqCopy.GetBody = nil
 			reqCopy.Response = nil
-			cr.Request = &reqCopy
+			// Cached response headers/body are normalized, not a fresh execution.
+			cr.Request = reqCopy.WithContext(context.WithValue(context.Background(), captureContextKey{}, &captureContext{cached: true}))
 		}
 	}
 
@@ -149,6 +154,12 @@ func (c *CachedResponse) ToResponseChain() *httpUtils.ResponseChain {
 		header = make(http.Header)
 	}
 
+	// Each returned view owns its request metadata too: a caller may mutate
+	// headers/URL without rewriting another observation or the cached snapshot.
+	var request *http.Request
+	if c.Request != nil {
+		request = c.Request.Clone(c.Request.Context())
+	}
 	// Build a synthetic http.Response with body from cache
 	resp := &http.Response{
 		StatusCode:    c.StatusCode,
@@ -159,7 +170,7 @@ func (c *CachedResponse) ToResponseChain() *httpUtils.ResponseChain {
 		Close:         c.Close,
 		Body:          io.NopCloser(bytes.NewReader(bodyBytes)),
 		ContentLength: int64(len(bodyBytes)),
-		Request:       c.Request,
+		Request:       request,
 	}
 
 	chain := httpUtils.NewResponseChain(resp, MaxBodyRead)
@@ -174,8 +185,9 @@ func (c *CachedResponse) ToResponseChain() *httpUtils.ResponseChain {
 
 // singleflightResult wraps the data returned through singleflight.
 type singleflightResult struct {
-	cached *CachedResponse
-	err    error
+	cached   *CachedResponse
+	original *httpUtils.ResponseChain // returned only to the caller that sent it
+	err      error
 }
 
 // RequestClusterer deduplicates concurrent identical HTTP requests using
@@ -285,8 +297,12 @@ func (rc *RequestClusterer) Execute(
 		rc.mu.Unlock()
 	}
 
-	// Layer 2: singleflight clustering
+	// Layer 2: singleflight clustering. The executing caller keeps its actual
+	// chain; only followers/cache hits receive normalized observations. Otherwise
+	// even the first send would lose its replayable request body and receipt.
+	executed := false
 	resultIface, err, shared := rc.group.Do(key, func() (interface{}, error) {
+		executed = true
 		resp, duration, execErr := doExecute(input, opts)
 		if execErr != nil {
 			return &singleflightResult{err: execErr}, nil
@@ -294,12 +310,11 @@ func (rc *RequestClusterer) Execute(
 
 		// Snapshot before the primary caller closes the chain
 		cached := snapshotResponse(resp, duration)
-		resp.Close()
 
 		// Store in cache under the byte budget (skips bodies too large to retain).
 		rc.admitToCache(key, cached)
 
-		return &singleflightResult{cached: cached}, nil
+		return &singleflightResult{cached: cached, original: resp}, nil
 	})
 
 	if err != nil {
@@ -319,6 +334,9 @@ func (rc *RequestClusterer) Execute(
 	// The singleflight `shared` flag is true for ALL callers (including the one that
 	// executed the function) when multiple callers waited. We return real duration
 	// from the cached result — which is fine since timing modules need the actual RTT.
+	if executed {
+		return result.original, result.cached.Duration, nil
+	}
 	return result.cached.ToResponseChain(), result.cached.Duration, nil
 }
 

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -222,13 +223,13 @@ func (m *Module) checkOrigin(
 	}
 
 	target := ctx.Target()
-	evidence := []string{
+	extracted := []string{
 		fmt.Sprintf("CDN Host: %s", cdnHost),
 		fmt.Sprintf("Origin URL: %s", originURL),
 		fmt.Sprintf("Missing headers at origin: %s", strings.Join(missingHeaders, ", ")),
 	}
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:     target,
 		Matched: target,
 		Request: string(modifiedRaw),
@@ -237,7 +238,7 @@ func (m *Module) checkOrigin(
 		// still open here (deferred Close), so capture it as the finding's response
 		// rather than letting the executor backfill an unrelated baseline.
 		Response:         resp.FullResponseString(),
-		ExtractedResults: evidence,
+		ExtractedResults: extracted,
 		Info: output.Info{
 			Name:        "Cloud Origin Bypass: Missing Security Headers",
 			Description: fmt.Sprintf("Cloud storage origin %s is directly reachable and missing %d security header(s) present on CDN: %s", parsed.Host, len(missingHeaders), strings.Join(missingHeaders, ", ")),
@@ -247,4 +248,6 @@ func (m *Module) checkOrigin(
 			Reference:   []string{"https://owasp.org/www-project-web-security-testing-guide/"},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleAttack, "selected probe")
+	return result
 }

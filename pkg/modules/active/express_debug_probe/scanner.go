@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -102,7 +103,8 @@ func (m *Module) ScanPerRequest(
 	}
 
 	// Fingerprint 404 response body hash
-	notFoundHash := get404Hash(ctx, httpClient)
+	var notFoundReceipt *evidence.Exchange
+	notFoundHash := get404Hash(ctx, httpClient, &notFoundReceipt)
 
 	var results []*output.ResultEvent
 	target := ctx.Target()
@@ -120,6 +122,13 @@ func (m *Module) ScanPerRequest(
 	// Probe 3: Type mismatch on numeric path segments
 	if rs := probeTypeMismatch(ctx, httpClient, target, host, notFoundHash); len(rs) > 0 {
 		results = append(results, rs...)
+	}
+
+	for _, result := range results {
+		ev := modkit.NewEvidenceCollector()
+		ev.AddExchange(notFoundReceipt, evidence.RoleControl, "known-missing path fingerprint")
+		result.Evidence = append(result.Evidence, ev.Evidence()...)
+		result.AdditionalEvidence = append(result.AdditionalEvidence, ev.Entries()...)
 	}
 
 	// All three probes prove the SAME signal — this host leaks debug info — so
@@ -175,7 +184,7 @@ func probeRandomEndpoint(
 
 	return buildResult(target, host, "Random 404 Endpoint", probePath,
 		"Default error handler leaks debug information",
-		evidence, string(probeRaw), resp.FullResponseString())
+		evidence, string(probeRaw), resp.FullResponseString(), http.CaptureEvidence(resp))
 }
 
 // probeMalformedJSON sends a POST with malformed JSON to trigger parsing errors.
@@ -217,7 +226,7 @@ func probeMalformedJSON(
 	path := ctx.Request().Path()
 	return buildResult(target, host, "Malformed JSON", path,
 		"Malformed JSON body triggers verbose error response",
-		evidence, string(probeRaw), resp.FullResponseString())
+		evidence, string(probeRaw), resp.FullResponseString(), http.CaptureEvidence(resp))
 }
 
 // probeTypeMismatch replaces numeric path segments with non-numeric values.
@@ -276,7 +285,7 @@ func probeTypeMismatch(
 
 	results = append(results, buildResult(target, host, "Type Mismatch", mutatedPath,
 		"Type-mismatch parameter triggers verbose error response",
-		evidence, string(probeRaw), resp.FullResponseString()))
+		evidence, string(probeRaw), resp.FullResponseString(), http.CaptureEvidence(resp)))
 
 	return results
 }
@@ -324,7 +333,7 @@ func analyzeErrorResponse(body string) []string {
 }
 
 // get404Hash fetches a known-missing path to fingerprint the 404 page.
-func get404Hash(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) string {
+func get404Hash(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, receipts ...**evidence.Exchange) string {
 	notFoundPath := "/vigolium-nonexistent-path-404-check"
 	raw, err := httpmsg.SetPath(ctx.Request().Raw(), notFoundPath)
 	if err != nil {
@@ -341,17 +350,20 @@ func get404Hash(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) st
 	}
 	defer resp.Close()
 
+	if len(receipts) > 0 {
+		*receipts[0] = http.CaptureEvidence(resp)
+	}
 	return utils.Sha1(resp.Body().String())
 }
 
-func buildResult(target, host, probeName, probePath, desc string, evidence []string, request, response string) *output.ResultEvent {
+func buildResult(target, host, probeName, probePath, desc string, details []string, request, response string, receipts ...*evidence.Exchange) *output.ResultEvent {
 	extracted := []string{
 		fmt.Sprintf("Probe: %s", probeName),
 		fmt.Sprintf("Endpoint: %s", probePath),
 	}
-	extracted = append(extracted, evidence...)
+	extracted = append(extracted, details...)
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		ModuleID:         ModuleID,
 		Host:             host,
 		URL:              target,
@@ -371,4 +383,13 @@ func buildResult(target, host, probeName, probePath, desc string, evidence []str
 			},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, firstReceipt(receipts), evidence.RoleObservation, "selected observation")
+	return result
+}
+
+func firstReceipt(receipts []*evidence.Exchange) *evidence.Exchange {
+	if len(receipts) > 0 {
+		return receipts[0]
+	}
+	return nil
 }

@@ -2,17 +2,15 @@ package database
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"strings"
+	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 )
 
-// TestOverwriteRecordResponseBody verifies the response body is replaced in
-// place and every derived field (hash, norm hash, words, content length) is
-// recomputed consistently.
+// TestOverwriteRecordResponseBody verifies raw transformations are rejected
+// without changing bytes, response hashes, metadata or timestamps.
 func TestOverwriteRecordResponseBody(t *testing.T) {
 	db := newTestDB(t)
 	repo := NewRepository(db)
@@ -42,8 +40,10 @@ func TestOverwriteRecordResponseBody(t *testing.T) {
 	newResp := origResp.WithRemovedHeader("Content-Encoding").WithBody([]byte(beaut))
 	newRaw := newResp.Raw()
 
-	if err := repo.OverwriteRecordResponseBody(ctx, uuid, newRaw); err != nil {
-		t.Fatalf("OverwriteRecordResponseBody: %v", err)
+	// A derived representation must not change the wire capture, even when
+	// the record is not yet referenced by a finding.
+	if err := repo.OverwriteRecordResponseBody(ctx, uuid, newRaw); !errors.Is(err, ErrImmutableRecordExchange) {
+		t.Fatalf("OverwriteRecordResponseBody should reject transformation: %v", err)
 	}
 
 	after, err := repo.GetRecordByUUID(ctx, uuid)
@@ -51,38 +51,11 @@ func TestOverwriteRecordResponseBody(t *testing.T) {
 		t.Fatalf("GetRecordByUUID(after): %v", err)
 	}
 
-	// Raw response replaced exactly.
-	if string(after.RawResponse) != string(newRaw) {
-		t.Errorf("RawResponse not replaced with the new raw")
+	if !reflect.DeepEqual(before, after) {
+		t.Fatal("rejected analysis transformation changed stored HTTP data")
 	}
-	// Response hash = sha256(newRaw).
-	want := sha256.Sum256(newRaw)
-	if after.ResponseHash != hex.EncodeToString(want[:]) {
-		t.Errorf("ResponseHash = %q, want sha256(newRaw)", after.ResponseHash)
-	}
-	// Content length = new body length.
-	if after.ResponseContentLength != int64(len(newResp.Body())) {
-		t.Errorf("ResponseContentLength = %d, want %d", after.ResponseContentLength, len(newResp.Body()))
-	}
-	// Words recomputed against the new body + headers.
-	wantWords := countResponseWords(newResp.Body(), newResp.Headers())
-	if after.ResponseWords != wantWords {
-		t.Errorf("ResponseWords = %d, want %d", after.ResponseWords, wantWords)
-	}
-	// Derived fields actually changed from the pre-overwrite values.
-	if after.ResponseHash == before.ResponseHash {
-		t.Error("ResponseHash should change after overwrite")
-	}
-	if after.ResponseNormHash == before.ResponseNormHash {
-		t.Error("ResponseNormHash should be recomputed")
-	}
-	// Path/URL are preserved (used for the norm hash).
-	if after.Path != before.Path || after.URL != before.URL {
-		t.Errorf("Path/URL must be preserved: before %q/%q after %q/%q", before.Path, before.URL, after.Path, after.URL)
-	}
-	// The stored response no longer carries Content-Encoding.
-	if strings.Contains(strings.ToLower(string(after.RawResponse)), "content-encoding") {
-		t.Error("overwritten response should not carry Content-Encoding")
+	if err := repo.OverwriteRecordResponseBody(ctx, uuid, before.RawResponse); err != nil {
+		t.Fatalf("identical overwrite should be a no-op: %v", err)
 	}
 }
 

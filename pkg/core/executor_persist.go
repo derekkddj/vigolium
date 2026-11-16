@@ -39,29 +39,24 @@ func (e *Executor) saveToDatabase(ctx context.Context, item *work.WorkItem, req 
 	if e.repo == nil {
 		return
 	}
-	if item.RecordUUID != "" {
-		// Item maps to an existing DB record — reuse its UUID (skip insert) so
-		// findings link to it instead of creating a duplicate record. Counted as
-		// stored: the question Stored() answers is "is this input in the store",
-		// and for a record that CAME from the store the answer is yes.
-		e.stored.Add(1)
-		e.caches.requestUUIDs.Store(req.Request().ID(), item.RecordUUID)
-
-		// Backfill the response for records stored as request-only stubs (e.g.
-		// endpoints synthesized from a discovered OpenAPI/Swagger spec). The
-		// executor just fetched a real baseline to scan the endpoint; persist it
-		// so the route shows its actual status/body instead of staying at
-		// status 0 with an empty response in the traffic view. item.Request is
-		// the untouched stub (fetchBaseline returns a copy via
-		// WithResponse), so a nil response there marks a stub even though req now
-		// carries one. The repo update is a no-op once the record has a response.
-		if item.Request != nil && item.Request.Response() == nil && req.Response() != nil {
-			if err := e.repo.BackfillRecordResponse(ctx, item.RecordUUID, req); err != nil {
-				zap.L().Debug("Failed to backfill stub record response",
-					zap.String("uuid", item.RecordUUID), zap.Error(err))
-			}
+	// Analysis projections may be truncated; persist the owned original pair.
+	analysisHash := req.Request().ID()
+	if snapshot := req.Evidence(); snapshot != nil && !item.StaticMeta {
+		if original, err := httpmsg.FromEvidenceExchange(snapshot); err == nil {
+			original = original.WithResponse(findingResponse(string(snapshot.Response), req.Response()))
+			req = original.WithEvidence(snapshot)
 		}
-		return
+	}
+	changedDBInput := false
+	if item.RecordUUID != "" {
+		record, err := e.repo.GetRecordByUUID(ctx, item.RecordUUID)
+		if err == nil && e.recordMatchesInput(record, req) {
+			e.stored.Add(1)
+			e.caches.requestUUIDs.Store(analysisHash, item.RecordUUID)
+			e.caches.requestUUIDs.Store(req.Request().ID(), item.RecordUUID)
+			return
+		}
+		changedDBInput = true // changed execution must not reuse the old UUID
 	}
 
 	// Redirect hops first, oldest to newest, so each one's parent already exists
@@ -78,7 +73,13 @@ func (e *Executor) saveToDatabase(ctx context.Context, item *work.WorkItem, req 
 			http.ShapeRedirectChain(redirectHops, req.Target()), target)
 	}
 
-	recordUUID, err := e.writeRecord(ctx, req, e.recordSource(), database.RecordLineage{
+	source := e.recordSource()
+	if changedDBInput {
+		// An observed version of a DB input needs exact exchange identity,
+		// not the crawler's endpoint-level duplicate rule.
+		source = database.RecordKindObservation
+	}
+	recordUUID, err := e.writeRecord(ctx, req, source, database.RecordLineage{
 		ParentUUID: parentUUID,
 		RootUUID:   rootUUID,
 		Target:     target,
@@ -98,6 +99,7 @@ func (e *Executor) saveToDatabase(ctx context.Context, item *work.WorkItem, req 
 		return
 	}
 	e.stored.Add(1)
+	e.caches.requestUUIDs.Store(analysisHash, recordUUID)
 	e.caches.requestUUIDs.Store(req.Request().ID(), recordUUID)
 	if e.cfg.OnRecordStored != nil {
 		e.cfg.OnRecordStored(recordUUID, req)

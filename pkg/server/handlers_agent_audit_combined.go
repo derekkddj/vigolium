@@ -133,11 +133,12 @@ func (h *Handlers) runCombinedAuditBackground(plan combinedAuditPlan) {
 
 	setup, err := h.prepareCombinedAuditRun(plan)
 	if err != nil {
+		agent.CleanupAuditSource(setup.resolvedSource, setup.cleanup, nil)
 		h.recordAuditFailure(plan.parentUUID, err)
 		return
 	}
 	if setup.cleanup != nil {
-		defer setup.cleanup()
+		defer func() { agent.CleanupAuditSource(setup.resolvedSource, setup.cleanup, nil) }()
 	}
 
 	ctx, cancel := context.WithCancel(h.runContext())
@@ -163,12 +164,13 @@ func (h *Handlers) handleCombinedAuditSSE(c fiber.Ctx, plan combinedAuditPlan) e
 
 		setup, err := h.prepareCombinedAuditRun(plan)
 		if err != nil {
+			agent.CleanupAuditSource(setup.resolvedSource, setup.cleanup, nil)
 			h.recordAuditFailure(plan.parentUUID, err)
 			_ = writeSSE(w, sseEvent{Type: "error", Error: err.Error()})
 			return
 		}
 		if setup.cleanup != nil {
-			defer setup.cleanup()
+			defer func() { agent.CleanupAuditSource(setup.resolvedSource, setup.cleanup, nil) }()
 		}
 
 		ctx, cancel := context.WithCancel(h.runContext())
@@ -182,11 +184,14 @@ func (h *Handlers) handleCombinedAuditSSE(c fiber.Ctx, plan combinedAuditPlan) e
 		// closing aggregate event below, so concurrent writes to w never
 		// overlap.
 		results := h.runDriversSequentially(ctx, plan, setup, w)
-		h.finalizeCombinedAuditRun(plan, setup, results, startedAt)
+		catalogErr := h.finalizeCombinedAuditRun(plan, setup, results, startedAt)
+		if catalogErr != nil {
+			_ = writeSSE(w, sseEvent{Type: "warning", Error: "Audit terminal summary persistence incomplete; inspect retained run evidence"})
+		}
 
 		anyErr := false
 		for _, r := range results {
-			if r.runErr != nil {
+			if agent.AuditRunnerOutcome(r.runner, r.runErr).ProcessErr != nil {
 				anyErr = true
 				break
 			}
@@ -236,6 +241,7 @@ func (h *Handlers) prepareCombinedAuditRun(plan combinedAuditPlan) (combinedAudi
 		}
 		setup.cleanup = gcsCleanup
 		source = extractedPath
+		setup.resolvedSource = extractedPath
 	}
 
 	resolved, _, _, err := agent.ResolveSourceAndDiff(
@@ -345,7 +351,7 @@ func (h *Handlers) runOneCombinedDriver(ctx context.Context, name string, plan c
 	}
 
 	logPath := filepath.Join(res.sessionDir, config.RuntimeLogFilename)
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		zap.L().Warn("Failed to open combined audit runtime.log",
 			zap.String("agentic_scan_uuid", plan.parentUUID),
@@ -408,8 +414,12 @@ func (h *Handlers) runOneCombinedDriver(ctx context.Context, name string, plan c
 
 	if sseWriter != nil {
 		end := sseEvent{Type: "driver_end", Driver: name}
-		if res.runErr != nil {
-			end.Error = res.runErr.Error()
+		outcome := agent.AuditRunnerOutcome(res.runner, res.runErr)
+		if outcome.ProcessErr != nil {
+			end.Error = outcome.ProcessErr.Error()
+		}
+		if outcome.EvidenceErr != nil {
+			_ = writeSSE(sseWriter, sseEvent{Type: "warning", Driver: name, Error: "Audit evidence degraded; inspect retained run evidence"})
 		}
 		_ = writeSSE(sseWriter, end)
 	}
@@ -551,16 +561,25 @@ func (h *Handlers) buildCombinedDriverCfg(name string, plan combinedAuditPlan, s
 // combinedAuditStatus is the parent row's status; see
 // database.MultiDriverAgenticScanStatus.
 func combinedAuditStatus(results []driverResult) string {
-	failed := 0
+	failed, degraded, cancelled := 0, false, false
 	for _, r := range results {
-		if r.runErr != nil {
+		out := agent.AuditRunnerOutcome(r.runner, r.runErr)
+		if out.ProcessErr != nil {
 			failed++
 		}
+		degraded = degraded || out.EvidenceErr != nil
+		cancelled = cancelled || out.Status == "cancelled"
+	}
+	if cancelled {
+		return "cancelled"
+	}
+	if failed == 0 && degraded {
+		return database.CompletedAgenticScanStatus(true)
 	}
 	return database.MultiDriverAgenticScanStatus(failed, len(results))
 }
 
-func (h *Handlers) finalizeCombinedAuditRun(plan combinedAuditPlan, setup combinedAuditSetup, results []driverResult, startedAt time.Time) {
+func (h *Handlers) finalizeCombinedAuditRun(plan combinedAuditPlan, setup combinedAuditSetup, results []driverResult, startedAt time.Time) error {
 	if !plan.req.NoDedup && h.repo != nil && plan.projectUUID != "" {
 		dedupCtx, cancel := context.WithTimeout(h.runContext(), agent.AuditDedupTimeout)
 		_, _, dedupErr := h.repo.DeduplicateFindings(dedupCtx, plan.projectUUID)
@@ -603,7 +622,7 @@ func (h *Handlers) finalizeCombinedAuditRun(plan combinedAuditPlan, setup combin
 	}
 	h.agentMu.Unlock()
 
-	h.enrichAgenticScanRecord(plan.parentUUID, func(run *database.AgenticScan) {
+	catalogErr := h.persistAuditCatalog(plan.parentUUID, func(run *database.AgenticScan) {
 		run.Status = status
 		run.ErrorMessage = errMsg
 		run.CompletedAt = now
@@ -612,9 +631,12 @@ func (h *Handlers) finalizeCombinedAuditRun(plan combinedAuditPlan, setup combin
 		run.SavedCount = totalSaved
 	})
 
-	// Skip upload when any driver failed — partial uploads stamped as
-	// "complete results" are worse than no upload.
-	if plan.req.UploadResults && setup.parentSessionDir != "" && status == "completed" {
+	if catalogErr != nil {
+		h.markAuditCatalogDegraded(plan.parentUUID)
+	}
+	// Skip upload when execution/evidence/catalog finalization failed: partial
+	// uploads stamped as "complete results" are worse than no upload.
+	if plan.req.UploadResults && setup.parentSessionDir != "" && status == "completed" && catalogErr == nil {
 		h.uploadAgenticResults(plan.projectUUID, plan.parentUUID, setup.parentSessionDir)
 	}
 
@@ -626,4 +648,5 @@ func (h *Handlers) finalizeCombinedAuditRun(plan combinedAuditPlan, setup combin
 		zap.String("status", status),
 		zap.Int("findings_parsed", totalParsed),
 		zap.Int("findings_saved", totalSaved))
+	return catalogErr
 }

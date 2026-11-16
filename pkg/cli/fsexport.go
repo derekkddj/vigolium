@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/uptrace/bun"
 	"github.com/vigolium/vigolium/internal/atomicfile"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/fsexport"
@@ -66,9 +65,10 @@ type fsExportStats struct {
 // fsTrafficPass is what the traffic pass hands on: the index entries it built,
 // and the two lookups the findings pass and the index backfill need.
 type fsTrafficPass struct {
-	entries    []fsexport.TrafficEntry
-	byUUID     map[string]int    // record uuid → index in entries
-	uuidToPath map[string]string // record uuid → "host/id", for finding cross-links
+	entries       []fsexport.TrafficEntry
+	byUUID        map[string]int    // record uuid → index in entries
+	uuidToPath    map[string]string // record uuid → "host/id", for finding cross-links
+	uuidToProject map[string]string // capture owner; links never hydrate a foreign soft reference
 	// stageDir is the STAGING traffic root the findings pass reads linked
 	// records back out of. Not the final root: that may still hold a previous
 	// generation, whose 0001.resp.body for the same host/id belongs to a
@@ -110,8 +110,9 @@ func fsExportTrafficPass(
 	hosts map[string]struct{},
 ) (fsTrafficPass, error) {
 	out := fsTrafficPass{
-		byUUID:     make(map[string]int),
-		uuidToPath: make(map[string]string),
+		byUUID:        make(map[string]int),
+		uuidToPath:    make(map[string]string),
+		uuidToProject: make(map[string]string),
 	}
 	seq := make(map[string]int)
 
@@ -158,6 +159,11 @@ func fsExportTrafficPass(
 
 		relPath := host + "/" + id
 		out.uuidToPath[rec.UUID] = relPath
+		owner := rec.ProjectUUID
+		if owner == "" {
+			owner = database.DefaultProjectUUID
+		}
+		out.uuidToProject[rec.UUID] = owner
 		out.byUUID[rec.UUID] = len(out.entries)
 		out.entries = append(out.entries, fsexport.TrafficEntry{
 			ID:          id,
@@ -193,56 +199,13 @@ func fsExportFindingsPass(
 	seq := make(map[string]int)
 	recTopSeverity := make(map[string]string) // record uuid → highest finding severity
 
-	fq := db.NewSelect().Model((*database.Finding)(nil)).OrderExpr("found_at ASC, id ASC")
-	if filters.ProjectUUID != "" {
-		fq = fq.Where("project_uuid = ?", filters.ProjectUUID)
-	}
-	// An identity selector narrows BOTH halves of the tree. Every other filter
-	// here is the findings-side counterpart of a record-side one (--host filters
-	// records by hostname and findings by hostname); --uuid had no counterpart,
-	// so `db export --uuid <one record> --format fs` wrote that one .req beside
-	// every finding in the store — a directory that reads as "these are the
-	// findings for this request" and is not. The counterpart of "this record" is
-	// "the findings linked to it", which is the same relation `db export --format
-	// jsonl` already uses to attach findings to the records it selected.
-	if len(filters.RecordUUIDs) > 0 {
-		fq = fq.Where("id IN (SELECT finding_id FROM finding_records WHERE record_uuid IN (?))",
-			bun.List(filters.RecordUUIDs))
-	}
-	if filters.HostPattern != "" {
-		fq = fq.Where(database.WithLikeEscape("hostname LIKE ?"), fsLikePattern(filters.HostPattern))
-	}
-	if len(filters.Severity) > 0 {
-		sevs := make([]string, len(filters.Severity))
-		for i, s := range filters.Severity {
-			sevs[i] = strings.ToLower(strings.TrimSpace(s))
-		}
-		fq = fq.Where("LOWER(severity) IN (?)", bun.List(sevs))
-	}
-	if term := fsSearchTerm(filters); term != "" {
-		p := database.LikeContains(term)
-		fq = fq.Where(database.WithLikeEscape(
-			"(module_id LIKE ? OR module_name LIKE ? OR description LIKE ? OR url LIKE ? OR hostname LIKE ?)"), p, p, p, p, p)
-	}
-	if filters.Limit > 0 {
-		fq = fq.Limit(int64(filters.Limit))
-	}
-	frows, err := fq.Rows(ctx)
-	if err != nil {
-		return nil, nil, fmt.Errorf("query findings: %w", err)
-	}
-	defer func() { _ = frows.Close() }()
-
-	for frows.Next() {
-		f := new(database.Finding)
-		if err := db.ScanRow(ctx, frows, f); err != nil {
-			return nil, nil, fmt.Errorf("scan finding: %w", err)
-		}
+	filters.SortBy, filters.SortAsc = "found_at", true
+	err := iterateFilteredEvidenceFindings(ctx, db, filters, func(f *database.Finding) error {
 		host := fsexport.SanitizeHost(fsexport.FindingHost(f))
 		hosts[host] = struct{}{}
 		dir, err := fsStageHostDir(stage, host, seq, "findings")
 		if err != nil {
-			return nil, nil, err
+			return err
 		}
 		seq[host]++
 		id := fmt.Sprintf("%04d", seq[host])
@@ -252,17 +215,25 @@ func fsExportFindingsPass(
 		// tree, so the finding markdown can embed them inline.
 		var linked []fsexport.LinkedRecord
 		var linkedPaths []string
+		owner := f.ProjectUUID
+		if owner == "" {
+			owner = database.DefaultProjectUUID
+		}
 		for _, u := range f.HTTPRecordUUIDs {
-			if p, ok := traffic.uuidToPath[u]; ok {
+			if p, ok := traffic.uuidToPath[u]; ok && traffic.uuidToProject[u] == owner {
 				linked = append(linked, fsexport.ReadLinkedRecord(traffic.stageDir, p, opts.omitResponse))
 				linkedPaths = append(linkedPaths, p)
 				recTopSeverity[u] = fsexport.MaxSeverity(recTopSeverity[u], f.Severity)
 			}
 		}
 
+		if err := fsexport.WriteFindingEvidenceFiles(dir, id, f, 0o644); err != nil {
+			return err
+		}
 		md := fsexport.RenderFindingMarkdown(f, linked, trafficDirBase)
+		md = append(md, []byte(fmt.Sprintf("\n[Selected evidence bundle](%s.evidence.json)\n", id))...)
 		if err := os.WriteFile(filepath.Join(dir, id+".md"), md, 0o644); err != nil {
-			return nil, nil, fmt.Errorf("write %s.md: %w", id, err)
+			return fmt.Errorf("write %s.md: %w", id, err)
 		}
 
 		title := f.ModuleName
@@ -270,19 +241,25 @@ func fsExportFindingsPass(
 			title = f.ModuleID
 		}
 		entries = append(entries, fsexport.FindingEntry{
-			ID:         id,
-			Host:       fsexport.FindingHost(f),
-			Path:       host + "/" + id + ".md",
-			Severity:   f.Severity,
-			Confidence: f.Confidence,
-			Module:     f.ModuleID,
-			Title:      title,
-			URL:        f.URL,
-			Traffic:    linkedPaths,
+			ID:                  id,
+			Host:                fsexport.FindingHost(f),
+			Path:                host + "/" + id + ".md",
+			Severity:            f.Severity,
+			Confidence:          f.Confidence,
+			Module:              f.ModuleID,
+			Title:               title,
+			URL:                 f.URL,
+			Traffic:             linkedPaths,
+			ProjectUUID:         f.ProjectUUID,
+			FindingID:           f.ID,
+			FindingHash:         f.FindingHash,
+			EvidenceStatus:      f.EvidenceStatus,
+			EvidenceStatusScope: "stored_finding",
 		})
-	}
-	if cerr := frows.Err(); cerr != nil {
-		return nil, nil, fmt.Errorf("read findings: %w", cerr)
+		return nil
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("export finding evidence: %w", err)
 	}
 	return entries, recTopSeverity, nil
 }

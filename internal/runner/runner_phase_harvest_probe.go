@@ -48,7 +48,7 @@ const (
 	harvestCountHosts       = "hosts"             // distinct origins among them
 	harvestCountHostsDead   = "hosts_dead"        // origins whose liveness request got no HTTP answer
 	harvestCountProbed      = "probed"            // GETs sent for harvested URLs (liveness excluded)
-	harvestCountKept        = "kept"              // stubs completed with their response
+	harvestCountKept        = "kept"              // fetched exchanges saved as immutable versions
 	harvestCountDeadHost    = "dropped_dead_host" // stubs on a dead origin, never fetched
 	harvestCountNotFound    = "dropped_not_found" // answered 404 or 410
 	harvestCountSoft404     = "dropped_soft_404"  // answered like the origin's not-found page
@@ -94,9 +94,10 @@ type harvestOrigin struct {
 //     followed. 404/410 is dropped, as is an answer indistinguishable from the
 //     origin's not-found fingerprint (a soft-404 on a catch-all host).
 //
-// Survivors keep source=harvest and get their response filled in; every dropped
-// URL's stub is deleted, so no later phase scans it. Everything goes through the
-// shared requester, so the scan's session, rate limit and host limiter apply.
+// Survivors keep source=harvest in a new immutable record of the actual exchange;
+// their historical request-only rows are not rewritten. Every dropped URL's stub
+// is deleted, so no later phase scans it. Everything goes through the shared
+// requester, so the scan's session, rate limit and host limiter apply.
 //
 // The plan schedules the step only when a later phase reaches the target (see
 // gateHarvestProbe); external_harvester.probe: false turns it into a no-op that
@@ -209,6 +210,9 @@ type harvestProber struct {
 	r         *Runner
 	requester *vighttp.Requester
 	workers   int
+	// Identity is captured before fetching; the writer may outlive cancellation.
+	scanUUID, projectUUID string
+	generation            uint64
 
 	done                                atomic.Int64 // stubs decided, for progress
 	probed, kept, notFound, soft404     atomic.Int64
@@ -220,12 +224,16 @@ func newHarvestProber(r *Runner, requester *vighttp.Requester, workers int) *har
 	if workers <= 0 {
 		workers = 1
 	}
-	return &harvestProber{r: r, requester: requester, workers: workers}
+	generation, _, _ := r.harvestAdmissionSnapshot(r.options.ScanUUID)
+	return &harvestProber{r: r, requester: requester, workers: workers,
+		scanUUID: r.options.ScanUUID, projectUUID: r.options.ProjectUUID, generation: generation}
 }
 
-// fetch sends one GET without following redirects, and returns the response
-// with the requester's measured duration.
-func (p *harvestProber) fetch(ctx context.Context, rr *httpmsg.HttpRequestResponse) (*httpmsg.HttpResponse, error) {
+// fetch sends one GET without following redirects, and owns the actual exchange
+// before closing the chain. The archive's intended request is not the sent pair:
+// session headers and transport defaults can change it, and its receipt (if any)
+// still describes a request-only seed, never this new execution.
+func (p *harvestProber) fetch(ctx context.Context, rr *httpmsg.HttpRequestResponse) (*httpmsg.HttpRequestResponse, error) {
 	// NoClustering: every URL here is distinct, and a snapshot from the
 	// clusterer would be another request's answer recorded against this one.
 	chain, elapsed, err := p.requester.ExecuteContext(ctx, rr, vighttp.Options{NoRedirects: true, NoClustering: true})
@@ -233,11 +241,15 @@ func (p *harvestProber) fetch(ctx context.Context, rr *httpmsg.HttpRequestRespon
 		return nil, err
 	}
 	defer chain.Close()
-	headers, body := chain.HeadersBytes(), chain.BodyBytes()
-	raw := make([]byte, 0, len(headers)+len(body))
-	raw = append(raw, headers...)
-	raw = append(raw, body...)
-	return httpmsg.NewHttpResponseWithDuration(raw, elapsed), nil
+	capture := vighttp.CaptureEvidence(chain)
+	if capture == nil || len(capture.Response) == 0 {
+		return nil, fmt.Errorf("harvest probe has no captured HTTP response")
+	}
+	observed, err := httpmsg.FromEvidenceExchange(capture)
+	if err != nil {
+		return nil, fmt.Errorf("invalid harvest probe capture: %w", err)
+	}
+	return observed.WithResponse(httpmsg.NewHttpResponseWithDuration(capture.Response, elapsed)).WithEvidence(capture), nil
 }
 
 // forEach runs fn over n items on the prober's worker count, stopping new work
@@ -263,7 +275,7 @@ func (p *harvestProber) checkLiveness(ctx context.Context, origins []*harvestOri
 			p.markDead(ctx, o)
 			return
 		}
-		resp, err := p.fetch(ctx, rr)
+		observed, err := p.fetch(ctx, rr)
 		if err != nil {
 			if isUnreachableError(err) {
 				p.markDead(ctx, o)
@@ -272,7 +284,7 @@ func (p *harvestProber) checkLiveness(ctx context.Context, origins []*harvestOri
 			return
 		}
 		o.alive = true
-		o.print = newNotFoundPrint(resp, target)
+		o.print = newNotFoundPrint(observed.Response(), target)
 	})
 }
 
@@ -286,7 +298,7 @@ func (p *harvestProber) markDead(ctx context.Context, o *harvestOrigin) {
 	p.hostsDead.Add(1)
 }
 
-// fetchStubs fetches every stub on a live origin, completes the survivors in the
+// fetchStubs fetches every stub on a live origin, saves survivor versions in the
 // store, and returns the UUIDs to delete: dead-origin stubs plus every URL whose
 // answer was dropped. Survivors are written by one goroutine so the step never
 // holds more than harvestProbeWriteQueue response bodies at once and never
@@ -336,11 +348,19 @@ func (p *harvestProber) fetchStubs(ctx context.Context, origins []*harvestOrigin
 		// cut short in the meantime — the request was paid for.
 		wctx := context.WithoutCancel(ctx)
 		for w := range writes {
-			if err := p.r.repository.BackfillRecordResponse(wctx, w.uuid, w.rr); err != nil {
+			versionUUID, err := p.r.repository.SaveRecordVersion(wctx, w.uuid, w.rr)
+			if err != nil {
 				p.wfailed.Add(1)
-				zap.L().Debug("HarvestProbe: failed to store response", zap.String("url", w.rr.Target()), zap.Error(err))
+				zap.L().Warn("HarvestProbe: failed to store observed version",
+					zap.String("record_uuid", w.uuid), zap.String("url", w.rr.Target()), zap.Error(err))
 				continue
 			}
+			// Explicitly adopt every successful result, including exact dedup
+			// hits. Ordinary DA excludes this seed before coalescing and reads
+			// the saved version normally; history/finding references stay intact.
+			p.r.rememberHarvestVersionForRun(p.generation, p.scanUUID, p.projectUUID, w.uuid, versionUUID)
+			zap.L().Debug("HarvestProbe: stored observed version",
+				zap.String("record_uuid", w.uuid), zap.String("version_uuid", versionUUID))
 			p.kept.Add(1)
 		}
 	}()
@@ -348,7 +368,7 @@ func (p *harvestProber) fetchStubs(ctx context.Context, origins []*harvestOrigin
 	skipped := p.forEach(ctx, len(jobs), func(i int) {
 		j := jobs[i]
 		defer p.done.Add(1)
-		resp, err := p.fetch(ctx, j.stub.req)
+		observed, err := p.fetch(ctx, j.stub.req)
 		if err != nil {
 			if ctx.Err() != nil {
 				p.unprobed.Add(1)
@@ -361,13 +381,13 @@ func (p *harvestProber) fetchStubs(ctx context.Context, origins []*harvestOrigin
 			return
 		}
 		p.probed.Add(1)
-		switch classifyHarvestResponse(j.origin.print, resp, harvestRequestTarget(j.stub.req)) {
+		switch classifyHarvestResponse(j.origin.print, observed.Response(), harvestRequestTarget(j.stub.req)) {
 		case harvestNotFound:
 			p.notFound.Add(1)
 		case harvestSoft404:
 			p.soft404.Add(1)
 		default:
-			writes <- survivor{uuid: j.stub.uuid, rr: j.stub.req.WithResponse(resp)}
+			writes <- survivor{uuid: j.stub.uuid, rr: observed}
 			return
 		}
 		drop(j.stub.uuid)

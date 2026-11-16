@@ -50,10 +50,47 @@ export interface DemoStatusResponse {
   expires?: string;
 }
 
+export type EvidenceRole = 'unknown' | 'baseline' | 'observation' | 'attack' | 'control' | 'confirmation';
+export type EvidenceState = 'unknown' | 'complete' | 'missing' | 'truncated';
+
+/** Request/response are base64-encoded authoritative captured bytes, not text. */
+export interface EvidenceExchange {
+  id: string;
+  url?: string;
+  service?: string;
+  request?: string;
+  response?: string;
+  request_state: EvidenceState;
+  response_state: EvidenceState;
+  provenance: 'captured' | 'producer_supplied' | 'cached_observation' | 'legacy_unknown';
+  content_hash: string;
+  captured_at: string;
+}
+
+export interface EvidenceEntry {
+  exchange_id: string;
+  role: EvidenceRole;
+  primary?: boolean;
+  label?: string;
+  occurrence_id?: string;
+  finding_url?: string;
+  scan_uuid?: string;
+  exchange?: EvidenceExchange;
+}
+
 export interface Finding {
   id: number;
+  project_uuid?: string;
+  url?: string;
+  hostname?: string;
   http_record_uuids: string[];
+  origin_record_uuid?: string;
   scan_uuid?: string;
+  agentic_scan_uuid?: string;
+  record_kind?: string;
+  evidence_grade?: string;
+  evidence?: EvidenceEntry[];
+  evidence_status?: string;
   module_id: string;
   module_name: string;
   module_type?: string;
@@ -72,7 +109,6 @@ export interface Finding {
   repo_name?: string;
   cvss_score?: number;
   status?: string;
-  agent_run_uuid?: string;
   finding_hash: string;
   found_at: string;
   created_at: string;
@@ -107,6 +143,9 @@ export interface HTTPRecord {
   source?: string;
   remarks?: string[];
   risk_score: number;
+  // Persisted capture fidelity. Absent legacy states do not imply completeness.
+  capture_request_state?: EvidenceState;
+  capture_response_state?: EvidenceState;
   // Detail-only fields (returned by GET /api/http-records/:uuid)
   raw_request?: string;
   raw_response?: string;
@@ -297,6 +336,38 @@ export interface Scan {
   status: string;
   scan_source?: string;
   scan_mode?: string;
+  target?: string;
+  scope_origin_mode?: string;
+  profile?: string;
+  agentic_scan_uuid?: string;
+  /** A terminal status is not a completeness verdict; absent means unknown. */
+  completeness?: string;
+  stop_reason?: string;
+  phase_outcomes?: {
+    phase: string;
+    state: string;
+    reasons?: string[];
+    limits?: string[];
+    errors?: number;
+    message?: string;
+    unprocessed?: number;
+    duration_ms: number;
+    persistence?: { writer: string; accepted: number; committed: number; failed?: number; unknown?: number; timed_out?: boolean };
+    targets?: {
+      requested: number; admitted: number; reached: number; reachability_checked?: boolean;
+      rejected?: { target: string; code: string; detail?: string }[];
+      unreachable?: { target: string; code: string; detail?: string }[];
+    };
+    counts?: Record<string, number>;
+    budget_exhausted_hosts?: string[];
+  }[];
+  /** Resolved plan JSON is owned by the backend resolver, not a UI coverage model. */
+  plan?: unknown;
+  heartbeat_at?: string;
+  current_phase?: string;
+  module_errors?: Record<string, number>;
+  extensions_failed?: string[];
+  error_message?: string;
   modules?: string;
   total_findings: number;
   processed_count: number;
@@ -684,13 +755,18 @@ export interface AgentSession {
   agent_name: string;
   template_id?: string;
   target_url?: string;
+  source_path?: string;
+  session_dir?: string;
+  parent_agentic_scan_uuid?: string;
+  storage_url?: string;
   input_type?: string;
   current_phase?: string;
   phases_run?: string[];
-  finding_count: number;
-  record_count: number;
-  saved_count: number;
-  duration_ms: number;
+  /** Legacy servers may omit zero; absence/null is unknown, not zero. */
+  finding_count?: number | null;
+  record_count?: number | null;
+  saved_count?: number | null;
+  duration_ms?: number | null;
   started_at: string;
   completed_at?: string;
   created_at: string;
@@ -708,6 +784,8 @@ export interface AgentSessionDetail extends AgentSession {
   attack_plan?: string;
   triage_result?: string;
   result_json?: string;
+  /** Nested agent/audit runs only; not membership in native scan history. */
+  child_runs?: AgentSessionDetail[];
 }
 
 export interface AgentSessionsQueryParams {
@@ -791,10 +869,20 @@ export interface ScanLog {
 export interface ScanLogsResponse {
   project_uuid?: string;
   logs: ScanLog[];
-  total: number;
-  /** Raw runtime.log tail, set when the server answers with the log file
-   *  (every scan that has one) rather than structured DB rows. */
+  /** Unknown for text tails and legacy responses without a count. */
+  total?: number;
+  offset?: number;
+  limit?: number;
+  has_more?: boolean;
+  source?: string;
+  /** v2 items may be aliased to data by the shared API client. */
+  data?: ScanLog[];
+  items?: ScanLog[];
+  /** Raw runtime.log tail rather than structured DB rows. */
   text?: string;
+  log_size?: number;
+  /** Unknown unless X-Log-Truncated was visible to the browser. */
+  truncated?: boolean;
 }
 
 export interface ScanLogsQueryParams {

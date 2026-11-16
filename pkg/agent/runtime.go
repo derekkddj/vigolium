@@ -70,21 +70,24 @@ type RecordSpec struct {
 // custom system prompt, turn cap, or tool set. The combination used by the
 // default NewSession — {SourcePath: ..., IncludeTools: true} — reproduces the
 // standard engine: builtin tools, the config's system prompt (or the package
-// default), and the engine's default turn cap.
+// default), and the config's turn cap (or the bounded engine default).
 type SessionSpec struct {
 	System       string // explicit system prompt; empty falls back to cfg/default
 	SourcePath   string // appended to the system prompt when set
-	MaxTurns     int    // 0 = engine default
+	MaxTurns     int    // positive overrides cfg.MaxTurns; otherwise cfg/bounded engine default
 	IncludeTools bool   // register the builtin tool set
 	// OfflineTools, with IncludeTools, narrows the builtin set to the tools
 	// that touch neither the network nor a shell (read_file, ls, grep, glob).
 	// For a run that must not contact the target (`agent triage --no-probe`).
-	OfflineTools      bool
+	OfflineTools bool
+	// PlanningOnly forbids tool execution and exposes skills as selection
+	// metadata only. It takes precedence over every other tool/skill flag.
+	PlanningOnly      bool
 	EnablePromptCache bool
-	// Skills, when non-nil and non-empty, injects an <available_skills> block
-	// into the system prompt and registers the load_skill tool (requires
-	// IncludeTools). Used by swarm plan/triage phases for planner-driven skill
-	// loading; nil for phases that don't surface skills.
+	// Skills exposes a selection-only catalog under PlanningOnly. Otherwise,
+	// nonempty skills inject load/follow guidance and register load_skill when
+	// IncludeTools is enabled and OfflineTools is false (e.g. swarm triage).
+	// Offline tool sessions suppress skill guidance; nil means no skill catalog.
 	Skills *skill.Registry
 	// VigTools, when non-nil with a Repo (and IncludeTools), registers the
 	// vigolium read+replay tool subset so a skill can actually confirm/escalate
@@ -98,6 +101,16 @@ type SessionSpec struct {
 	// reasoning) persist for debugging. Zero value = no transcript.
 	Record RecordSpec
 }
+
+// RuntimeBudgetError distinguishes a bounded per-call runtime stop from provider
+// failure and from the cumulative RunBudget. It must not refill a work budget
+// via ordinary transient retries. Partial output is still returned separately.
+type RuntimeBudgetError struct {
+	Kind   string // "turns" or "tool_calls"
+	Reason string
+}
+
+func (e *RuntimeBudgetError) Error() string { return e.Reason }
 
 // defaultRuntime backs package-level helpers that don't carry an Engine (e.g.
 // the guardrail classifier). It's a var so tests can substitute a fake.

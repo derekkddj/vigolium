@@ -63,6 +63,10 @@ type Logger struct {
 	turnW   io.Writer
 	thinkW  io.Writer
 	verbose bool
+	// fullDir enables complete operator output for recorded runs. It never
+	// changes the provider/model's bounded history or unrecorded CLI previews.
+	fullDir string
+	fullErr error
 	mu      sync.Mutex
 	starts  map[string]time.Time
 	// think accumulates the current turn's reasoning deltas; flushed as one
@@ -251,6 +255,10 @@ func (l *Logger) start(ev engine.Event) {
 	l.starts[ev.ToolCallID] = time.Now()
 	l.mu.Unlock()
 
+	if l.fullDir != "" {
+		l.writeFullStart(ev)
+		return
+	}
 	arrow, name := arrowAndName(ev.ToolCategory, ev.ToolName)
 	args := coloredArgs(ev.ToolArgs)
 	if args == "" {
@@ -261,6 +269,12 @@ func (l *Logger) start(ev engine.Event) {
 }
 
 func (l *Logger) end(ev engine.Event) {
+	// The byte count below describes the tool-returned payload (before the
+	// engine's model cap), not raw stdout/stderr. Surface retention separately,
+	// including failed/partial archives, without dumping sensitive evidence.
+	if l.fullDir == "" {
+		defer l.writeArchiveReceipt(ev)
+	}
 	var elapsed time.Duration
 	l.mu.Lock()
 	if t, ok := l.starts[ev.ToolCallID]; ok {
@@ -269,6 +283,10 @@ func (l *Logger) end(ev engine.Event) {
 	}
 	l.mu.Unlock()
 
+	if l.fullDir != "" {
+		l.writeFullEnd(ev, elapsed)
+		return
+	}
 	timing := terminal.Muted("(" + formatElapsed(elapsed) + ")")
 
 	if ev.ToolIsErr {
@@ -287,6 +305,67 @@ func (l *Logger) end(ev engine.Event) {
 	if l.verbose {
 		l.writePreview(ev)
 	}
+}
+
+func (l *Logger) writeArchiveReceipt(ev engine.Event) {
+	receipt, ok := ev.ToolDetails[tool.ArchiveDetailsKey].(map[string]any)
+	if !ok {
+		return
+	}
+	complete, _ := receipt["complete"].(bool)
+	if !complete {
+		// Do not print a possibly sensitive filesystem error or arbitrary tool
+		// detail here. The private receipt carries the hydration metadata.
+		_, _ = fmt.Fprintf(l.w, "    %s\n", terminal.Yellow("archive incomplete; full output retention is not guaranteed"))
+		return
+	}
+	line := "archive complete"
+	// Only print the generated relative UUID directory, never tool-controlled
+	// names/IDs or absolute paths (which could contain credential material).
+	if path, ok := receipt["path"].(string); ok && safeArchiveLabel(path) {
+		line += ": " + path
+	}
+	if streams, ok := receipt["streams"].(map[string]any); ok {
+		counts := make([]string, 0, 2)
+		for _, name := range []string{"stdout", "stderr"} {
+			stream, ok := streams[name].(map[string]any)
+			if !ok {
+				continue
+			}
+			// JSON decoders use float64; live engine receipts use int64.
+			switch n := stream["stored_bytes"].(type) {
+			case int64:
+				if n >= 0 {
+					counts = append(counts, fmt.Sprintf("%s=%d bytes", name, n))
+				}
+			case float64:
+				if n >= 0 && n < 1<<63 {
+					counts = append(counts, fmt.Sprintf("%s=%.0f bytes", name, n))
+				}
+			}
+		}
+		if len(counts) > 0 {
+			line += " (raw " + strings.Join(counts, ", ") + ")"
+		}
+	}
+	_, _ = fmt.Fprintf(l.w, "    %s\n", terminal.Muted(line))
+}
+
+func safeArchiveLabel(path string) bool {
+	const prefix = tool.ArchiveDirectory + "/"
+	if !strings.HasPrefix(path, prefix) || len(path) != len(prefix)+36 {
+		return false
+	}
+	for i, c := range path[len(prefix):] {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+		} else if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (l *Logger) turn(ev engine.Event) {

@@ -9,7 +9,10 @@ import (
 
 // ScanHeartbeat is one liveness beat of a running scan, written onto its row.
 type ScanHeartbeat struct {
-	At time.Time
+	// ProjectUUID, when supplied, conditions the write on the captured owner.
+	// Empty preserves the legacy unscoped repository method contract.
+	ProjectUUID string
+	At          time.Time
 	// Phase is the phase running now; "" between phases (and on the final beat)
 	// clears current_phase.
 	Phase string
@@ -36,6 +39,9 @@ func (r *Repository) UpdateScanHeartbeat(ctx context.Context, scanUUID string, h
 		Set("heartbeat_at = ?", hb.At).
 		Where("uuid = ?", scanUUID).
 		Where("status = ?", "running")
+	if hb.ProjectUUID != "" {
+		q = q.Where("project_uuid = ?", hb.ProjectUUID)
+	}
 	if hb.Phase == "" {
 		q = q.Set("current_phase = NULL")
 	} else {
@@ -126,13 +132,18 @@ func (r *Repository) ListRunningScans(ctx context.Context, projectUUID string) (
 
 // ReapAbandonedScan finalizes a scan whose row still says "running" but whose
 // process is gone (the caller's liveness verdict): status failed, completeness
-// partial, stop_reason abandoned, and an error_message naming the last write.
-// finished_at is that last write when known (when the scan actually stopped),
-// else now; phase_outcomes and the severity counts are left as they are.
+// partial, stop_reason abandoned, and an error_message appending the last write
+// to any existing diagnostics. lastWriteAt is the last observed write, NOT the
+// exact time the process died. finished_at uses that observation when known,
+// else now; phase_outcomes, counts, and stored evidence are left as they are.
 //
-// Only a row still "running" is touched, so a scan that finalized between the
-// caller's read and this write keeps its own verdict. reaped reports whether
-// this call wrote the row.
+// The caller must supply the database-loaded scan it checked for liveness. One
+// atomic UPDATE checks its captured project, PID, host, start, heartbeat, and edit
+// time as well as the running status: an advanced heartbeat, reassignment, restart,
+// resume edit, or finalization makes this a no-op. The project is never defaulted
+// or omitted.
+// reaped reports whether this call wrote the row; this method does not infer
+// abandonment from staleness or run automatically on startup.
 func (r *Repository) ReapAbandonedScan(ctx context.Context, scan *Scan, lastWriteAt time.Time) (reaped bool, err error) {
 	if scan == nil {
 		return false, nil
@@ -148,10 +159,12 @@ func (r *Repository) ReapAbandonedScan(ctx context.Context, scan *Scan, lastWrit
 	if !scan.StartedAt.IsZero() && finishedAt.After(scan.StartedAt) {
 		durationMs = finishedAt.Sub(scan.StartedAt).Milliseconds()
 	}
-	res, err := r.db.NewUpdate().
+	q := r.db.NewUpdate().
 		Model((*Scan)(nil)).
 		Set("status = ?", "failed").
-		Set("error_message = ?", msg).
+		// Append the CURRENT diagnostics inside the UPDATE, not scan.ErrorMessage:
+		// an error written since the liveness read must not be lost.
+		Set("error_message = CASE WHEN COALESCE(error_message, '') = '' THEN ? ELSE error_message || ? END", msg, "\n"+msg).
 		Set("completeness = ?", CompletenessPartial).
 		Set("stop_reason = ?", ReasonAbandoned).
 		Set("finished_at = ?", finishedAt).
@@ -159,11 +172,37 @@ func (r *Repository) ReapAbandonedScan(ctx context.Context, scan *Scan, lastWrit
 		Set("current_phase = NULL").
 		Set("updated_at = CURRENT_TIMESTAMP").
 		Where("uuid = ?", scan.UUID).
+		Where("project_uuid = ?", scan.ProjectUUID).
 		Where("status = ?", "running").
-		Exec(ctx)
+		// These nullzero fields load SQL NULL as Go's zero value on legacy rows.
+		Where("COALESCE(pid, 0) = ?", scan.PID).
+		Where("COALESCE(runner_host, '') = ?", scan.RunnerHost)
+	q = scanLivenessTimeEqual(q, r.db.Driver(), "started_at", scan.StartedAt)
+	// Pause/resume edits updated_at even before a resumed runner sends a beat.
+	q = scanLivenessTimeEqual(q, r.db.Driver(), "updated_at", scan.UpdatedAt)
+	if scan.HeartbeatAt == nil {
+		q = q.Where("heartbeat_at IS NULL")
+	} else {
+		q = scanLivenessTimeEqual(q, r.db.Driver(), "heartbeat_at", *scan.HeartbeatAt)
+	}
+	res, err := q.Exec(ctx)
 	if err != nil {
 		return false, err
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+// scanLivenessTimeEqual compares database-loaded timestamps without dropping
+// precision. column is a trusted internal identifier. PostgreSQL uses native
+// timestamps with Bun's time binding; SQLite needs identical text for SQL's
+// CURRENT_TIMESTAMP and Bun writes (UTC suffix and fractional trailing zeros).
+// Do not use datetime/julianday: rounding could accept an advanced heartbeat.
+func scanLivenessTimeEqual(q *bun.UpdateQuery, driver, column string, at time.Time) *bun.UpdateQuery {
+	if driver != driverSQLite {
+		return q.Where(column+" = ?", at.UTC())
+	}
+	utc := "replace(" + column + ", '+00:00', '')"
+	exact := "(CASE WHEN instr(" + utc + ", '.') > 0 THEN rtrim(rtrim(" + utc + ", '0'), '.') ELSE " + utc + " END)"
+	return q.Where(exact+" = ?", at.UTC().Format("2006-01-02 15:04:05.999999999"))
 }

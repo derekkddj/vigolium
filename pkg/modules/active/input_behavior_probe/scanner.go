@@ -91,14 +91,24 @@ func (m *Module) ScanPerRequest(
 	// pool serving either a 5.9 KB or an 11.3 KB Apache default page) makes every
 	// probe "diverge". Checked only once a probe has diverged, and memoized per
 	// record, so the probing above is unaffected.
-	if len(results) > 0 && modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+	guardProof := modkit.NewEvidenceCollector()
+	if len(results) > 0 && modkit.EndpointVolatileWithEvidence(scanCtx, ctx, httpClient, guardProof) {
 		return nil, nil
 	}
 
 	// Collapse every probe that diverged for this endpoint into ONE finding so the
 	// run writes a single http_record instead of one per probe (the rest ride along
 	// as inline AdditionalEvidence) — keeps probe traffic from flooding the table.
-	return collapseProbeFindings(results), nil
+	// Keep the deciding stability receipts with each candidate before folded
+	// probes consume the shared context cap; collapse does not change its primary.
+	for _, result := range results {
+		modkit.AppendEvidence(result, guardProof)
+	}
+	findings := collapseProbeFindings(results)
+	for _, finding := range findings {
+		modkit.AppendEvidence(finding, guardProof)
+	}
+	return findings, nil
 }
 
 // ScanPerInsertionPoint tests a single insertion point for HTML structure
@@ -147,13 +157,23 @@ func (m *Module) ScanPerInsertionPoint(
 
 	// Same endpoint-determinism gate as ScanPerRequest: a diff-only verdict is not
 	// evidence on a non-deterministic endpoint.
-	if len(results) > 0 && modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+	guardProof := modkit.NewEvidenceCollector()
+	if len(results) > 0 && modkit.EndpointVolatileWithEvidence(scanCtx, ctx, httpClient, guardProof) {
 		return nil, nil
 	}
 
 	// Collapse to a single finding (one http_record) per insertion point; the other
 	// diverging char/polyglot probes become inline AdditionalEvidence.
-	return collapseProbeFindings(results), nil
+	// Keep the deciding stability receipts with each candidate before folded
+	// probes consume the shared context cap; collapse does not change its primary.
+	for _, result := range results {
+		modkit.AppendEvidence(result, guardProof)
+	}
+	findings := collapseProbeFindings(results)
+	for _, finding := range findings {
+		modkit.AppendEvidence(finding, guardProof)
+	}
+	return findings, nil
 }
 
 // probePolyglot sends a polyglot payload to detect HTML tag structure changes.
@@ -187,7 +207,7 @@ func (m *Module) probePolyglot(
 		return []*output.ResultEvent{
 			buildProbeResult(
 				urlStr, fuzzedRaw, fuzzedResp.FullResponseString(),
-				ip.Name(), "polyglot_fuzz", fuzzPayload, change,
+				ip.Name(), "polyglot_fuzz", fuzzPayload, change, http.CaptureEvidence(fuzzedResp),
 			),
 		}
 	}

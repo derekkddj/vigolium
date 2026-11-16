@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	receipt "github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -131,7 +132,8 @@ func (m *Module) ScanPerRequest(
 	m.plantOAST(ctx, httpClient, scanCtx, urlx.String(), baselineRaw, service, candidates)
 
 	// Establish the endpoint's natural variance (the noise floor).
-	baseSig, baseStatus, selfRatio, ok := m.measureBaseline(httpClient, service, baselineRaw)
+	baselineProof := modkit.NewEvidenceCollector()
+	baseSig, baseStatus, selfRatio, ok := m.measureBaseline(httpClient, service, baselineRaw, baselineProof)
 	if !ok || selfRatio < minSelfStability {
 		return nil, nil // unreachable, WAF-blocked, or too unstable to judge
 	}
@@ -180,17 +182,19 @@ func (m *Module) ScanPerRequest(
 				break
 			}
 		}
-		results = append(results, m.buildFinding(urlx.String(), name, baseStatus, baseSig.BodyLength, diverging))
+		results = append(results, m.buildFinding(urlx.String(), name, baseStatus, baseSig.BodyLength, diverging, baselineProof))
+		modkit.AppendEvidence(results[len(results)-1], baselineProof)
 	}
 	return results, nil
 }
 
 // probeResp is a single fetched response, reduced to what the comparison needs.
 type probeResp struct {
-	status  int
-	body    string
-	full    string
-	blocked bool
+	exchange *receipt.Exchange
+	status   int
+	body     string
+	full     string
+	blocked  bool
 }
 
 // fetch re-issues a raw request and returns its reduced response. NoRedirects so a
@@ -203,7 +207,7 @@ func (m *Module) fetch(httpClient *http.Requester, service *httpmsg.Service, raw
 	req := httpmsg.NewRequestResponseRaw(raw, service)
 	resp, _, err := httpClient.Execute(req, http.Options{NoRedirects: true, NoClustering: true})
 	if err != nil {
-		return probeResp{}, false
+		return probeResp{exchange: http.CaptureFailureEvidence(err)}, false
 	}
 	defer resp.Close()
 	if resp.Response() == nil {
@@ -215,10 +219,11 @@ func (m *Module) fetch(httpClient *http.Requester, service *httpmsg.Service, raw
 	// genuine auth-bypass-via-header signal where a header turns a 401 into a 200).
 	// Status policy is owned by passesStatusGate instead.
 	return probeResp{
-		status:  resp.Response().StatusCode,
-		body:    resp.Body().String(),
-		full:    resp.FullResponseString(),
-		blocked: infra.GetBlockDetectionValidator().Validate(resp) != nil,
+		exchange: http.CaptureEvidence(resp),
+		status:   resp.Response().StatusCode,
+		body:     resp.Body().String(),
+		full:     resp.FullResponseString(),
+		blocked:  infra.GetBlockDetectionValidator().Validate(resp) != nil,
 	}, true
 }
 
@@ -242,8 +247,11 @@ func (m *Module) probe(httpClient *http.Requester, service *httpmsg.Service, bas
 // floor is measured ONCE and reused across every candidate header and probe value
 // (many comparisons per endpoint), and compareToBaseline strips the injected value
 // from the signature so a reflection of the probe value is never read as a change.
-func (m *Module) measureBaseline(httpClient *http.Requester, service *httpmsg.Service, baselineRaw []byte) (modkit.ResponseSignature, int, float64, bool) {
+func (m *Module) measureBaseline(httpClient *http.Requester, service *httpmsg.Service, baselineRaw []byte, collectors ...*modkit.EvidenceCollector) (modkit.ResponseSignature, int, float64, bool) {
 	first, ok := m.fetch(httpClient, service, baselineRaw)
+	for _, proof := range collectors {
+		proof.AddExchange(first.exchange, receipt.RoleBaseline, "fresh no-header baseline")
+	}
 	if !ok || first.blocked || len(first.body) == 0 {
 		// A blank baseline body makes the size differential meaningless, so bail.
 		return modkit.ResponseSignature{}, 0, 0, false
@@ -252,6 +260,9 @@ func (m *Module) measureBaseline(httpClient *http.Requester, service *httpmsg.Se
 	selfRatio := 1.0
 	for i := 1; i < selfRounds; i++ {
 		s, ok := m.fetch(httpClient, service, baselineRaw)
+		for _, proof := range collectors {
+			proof.AddExchange(s.exchange, receipt.RoleControl, fmt.Sprintf("no-header stability sample %d", i+1))
+		}
 		if !ok || s.blocked {
 			return modkit.ResponseSignature{}, 0, 0, false
 		}
@@ -268,13 +279,15 @@ func (m *Module) measureBaseline(httpClient *http.Requester, service *httpmsg.Se
 
 // valueVerdict records a probe value that reproducibly shifted the response.
 type valueVerdict struct {
-	label   string
-	value   string
-	ratio   float64
-	status  int
-	bodyLen int
-	reqRaw  string
-	respRaw string
+	exchange     *receipt.Exchange
+	confirmation *receipt.Exchange
+	label        string
+	value        string
+	ratio        float64
+	status       int
+	bodyLen      int
+	reqRaw       string
+	respRaw      string
 }
 
 // runBattery tests every battery value against the live header and returns the
@@ -305,13 +318,15 @@ func (m *Module) runBattery(httpClient *http.Requester, service *httpmsg.Service
 			continue // not reproducible (token + size) → drop
 		}
 		out = append(out, valueVerdict{
-			label:   pv.label,
-			value:   pv.value,
-			ratio:   ratio,
-			status:  first.status,
-			bodyLen: sig.BodyLength,
-			reqRaw:  string(raw),
-			respRaw: first.full,
+			exchange:     first.exchange,
+			confirmation: second.exchange,
+			label:        pv.label,
+			value:        pv.value,
+			ratio:        ratio,
+			status:       first.status,
+			bodyLen:      sig.BodyLength,
+			reqRaw:       string(raw),
+			respRaw:      first.full,
 		})
 	}
 	return out
@@ -400,13 +415,32 @@ func (m *Module) plantOAST(
 
 // buildFinding assembles one Suspect/Tentative finding for a header whose value
 // reproducibly drives a response-body change.
-func (m *Module) buildFinding(target, name string, baseStatus, baseLen int, verdicts []valueVerdict) *output.ResultEvent {
+func (m *Module) buildFinding(target, name string, baseStatus, baseLen int, verdicts []valueVerdict, baselines ...*modkit.EvidenceCollector) (finding *output.ResultEvent) {
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, verdicts[0].exchange, receipt.RoleAttack, "selected internal-header value")
+	}()
 	extracted := []string{
 		fmt.Sprintf("Header: %s", name),
 		fmt.Sprintf("Baseline status: %d, body: %d bytes", baseStatus, baseLen),
 	}
+	// Reserve bounded context for the fresh baseline and its stability samples;
+	// a large value battery must not consume their slots before the caller appends.
+	valueLimit := modkit.MaxEvidencePairs
+	for _, proof := range baselines {
+		valueLimit -= proof.Len()
+	}
+	valueLimit = max(0, valueLimit)
 	var evidence []string
+	var selected []receipt.Entry
 	for _, v := range verdicts {
+		for _, entry := range []receipt.Entry{
+			receipt.Select(v.exchange, receipt.RoleAttack, false, "supporting header value"),
+			receipt.Select(v.confirmation, receipt.RoleConfirmation, false, "header value replay"),
+		} {
+			if len(selected) < valueLimit {
+				selected = append(selected, entry)
+			}
+		}
 		shown := v.value
 		if shown == "" {
 			shown = "(empty)"
@@ -417,9 +451,11 @@ func (m *Module) buildFinding(target, name string, baseStatus, baseLen int, verd
 		}
 		sizeNote := fmt.Sprintf(", body %d→%d bytes", baseLen, v.bodyLen)
 		extracted = append(extracted, fmt.Sprintf("%s=%q → similarity %.2f%s%s", name, shown, v.ratio, statusNote, sizeNote))
-		evidence = append(evidence, output.BuildEvidence(
-			fmt.Sprintf("%s: %s=%q (similarity %.2f%s%s)", v.label, name, shown, v.ratio, statusNote, sizeNote),
-			v.reqRaw, v.respRaw))
+		if len(evidence) < valueLimit {
+			evidence = append(evidence, output.BuildEvidence(
+				fmt.Sprintf("%s: %s=%q (similarity %.2f%s%s)", v.label, name, shown, v.ratio, statusNote, sizeNote),
+				v.reqRaw, v.respRaw))
+		}
 	}
 	return &output.ResultEvent{
 		URL:                target,
@@ -428,6 +464,7 @@ func (m *Module) buildFinding(target, name string, baseStatus, baseLen int, verd
 		Response:           verdicts[0].respRaw,
 		ExtractedResults:   extracted,
 		AdditionalEvidence: evidence,
+		Evidence:           selected,
 		Info: output.Info{
 			Name: fmt.Sprintf("Internal Header Influences Response: %s", name),
 			Description: fmt.Sprintf(

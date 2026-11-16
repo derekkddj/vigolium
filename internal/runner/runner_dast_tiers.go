@@ -143,8 +143,8 @@ func (r *Runner) runTieredRound(
 	if len(l.pass1) == 0 {
 		cfg := baseCfg
 		cfg.Ledger = l.spec(true)
-		src := r.newDASource(infra, inScopeHosts).WithCoverage(0)
-		return r.runDAPass(ctx, infra, round, l.pass0, passiveModules, cfg, oastService, src)
+		src := r.newDynamicAssessmentSource(infra, inScopeHosts).WithCoverage(0)
+		return r.runDAPass(ctx, infra, round, inScopeHosts, l.pass0, passiveModules, cfg, oastService, src)
 	}
 
 	// Pass 0, bounded to a share of the remaining phase time.
@@ -156,8 +156,8 @@ func (r *Runner) runTieredRound(
 	}
 	cfg0 := baseCfg
 	cfg0.Ledger = l.spec(true)
-	src0 := r.newDASource(infra, inScopeHosts).WithoutCursorCommit().WithCoverage(0)
-	res0, err := r.runDAPass(pass0Ctx, infra, round, l.pass0, passiveModules, cfg0, oastService, src0)
+	src0 := r.newDynamicAssessmentSource(infra, inScopeHosts).WithoutCursorCommit().WithCoverage(0)
+	res0, err := r.runDAPass(pass0Ctx, infra, round, inScopeHosts, l.pass0, passiveModules, cfg0, oastService, src0)
 	cancel0()
 	if err != nil {
 		return res0, err
@@ -176,8 +176,8 @@ func (r *Runner) runTieredRound(
 	// ran in pass 0 (passive_done), so it runs active modules only.
 	cfg1 := baseCfg
 	cfg1.Ledger = l.spec(false)
-	src1 := r.newDASource(infra, inScopeHosts).WithBound(boundAt, boundID).WithCoverage(1)
-	res1, err := r.runDAPass(ctx, infra, round, l.pass1, nil, cfg1, oastService, src1)
+	src1 := r.newDynamicAssessmentSource(infra, inScopeHosts).WithBound(boundAt, boundID).WithCoverage(1)
+	res1, err := r.runDAPass(ctx, infra, round, inScopeHosts, l.pass1, nil, cfg1, oastService, src1)
 	res1.processed += res0.processed
 	res1.moduleMetrics = mergeModuleMetrics(res0.moduleMetrics, res1.moduleMetrics)
 	return res1, err

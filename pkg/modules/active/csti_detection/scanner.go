@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -101,6 +102,7 @@ func (m *Module) ScanPerInsertionPoint(
 		return nil, nil
 	}
 
+	ev := modkit.NewEvidenceCollector()
 	// Run confirmation loop
 	for attempt := range confirmCount {
 		probe, markers := buildCSTIProbe()
@@ -124,6 +126,7 @@ func (m *Module) ScanPerInsertionPoint(
 		if resp.Response() != nil {
 			attackContentType = resp.Response().Header.Get("Content-Type")
 		}
+		exchange := http.CaptureEvidence(resp)
 		resp.Close()
 
 		// CSTI confirmation here is pure LITERAL reflection of the {{...}} probe
@@ -155,6 +158,9 @@ func (m *Module) ScanPerInsertionPoint(
 			break
 		}
 
+		if attempt < confirmCount-1 {
+			ev.AddExchange(exchange, evidence.RoleConfirmation, "fresh expression replay")
+		}
 		// On final confirmation, report finding
 		if attempt == confirmCount-1 {
 			confidence := severity.Firm
@@ -162,30 +168,32 @@ func (m *Module) ScanPerInsertionPoint(
 				confidence = severity.Certain
 			}
 
-			return []*output.ResultEvent{
-				{
-					URL:              urlx.String(),
-					Request:          string(fuzzedRaw),
-					Response:         fullResponse,
-					FuzzingParameter: ip.Name(),
-					ExtractedResults: []string{probe, fw.Name},
-					Info: output.Info{
-						Name: "Client-Side Template Injection (CSTI)",
-						Description: fmt.Sprintf(
-							"The parameter '%s' reflects a template expression {{...}} literally in the HTML response "+
-								"within a %s application scope. The %s framework will evaluate this expression in the "+
-								"victim's browser, enabling arbitrary JavaScript execution.\n\n"+
-								"Proof: injected `%s` — reflected verbatim in response body.",
-							ip.Name(), fw.Name, fw.Name, probe,
-						),
-						Confidence: confidence,
-						Reference: []string{
-							"https://portswigger.net/research/xss-without-html-client-side-template-injection-with-angularjs",
-							"https://portswigger.net/web-security/cross-site-scripting/contexts/client-side-template-injection",
-						},
+			result := &output.ResultEvent{
+				URL:              urlx.String(),
+				Request:          string(fuzzedRaw),
+				Response:         fullResponse,
+				FuzzingParameter: ip.Name(),
+				ExtractedResults: []string{probe, fw.Name},
+				Info: output.Info{
+					Name: "Client-Side Template Injection (CSTI)",
+					Description: fmt.Sprintf(
+						"The parameter '%s' reflects a template expression {{...}} literally in the HTML response "+
+							"within a %s application scope. The %s framework will evaluate this expression in the "+
+							"victim's browser, enabling arbitrary JavaScript execution.\n\n"+
+							"Proof: injected `%s` — reflected verbatim in response body.",
+						ip.Name(), fw.Name, fw.Name, probe,
+					),
+					Confidence: confidence,
+					Reference: []string{
+						"https://portswigger.net/research/xss-without-html-client-side-template-injection-with-angularjs",
+						"https://portswigger.net/web-security/cross-site-scripting/contexts/client-side-template-injection",
 					},
 				},
-			}, nil
+			}
+			result.Evidence = ev.Evidence()
+			result.AdditionalEvidence = ev.Entries()
+			modkit.SetPrimaryEvidence(result, exchange, evidence.RoleAttack, "selected probe")
+			return []*output.ResultEvent{result}, nil
 		}
 	}
 

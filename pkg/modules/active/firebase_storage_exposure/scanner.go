@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -172,7 +173,7 @@ func (m *Module) probeFirebaseStorage(
 		responseStr = responseStr[:4096] + "\n... (truncated)"
 	}
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:      targetURL,
 		Matched:  targetURL,
 		Request:  rawReq,
@@ -191,6 +192,8 @@ func (m *Module) probeFirebaseStorage(
 			"hasPrefixes": hasPrefixes,
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+	return result
 }
 
 func (m *Module) probeGCSEndpoint(
@@ -229,7 +232,7 @@ func (m *Module) probeGCSEndpoint(
 		responseStr = responseStr[:4096] + "\n... (truncated)"
 	}
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:      targetURL,
 		Matched:  targetURL,
 		Request:  rawReq,
@@ -246,4 +249,6 @@ func (m *Module) probeGCSEndpoint(
 			"endpoint": "gcs",
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+	return result
 }

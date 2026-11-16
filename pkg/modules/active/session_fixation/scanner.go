@@ -6,6 +6,7 @@ import (
 
 	"github.com/vigolium/vigolium/pkg/authsig"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -71,7 +72,7 @@ func (m *Module) ScanPerRequest(
 	if !hadCookie {
 		stripped = raw
 	}
-	status0, set0, ok0 := m.send(ctx, httpClient, stripped)
+	status0, set0, gateReceipt, ok0 := m.send(ctx, httpClient, stripped)
 	if !ok0 || status0 >= 400 {
 		return nil, nil
 	}
@@ -85,12 +86,18 @@ func (m *Module) ScanPerRequest(
 	// accepted.
 	fixed1 := "vigfix" + utils.RandomString(24)
 	fixed2 := "vigfix" + utils.RandomString(24)
-	if !m.explicitlyAdoptsValue(ctx, httpClient, raw, name, fixed1) {
+	firstReceipt, firstAdopted := m.explicitlyAdoptsValue(ctx, httpClient, raw, name, fixed1)
+	if !firstAdopted {
 		return nil, nil
 	}
-	if !m.explicitlyAdoptsValue(ctx, httpClient, raw, name, fixed2) {
+	secondReceipt, secondAdopted := m.explicitlyAdoptsValue(ctx, httpClient, raw, name, fixed2)
+	if !secondAdopted {
 		return nil, nil
 	}
+	ev := modkit.NewEvidenceCollector()
+	ev.AddBaseline("input baseline", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
+	ev.AddExchange(gateReceipt, evidence.RoleControl, "cookie-stripped session issuance")
+	ev.AddExchange(secondReceipt, evidence.RoleConfirmation, "independent attacker-chosen session value")
 
 	target := urlx.String()
 	kind := output.RecordKindCandidate
@@ -103,12 +110,14 @@ func (m *Module) ScanPerRequest(
 		nameText = "Session Fixation Across Authentication"
 		description = fmt.Sprintf("The authentication request explicitly preserved two attacker-chosen %q cookie values instead of rotating to server-generated identifiers. The attacker-controlled session identifier therefore survives the authentication transition.", name)
 	}
-	return []*output.ResultEvent{{
-		ModuleID:      ModuleID,
-		URL:           target,
-		Matched:       target,
-		RecordKind:    kind,
-		EvidenceGrade: grade,
+	result := &output.ResultEvent{
+		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
+		ModuleID:           ModuleID,
+		URL:                target,
+		Matched:            target,
+		RecordKind:         kind,
+		EvidenceGrade:      grade,
 		ExtractedResults: []string{
 			"session_cookie=" + name,
 			"behavior=server explicitly Set-Cookie'd two attacker-supplied values unchanged",
@@ -125,7 +134,9 @@ func (m *Module) ScanPerRequest(
 			"explicit_adoption_rounds":  2,
 			"authentication_transition": kind == output.RecordKindFinding,
 		},
-	}}, nil
+	}
+	modkit.SetPrimaryEvidence(result, firstReceipt, evidence.RoleAttack, "attacker-chosen session value")
+	return []*output.ResultEvent{result}, nil
 }
 
 // explicitlyAdoptsValue requires affirmative server evidence: Set-Cookie must
@@ -136,17 +147,17 @@ func (m *Module) explicitlyAdoptsValue(
 	httpClient *http.Requester,
 	raw []byte,
 	name, value string,
-) bool {
+) (*evidence.Exchange, bool) {
 	modified, err := httpmsg.SetCookie(raw, name, value)
 	if err != nil {
-		return false
+		return nil, false
 	}
-	status, setCookies, ok := m.send(ctx, httpClient, modified)
+	status, setCookies, receipt, ok := m.send(ctx, httpClient, modified)
 	if !ok || status >= 400 {
-		return false
+		return nil, false
 	}
 	reissued, present := cookieValue(setCookies, name)
-	return present && reissued == value
+	return receipt, present && reissued == value
 }
 
 func isSuccessfulAuthenticationTransition(ctx *httpmsg.HttpRequestResponse) bool {
@@ -188,19 +199,19 @@ func isSuccessfulAuthenticationTransition(ctx *httpmsg.HttpRequestResponse) bool
 }
 
 // send issues raw and returns the status and the Set-Cookie name→value map.
-func (m *Module) send(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte) (int, map[string]string, bool) {
+func (m *Module) send(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte) (int, map[string]string, *evidence.Exchange, bool) {
 	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
 	// Use the raw transport so the requester's cookie jar cannot merge the
 	// server-generated technology-gate cookie into attacker-value probes. Each
 	// probe must carry exactly the Cookie header constructed above.
 	resp, _, err := httpClient.Execute(req, http.Options{NoClustering: true, RawRequest: true})
 	if err != nil {
-		return 0, nil, false
+		return 0, nil, nil, false
 	}
 	defer resp.Close()
 	r := resp.Response()
 	if r == nil {
-		return 0, nil, false
+		return 0, nil, nil, false
 	}
 	// r is a stdlib *http.Response, so use its parsed cookies rather than
 	// re-parsing Set-Cookie by hand.
@@ -211,7 +222,7 @@ func (m *Module) send(ctx *httpmsg.HttpRequestResponse, httpClient *http.Request
 		// cookie on compliant servers.
 		set[c.Name] = c.Value
 	}
-	return r.StatusCode, set, true
+	return r.StatusCode, set, http.CaptureEvidence(resp), true
 }
 
 func cookieValue(set map[string]string, name string) (string, bool) {

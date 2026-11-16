@@ -160,38 +160,95 @@ func (s *SwarmRunner) newSwarmPipelineState(ctx context.Context, cfg SwarmConfig
 	}, cleanup, nil
 }
 
-// attributeRunFindings stamps agentic_scan_uuid onto every finding this run's
-// native scan produced (matched by the run-unique scan_uuid), so downstream
-// finding counts — and the `finding --agentic-scan` view — can scope to the
-// run instead of the whole project. Best-effort and idempotent: a failure is
-// logged and the caller's count simply reflects whatever is currently stamped.
+// attributeRunFindings reconciles the known native child even on fatal exits.
+// Discovery can persist passive findings before the planner ever runs. A run
+// that never created a native row needs no attribution; orphan findings do.
 func (ps *swarmPipelineState) attributeRunFindings(ctx context.Context) {
-	if ps.runner.repo == nil {
+	if ps.runner.repo == nil || ps.cfg.ScanUUID == "" {
 		return
 	}
-	if err := ps.runner.repo.AttributeScanToAgenticScan(ctx, ps.cfg.ScanUUID, ps.agenticScan.UUID); err != nil {
-		zap.L().Debug("Failed to attribute scan findings to agentic scan", zap.Error(err))
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	exists, err := ps.runner.repo.DB().NewSelect().Model((*database.Scan)(nil)).Where("uuid = ?", ps.cfg.ScanUUID).Exists(ctx)
+	if err == nil && !exists {
+		exists, err = ps.runner.repo.DB().NewSelect().Model((*database.Finding)(nil)).Where("scan_uuid = ?", ps.cfg.ScanUUID).Exists(ctx)
+	}
+	if err == nil && exists {
+		err = ps.runner.repo.AttributeScanToAgenticScan(ctx, ps.cfg.ScanUUID, ps.agenticScan.UUID)
+	}
+	if err != nil {
+		ps.findingCountWarning("native child attribution failed; finding count may be incomplete: %v", err)
 	}
 }
 
-// runFindingCounts counts the findings attributed to this run, returning the
-// total and the per-severity breakdown. It does NOT stamp — callers that just
-// produced new findings (scan, finalize) call attributeRunFindings first;
-// read-only gates (replan) call this directly. Returns zero values when there's
-// no repo or the query fails.
+func (ps *swarmPipelineState) findingCountWarning(format string, args ...any) {
+	message := fmt.Sprintf(format, args...)
+	for _, warning := range ps.result.Warnings {
+		if warning == message {
+			return
+		}
+	}
+	ps.runner.addWarning(ps.result, "%s", message)
+	zap.L().Warn("Agent run finding accounting incomplete", zap.String("agentic_scan_uuid", ps.agenticScan.UUID))
+}
+
+// runFindingCounts counts persisted canonical findings, scoped by project and
+// native-child ownership as well as direct agent attribution. It does not
+// reconstruct dedup occurrences: an older finding's original scan/parent stays
+// unchanged and is not claimed by this run. Until the occurrence model exists,
+// these are available canonical findings, not every detection in the run.
+// -1 explicitly means unavailable, never a confidently empty run.
 func (ps *swarmPipelineState) runFindingCounts(ctx context.Context) (int, map[string]int) {
 	if ps.runner.repo == nil {
-		return 0, nil
+		if ps.agenticScan.UUID != "" && (ps.cfg.ScanFunc != nil || ps.cfg.DiscoverFunc != nil) {
+			ps.findingCountWarning("persisted finding count unavailable: no repository")
+			return -1, nil
+		}
+		return 0, nil // no native work to count (e.g. source-analysis-only)
 	}
-	counts, err := database.CountFindingsByAgenticScan(ctx, ps.runner.repo.DB(), ps.agenticScan.UUID)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if ps.agenticScan.UUID == "" {
+		ps.findingCountWarning("persisted finding count unavailable: missing parent UUID")
+		return -1, nil
+	}
+	projectUUID := ps.agenticScan.ProjectUUID
+	if projectUUID == "" {
+		projectUUID = database.DefaultProjectUUID
+	}
+	parent := &database.AgenticScan{}
+	if err := ps.runner.repo.DB().NewSelect().Model(parent).Column("uuid", "project_uuid").Where("uuid = ?", ps.agenticScan.UUID).Scan(ctx); err != nil {
+		ps.findingCountWarning("persisted finding count unavailable: parent lookup failed: %v", err)
+		return -1, nil
+	}
+	if parent.ProjectUUID != projectUUID {
+		ps.findingCountWarning("persisted finding count unavailable: parent belongs to another project")
+		return -1, nil
+	}
+	var rows []database.SeverityCount
+	err := ps.runner.repo.DB().NewSelect().Model((*database.Finding)(nil)).
+		ColumnExpr("f.severity, COUNT(*) AS count").
+		Where("f.project_uuid = ?", projectUUID).
+		Where("(f.agentic_scan_uuid = ? OR ((f.agentic_scan_uuid IS NULL OR f.agentic_scan_uuid = '') AND EXISTS (SELECT 1 FROM scans s WHERE s.uuid = f.scan_uuid AND s.project_uuid = f.project_uuid AND s.agentic_scan_uuid = ?)))", ps.agenticScan.UUID, ps.agenticScan.UUID).
+		Where("(f.record_kind IS NULL OR f.record_kind = '' OR f.record_kind = ?)", database.RecordKindFinding).
+		GroupExpr("f.severity").Scan(ctx, &rows)
 	if err != nil {
-		return 0, nil
+		ps.findingCountWarning("persisted finding count unavailable: %v", err)
+		return -1, nil
 	}
 	total := 0
-	sev := make(map[string]int, len(counts))
-	for s, c := range counts {
-		total += int(c)
-		sev[s] = int(c)
+	sev := make(map[string]int, len(rows))
+	for _, row := range rows {
+		key := strings.ToLower(strings.TrimSpace(row.Severity))
+		total += int(row.Count)
+		sev[key] += int(row.Count)
+	}
+	if total == 0 {
+		for _, warning := range ps.result.Warnings {
+			if strings.HasPrefix(warning, "native child attribution failed;") {
+				return -1, nil // zero could merely mean attribution never committed
+			}
+		}
 	}
 	return total, sev
 }
@@ -268,9 +325,15 @@ func (normalizeSwarmStep) Run(ctx context.Context, ps *swarmPipelineState) error
 		ps.agenticScan.RecordCount = len(ps.records)
 		ps.result.TotalRecords = len(ps.records)
 	} else {
-		recordUUIDs := ps.runner.validateProbeAndSave(ctx, ps.records, nil, nil, "agent-swarm", ps.cfg.ProjectUUID, ps.cfg.probeConfig())
-		ps.agenticScan.RecordCount = len(recordUUIDs)
-		ps.result.TotalRecords = len(recordUUIDs)
+		recordUUIDs := ps.runner.validateProbeAndSave(ctx, ps.records, nil, nil, nil, "agent-swarm", ps.cfg.ProjectUUID, ps.cfg.probeConfig())
+		var savedCount int
+		for _, id := range recordUUIDs {
+			if id != "" {
+				savedCount++
+			}
+		}
+		ps.agenticScan.RecordCount = savedCount
+		ps.result.TotalRecords = savedCount
 	}
 	ps.recordStats.Initial = len(ps.records)
 
@@ -334,6 +397,7 @@ func (sourceAnalysisSwarmStep) Run(ctx context.Context, ps *swarmPipelineState) 
 	started := ps.startPhase(ctx, SwarmPhaseSourceAnalysis, true)
 	var saRecords []*httpmsg.HttpRequestResponse
 	var saNotes []string
+	var saRecordUUIDs []string
 	var saExtensions []GeneratedExtension
 	var discoveredSessionConfig *AgentSessionConfig
 
@@ -366,21 +430,23 @@ func (sourceAnalysisSwarmStep) Run(ctx context.Context, ps *swarmPipelineState) 
 	}
 
 	if saErr != nil {
-		zap.L().Warn("Source analysis failed, continuing with input records only", zap.Error(saErr))
-		ps.runner.addWarning(ps.result, "source analysis failed: %v", saErr)
-	} else if saResult != nil {
+		zap.L().Warn("Source analysis incomplete, retaining any usable results", zap.Error(saErr))
+		ps.runner.addWarning(ps.result, "source analysis incomplete: %v", saErr)
+	}
+	if saResult != nil {
 		// Source analysis produced a usable result — the stack was inferred from
 		// source, so the live recon sweep can be skipped downstream.
 		ps.sourceAnalysisOK = true
 		printPhaseLine("source-analysis", fmt.Sprintf("result: %d http_records, %d extensions  has_session_config=%v",
 			len(saResult.HTTPRecords), len(saResult.Extensions), saResult.SessionConfig != nil))
 
-		filteredRecords, filteredNotes := filterSourceRecordsByHostname(saResult.HTTPRecords, ps.targetURL)
+		filteredRecords, filteredNotes, filteredUUIDs := filterSourceRecordsByHostname(saResult.HTTPRecords, ps.targetURL)
 		if len(filteredRecords) > 0 {
 			printPhaseLine("source-analysis", fmt.Sprintf("appending source-discovered routes  total=%d hostname_matched=%d",
 				len(saResult.HTTPRecords), len(filteredRecords)))
 			saRecords = filteredRecords
 			saNotes = filteredNotes
+			saRecordUUIDs = filteredUUIDs
 		}
 		saExtensions = append(saExtensions, saResult.Extensions...)
 		ps.cfg.CredentialSets = resolveIntentCredentialSets(ps.cfg.Credentials, ps.cfg.CredentialSets)
@@ -419,11 +485,12 @@ func (sourceAnalysisSwarmStep) Run(ctx context.Context, ps *swarmPipelineState) 
 			discoveredSessionConfig = saResult.SessionConfig
 			loginRecords := authsession.SessionConfigToHTTPRecords(saResult.SessionConfig)
 			if len(loginRecords) > 0 {
-				loginFiltered, loginNotes := filterSourceRecordsByHostname(loginRecords, ps.targetURL)
+				loginFiltered, loginNotes, loginUUIDs := filterSourceRecordsByHostname(loginRecords, ps.targetURL)
 				if len(loginFiltered) > 0 {
 					printPhaseLine("source-analysis", fmt.Sprintf("appending login endpoint records  count=%d", len(loginFiltered)))
 					saRecords = append(saRecords, loginFiltered...)
 					saNotes = append(saNotes, loginNotes...)
+					saRecordUUIDs = append(saRecordUUIDs, loginUUIDs...)
 				}
 			}
 		}
@@ -436,7 +503,8 @@ func (sourceAnalysisSwarmStep) Run(ctx context.Context, ps *swarmPipelineState) 
 	}
 
 	authHeaders := ps.hydrateSourceAnalysisSessions(ctx, discoveredSessionConfig, saRecords)
-	ps.runner.validateProbeAndSave(ctx, saRecords, saNotes, authHeaders, "agent-swarm-source", ps.cfg.ProjectUUID, ps.cfg.probeConfig())
+	savedUUIDs := ps.runner.validateProbeAndSave(ctx, saRecords, saNotes, saRecordUUIDs, authHeaders, "agent-swarm-source", ps.cfg.ProjectUUID, ps.cfg.probeConfig())
+	saRecordUUIDs = swarmRecordUUIDsAfterProbe(saRecordUUIDs, savedUUIDs)
 	if len(saRecords) > 0 {
 		printPhaseLine("source-analysis", fmt.Sprintf("%s source analysis routes: %d %s", terminal.SymbolBullet, len(saRecords), formatRouteStatusSummary(saRecords)))
 	}
@@ -456,17 +524,24 @@ func (sourceAnalysisSwarmStep) Run(ctx context.Context, ps *swarmPipelineState) 
 		ps.finishPhase(SwarmPhaseCodeAudit, codeAuditStarted)
 	}
 
+	if ps.runner.repo != nil && ps.targetURL != "" {
+		hostname := hostnameFromURL(ps.targetURL)
+		if hostname != "" {
+			// Versions preserve their original source, so engine-ingested routes
+			// and swarm-only/login seeds may need separate fallback queries.
+			for _, source := range []string{"source-analysis", "agent-swarm-source"} {
+				if _, err := ps.runner.reprobeUnprobedRecords(ctx, ps.cfg.ProjectUUID, hostname, authHeaders, source, saRecords, saRecordUUIDs); err != nil {
+					ps.runner.addWarning(ps.result, "source analysis reprobe incomplete: %v", err)
+				}
+			}
+		}
+	}
+	// Append only after fallback adoption: planner/scanner/checkpoint consumers
+	// and route summaries must all see the same complete sent exchanges.
 	ps.records = append(ps.records, saRecords...)
 	ps.result.TotalRecords = len(ps.records)
 	ps.recordStats.Source = len(saRecords)
 	ps.sourceExtensions = append(ps.sourceExtensions, saExtensions...)
-
-	if ps.runner.repo != nil && ps.targetURL != "" {
-		hostname := hostnameFromURL(ps.targetURL)
-		if hostname != "" {
-			ps.runner.reprobeUnprobedRecords(ctx, ps.cfg.ProjectUUID, hostname, authHeaders, "agent-swarm-source")
-		}
-	}
 	if len(saRecords) > 0 {
 		printPhaseLine("source-analysis", fmt.Sprintf("%s routes discovered: %d %s",
 			terminal.SymbolBullet, len(saRecords), formatRouteStatusSummary(saRecords)))
@@ -540,9 +615,8 @@ func (ps *swarmPipelineState) hydrateSourceAnalysisSessions(ctx context.Context,
 			printPhaseLine("source-analysis", fmt.Sprintf("%s sessions: %d discovered, no auth tokens obtained", terminal.SymbolBullet, len(discoveredSessionConfig.Sessions)))
 		}
 	}
-	if len(authHeaders) > 0 && len(saRecords) > 0 {
-		authsession.ReplaceAuthHeadersInHTTPRR(saRecords, authHeaders)
-	}
+	// validateProbeAndSave applies auth and invalidates any changed exchange
+	// before probing. Do not pair a refreshed request with its old response here.
 	return authHeaders
 }
 
@@ -564,6 +638,12 @@ func (discoverySwarmStep) Run(ctx context.Context, ps *swarmPipelineState) error
 			ps.recordStats.Discovery = len(discoveredRecords)
 			ps.result.TotalRecords = len(ps.records)
 		}
+	}
+	// Passive findings exist already, even when discovery returned an error.
+	// Attribute before the planner so later early exits retain their evidence.
+	if ps.runner.repo != nil {
+		ps.attributeRunFindings(ctx)
+		ps.result.TotalFindings, ps.result.SeverityCounts = ps.runFindingCounts(ctx)
 	}
 	ps.finishPhase(SwarmPhaseDiscover, started)
 	fmt.Fprintf(os.Stderr, "  %s Total records after discovery: %s\n", terminal.Cyan(terminal.SymbolBullet), terminal.Orange(fmt.Sprintf("%d", len(ps.records))))
@@ -865,6 +945,9 @@ func (scanSwarmStep) Run(ctx context.Context, ps *swarmPipelineState) error {
 	ps.attributeRunFindings(ctx)
 	scanFindings, _ := ps.runFindingCounts(ctx)
 	summary := fmt.Sprintf("completed — %d findings in %s", scanFindings, ps.phaseTimings[SwarmPhaseScan].Round(time.Second))
+	if scanFindings < 0 {
+		summary = fmt.Sprintf("completed — finding count unavailable in %s", ps.phaseTimings[SwarmPhaseScan].Round(time.Second))
+	}
 	if ps.extensionDir != "" {
 		summary += " (custom extensions loaded)"
 	}
@@ -892,8 +975,9 @@ func (replanOnEmptySwarmStep) Run(ctx context.Context, ps *swarmPipelineState) e
 	}
 	// Scope to this run, not the project: a project with prior findings must
 	// not suppress the supplemental pass when THIS scan found nothing. The scan
-	// step already stamped, so count-only here (no redundant re-stamp).
-	if total, _ := ps.runFindingCounts(ctx); total > 0 {
+	// step already stamped, so count-only here (no redundant re-stamp). An
+	// unavailable count is not evidence of an empty run and must not replan.
+	if total, _ := ps.runFindingCounts(ctx); total != 0 {
 		return nil
 	}
 	if !replanWorthwhile(ps.techStack, ps.records) {

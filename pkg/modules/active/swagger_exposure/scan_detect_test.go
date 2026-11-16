@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/modules/modtest"
@@ -44,6 +45,33 @@ func TestScanPerRequest_DetectsContextPathSwagger(t *testing.T) {
 	assert.Equal(t, output.RecordKindObservation, res[0].RecordKind)
 	assert.Equal(t, output.EvidenceGradeObservation, res[0].EvidenceGrade)
 	assert.False(t, res[0].IsFinding())
+	require.Len(t, res[0].Evidence, 4, "the selected probe plus directory, root and slug controls")
+	require.Equal(t, "selected", res[0].EvidenceStatus)
+	require.False(t, res[0].BaselineEvidence)
+	entry := res[0].Evidence[0]
+	require.True(t, entry.Primary)
+	require.Equal(t, evidence.RoleAttack, entry.Role)
+	require.Equal(t, evidence.ProvenanceCaptured, entry.Exchange.Provenance)
+	require.Contains(t, string(entry.Exchange.Request), "GET /orders/swagger-ui.html HTTP/1.1")
+	require.Contains(t, string(entry.Exchange.Response), "SwaggerUIBundle")
+	require.NoError(t, entry.Exchange.Validate(), "guard fetches after Close cannot mutate the chosen receipt")
+	require.Equal(t, string(entry.Exchange.Request), res[0].Request)
+	require.Equal(t, string(entry.Exchange.Response), res[0].Response)
+	labels := []string{"nonexistent directory", "root-page shell comparison", "path-segment reflection control"}
+	ids := map[string]bool{entry.ExchangeID: true}
+	for i, control := range res[0].Evidence[1:] {
+		require.False(t, control.Primary)
+		require.Equal(t, evidence.RoleControl, control.Role)
+		require.Equal(t, labels[i], control.Label)
+		require.NotNil(t, control.Exchange)
+		require.Equal(t, evidence.ProvenanceCaptured, control.Exchange.Provenance)
+		require.False(t, ids[control.ExchangeID], "each guard retains its own execution")
+		ids[control.ExchangeID] = true
+		require.NoError(t, control.Exchange.Validate())
+		require.Contains(t, string(control.Exchange.Response), "HTTP/1.1 404 Not Found")
+		require.NotContains(t, string(control.Exchange.Response), "SwaggerUIBundle")
+	}
+	require.Contains(t, string(res[0].Evidence[2].Exchange.Request), "GET / HTTP/1.1")
 }
 
 func TestScanPerRequest_AuthenticatedSpecIsNotCalledPublic(t *testing.T) {

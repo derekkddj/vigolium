@@ -1124,9 +1124,9 @@ type AgenticScanStatusResponse struct {
 	Status          string        `json:"status"`                 // "running", "completed", "failed"
 	AgentName       string        `json:"agent_name,omitempty"`
 	TemplateID      string        `json:"template_id,omitempty"`
-	FindingCount    int           `json:"finding_count,omitempty"`
-	RecordCount     int           `json:"record_count,omitempty"`
-	SavedCount      int           `json:"saved_count,omitempty"`
+	FindingCount    int           `json:"finding_count"`
+	RecordCount     int           `json:"record_count"`
+	SavedCount      int           `json:"saved_count"`
 	Error           string        `json:"error,omitempty"`
 	CompletedAt     *time.Time    `json:"completed_at,omitempty"`
 	Result          *agent.Result `json:"result,omitempty"`
@@ -1155,11 +1155,11 @@ type AgentSessionSummary struct {
 	ParentAgenticScanUUID string     `json:"parent_agentic_scan_uuid,omitempty"`
 	CurrentPhase          string     `json:"current_phase,omitempty"`
 	PhasesRun             []string   `json:"phases_run,omitempty"`
-	FindingCount          int        `json:"finding_count,omitempty"`
-	RecordCount           int        `json:"record_count,omitempty"`
-	SavedCount            int        `json:"saved_count,omitempty"`
+	FindingCount          int        `json:"finding_count"`
+	RecordCount           int        `json:"record_count"`
+	SavedCount            int        `json:"saved_count"`
 	ErrorMessage          string     `json:"error_message,omitempty"`
-	DurationMs            int64      `json:"duration_ms,omitempty"`
+	DurationMs            int64      `json:"duration_ms"`
 	StartedAt             *time.Time `json:"started_at,omitempty"`
 	CompletedAt           *time.Time `json:"completed_at,omitempty"`
 	CreatedAt             time.Time  `json:"created_at"`

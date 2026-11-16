@@ -172,7 +172,9 @@ func NewServer(cfg ServerConfig, q queue.Queue, db *database.DB, repo *database.
 			s.fsMirror = mirror
 			handlers.mirrorDropped = mirror.Dropped
 			repo.OnRecordSaved = mirror.OnRecord
-			repo.OnFindingSaved = mirror.OnFinding
+			// The occurrence hook also fires for new rows: do not wire both hooks,
+			// which would mirror each initial occurrence twice.
+			repo.OnFindingOccurrenceSaved = mirror.OnFindingOccurrence
 			zap.L().Info("Filesystem mirror enabled", zap.String("path", cfg.MirrorFSPath))
 		}
 	}

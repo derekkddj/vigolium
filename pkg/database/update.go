@@ -1,11 +1,11 @@
 package database
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
 	"slices"
-	"time"
 
 	"github.com/uptrace/bun"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
@@ -24,87 +24,47 @@ type RecordResponseUpdate struct {
 	ResponseTimeMs        int64
 }
 
-// UpdateRecordResponse replaces the response fields of an existing HTTP record.
+// UpdateRecordResponse guards the former in-place replay API. A response-only
+// update cannot prove which request was actually sent. Identical response bytes
+// are a no-op; changed responses require SaveRecordVersion with the full exchange
+// and adoption of its returned UUID. The old row and all references stay intact.
 func (r *Repository) UpdateRecordResponse(ctx context.Context, uuid string, update *RecordResponseUpdate) error {
-	result, err := r.db.NewUpdate().
-		Model((*HTTPRecord)(nil)).
-		Set("status_code = ?", update.StatusCode).
-		Set("status_phrase = ?", update.StatusPhrase).
-		Set("response_http_version = ?", update.ResponseHTTPVersion).
-		Set("response_content_type = ?", update.ResponseContentType).
-		Set("response_content_length = ?", update.ResponseContentLength).
-		Set("raw_response = ?", update.RawResponse).
-		// The caller's bytes are stored as given, so nothing was decoded.
-		Set("response_decoded_from = NULL").
-		Set("response_hash = ?", update.ResponseHash).
-		Set("response_time_ms = ?", update.ResponseTimeMs).
-		// Derived from the bytes being written rather than taken from the caller,
-		// so it cannot describe the response this row used to hold: a replayed
-		// redirect that now points somewhere else must not keep rendering the old
-		// destination. Clearing it is as important as setting it — a replay that
-		// turns a 302 into a 200 has no location.
-		Set("response_location = ?", redirectLocationFromRaw(update.StatusCode, update.RawResponse)).
-		Set("has_response = ?", true).
-		Set("received_at = ?", time.Now()).
-		Where("uuid = ?", uuid).
-		Exec(ctx)
+	if update == nil {
+		return fmt.Errorf("UpdateRecordResponse: missing response update")
+	}
+	record, err := r.GetRecordByUUID(ctx, uuid)
 	if err != nil {
-		return fmt.Errorf("failed to update record response: %w", err)
+		return fmt.Errorf("UpdateRecordResponse: load record: %w", err)
 	}
-
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("no record found with uuid %s", uuid)
+	if record.HasResponse && bytes.Equal(record.RawResponse, update.RawResponse) {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("UpdateRecordResponse: %w; save the complete replay as a version", ErrImmutableRecordExchange)
 }
 
-// BackfillRecordResponse populates the response columns of an existing
-// request-only http_record stub from a freshly fetched request/response,
-// computing every response-derived field (content-type/length, hashes,
-// normalized hash, word count, title) via the shared FromHttpRequestResponse
-// converter so the backfilled row matches a normally-saved record.
-//
-// Discovery stores endpoints synthesized from a parsed OpenAPI/Swagger/Postman
-// spec as request-only stubs (status 0, empty body); the executor then fetches
-// each baseline to scan the endpoint, but without this the stub stays at
-// status 0 with an empty response in the traffic view. The update is guarded on
-// has_response = false so it only ever fills a genuine stub — it never clobbers
-// a record that already captured a response, making it idempotent across the
-// discovery and dynamic-assessment phases. An rr with no response is a no-op.
+// BackfillRecordResponse guards the former stub mutation API. Response absence
+// is itself part of a captured exchange, even before references are committed.
+// An rr without a response remains a no-op for compatibility. An identical
+// complete exchange is also a no-op; otherwise callers must SaveRecordVersion
+// (or save an observation normally) and adopt the returned UUID.
 func (r *Repository) BackfillRecordResponse(ctx context.Context, uuid string, rr *httpmsg.HttpRequestResponse) error {
 	if rr == nil || rr.Response() == nil {
 		return nil
 	}
 
-	// The rr.Response() guard above already guarantees the converter populates
-	// the response columns (HasResponse), so no post-convert recheck is needed.
-	rec := &HTTPRecord{}
-	if err := rec.FromHttpRequestResponse(rr); err != nil {
-		return fmt.Errorf("backfill: convert record: %w", err)
-	}
-
-	_, err := r.db.NewUpdate().
-		Model((*HTTPRecord)(nil)).
-		Set("status_code = ?", rec.StatusCode).
-		Set("response_http_version = ?", rec.ResponseHTTPVersion).
-		Set("response_content_type = ?", rec.ResponseContentType).
-		Set("response_content_length = ?", rec.ResponseContentLength).
-		Set("raw_response = ?", rec.RawResponse).
-		Set("response_decoded_from = NULLIF(?, '')", rec.ResponseDecodedFrom).
-		Set("response_hash = ?", rec.ResponseHash).
-		Set("response_norm_hash = ?", rec.ResponseNormHash).
-		Set("response_words = ?", rec.ResponseWords).
-		Set("response_title = ?", rec.ResponseTitle).
-		Set("response_location = ?", rec.ResponseLocation).
-		Set("has_response = ?", true).
-		Set("received_at = ?", time.Now()).
-		Where("uuid = ? AND has_response = ?", uuid, false).
-		Exec(ctx)
+	record, err := r.GetRecordByUUID(ctx, uuid)
 	if err != nil {
-		return fmt.Errorf("backfill record response: %w", err)
+		return fmt.Errorf("BackfillRecordResponse: load record: %w", err)
 	}
-	return nil
+	candidate := &HTTPRecord{ProjectUUID: record.ProjectUUID}
+	if err := candidate.PrepareIdentity(rr); err != nil {
+		return fmt.Errorf("BackfillRecordResponse: convert identity: %w", err)
+	}
+	prepareRecordExchangeIdentity(candidate, rr)
+	if recordExchangeBytesValid(record) && recordDedupKey(candidate) == recordDedupKey(record) {
+		return nil
+	}
+	return fmt.Errorf("BackfillRecordResponse: %w; save the fetched exchange as a version", ErrImmutableRecordExchange)
 }
 
 // DeleteRequestOnlyStubs removes request-only records that a check against the

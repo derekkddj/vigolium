@@ -1,7 +1,6 @@
 package tool
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -15,9 +14,10 @@ import (
 	"github.com/vigolium/vigolium/pkg/procutil"
 )
 
-// maxBashCapture bounds how much combined stdout+stderr the bash tool retains in
-// memory. Output beyond this is drained from the pipe (so the command never
-// blocks on a full pipe) but discarded from the captured result.
+// maxBashCapture bounds the combined stdout+stderr retained for model/UI use.
+// When a per-call archive is attached, all raw bytes stream to private files
+// before this cap is applied. Without an archive the omitted bytes are explicitly
+// reported as lost; a bounded model preview must never imply full retention.
 const maxBashCapture = 1 << 20 // 1 MiB
 
 // Catastrophic patterns match on a single shell *segment* (a piece
@@ -207,90 +207,67 @@ func (*bashTool) Execute(ctx context.Context, args map[string]any, onUpdate Upda
 		cmd.Env = env
 	}
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return Result{}, err
+	capture := &bashCapture{archive: callArchiveFrom(ctx)}
+	// Separate exec-managed copy pipes preserve raw stdout and stderr while a
+	// shared collector records their observed combined ordering. Wait joins
+	// both readers; archive write failures never stop pipe drainage/execution.
+	cmd.Stdout = bashCaptureWriter{capture: capture, stream: "stdout"}
+	cmd.Stderr = bashCaptureWriter{capture: capture, stream: "stderr"}
+	if capture.archive != nil {
+		// Retain even empty streams, so no file is mistaken for missing capture.
+		for _, stream := range []string{"stdout", "stderr", "combined"} {
+			capture.archive.WriteStream(stream, nil)
+		}
 	}
-	cmd.Stderr = cmd.Stdout
 
 	if err := cmd.Start(); err != nil {
 		return Result{Content: fmt.Sprintf("start failed: %v", err), IsError: true}, nil
 	}
 
-	var (
-		mu  sync.Mutex
-		buf strings.Builder
-	)
-
-	flushCh := make(chan struct{}, 1)
 	doneCh := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-doneCh:
-				return
-			case <-ticker.C:
+	var updates sync.WaitGroup
+	if onUpdate != nil {
+		updates.Add(1)
+		go func() {
+			defer updates.Done()
+			ticker := time.NewTicker(50 * time.Millisecond)
+			defer ticker.Stop()
+			lastEmitted := 0
+			for {
 				select {
-				case flushCh <- struct{}{}:
-				default:
+				case <-doneCh:
+					return
+				case <-ticker.C:
+					current := capture.snapshot()
+					if len(current) > lastEmitted {
+						onUpdate(Result{Content: truncateForDisplay(current)})
+						lastEmitted = len(current)
+					}
 				}
 			}
-		}
-	}()
-	go func() {
-		lastEmitted := 0
-		for {
-			select {
-			case <-doneCh:
-				return
-			case <-flushCh:
-				mu.Lock()
-				current := buf.String()
-				mu.Unlock()
-				if len(current) > lastEmitted && onUpdate != nil {
-					onUpdate(Result{Content: truncateForDisplay(current)})
-					lastEmitted = len(current)
-				}
-			}
-		}
-	}()
-
-	reader := bufio.NewReader(stdout)
-	capped := false
-	for {
-		chunk := make([]byte, 4096)
-		n, rerr := reader.Read(chunk)
-		if n > 0 {
-			mu.Lock()
-			if !capped {
-				if buf.Len()+n > maxBashCapture {
-					buf.Write(chunk[:maxBashCapture-buf.Len()])
-					fmt.Fprintf(&buf, "\n... [output capped at %d bytes; remainder discarded]", maxBashCapture)
-					capped = true
-				} else {
-					buf.Write(chunk[:n])
-				}
-			}
-			// Once capped we keep reading (below) to drain the pipe but stop
-			// appending, bounding memory regardless of how much the command emits.
-			mu.Unlock()
-		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			break
-		}
+		}()
 	}
 
 	waitErr := cmd.Wait()
 	close(doneCh)
+	updates.Wait() // no progress callback may outlive ToolExecEnd/archive close
 
-	output := buf.String()
+	output := capture.snapshot()
+	details := capture.details()
+	if details["output_capture_complete"] != true {
+		details["output_capture_error"] = "pipe_drain_incomplete"
+		capture.archive.markStreamsIncomplete()
+	}
+	if capture.seen > int64(maxBashCapture) {
+		retention := "remainder not archived"
+		if capture.archive != nil {
+			retention = "raw output streamed to private archive; consult receipt for retention status"
+		}
+		output += fmt.Sprintf("\n... [output capped at %d bytes for model/display; %s]", maxBashCapture, retention)
+	}
 	if runCtx.Err() == context.DeadlineExceeded {
-		return Result{Content: output + fmt.Sprintf("\n[timed out after %s]", timeout), IsError: true}, nil
+		details["exit_code"] = -1
+		return Result{Content: output + fmt.Sprintf("\n[timed out after %s]", timeout), Details: details, IsError: true}, nil
 	}
 	if waitErr != nil {
 		exitCode := -1
@@ -298,13 +275,104 @@ func (*bashTool) Execute(ctx context.Context, args map[string]any, onUpdate Upda
 		if errors.As(waitErr, &exitErr) {
 			exitCode = exitErr.ExitCode()
 		}
-		return Result{
-			Content: output + fmt.Sprintf("\n[exit %d]", exitCode),
-			Details: map[string]any{"exit_code": exitCode},
-			IsError: true,
-		}, nil
+		details["exit_code"] = exitCode
+		return Result{Content: output + fmt.Sprintf("\n[exit %d]", exitCode), Details: details, IsError: true}, nil
 	}
-	return Result{Content: output, Details: map[string]any{"exit_code": 0}}, nil
+	details["exit_code"] = 0
+	return Result{Content: output, Details: details}, nil
+}
+
+// bashCapture keeps only the model budget in memory. Disk archival happens
+// under the same lock BEFORE appending a bounded preview, so no interleaving can
+// disagree about stdout/stderr and combined chunk order. Combined ordering is
+// the order observed by the pipe readers, not a reconstruction of syscall order.
+type bashCapture struct {
+	mu        sync.Mutex
+	buf       strings.Builder
+	seen      int64
+	stdout    int64
+	stderr    int64
+	stdoutEOF bool
+	stderrEOF bool
+	archive   *CallArchive
+}
+
+type bashCaptureWriter struct {
+	capture *bashCapture
+	stream  string
+}
+
+func (w bashCaptureWriter) Write(p []byte) (int, error) {
+	c := w.capture
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.archive != nil {
+		c.archive.WriteStream(w.stream, p)
+		c.archive.WriteStream("combined", p)
+	}
+	c.seen += int64(len(p))
+	if w.stream == "stderr" {
+		c.stderr += int64(len(p))
+	} else {
+		c.stdout += int64(len(p))
+	}
+	if remaining := maxBashCapture - c.buf.Len(); remaining > 0 {
+		n := len(p)
+		if n > remaining {
+			n = remaining
+		}
+		_, _ = c.buf.Write(p[:n])
+	}
+	return len(p), nil
+}
+
+// ReadFrom is used by exec's pipe copies. Track real EOF independently of
+// cmd.Wait's error: Wait can report a process ExitError while hiding a pipe
+// drain deadline. Without this, a failed command could falsely claim complete
+// raw capture even though descendants held the pipe open and it was cut short.
+func (w bashCaptureWriter) ReadFrom(r io.Reader) (int64, error) {
+	buf := make([]byte, 32*1024)
+	var total int64
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			_, _ = w.Write(buf[:n]) // always drains, even when disk archival fails
+			total += int64(n)
+		}
+		if err != nil {
+			if err == io.EOF {
+				w.capture.mu.Lock()
+				if w.stream == "stdout" {
+					w.capture.stdoutEOF = true
+				} else {
+					w.capture.stderrEOF = true
+				}
+				w.capture.mu.Unlock()
+				return total, nil
+			}
+			return total, err
+		}
+	}
+}
+
+func (c *bashCapture) snapshot() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.String()
+}
+
+func (c *bashCapture) details() map[string]any {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return map[string]any{
+		"stdout_bytes": c.stdout, "stderr_bytes": c.stderr,
+		"output_bytes": c.seen, "output_retained_bytes": c.buf.Len(),
+		"output_omitted_bytes": c.seen - int64(c.buf.Len()),
+		"output_truncated":     c.seen > int64(c.buf.Len()), "output_archive_enabled": c.archive != nil,
+		"output_capture_complete": c.stdoutEOF && c.stderrEOF,
+		// Durable retention status belongs to the final tool_archive receipt,
+		// not this pre-finalization capture snapshot.
+	}
 }
 
 func truncateForDisplay(s string) string {

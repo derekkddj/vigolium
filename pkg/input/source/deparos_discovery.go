@@ -1034,6 +1034,11 @@ func (d *DeparosDiscoverySource) discoverTarget(parentCtx context.Context, targe
 	// starts, so its init-time JSTangle pass analyzes bundles the crawl itself
 	// never fetches (SPA bundles the browser revealed).
 	d.seedSpideredJS(ctx, siteMap, target)
+	// These rows contain decoded JS for extraction, not HTTP receipts. The
+	// collector rebuilds nodes as HTTP messages, so start it after this seed-only
+	// prefix rather than re-importing invented GET/200 exchanges as scan inputs.
+	// Capture the boundary before the engine can store genuinely fetched nodes.
+	seededThrough := siteMap.LatestNodeID()
 
 	engine, err := discovery.NewEngineWithContext(ctx, cfg, siteMap)
 	if err != nil {
@@ -1060,6 +1065,7 @@ func (d *DeparosDiscoverySource) discoverTarget(parentCtx context.Context, targe
 	}
 
 	collector := newTargetCollector(d, target, siteMap)
+	collector.cursor.Store(seededThrough)
 	stopFlusher := collector.startFlusher(ctx)
 
 	_ = engine.WaitForQueues(ctx)

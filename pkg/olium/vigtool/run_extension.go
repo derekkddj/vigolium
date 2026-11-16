@@ -2,7 +2,6 @@ package vigtool
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -145,31 +144,13 @@ func (r *runExtensionTool) Execute(ctx context.Context, args map[string]any, onU
 	r.count.Add(1)
 
 	res, err := runner.LaunchScan(ctx, params)
+	details := reconcileScanReceipt(ctx, r.ctx, res)
+	details["script"] = filepath.Base(resolved)
 	if err != nil {
-		uuid := ""
-		if res != nil {
-			uuid = res.ScanUUID
-		}
-		return tool.Result{
-			Content: fmt.Sprintf("extension run failed (uuid=%s): %v", uuid, err),
-			IsError: true,
-		}, nil
+		return failedScanReceipt("extension run", res, err, details), nil
 	}
 
-	// Attribute this child scan (and its findings) to the parent agentic scan.
-	r.ctx.attributeChildScan(ctx, res.ScanUUID)
-
-	body, _ := json.Marshal(res)
-	return tool.Result{
-		Content: string(body),
-		Details: map[string]any{
-			"scan_uuid":     res.ScanUUID,
-			"status":        res.Status,
-			"finding_count": res.FindingCount,
-			"duration_ms":   res.DurationMs,
-			"script":        filepath.Base(resolved),
-		},
-	}, nil
+	return successfulScanReceipt(res, details), nil
 }
 
 // resolveExtensionPath returns an absolute path to the script the runner

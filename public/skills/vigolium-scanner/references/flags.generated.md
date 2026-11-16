@@ -1229,8 +1229,8 @@ Browse vulnerability findings with fuzzy search and filtering
 | `--columns` | - | stringSlice | - | Columns to show (comma-separated, e.g. ID,SEVERITY,MODULE) |
 | `--compact` | - | bool | `false` | With --json, emit metadata only: omit request/response bodies and each finding's description, remediation and additional_evidence (name one in --fields to keep it). --markdown already compacts response bodies by default; use --full-body to render them whole |
 | `--confidence` | - | string | - | Filter by confidence: certain,firm,tentative (comma-separated) |
-| `--curl` | - | bool | `false` | Render each selected finding's proving request (its stored evidence, else its first linked record) as a curl command; -j gives {id, finding_hash, record_uuid, curl, argv} |
-| `--curl-all` | - | bool | `false` | Like --curl, but render every HTTP record linked to each finding |
+| `--curl` | - | bool | `false` | Render the explicitly selected primary request as curl (legacy inline fallback is role unknown, not proof); nothing is sent |
+| `--curl-all` | - | bool | `false` | Render all selected exchanges and linked context requests with their roles; nothing is sent |
 | `--exclude-body` | - | string | - | Exclude findings whose linked request/response body contains the term (inverse of --body; bodies only) (alias: --exclude-body-search) |
 | `--exclude-columns` | - | stringSlice | - | Columns to hide (comma-separated) |
 | `--exclude-header` | - | string | - | Exclude findings whose linked request/response header block contains the term (inverse of --header; headers only) (alias: --exclude-header-search) |
@@ -2273,7 +2273,7 @@ Re-send a stored or supplied HTTP request and diff baseline vs replay
 | `--host` | - | string | - | Bulk: filter records by hostname pattern (wildcard supported) |
 | `--http-mode` | - | string | - | With --send-via-burp: wire protocol — auto\|http1\|http2\|http2_ignore_alpn (default auto; use http1 for request smuggling/desync) |
 | `--ignore-scope` | - | bool | `false` | Send to hosts outside the configured host scope |
-| `--in-replace` | - | bool | `false` | When the source is a stored record, update its stored response with the replay |
+| `--in-replace` | - | bool | `false` | Save the complete replay as an immutable version of the stored record |
 | `--input` | `-i` | string | - | Raw input: curl, raw HTTP, Burp XML, base64 or URL text, a path to a file holding one, or '-' for stdin |
 | `--input-file` | - | string | - | Read --input value from a file |
 | `--keep-host` | - | bool | `false` | With -t: send the request's Host header unchanged even when it names the old destination |

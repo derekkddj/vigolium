@@ -161,20 +161,24 @@ func (m *Module) runCheck(
 		if modkit.ResemblesObservedPage(ctx, res.Body) {
 			continue
 		}
+		proof := aem.NewProof(res)
+		proof.Control(clean)
 		// The bypass must reproduce, and the direct path must still be blocked on a
 		// fresh fetch — so a flapping upstream is not mistaken for a bypass.
 		if !aem.ReproduceMarker(ctx, httpClient, bp, reproduceRounds, func(r aem.ProbeResult) bool {
 			_, _, rok := c.confirm(r)
 			return rok
-		}) {
+		}, proof) {
 			continue
 		}
-		if fresh := aem.Get(ctx, httpClient, c.cleanPath, nil); fresh.OK {
+		fresh := aem.Get(ctx, httpClient, c.cleanPath, nil)
+		proof.Control(fresh)
+		if fresh.OK {
 			if _, _, stillOpen := c.confirm(fresh); stillOpen {
 				continue // direct path now serves it too → not a bypass
 			}
 		}
-		return m.build(c, evidence, sev, bp, clean.Status, baseURL)
+		return m.build(c, evidence, sev, bp, clean.Status, baseURL, proof)
 	}
 	return nil
 }
@@ -186,6 +190,7 @@ func (m *Module) build(
 	bypassPath string,
 	cleanStatus int,
 	baseURL string,
+	proof *aem.Proof,
 ) *output.ResultEvent {
 	matchedURL := baseURL + bypassPath
 	tags := append([]string{"aem", "adobe", "acl-bypass", "path-normalization"}, c.tags...)
@@ -201,7 +206,8 @@ func (m *Module) build(
 		"bypass path: " + bypassPath,
 	}, evidence...)
 
-	return &output.ResultEvent{
+	proof.Payload = bypassPath
+	return proof.Attack(&output.ResultEvent{
 		ModuleID:         ModuleID,
 		Host:             aem.HostFromBase(baseURL),
 		URL:              matchedURL,
@@ -218,5 +224,5 @@ func (m *Module) build(
 				"https://i.blackhat.com/us-18/Wed-August-8/us-18-Orange-Tsai-Breaking-Parser-Logic-Take-Your-Path-Normalization-Off-And-Pop-0days-Out-2.pdf",
 			}, c.ref...),
 		},
-	}
+	})
 }

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -73,6 +74,10 @@ type directScanSession struct {
 	sharedCreated bool
 	agg           directScanAggregate
 
+	// Captured only after begin validates identity. Completion never adopts a
+	// stored row's project (or another store) when this invocation lacks scope.
+	scanScopes map[string]directScanScope
+
 	// budget is the invocation's request budget (--max-requests,
 	// --max-requests-per-host), shared by every input; nil when unset. Its
 	// verdict is folded into each row (runner.ApplyRequestBudget).
@@ -103,6 +108,11 @@ type directScanSession struct {
 	finished     []string
 	finishedOut  map[string]webhook.Outcome
 	finishedRepo *database.Repository
+}
+
+type directScanScope struct {
+	db      *database.DB
+	project string
 }
 
 // directSettings is the settings one scan-url / scan-request invocation on the
@@ -155,6 +165,7 @@ func (a *directScanAggregate) add(rep core.ExecutionReport, reached, interrupted
 	a.rep.Unacked += rep.Unacked
 	a.rep.ScopeRejected += rep.ScopeRejected
 	a.rep.Responded += rep.Responded
+	a.rep.FindingStoreFailed += rep.FindingStoreFailed
 	a.reached = a.reached || reached
 	a.interrupted = a.interrupted || interrupted
 	if a.err == nil {
@@ -287,20 +298,65 @@ func (s *directScanSession) startHeartbeat(repo *database.Repository, projectUUI
 	})
 }
 
+// validateBeforeSchemeProbe checks direct scan-request's store and pinned
+// identity before its optional TCP/TLS probe. It creates no scan or log rows;
+// begin validates again and captures ownership after the final URL is known.
+func (s *directScanSession) validateBeforeSchemeProbe(ctx context.Context) error {
+	repo, project, err := acquireDirectScanDB(getDB)
+	if err != nil {
+		return err
+	}
+	if repo == nil {
+		if s.pinned != "" {
+			return fmt.Errorf("pinned scan UUID requires a database to validate ownership")
+		}
+		return nil
+	}
+	s.noteStore()
+	if s.pinned == "" {
+		return nil
+	}
+	if project == "" {
+		project = database.DefaultProjectUUID
+	}
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), directScanFinalizeBudget)
+	defer cancel()
+	scan, err := repo.GetScanByUUID(readCtx, s.pinned)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // A new pinned scan will be created by begin.
+	}
+	if err != nil {
+		return fmt.Errorf("validate pinned direct scan before scheme probe: %w", err)
+	}
+	if scan.ProjectUUID != project {
+		return fmt.Errorf("%w: pinned direct scan belongs to another project", database.ErrScanProjectMismatch)
+	}
+	return nil
+}
+
 // begin creates the scan row an input reports into, after the store was
 // acquired and before any request goes out (and before an interrupt is
-// checked: an interrupted input still gets a row that says so). A failure warns rather than fails,
-// as the runner's own row creation does: the scan is still worth running.
-func (s *directScanSession) begin(ctx context.Context, repo *database.Repository, projectUUID, scanUUID, target, method string, active, passive int) {
+// checked: an interrupted input still gets a row that says so). Once a store is
+// selected, creation or identity failures are fatal before any target requests
+// or evidence writes. Unpinned, explicitly memory-only inputs need no row.
+func (s *directScanSession) begin(ctx context.Context, repo *database.Repository, projectUUID, scanUUID, target, method string, active, passive int) error {
 	if repo == nil {
-		return
+		if s.pinned != "" {
+			return fmt.Errorf("pinned scan UUID requires a database to validate ownership")
+		}
+		return nil
 	}
 	// Detached and bounded, like the finalizer: a Ctrl-C landing between store
 	// acquisition and here must not leave findings stamped with a UUID that
 	// has no row.
 	rowCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), directScanFinalizeBudget)
 	defer cancel()
-	logger := database.NewScanLogger(repo, scanUUID)
+	if projectUUID == "" {
+		projectUUID = database.DefaultProjectUUID
+	}
+	if scope, ok := s.scanScopes[scanUUID]; ok && (scope.db != repo.DB() || scope.project != projectUUID) {
+		return fmt.Errorf("direct scan store or project changed during invocation")
+	}
 	if s.pinned == "" || !s.sharedCreated {
 		rowTarget := target
 		if s.pinned != "" {
@@ -311,29 +367,51 @@ func (s *directScanSession) begin(ctx context.Context, repo *database.Repository
 		if err := repo.CreateScan(rowCtx, row); err != nil {
 			zap.L().Warn("Failed to create scan record", zap.String("scan_uuid", scanUUID), zap.Error(err))
 			if !globalSilent {
-				fmt.Fprintf(os.Stderr, "%s scan row not created (%v): findings are stored but `log`/`scan status` will not find %s\n",
+				fmt.Fprintf(os.Stderr, "%s scan record/log initialization skipped (%v): %s\n",
 					terminal.WarnPrefix(), err, scanUUID)
 			}
-		}
-		if s.pinned != "" {
-			s.sharedCreated = true
+			return fmt.Errorf("initialize direct scan: %w", err)
 		}
 	}
-	s.startHeartbeat(repo, projectUUID, scanUUID)
+	// CreateScan is get-or-create. Confirm the stored identity even when a
+	// pinned batch already initialized its shared row, and fail closed on a
+	// read error. ScanLogger trusts the explicit scope supplied by its caller;
+	// it must receive the confirmed row's scope, never a guessed/default store.
+	scan, err := repo.GetScanByUUID(rowCtx, scanUUID)
+	if err != nil {
+		return fmt.Errorf("validate direct scan identity: %w", err)
+	}
+	if scan.ProjectUUID != projectUUID {
+		return fmt.Errorf("%w: direct scan belongs to another project", database.ErrScanProjectMismatch)
+	}
+	if s.scanScopes == nil {
+		s.scanScopes = make(map[string]directScanScope)
+	}
+	s.scanScopes[scanUUID] = directScanScope{db: repo.DB(), project: projectUUID}
+	if s.pinned != "" {
+		s.sharedCreated = true
+	}
+	logger := database.NewScanLogger(repo, scanUUID, scan.ProjectUUID)
+	defer logger.Close()
+	s.startHeartbeat(repo, scan.ProjectUUID, scanUUID)
 	logger.Info("scan", fmt.Sprintf("%s started: %s %s with %d active + %d passive modules", s.name, method, target, active, passive))
+	return nil
 }
 
 // end completes the row for one finished input on a detached, bounded context:
 // on an interrupt the invocation's context is already cancelled, and writing on
 // it would leave the row "running" forever. Runs on every exit path that had a
 // row, interrupted or not.
-func (s *directScanSession) end(ctx context.Context, repo *database.Repository, scanUUID, target string, executor *core.Executor, interrupted bool, execErr error, findings int) {
+func (s *directScanSession) end(ctx context.Context, repo *database.Repository, scanUUID, target string, executor *core.Executor, interrupted bool, execErr error, findings int) error {
+	if repo == nil && s.pinned != "" {
+		return fmt.Errorf("pinned scan completion requires its validated database")
+	}
 	if repo == nil || executor == nil {
-		return
+		return nil
 	}
 	rep := executor.Report()
 	failures := executor.BaselineFailures()
-	s.complete(ctx, repo, scanUUID, target, rep, failures, interrupted, execErr, runner.DirectTargetTally(target, rep, failures), findings)
+	return s.complete(ctx, repo, scanUUID, target, rep, failures, interrupted, execErr, runner.DirectTargetTally(target, rep, failures), findings)
 }
 
 // rejectInput reports an input scope refused, without sending anything: the
@@ -348,9 +426,13 @@ func (s *directScanSession) rejectInput(ctx context.Context, scanUUID, target, m
 	if repo != nil {
 		s.noteStore()
 	}
-	s.begin(ctx, repo, projectUUID, scanUUID, target, method, 0, 0)
+	if err := s.begin(ctx, repo, projectUUID, scanUUID, target, method, 0, 0); err != nil {
+		return nil, err
+	}
 	tally := runner.AdmissionTally(types.TargetAdmission{Rejected: []types.TargetVerdict{v}})
-	s.complete(ctx, repo, scanUUID, target, core.ExecutionReport{}, nil, false, nil, tally, 0)
+	if err := s.complete(ctx, repo, scanUUID, target, core.ExecutionReport{}, nil, false, nil, tally, 0); err != nil {
+		return nil, err
+	}
 	return &scanResult{
 		Target:          target,
 		Method:          method,
@@ -365,9 +447,27 @@ func (s *directScanSession) rejectInput(ctx context.Context, scanUUID, target, m
 }
 
 // complete finishes one input's row from the run's report and target tally.
-func (s *directScanSession) complete(ctx context.Context, repo *database.Repository, scanUUID, target string, rep core.ExecutionReport, failures []core.BaselineFailure, interrupted bool, execErr error, tally database.TargetTally, findings int) {
+func (s *directScanSession) complete(ctx context.Context, repo *database.Repository, scanUUID, target string, rep core.ExecutionReport, failures []core.BaselineFailure, interrupted bool, execErr error, tally database.TargetTally, findings int) error {
 	if repo == nil {
-		return
+		if s.pinned != "" || s.scanScopes[scanUUID].db != nil {
+			return fmt.Errorf("direct scan completion requires its validated database")
+		}
+		return nil
+	}
+	// A missing capture means begin failed or was bypassed. Never recover by
+	// adopting whichever project's row happens to have this UUID now.
+	scope, ok := s.scanScopes[scanUUID]
+	if !ok || scope.db != repo.DB() {
+		return fmt.Errorf("direct scan completion lacks validated store/project scope")
+	}
+	finalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), directScanFinalizeBudget)
+	defer cancel()
+	scan, err := repo.GetScanByUUID(finalCtx, scanUUID)
+	if err != nil {
+		return fmt.Errorf("validate direct scan completion: %w", err)
+	}
+	if scan.ProjectUUID != scope.project {
+		return fmt.Errorf("%w: direct scan completion belongs to another project", database.ErrScanProjectMismatch)
 	}
 	reached := rep.Responded > 0
 
@@ -395,7 +495,14 @@ func (s *directScanSession) complete(ctx context.Context, repo *database.Reposit
 		}
 	}
 
-	logger := database.NewScanLogger(repo, scanUUID)
+	errMsg := runner.DirectScanErrorMessage(execErr, completion)
+	// The write itself is scoped too, closing the read/update race. Only a
+	// successful completion is logged or queued for webhook emission.
+	if err := repo.CompleteScanWithOutcomeForProject(finalCtx, scope.project, scanUUID, errMsg, completion); err != nil {
+		return fmt.Errorf("complete direct scan: %w", err)
+	}
+	logger := database.NewScanLogger(repo, scanUUID, scope.project)
+	defer logger.Close()
 	for _, issue := range tally.Rejected {
 		logger.Error(string(runner.PhasePreflight), fmt.Sprintf("target %s rejected by scope (%s); nothing sent", issue.Target, issue.Code))
 	}
@@ -410,12 +517,6 @@ func (s *directScanSession) complete(ctx context.Context, repo *database.Reposit
 		logger.Error(string(runner.PhaseDynamicAssessment), execErr.Error())
 	}
 
-	finalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), directScanFinalizeBudget)
-	defer cancel()
-	errMsg := runner.DirectScanErrorMessage(execErr, completion)
-	if err := repo.CompleteScanWithOutcome(finalCtx, scanUUID, errMsg, completion); err != nil {
-		zap.L().Warn("Failed to complete scan record", zap.String("scan_uuid", scanUUID), zap.Error(err))
-	}
 	var outErr error
 	if errMsg != "" && completion.StopReason != database.ReasonCancelled {
 		outErr = errors.New(errMsg)
@@ -431,4 +532,5 @@ func (s *directScanSession) complete(ctx context.Context, repo *database.Reposit
 		line += ", partial (" + completion.StopReason + ")"
 	}
 	logger.Info("scan", line)
+	return nil
 }

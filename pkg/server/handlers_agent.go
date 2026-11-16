@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -597,7 +598,7 @@ func (h *Handlers) openSessionRuntimeLog(sessionDir, agenticScanUUID string) *os
 		return nil
 	}
 	logPath := filepath.Join(sessionDir, config.RuntimeLogFilename)
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		zap.L().Warn("Failed to open runtime.log",
 			zap.String("agentic_scan_uuid", agenticScanUUID),
@@ -649,10 +650,10 @@ func parseBoolParam(v string) bool {
 	return false
 }
 
-// HandleAgentSessionLogs serves the raw run.log console stream for an agent
+// HandleAgentSessionLogs serves the runtime.log console stream for an agent
 // session. With Accept: text/event-stream it tails the file as SSE until the
-// run reaches a terminal status; otherwise it returns the full file as
-// text/plain. ANSI colors are preserved by default so clients that render a
+// run reaches a terminal status; otherwise it returns a bounded tail as
+// text/plain. Complete stored pages/downloads use the session artifacts route. ANSI colors are preserved by default so clients that render a
 // terminal (xterm.js, etc.) see what the CLI user would see; pass ?strip=1
 // to get plain text with escape sequences removed.
 func (h *Handlers) HandleAgentSessionLogs(c fiber.Ctx) error {
@@ -751,9 +752,10 @@ func (h *Handlers) HandleAgentSessionArtifacts(c fiber.Ctx) error {
 // resolved within the session_dir; any attempt to escape via "..", absolute
 // paths, or symlinks pointing outside the session_dir is rejected with 400.
 //
-// When the file exists and is small enough, its bytes are streamed back with
-// a content-type derived from the extension. Use ?max_bytes=N to override the
-// default 10 MiB cap (hard cap: 100 MiB).
+// Preview reads are bounded (10 MiB by default, hard cap 100 MiB) and support
+// ?offset=N for byte-wise paging. ?download=1 streams the entire file as an
+// attachment without the preview cap. Both paths report the source size and
+// selected byte interval; neither loads the archive into memory.
 func (h *Handlers) HandleAgentSessionArtifact(c fiber.Ctx) error {
 	sessionDir, _, answered, err := h.resolveSessionDirForRun(c)
 	if answered {
@@ -764,39 +766,40 @@ func (h *Handlers) HandleAgentSessionArtifact(c fiber.Ctx) error {
 	if name == "" {
 		return respondErrorMsg(c, fiber.StatusBadRequest, "missing artifact name")
 	}
+	// Artifact names are URL path segments, not query strings. Decode exactly
+	// once unless Fiber already did so; otherwise a%20b.log can open the literal
+	// percent-named file rather than a b.log. Never decode twice: %252F denotes
+	// a literal %2F in a filename, not a directory separator.
+	if !c.App().Config().UnescapePath {
+		name, err = url.PathUnescape(name)
+		if err != nil {
+			return respondError(c, fiber.StatusBadRequest, errInvalidArtifactName)
+		}
+	}
 
-	fullPath, err := safeArtifactPath(sessionDir, name)
-	if err != nil {
+	if _, err := safeArtifactPath(sessionDir, name); err != nil {
 		return respondError(c, fiber.StatusBadRequest, err)
 	}
 
-	f, openErr := os.Open(fullPath)
+	// Enforce containment during opening as well as validation. A mutable
+	// session tree must not turn a checked path into an outside symlink before
+	// os.Open resolves it. Root.Open resolves relative to a directory handle.
+	root, openErr := os.OpenRoot(sessionDir)
+	if openErr != nil {
+		return respondErrorMsg(c, fiber.StatusNotFound, "session directory not found")
+	}
+	f, openErr := openArtifactInRoot(root, filepath.FromSlash(name))
+	_ = root.Close()
 	if openErr != nil {
 		return respondErrorMsg(c, fiber.StatusNotFound, "artifact not found")
 	}
 	info, statErr := f.Stat()
-	if statErr != nil || info.IsDir() {
+	if statErr != nil || !info.Mode().IsRegular() {
 		_ = f.Close()
 		return respondErrorMsg(c, fiber.StatusNotFound, "artifact not found")
 	}
+	return sendArtifactFile(c, f, info)
 
-	maxBytes := queryByteLimit(c, maxArtifactReadBytes, maxArtifactReadBytesHardCap)
-
-	sendSize := info.Size()
-	truncated := false
-	if sendSize > maxBytes {
-		sendSize = maxBytes
-		truncated = true
-	}
-
-	c.Set("Content-Type", artifactContentType(info.Name()))
-	if truncated {
-		c.Set("X-Artifact-Truncated", "1")
-		c.Set("X-Artifact-Total-Size", strconv.FormatInt(info.Size(), 10))
-	}
-	// Stream the file via fasthttp's body stream; it closes the reader when
-	// done writing the response, so we don't keep a copy in memory.
-	return c.SendStream(&closingLimitReader{R: io.LimitReader(f, sendSize), C: f}, int(sendSize))
 }
 
 // closingLimitReader couples a size-limited reader with the closer of the

@@ -60,6 +60,7 @@ func (m *Module) reflectsMarker(
 	schema *graphqlx.Schema,
 	c xssCandidate,
 	endpointPath, marker string,
+	proofs ...*gqlProof,
 ) (reflected, htmlCtx bool) {
 	q, ok := schema.RenderProbe(c.field, c.arg, graphqlx.QuoteString(marker), 0)
 	if !ok {
@@ -74,6 +75,17 @@ func (m *Module) reflectsMarker(
 	// &lt;vgx…&gt; and fail this check).
 	if !strings.Contains(r.body, marker) {
 		return false, false
+	}
+	for _, proof := range proofs {
+		if r.isHTML() && !proof.primaryHTML {
+			// Severity uses any HTML reflection, so explicitly select the HTTP
+			// operation establishing that context and retain the earlier marker.
+			proof.confirm(&gqlResp{Exchange: proof.primary})
+			proof.primary, proof.payload = r.Exchange, graphqlx.QueryBody(q)
+			proof.primaryHTML = true
+		} else {
+			proof.attack(r, graphqlx.QueryBody(q))
+		}
 	}
 	return true, r.isHTML()
 }
@@ -100,10 +112,11 @@ func (m *Module) phaseXSSError(
 	}
 
 	for _, c := range candidates {
+		proof := &gqlProof{}
 		anyHTML := false
 		allReflected := true
 		for _, marker := range xssMarkers {
-			reflected, htmlCtx := m.reflectsMarker(ctx, httpClient, schema, c, endpointPath, marker)
+			reflected, htmlCtx := m.reflectsMarker(ctx, httpClient, schema, c, endpointPath, marker, proof)
 			if !reflected {
 				allReflected = false
 				break
@@ -130,7 +143,7 @@ func (m *Module) phaseXSSError(
 			grade = output.EvidenceGradeDifferential
 		}
 
-		return &output.ResultEvent{
+		return proof.finding(&output.ResultEvent{
 			ModuleID:      ModuleID,
 			RecordKind:    kind,
 			EvidenceGrade: grade,
@@ -160,7 +173,7 @@ func (m *Module) phaseXSSError(
 				"execution_proven": false,
 				"markers":          append([]string(nil), xssMarkers...),
 			},
-		}
+		})
 	}
 	return nil
 }

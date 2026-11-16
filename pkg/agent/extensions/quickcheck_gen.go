@@ -98,8 +98,11 @@ func generateQuickCheckPerInsertionPoint(qc agenttypes.QuickCheck, severity, sca
           matched: payloads[i],
           name: "Quick Check: %s",
           description: "Matched payload in " + insertion.name + ": " + payloads[i],
-          request: req,
-          response: resp.raw
+          payload: payloads[i],
+          fuzzingParameter: insertion.name,
+          request: resp.request,
+          response: resp.raw,
+          evidence: [{exchange: resp.exchange, role: "attack", primary: true}]
         });
       }
     }
@@ -142,8 +145,9 @@ func generateQuickCheckPerRequestOrHost(qc agenttypes.QuickCheck, severity, scan
           matched: requests[i].path,
           name: "Quick Check: %s",
           description: "Match found at " + requests[i].path,
-          request: opts.method + " " + opts.url,
-          response: resp.raw
+          request: resp.request,
+          response: resp.raw,
+          evidence: [{exchange: resp.exchange, role: "observation", primary: true}]
         });
       }
     }

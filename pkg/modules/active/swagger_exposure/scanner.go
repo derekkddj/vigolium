@@ -5,6 +5,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -185,30 +186,32 @@ func (m *Module) ScanPerRequest(
 				continue
 			}
 
-			statusCode := resp.Response().StatusCode
-			// Copy the body before Close: resp.Body().Bytes() aliases the pooled
-			// *bytes.Buffer that Close() returns to a process-global pool, so reading
-			// `body` afterwards (DetectSpecType, looksLikeSwaggerUI) races with a
-			// concurrent request reusing that buffer. (Same fix as idor_detection.)
-			body := append([]byte(nil), resp.Body().Bytes()...)
-			fullResponse := resp.FullResponseString()
-			resp.Close()
-
-			if statusCode != 200 || len(body) < 32 {
+			body := resp.Body().Bytes()
+			if resp.Response().StatusCode != 200 || len(body) < 32 {
+				resp.Close()
 				continue
 			}
 
-			var kind string
-			switch {
-			case specutil.DetectSpecType(body) != specutil.Unknown:
-				// Structural spec detection (JSON/YAML shape) — a reflected HTML
-				// slug cannot satisfy it, so no slug-reflection guard is needed.
-				kind = "OpenAPI/Swagger specification document"
-			default:
-				marker, ok := swaggerUIMarker(body)
+			kind := "OpenAPI/Swagger specification document"
+			marker := ""
+			if specutil.DetectSpecType(body) == specutil.Unknown {
+				var ok bool
+				marker, ok = swaggerUIMarker(body)
 				if !ok {
+					resp.Close()
 					continue
 				}
+				kind = "interactive API documentation UI"
+			}
+			// Select only the current plausible hit, while its pooled body is alive.
+			// Close before guard requests; their responses must not replace this
+			// anonymous probe's final sent request/response or accumulate traffic.
+			exchange := http.CaptureEvidence(resp)
+			candidateBody := string(body)
+			resp.Close()
+
+			guardProof := modkit.NewEvidenceCollector()
+			if marker != "" {
 				// A path-reflecting SPA/CMS shell serves one page for every route and
 				// reflects the requested slug into it, so a "docs UI" body carrying a UI
 				// marker that IS its own path slug (/redoc, /swagger-ui/) is that shell,
@@ -218,42 +221,42 @@ func (m *Module) ScanPerRequest(
 				// host the shell guard misses (e.g. a 302 root). Both cost no true
 				// positives — a genuine Swagger/Redoc UI is never ~equal to the homepage,
 				// and SlugReflectionFP requires an exact 200 canary reflection.
-				if modkit.ResemblesCatchAllShell(scanCtx, anonymousCtx, anonymousClient, string(body)) {
+				if modkit.ResemblesCatchAllShellWithEvidence(scanCtx, anonymousCtx, anonymousClient, candidateBody, guardProof) {
 					continue
 				}
-				if modkit.SlugReflectionFP(anonymousCtx, anonymousClient, probePath, []string{marker}) {
+				if modkit.SlugReflectionFPWithEvidence(anonymousCtx, anonymousClient, probePath, []string{marker}, guardProof) {
 					continue
 				}
-				kind = "interactive API documentation UI"
 			}
 
 			// First confirmed exposure is sufficient — stop probing this host.
 			hit := baseURL + probePath
-			return []*output.ResultEvent{
-				{
-					ModuleID:      ModuleID,
-					RecordKind:    output.RecordKindObservation,
-					EvidenceGrade: output.EvidenceGradeObservation,
-					URL:           hit,
-					Matched:       hit,
-					Request:       string(modifiedRaw),
-					Response:      fullResponse,
-					Info: output.Info{
-						Name: "API Documentation Observed",
-						Description: "A credential-free request reached a " + kind + " at " + probePath +
-							". This is security-relevant reconnaissance; it does not prove that any documented operation is sensitive or unauthorized.",
-						Severity:   ModuleSeverity,
-						Confidence: ModuleConfidence,
-						Tags:       ModuleTags,
-					},
-					Metadata: map[string]any{
-						"credential_free":        true,
-						"documentation_kind":     kind,
-						"authorization_bypassed": false,
-						"sensitive_route_proven": false,
-					},
+			result := &output.ResultEvent{
+				ModuleID:      ModuleID,
+				RecordKind:    output.RecordKindObservation,
+				EvidenceGrade: output.EvidenceGradeObservation,
+				URL:           hit,
+				Matched:       hit,
+				Info: output.Info{
+					Name: "API Documentation Observed",
+					Description: "A credential-free request reached a " + kind + " at " + probePath +
+						". This is security-relevant reconnaissance; it does not prove that any documented operation is sensitive or unauthorized.",
+					Severity:   ModuleSeverity,
+					Confidence: ModuleConfidence,
+					Tags:       ModuleTags,
 				},
-			}, nil
+				Metadata: map[string]any{
+					"credential_free":        true,
+					"documentation_kind":     kind,
+					"authorization_bypassed": false,
+					"sensitive_route_proven": false,
+				},
+			}
+			// This is an explicit credential-free probe, not inherited input.
+			// Its role does not upgrade the existing reconnaissance classification.
+			modkit.SetPrimaryEvidence(result, exchange, evidence.RoleAttack, "credential-free documentation probe")
+			modkit.AppendEvidence(result, guardProof)
+			return []*output.ResultEvent{result}, nil
 		}
 	}
 

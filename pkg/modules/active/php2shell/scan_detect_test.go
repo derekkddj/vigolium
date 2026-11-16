@@ -2,9 +2,11 @@ package php2shell
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -12,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/modules/modtest"
 	"github.com/vigolium/vigolium/pkg/types/severity"
@@ -47,13 +50,46 @@ func phpScanCtx(t *testing.T, srvURL string) *modkit.ScanContext {
 func TestScanPerRequest_MemoryExhaustedIsSuspect(t *testing.T) {
 	t.Parallel()
 	var hits int64
-	srv := phpServer(t, "", func(w http.ResponseWriter) {
+	written := make(chan struct{}, 8)
+	observedProbe := make(chan []byte, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&hits, 1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return
+		}
+		// Native capture detaches at RoundTrip return, which may precede the
+		// write goroutine's WroteRequest callback even after this body arrived.
+		// Synchronize the fixture, not production: certify the completed write
+		// before returning a response instead of assuming trace scheduling.
+		select {
+		case <-written:
+		case <-r.Context().Done():
+			return
+		}
+		if len(body) < 1024 {
+			w.Header().Set("X-Receipt", "control")
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+		observedProbe <- body
+		w.Header().Set("X-Receipt", "probe")
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte("PHP Fatal error:  Allowed memory size of 134217728 bytes exhausted (tried to allocate 20480 bytes) in Unknown on line 0"))
-	}, &hits)
-
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			if info.Err == nil {
+				written <- struct{}{}
+			}
+		},
+	})
+	client := modtest.Requester(t).WithContext(ctx)
 	rr := modtest.Request(t, srv.URL+"/")
-	res, err := New().ScanPerRequest(rr, modtest.Requester(t), phpScanCtx(t, srv.URL))
+	res, err := New().ScanPerRequest(rr, client, phpScanCtx(t, srv.URL))
 	require.NoError(t, err)
 	require.Len(t, res, 1)
 
@@ -63,9 +99,33 @@ func TestScanPerRequest_MemoryExhaustedIsSuspect(t *testing.T) {
 	assert.Equal(t, srv.URL+defaultPath, r.URL)
 	assert.Contains(t, r.Info.Name, "CVE-2026-109618")
 	assert.EqualValues(t, 2, atomic.LoadInt64(&hits), "control + the first (1 MiB) probe, then stop")
-	assert.Less(t, len(r.Request), 8*1024, "the probe body must be elided from stored evidence")
+	assert.Equal(t, int64(2), client.RequestsSent())
+	require.Len(t, r.Evidence, 2)
+	primary, control := r.Evidence[0], r.Evidence[1]
+	require.NotNil(t, primary.Exchange)
+	require.NotNil(t, control.Exchange)
+	assert.True(t, primary.Primary)
+	assert.Equal(t, evidence.RoleAttack, primary.Role)
+	assert.Equal(t, evidence.RoleControl, control.Role)
+	assert.False(t, control.Primary)
+	assert.NotEqual(t, primary.ExchangeID, control.ExchangeID)
+	assert.Equal(t, evidence.ProvenanceCaptured, primary.Exchange.Provenance)
+	assert.Equal(t, evidence.StateComplete, primary.Exchange.RequestState)
+	assert.Equal(t, evidence.StateComplete, primary.Exchange.ResponseState)
+	assert.NoError(t, primary.Exchange.Validate())
+	assert.Equal(t, string(primary.Exchange.Request), r.Request)
+	assert.Equal(t, string(primary.Exchange.Response), r.Response)
 	assert.Contains(t, r.Request, "multipart/form-data; boundary=")
-	assert.Contains(t, r.Request, "more bytes of the probe body elided")
+	assert.NotContains(t, r.Request, "more bytes of the probe body elided", "a display annotation is not emitted traffic")
+	select {
+	case body := <-observedProbe:
+		require.GreaterOrEqual(t, len(primary.Exchange.Request), len(body), "available captured proof is never elided")
+		assert.Equal(t, body, primary.Exchange.Request[len(primary.Exchange.Request)-len(body):])
+	default:
+		t.Fatal("the server did not observe the decisive multipart body")
+	}
+	assert.Contains(t, r.Response, "X-Receipt: probe")
+	assert.Contains(t, string(control.Exchange.Response), "X-Receipt: control")
 }
 
 func TestScanPerRequest_EmptyFPMResponseIsSuspect(t *testing.T) {

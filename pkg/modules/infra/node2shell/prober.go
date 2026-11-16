@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	// maxEvidenceBytes caps the response kept on an Exchange.
+	// maxEvidenceBytes caps only the legacy response projection, not Receipt.
 	maxEvidenceBytes = 2048
 	// streamEvidenceBytes is how much of a multi-MiB request is kept before the
 	// elision marker: enough for the request line, the headers and the start of
@@ -74,9 +74,9 @@ func (p *Prober) Send(name, value string, body []byte) (Exchange, bool) {
 // connection afterwards rather than returning a socket that just carried a
 // probe to the pool.
 //
-// The body is elided from the evidence: a finding travels through the database,
-// the JSON envelope and the report, and must not carry 22 MiB through any of
-// them.
+// The body is elided only from the legacy projection. Receipt owns the complete
+// request captured at the transport boundary; analysis and report projections
+// must not silently truncate that separately selected receipt.
 func (p *Prober) SendStream(encoding string, body []byte) (Exchange, bool) {
 	raw, err := httpmsg.AddOrReplaceHeader(p.base, ContentEncoding, encoding)
 	if err == nil {
@@ -113,6 +113,7 @@ func (p *Prober) exec(raw []byte, requestEvidence string) (Exchange, bool) {
 		return Exchange{}, false
 	}
 	return Exchange{
+		Receipt:  http.CaptureEvidence(resp),
 		Sig:      modkit.NewResponseSignature(hr.StatusCode, resp.BodyString(), ""),
 		Header:   hr.Header,
 		Request:  requestEvidence,

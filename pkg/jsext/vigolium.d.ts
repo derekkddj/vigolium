@@ -184,7 +184,7 @@ declare namespace vigolium {
      * Fetch a GraphQL introspection schema from the given endpoint.
      * Returns null if introspection is disabled or the request fails.
      */
-    function graphqlSchema(url: string, opts?: GraphQLSchemaOptions): object | null;
+    function graphqlSchema(url: string, opts?: GraphQLSchemaOptions): GraphQLSchema | null;
 
     /**
      * Enable response caching for subsequent requests. Cached responses are returned
@@ -406,7 +406,35 @@ interface HttpHeaderMethods {
  */
 type HttpHeaders = HttpHeaderMethods & { [name: string]: string | undefined };
 
+type EvidenceRole = "unknown" | "baseline" | "observation" | "attack" | "control" | "confirmation";
+/** Invocation-local capture handle. Keep this object; cloned/serialized receipts cannot be selected. */
+interface ExchangeReceipt {
+  id: string;
+  url: string;
+  service: string;
+  request_base64: string;
+  response_base64: string;
+  request_state: "unknown" | "complete" | "missing" | "truncated";
+  response_state: "unknown" | "complete" | "missing" | "truncated";
+  provenance: "captured" | "producer_supplied" | "legacy_unknown";
+  content_hash: string;
+  captured_at: string;
+}
+interface EvidenceSelection {
+  exchange: ExchangeReceipt;
+  role: EvidenceRole;
+  /** At most one primary per finding; attack, observation or confirmation only. */
+  primary?: boolean;
+  label?: string;
+}
+
 interface HttpResponse {
+  /** Actual final request text; binary authoritative bytes are in exchange. */
+  request: string;
+  url: string;
+  exchange: ExchangeReceipt;
+  /** Cache helpers may return an older receipt, not a new network execution. */
+  cached?: boolean;
   status: number;
   body: string;
   raw: string;
@@ -1007,6 +1035,8 @@ interface AuthTestOptions {
 }
 
 interface AuthTestResult {
+  /** Unmodified replay response; undefined on failure. Select original.exchange as baseline context. */
+  original?: HttpResponse;
   record_uuid: string;
   url: string;
   results: AuthTestSessionResult[];
@@ -1015,6 +1045,8 @@ interface AuthTestResult {
 }
 
 interface AuthTestSessionResult {
+  /** This session's replay response and selectable exchange; undefined on failure. */
+  response?: HttpResponse;
   session_label: string;
   status: number;
   /** Jaccard similarity of response body vs original response. */
@@ -1077,6 +1109,8 @@ interface RecordGroup {
 
 /** Context object passed to extension scanPerRequest / scanPerHost / scanPerInsertionPoint. */
 interface ExtensionContext {
+  /** Baseline receipt; historical producer bytes have unknown fidelity. */
+  exchange: ExchangeReceipt;
   request: {
     raw: string;
     method: string;
@@ -1191,6 +1225,15 @@ interface GraphQLResult {
   errors: any[];
   /** The raw HTTP response. */
   raw: HttpResponse;
+}
+
+/** Direct introspection schema fields are unchanged; receipt properties are non-enumerable. */
+interface GraphQLSchema {
+  [key: string]: any;
+  /** Original HTTP response. Its raw property remains the raw HTTP string. */
+  readonly raw: HttpResponse;
+  /** Same selectable handle as raw.exchange; present when the response carries a receipt. */
+  readonly exchange?: ExchangeReceipt;
 }
 
 interface GraphQLSchemaOptions {
@@ -1340,8 +1383,13 @@ interface ExtensionResult {
   /** Parameter that triggered the finding (alias: `param`). */
   fuzzingParameter?: string;
   param?: string;
-  /** Extra evidence strings (or objects, stored as JSON) attached to the finding. */
-  evidence?: Array<string | { request?: string; response?: string; note?: string }>;
+  /** Explicit receipt selection. Legacy text remains unclassified additional evidence. */
+  evidence?: string | Array<EvidenceSelection | string | { request?: string; response?: string; note?: string }>;
+  additional_evidence?: string[];
+  payload?: string;
+  record_kind?: "finding" | "candidate" | "observation";
+  evidence_grade?: "E0" | "E1" | "E2" | "E3" | "E4";
+  baseline_evidence?: boolean;
   url?: string;
   matched?: string;
   request?: string;

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/uptrace/bun"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/output"
 	"go.uber.org/zap"
 )
@@ -39,7 +40,7 @@ func (r *Repository) SaveFindingInserted(ctx context.Context, event *output.Resu
 	}
 
 	finding := &Finding{
-		HTTPRecordUUIDs: httpRecordUUIDs,
+		HTTPRecordUUIDs: append([]string(nil), httpRecordUUIDs...),
 		ScanUUID:        scanUUID,
 		ProjectUUID:     defaultProjectUUID(projectUUID),
 	}
@@ -51,9 +52,7 @@ func (r *Repository) SaveFindingInserted(ctx context.Context, event *output.Resu
 	if err != nil {
 		return false, err
 	}
-	if inserted {
-		r.emitFindingSaved(finding)
-	}
+	r.emitFindingCommitted(finding, inserted)
 	return inserted, nil
 }
 
@@ -124,6 +123,19 @@ func (r *Repository) SaveFindingsBatchResults(ctx context.Context, writes []Find
 // a new finding row was written (false on a dedup-append to an existing finding),
 // so callers fire the OnFindingSaved hook exactly once per genuinely new finding.
 func (r *Repository) saveFindingIDB(ctx context.Context, idb bun.IDB, finding *Finding, httpRecordUUIDs []string) (bool, error) {
+	// Missing records are soft references (imports can arrive out of order), but
+	// an existing record owned by another project must never become proof here.
+	refs := append(append([]string{}, httpRecordUUIDs...), finding.OriginRecordUUID)
+	if err := checkFindingRecordProjects(ctx, idb, finding.ProjectUUID, refs); err != nil {
+		return false, err
+	}
+	finding.HTTPRecordUUIDs = mergeUniqueStrings(nil, httpRecordUUIDs)
+	httpRecordUUIDs = finding.HTTPRecordUUIDs
+	// Cap fresh inserts without discarding the original candidates: on conflict,
+	// duplicates of the survivor must be removed BEFORE selecting the sample.
+	// Record identities remain uncapped.
+	candidate := *finding
+	candidate.AdditionalEvidence = appendUniqueEvidence(nil, buildEvidence(finding.Request, finding.Response), finding.AdditionalEvidence...)
 	// Atomic dedup: INSERT with conflict resolution on finding_hash.
 	// If a duplicate hash exists, the row is silently skipped.
 	if finding.LastSeenAt == nil {
@@ -136,11 +148,11 @@ func (r *Repository) saveFindingIDB(ctx context.Context, idb bun.IDB, finding *F
 	var res sql.Result
 	var err error
 	if finding.FindingHash != "" {
-		res, err = idb.NewInsert().Model(finding).
+		res, err = idb.NewInsert().Model(&candidate).
 			On("CONFLICT (project_uuid, finding_hash) DO NOTHING").
 			Exec(ctx)
 	} else {
-		res, err = idb.NewInsert().Model(finding).Exec(ctx)
+		res, err = idb.NewInsert().Model(&candidate).Exec(ctx)
 	}
 	if err != nil {
 		return false, fmt.Errorf("failed to insert finding: %w", err)
@@ -149,10 +161,16 @@ func (r *Repository) saveFindingIDB(ctx context.Context, idb bun.IDB, finding *F
 	// If ON CONFLICT fired, no row was inserted — append records and evidence to existing finding
 	if finding.FindingHash != "" {
 		if n, _ := res.RowsAffected(); n == 0 {
-			return false, r.appendRecordsToFinding(ctx, idb, finding, httpRecordUUIDs, buildEvidence(finding.Request, finding.Response))
+			if err := r.appendRecordsToFinding(ctx, idb, finding); err != nil {
+				return false, err
+			}
+			return false, r.persistFindingEvidence(ctx, idb, finding)
 		}
 	}
 
+	// Preserve Bun-populated defaults (timestamps, lifecycle, etc.) as well as
+	// the assigned ID on a fresh insert, just as inserting the caller's model did.
+	*finding = candidate
 	// A finding row without its evidence links is a finding whose proof cannot be
 	// resolved, so surface the failure rather than committing a half-written one.
 	// Inside a transaction this rolls the row back with it.
@@ -160,6 +178,9 @@ func (r *Repository) saveFindingIDB(ctx context.Context, idb bun.IDB, finding *F
 		return false, err
 	}
 	if err := recordFindingObservation(ctx, idb, finding.ProjectUUID, finding.ID, finding.FindingHash, finding.ScanUUID); err != nil {
+		return false, err
+	}
+	if err := r.persistFindingEvidence(ctx, idb, finding); err != nil {
 		return false, err
 	}
 
@@ -170,6 +191,10 @@ func (r *Repository) saveFindingIDB(ctx context.Context, idb bun.IDB, finding *F
 // paths: the finding row, its evidence links and its observation commit
 // together or not at all.
 func (r *Repository) saveFindingTx(ctx context.Context, finding *Finding, httpRecordUUIDs []string) (bool, error) {
+	if err := prepareFindingEvidence(finding); err != nil {
+		return false, err
+	}
+	snapshot := *finding
 	var inserted bool
 	err := r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
 		var err error
@@ -177,6 +202,7 @@ func (r *Repository) saveFindingTx(ctx context.Context, finding *Finding, httpRe
 		return err
 	})
 	if err != nil {
+		*finding = snapshot
 		return false, err
 	}
 	return inserted, nil
@@ -204,9 +230,7 @@ func (r *Repository) SaveFindingReported(ctx context.Context, finding *Finding) 
 	if err != nil {
 		return false, err
 	}
-	if inserted {
-		r.emitFindingSaved(finding)
-	}
+	r.emitFindingCommitted(finding, inserted)
 	return inserted, nil
 }
 
@@ -235,8 +259,8 @@ func (r *Repository) SaveFindingsDirectBatch(ctx context.Context, findings []*Fi
 
 // saveFindingsBatchCore persists pre-built findings in one transaction, retrying
 // each finding individually if the transaction fails so one bad finding can't
-// drop the rest, and firing OnFindingSaved hooks only after commit so a mirror
-// never sees a rolled-back finding. nil entries are tolerated (zero-value
+// drop the rest, and firing new-finding and occurrence hooks only after commit
+// so a mirror never sees a rolled-back finding. nil entries are tolerated (zero-value
 // result). The returned slice is aligned with the input. This is the shared
 // engine behind SaveFindingsBatch (which adapts []FindingWrite) and
 // SaveFindingsDirectBatch (pre-built []*Finding); callers own input conversion
@@ -247,9 +271,22 @@ func (r *Repository) saveFindingsBatchCore(ctx context.Context, findings []*Find
 		return results
 	}
 
+	// Prepare owned receipts before the transaction. Keep snapshots so a rolled
+	// back Bun-assigned ID/default cannot poison the per-finding retry.
+	snapshots := make([]Finding, len(findings))
+	for i, f := range findings {
+		if f == nil {
+			continue
+		}
+		if err := prepareFindingEvidence(f); err != nil {
+			results[i].Err = err
+			continue
+		}
+		snapshots[i] = *f
+	}
 	err := r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
 		for i, f := range findings {
-			if f == nil {
+			if f == nil || results[i].Err != nil {
 				continue
 			}
 			inserted, err := r.saveFindingIDB(ctx, tx, f, f.HTTPRecordUUIDs)
@@ -262,8 +299,8 @@ func (r *Repository) saveFindingsBatchCore(ctx context.Context, findings []*Find
 	})
 	if err == nil {
 		for i, f := range findings {
-			if results[i].Inserted {
-				r.emitFindingSaved(f)
+			if f != nil && results[i].Err == nil {
+				r.emitFindingCommitted(f, results[i].Inserted)
 			}
 		}
 		return results
@@ -271,18 +308,60 @@ func (r *Repository) saveFindingsBatchCore(ctx context.Context, findings []*Find
 
 	zap.L().Warn("saveFindingsBatchCore: transaction failed, retrying findings individually", zap.Error(err))
 	for i, f := range findings {
-		results[i] = FindingSaveResult{}
-		if f == nil {
+		if f == nil || results[i].Err != nil {
 			continue
 		}
+		*f = snapshots[i]
+		results[i] = FindingSaveResult{}
 		inserted, e := r.saveFindingTx(ctx, f, f.HTTPRecordUUIDs)
 		results[i].Inserted = inserted
 		results[i].Err = e
-		if inserted {
-			r.emitFindingSaved(f)
+		if e == nil {
+			r.emitFindingCommitted(f, inserted)
 		}
 	}
 	return results
+}
+
+// emitFindingCommitted keeps new-row accounting separate from occurrence
+// notifications. Snapshot before invoking the legacy hook so even a consumer
+// modifying that model cannot change the occurrence handed to another consumer.
+// No receipt/manifest hydration is performed: doing so would turn a small later
+// occurrence into the survivor's entire history, including unrelated bodies.
+func (r *Repository) emitFindingCommitted(f *Finding, inserted bool) {
+	var occurrence *Finding
+	if r.OnFindingOccurrenceSaved != nil {
+		snapshot := *f
+		snapshot.HTTPRecordUUIDs = append([]string(nil), f.HTTPRecordUUIDs...)
+		snapshot.Tags = append([]string(nil), f.Tags...)
+		snapshot.MatchedAt = append([]string(nil), f.MatchedAt...)
+		snapshot.ExtractedResults = append([]string(nil), f.ExtractedResults...)
+		snapshot.AdditionalEvidence = append([]string(nil), f.AdditionalEvidence...)
+		snapshot.Evidence = evidence.CloneEntries(f.Evidence)
+		if f.InsertionPoint != nil {
+			point := *f.InsertionPoint
+			snapshot.InsertionPoint = &point
+		}
+		if f.Verification != nil {
+			verification := *f.Verification
+			snapshot.Verification = &verification
+		}
+		if f.VerifiedAt != nil {
+			at := *f.VerifiedAt
+			snapshot.VerifiedAt = &at
+		}
+		if f.StatusUpdatedAt != nil {
+			at := *f.StatusUpdatedAt
+			snapshot.StatusUpdatedAt = &at
+		}
+		occurrence = &snapshot
+	}
+	if inserted {
+		r.emitFindingSaved(f)
+	}
+	if occurrence != nil {
+		r.OnFindingOccurrenceSaved(occurrence)
+	}
 }
 
 // firstResultErr returns the first non-nil per-finding error in a batch result,
@@ -344,24 +423,34 @@ func (r *Repository) insertFindingRecords(ctx context.Context, idb bun.IDB, find
 // A re-detection also updates what the later scan says about the issue (see
 // recordRedetectionTx): last_seen_at, the latest severity/confidence/description,
 // and a `fixed` finding reopens.
-func (r *Repository) appendRecordsToFinding(ctx context.Context, idb bun.IDB, latest *Finding, newUUIDs []string, evidence string) error {
-	projectUUID, findingHash, scanUUID := latest.ProjectUUID, latest.FindingHash, latest.ScanUUID
-	// Only fetch the (potentially large) request/response bodies when there's
-	// evidence to append — they're needed solely to dedup against the survivor's
-	// own primary pair below.
+func (r *Repository) appendRecordsToFinding(ctx context.Context, idb bun.IDB, incoming *Finding) error {
+	projectUUID, findingHash, scanUUID := incoming.ProjectUUID, incoming.FindingHash, incoming.ScanUUID
+	evidence := buildEvidence(incoming.Request, incoming.Response)
+	// Load the survivor's primary pair to deduplicate all incoming supporting
+	// pairs and fill inline proof only when the entire historic pair is empty.
 	existing := &Finding{}
 	sel := idb.NewSelect().Model(existing).
-		Column("id", "http_record_uuids", "additional_evidence", "status").
+		Column("id", "http_record_uuids", "additional_evidence", "status",
+			"description", "remediation", "cwe_id", "cvss_score", "origin_record_uuid", "agentic_scan_uuid", "evidence_status").
 		Where("project_uuid = ?", defaultProjectUUID(projectUUID)).
 		Where("finding_hash = ?", findingHash)
-	if evidence != "" {
+	if evidence != "" || len(incoming.AdditionalEvidence) > 0 {
 		sel = sel.Column("request", "response")
+	}
+	if r.db.Driver() == "postgres" {
+		// Serialize read/union/write appenders on the survivor. Transactions alone
+		// do not prevent lost supporting pairs under PostgreSQL READ COMMITTED.
+		sel = sel.For("UPDATE")
 	}
 	if err := sel.Scan(ctx); err != nil {
 		return fmt.Errorf("failed to look up existing finding: %w", err)
 	}
 
-	if err := r.insertFindingRecords(ctx, idb, existing.ID, newUUIDs); err != nil {
+	// INSERT ... DO NOTHING may leave incoming.ID unset or stale. Report the
+	// canonical survivor, never the id of the rejected candidate.
+	incoming.ID = existing.ID
+	merged, err := syncFindingRecordRefs(ctx, idb, existing.ID, incoming.HTTPRecordUUIDs)
+	if err != nil {
 		return err
 	}
 	// A re-detection is an observation too: without it a finding first seen by
@@ -370,8 +459,7 @@ func (r *Repository) appendRecordsToFinding(ctx context.Context, idb bun.IDB, la
 		return err
 	}
 
-	merged := mergeUniqueStrings(existing.HTTPRecordUUIDs, newUUIDs)
-	q, reopened := recordRedetectionTx(idb, existing.ID, existing.Status, latest)
+	q, reopened := recordRedetectionTx(idb, existing.ID, existing.Status, incoming)
 	q = q.Set("http_record_uuids = ?", merged)
 	if reopened != nil {
 		if _, err := idb.NewInsert().Model(reopened).Exec(ctx); err != nil {
@@ -393,22 +481,206 @@ func (r *Repository) appendRecordsToFinding(ctx context.Context, idb bun.IDB, la
 	// Skip evidence that just duplicates the survivor's own primary
 	// request/response (or an entry it already has) — otherwise re-emitting the
 	// same finding shows its response twice (primary + Additional Evidence).
-	//
-	// Gated on the cap as well: appendUniqueEvidence enforces it, but reaching it
-	// still costs a concat of the survivor's whole primary pair plus a hash of
-	// every retained pair — on a finding re-detected thousands of times across a
-	// large host, all to produce a list that cannot change.
-	if evidence != "" && len(existing.AdditionalEvidence) < maxAdditionalEvidence {
-		primary := buildEvidence(existing.Request, existing.Response)
-		if updated := appendUniqueEvidence(existing.AdditionalEvidence, primary, evidence); len(updated) > len(existing.AdditionalEvidence) {
+	// Retain the earliest supporting pairs: existing evidence first, incoming
+	// primary next, then incoming support in order, up to maxAdditionalEvidence.
+	// This sample is not per-occurrence history; linked identities remain uncapped.
+	primary := buildEvidence(existing.Request, existing.Response)
+	if primary == "" && evidence != "" {
+		// Fill the pair together; never combine two exchanges' halves.
+		q = q.Set("request = ?", incoming.Request).Set("response = ?", incoming.Response)
+		primary = evidence
+	}
+	if len(existing.AdditionalEvidence) < maxAdditionalEvidence {
+		candidates := append([]string{evidence}, incoming.AdditionalEvidence...)
+		if updated := appendUniqueEvidence(existing.AdditionalEvidence, primary, candidates...); len(updated) > len(existing.AdditionalEvidence) {
 			q = q.Set("additional_evidence = ?", updated)
 		}
+	}
+	// Empty enrichment may be filled, but historic attribution and lifecycle
+	// decisions are not overwritten by a re-detection/import. The description
+	// follows the latest detection (recordRedetectionTx).
+	for _, field := range []struct{ column, old, value string }{
+		{"remediation", existing.Remediation, incoming.Remediation},
+		{"cwe_id", existing.CWEID, incoming.CWEID},
+		{"origin_record_uuid", existing.OriginRecordUUID, incoming.OriginRecordUUID},
+		{"agentic_scan_uuid", existing.AgenticScanUUID, incoming.AgenticScanUUID},
+		{"evidence_status", existing.EvidenceStatus, incoming.EvidenceStatus},
+	} {
+		if field.old == "" && field.value != "" {
+			q = q.Set(field.column+" = ?", field.value)
+		}
+	}
+	if existing.CVSSScore == 0 && incoming.CVSSScore != 0 {
+		q = q.Set("cvss_score = ?", incoming.CVSSScore)
 	}
 
 	if _, err := q.Exec(ctx); err != nil {
 		return fmt.Errorf("failed to update finding record UUIDs: %w", err)
 	}
 	return nil
+}
+
+// checkFindingRecordProjects rejects only existing foreign records, not missing
+// soft references. Legacy ghosts are preserved; readers label them unavailable.
+func checkFindingRecordProjects(ctx context.Context, idb bun.IDB, project string, refs []string) error {
+	for chunk := range slices.Chunk(filterEmpty(refs), SQLChunkSize) {
+		var foreign string
+		err := idb.NewSelect().Model((*HTTPRecord)(nil)).Column("uuid").
+			Where("uuid IN (?)", bun.List(chunk)).Where("project_uuid != ?", defaultProjectUUID(project)).
+			Limit(1).Scan(ctx, &foreign)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("check finding record project: %w", err)
+		}
+		return fmt.Errorf("finding record reference %q belongs to another project", foreign)
+	}
+	return nil
+}
+
+// syncFindingRecordRefs synchronizes BOTH representations inside the caller's
+// transaction. The stable union retains array-only and junction-only soft/ghost
+// references, with no URL inference and no cap on identities.
+func syncFindingRecordRefs(ctx context.Context, idb bun.IDB, id int64, extra []string) ([]string, error) {
+	f := &Finding{}
+	if err := idb.NewSelect().Model(f).Column("http_record_uuids").Where("id = ?", id).Scan(ctx); err != nil {
+		return nil, err
+	}
+	var links []string
+	if err := idb.NewRaw("SELECT record_uuid FROM finding_records WHERE finding_id = ? ORDER BY record_uuid", id).Scan(ctx, &links); err != nil {
+		return nil, err
+	}
+	union := mergeUniqueStrings(mergeUniqueStrings(f.HTTPRecordUUIDs, extra), links)
+	for chunk := range slices.Chunk(union, SQLChunkSize) {
+		var query strings.Builder
+		query.WriteString("INSERT INTO finding_records (finding_id, record_uuid) VALUES ")
+		args := make([]any, 0, len(chunk)*2)
+		for i, ref := range chunk {
+			if i > 0 {
+				query.WriteByte(',')
+			}
+			query.WriteString("(?, ?)")
+			args = append(args, id, ref)
+		}
+		query.WriteString(" ON CONFLICT DO NOTHING")
+		if _, err := idb.ExecContext(ctx, query.String(), args...); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := idb.NewUpdate().Model((*Finding)(nil)).Set("http_record_uuids = ?", union).Where("id = ?", id).Exec(ctx); err != nil {
+		return nil, err
+	}
+	return union, nil
+}
+
+// HydrateFindingRecordRefs exposes the union of legacy relation representations
+// for selected findings without repairing the store. Missing/foreign references
+// stay visible as identities, but must be resolved via project-scoped readers.
+func (r *Repository) HydrateFindingRecordRefs(ctx context.Context, findings []*Finding) error {
+	idx := make(map[int64]*Finding, len(findings))
+	var ids []int64
+	for _, f := range findings {
+		if f != nil && f.ID != 0 {
+			idx[f.ID] = f
+			ids = append(ids, f.ID)
+		}
+	}
+	for chunk := range slices.Chunk(ids, SQLChunkSize) {
+		var rows []struct {
+			ID      int64  `bun:"id"`
+			Project string `bun:"project_uuid"`
+			Ref     string `bun:"record_uuid"`
+		}
+		if err := r.db.NewRaw(`SELECT f.id, f.project_uuid, fr.record_uuid FROM finding_records fr
+			JOIN findings f ON f.id = fr.finding_id
+			WHERE f.id IN (?) ORDER BY f.id, fr.record_uuid`, bun.List(chunk)).Scan(ctx, &rows); err != nil {
+			return err
+		}
+		links := make(map[int64][]string)
+		for _, row := range rows {
+			if f := idx[row.ID]; f != nil && defaultProjectUUID(f.ProjectUUID) == row.Project {
+				links[row.ID] = append(links[row.ID], row.Ref)
+			}
+		}
+		for id, refs := range links {
+			f := idx[id]
+			f.HTTPRecordUUIDs = mergeUniqueStrings(f.HTTPRecordUUIDs, refs)
+		}
+	}
+	return nil
+}
+
+// GetFindingRecordsScoped resolves exact references only in their finding's
+// project (blank means default, NEVER all projects), including out-of-order
+// imports whose unavailable references should remain on the finding.
+func (r *Repository) GetFindingRecordsScoped(ctx context.Context, project string, refs []string) ([]*HTTPRecord, error) {
+	var records []*HTTPRecord
+	for chunk := range slices.Chunk(refs, SQLChunkSize) {
+		var page []*HTTPRecord
+		q := r.db.NewSelect().Model(&page).Where("uuid IN (?)", bun.List(chunk)).
+			Where("project_uuid = ?", defaultProjectUUID(project))
+		if r.db.readOnly {
+			// CLI raw finding/view hydration reads archived rows in place. Missing
+			// pre-v10 capture states must remain zero without weakening project scope.
+			q = q.ColumnExpr("r.*")
+		}
+		if err := q.Scan(ctx); err != nil {
+			return nil, err
+		}
+		records = append(records, page...)
+	}
+	return records, nil
+}
+
+// GetFindingRecordUUIDsScoped resolves only the identity inventory, never HTTP
+// bodies. Missing and foreign-project references are both absent from the result,
+// so detail readers can label them unavailable without revealing foreign owners.
+func (r *Repository) GetFindingRecordUUIDsScoped(ctx context.Context, project string, refs []string) ([]string, error) {
+	var available []string
+	for chunk := range slices.Chunk(refs, SQLChunkSize) {
+		var page []string
+		if err := r.db.NewSelect().Model((*HTTPRecord)(nil)).Column("uuid").
+			Where("uuid IN (?)", bun.List(chunk)).Where("project_uuid = ?", defaultProjectUUID(project)).Scan(ctx, &page); err != nil {
+			return nil, err
+		}
+		available = append(available, page...)
+	}
+	return available, nil
+}
+
+// HydrateFindingEvidence loads inline proof only for a selected page, matching
+// each row's project before loading bodies. Metadata-only list queries stay light.
+func (r *Repository) HydrateFindingEvidence(ctx context.Context, findings []*Finding) error {
+	byProject := make(map[string]map[int64]*Finding)
+	for _, f := range findings {
+		if f == nil || f.ID == 0 {
+			continue
+		}
+		project := defaultProjectUUID(f.ProjectUUID)
+		if byProject[project] == nil {
+			byProject[project] = make(map[int64]*Finding)
+		}
+		byProject[project][f.ID] = f
+	}
+	for project, idx := range byProject {
+		ids := make([]int64, 0, len(idx))
+		for id := range idx {
+			ids = append(ids, id)
+		}
+		for chunk := range slices.Chunk(ids, SQLChunkSize) {
+			var rows []*Finding
+			if err := r.db.NewSelect().Model(&rows).Column("id", "request", "response", "additional_evidence").
+				Where("id IN (?)", bun.List(chunk)).Where("project_uuid = ?", project).Scan(ctx); err != nil {
+				return err
+			}
+			for _, row := range rows {
+				f := idx[row.ID]
+				f.Request, f.Response, f.AdditionalEvidence = row.Request, row.Response, row.AdditionalEvidence
+			}
+		}
+	}
+	return r.HydrateFindingEvidenceManifest(ctx, findings)
 }
 
 // GetFindingByID retrieves a single finding by numeric ID.
@@ -419,6 +691,23 @@ func (r *Repository) GetFindingByID(ctx context.Context, id int64) (*Finding, er
 		Where("id = ?", id).
 		Scan(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := r.HydrateFindingEvidenceManifest(ctx, []*Finding{finding}); err != nil {
+		return nil, err
+	}
+	return finding, nil
+}
+
+// GetFindingByHash retrieves one exact hash in a project, with manifest metadata
+// only for selected receipts. Blank project means the default project.
+func (r *Repository) GetFindingByHash(ctx context.Context, hash, projectUUID string) (*Finding, error) {
+	finding := &Finding{}
+	if err := r.db.NewSelect().Model(finding).Where("finding_hash = ?", hash).
+		Where("project_uuid = ?", defaultProjectUUID(projectUUID)).Scan(ctx); err != nil {
+		return nil, err
+	}
+	if err := r.HydrateFindingEvidenceManifest(ctx, []*Finding{finding}); err != nil {
 		return nil, err
 	}
 	return finding, nil
@@ -493,6 +782,9 @@ func (r *Repository) GetFindingsByRecordUUID(ctx context.Context, uuid string) (
 	if err != nil {
 		return nil, err
 	}
+	if err := r.HydrateFindingEvidenceManifest(ctx, findings); err != nil {
+		return nil, err
+	}
 	return findings, nil
 }
 
@@ -519,6 +811,9 @@ func (r *Repository) GetFindingsBySeverity(ctx context.Context, projectUUID, sev
 	}
 	err := q.Scan(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := r.HydrateFindingEvidenceManifest(ctx, findings); err != nil {
 		return nil, err
 	}
 	return findings, nil

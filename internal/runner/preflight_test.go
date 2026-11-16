@@ -42,7 +42,7 @@ func preflightRunner(t *testing.T, tune ...func(*types.Options)) (*Runner, *phas
 	if err != nil {
 		t.Fatalf("NewRequester: %v", err)
 	}
-	r := &Runner{options: opts, scanLogger: database.NewScanLogger(nil, "")}
+	r := &Runner{options: opts, scanLogger: database.NewScanLogger(nil, "", "")}
 	return r, &phaseInfra{httpRequester: req}
 }
 

@@ -10,6 +10,7 @@ import (
 	urlutil "github.com/projectdiscovery/utils/url"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/active/open_redirect"
@@ -241,6 +242,7 @@ func (m *Module) testRedirectURIManipulation(
 						"credential_delivered":         false,
 					},
 				})
+				modkit.SetPrimaryEvidence(results[len(results)-1], http.CaptureEvidence(resp), evidence.RoleAttack, "OAuth redirect-uri mutation")
 				resp.Close()
 				return results, nil
 			}
@@ -276,6 +278,9 @@ func (m *Module) testMissingState(
 	}
 
 	return &output.ResultEvent{
+		// This observation analyzes the original authorization request only;
+		// redirect and response-type probes must not inherit baseline proof.
+		BaselineEvidence: true,
 		ModuleID:         ModuleID,
 		RecordKind:       output.RecordKindObservation,
 		EvidenceGrade:    output.EvidenceGradeObservation,
@@ -357,7 +362,12 @@ func (m *Module) testResponseTypeDowngrade(
 		description = "The endpoint reproducibly issued an access token after response_type was changed from code to token, while rejecting an invalid response type. This directly confirms implicit-flow token delivery in the observed session."
 	}
 
-	return &output.ResultEvent{
+	finding := &output.ResultEvent{
+		Evidence: []evidence.Entry{
+			evidence.Select(invalidRounds[0].exchange, evidence.RoleControl, false, "invalid response type"),
+			evidence.Select(tokenRounds[1].exchange, evidence.RoleConfirmation, false, "token response-type replay"),
+			evidence.Select(invalidRounds[1].exchange, evidence.RoleControl, false, "invalid response-type replay"),
+		},
 		ModuleID:      ModuleID,
 		RecordKind:    kind,
 		EvidenceGrade: grade,
@@ -390,10 +400,13 @@ func (m *Module) testResponseTypeDowngrade(
 			"access_token_issued":       allIssuedToken,
 			"confirmation_rounds":       2,
 		},
-	}, nil
+	}
+	modkit.SetPrimaryEvidence(finding, tokenRounds[0].exchange, evidence.RoleAttack, "token response-type mutation")
+	return finding, nil
 }
 
 type oauthProbeResponse struct {
+	exchange *evidence.Exchange
 	status   int
 	location string
 	body     string
@@ -421,6 +434,7 @@ func (m *Module) executeOAuthProbe(ctx *httpmsg.HttpRequestResponse, httpClient 
 		return oauthProbeResponse{}, nil
 	}
 	return oauthProbeResponse{
+		exchange: http.CaptureEvidence(resp),
 		status:   resp.Response().StatusCode,
 		location: resp.Response().Header.Get("Location"),
 		body:     resp.BodyString(),

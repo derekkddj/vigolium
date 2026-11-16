@@ -21,6 +21,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/burpbridge"
 	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	vighttp "github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/http/proxyenv"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
@@ -89,8 +90,8 @@ var (
 	replayBulkLimit         int
 	replayConcurrency       int
 
-	// replayInReplace overwrites each replayed record's stored response with the
-	// replay response. Bound by both `replay --in-replace` and the
+	// replayInReplace saves the complete replay as an immutable record version.
+	// Bound by both `replay --in-replace` and the
 	// `traffic --replay --in-replace` shortcut — only one command runs per
 	// process, so a single global backs both registrations.
 	replayInReplace bool
@@ -192,7 +193,7 @@ func init() {
 
 	// Result handling.
 	f.BoolVar(&replayInReplace, "in-replace", false,
-		"When the source is a stored record, update its stored response with the replay")
+		"Save the complete replay as an immutable version of the stored record")
 	registerRowShapingFlags(f)
 	f.IntVar(&replayExcerptBytes, "excerpt-bytes", replay.DefaultExcerptCap,
 		"Bytes of each response (and the mutated request) kept as an excerpt in the -j/JSONL result")
@@ -560,6 +561,7 @@ func (rr *replayRun) one(ctx context.Context, src *replaySource, overlay map[str
 		Port:                 src.Port,
 		HeaderOverlay:        overlay,
 		NoRedirects:          replayNoRedirects,
+		CaptureExchange:      replayInReplace,
 		Client:               rr.client,
 		SendBaseline:         replaySendBaseline,
 		BaselineIsEvidence:   src.FindingID != 0 && len(src.BaselineResponse) > 0,
@@ -579,7 +581,7 @@ func (rr *replayRun) one(ctx context.Context, src *replaySource, overlay map[str
 
 	if replayInReplace {
 		if err := persistReplayResponse(ctx, src, result); err != nil {
-			fmt.Fprintf(os.Stderr, "%s replay: --in-replace failed: %v\n", terminal.WarningSymbol(), err)
+			return nil, fmt.Errorf("save replay version: %w", err)
 		}
 	}
 	if rr.saveToBurp {
@@ -701,14 +703,9 @@ func sourceFromRecord(ctx context.Context, repo *database.Repository, ref string
 	return sourceFromDBRecord(rec), nil
 }
 
-// sourceFromFinding resolves a finding to a baseline. Preference order:
-//  1. First HTTPRecordUUIDs entry that loads — uses the canonical record
-//     (which has correct host/port/scheme metadata).
-//  2. Finding.Request / Finding.Response — for findings imported without
-//     a backing HTTPRecord (audit findings, jsonl imports).
-//
-// We use the same priority order the UI does so the operator and the
-// CLI see the same evidence.
+// sourceFromFinding replays a single explicit primary receipt without URL/service
+// inference or request repair. Missing/ambiguous selections fail closed. Genuine
+// legacy findings retain their project-owned linked/inline unknown-role context.
 func sourceFromFinding(ctx context.Context, repo *database.Repository, id int64) (*replaySource, error) {
 	finding, err := repo.GetFindingByID(ctx, id)
 	if err != nil || finding == nil {
@@ -718,9 +715,18 @@ func sourceFromFinding(ctx context.Context, repo *database.Repository, id int64)
 		return nil, fmt.Errorf("finding #%d does not belong to the current project", id)
 	}
 
+	if len(finding.Evidence) > 0 {
+		if err := hydrateSelectedFindingEvidence(ctx, repo, finding, true); err != nil {
+			return nil, err
+		}
+		return sourceFromSelectedFinding(finding)
+	}
+	if finding.EvidenceStatus != "" && finding.EvidenceStatus != "legacy_unknown" && finding.EvidenceStatus != "unclassified" {
+		return nil, fmt.Errorf("finding #%d has no selected manifest; no legacy fallback replayed", id)
+	}
 	for _, uuid := range finding.HTTPRecordUUIDs {
 		rec, err := repo.GetRecordByUUID(ctx, uuid)
-		if err == nil && rec != nil {
+		if err == nil && rec != nil && rec.ProjectUUID == finding.ProjectUUID {
 			src := sourceFromDBRecord(rec)
 			src.FindingID = finding.ID
 			src.OriginLabel = fmt.Sprintf("finding #%d via record %s", finding.ID, rec.UUID)
@@ -1083,41 +1089,40 @@ func persistReplayResponse(ctx context.Context, src *replaySource, result *repla
 		//vigolium:not-usage reached after the replay was sent
 		return fmt.Errorf("--in-replace skipped: live Burp records are read-only")
 	}
-	if result.Replay == nil || result.Replay.Error != "" {
+	if result == nil || result.Replay == nil || result.Replay.Error != "" {
 		//vigolium:not-usage reached after the replay was sent
 		return fmt.Errorf("--in-replace skipped: replay had no usable response")
 	}
-	body := result.Replay.RawBody
-	if body == nil {
-		// Defensive: the engine populates RawBody on every successful
-		// send. If we ever stop doing that, refuse rather than write
-		// the clipped excerpt back as the canonical body.
+	x := result.Replay.Exchange
+	if x == nil || x.RequestState != evidence.StateComplete || x.ResponseState != evidence.StateComplete {
+		// Never combine the original stored request (or the intended mutation)
+		// with a response that belongs to a different final/authenticated request.
 		//vigolium:not-usage reached after the replay was sent
-		return fmt.Errorf("--in-replace skipped: engine did not return body bytes")
+		return fmt.Errorf("--in-replace skipped: replay has no complete captured exchange")
 	}
-	// Write back to the same store the record was read from — openReadDB, not
-	// getDB. Under -S/--stateless that is the standalone export being replayed,
-	// which is where the refreshed response belongs; routing to the project DB
-	// instead would update rows whose UUIDs came from a different database.
+	sent, err := httpmsg.FromEvidenceExchange(x)
+	if err != nil {
+		//vigolium:not-usage reached after the replay was sent
+		return fmt.Errorf("--in-replace skipped: invalid replay capture: %w", err)
+	}
+	// Save the version in the same store the record was read from — openReadDB,
+	// not getDB. Under -S/--stateless that is the standalone export; routing to
+	// the project DB could pick a UUID belonging to a different database.
 	db, err := openReadDB(globDBSkipSet{})
 	if err != nil {
 		return err
 	}
 	repo := database.NewRepository(db)
 
-	raw := rawReplayResponse(result.Replay)
-
-	update := &database.RecordResponseUpdate{
-		StatusCode:            result.Replay.Status,
-		StatusPhrase:          http.StatusText(result.Replay.Status),
-		ResponseHTTPVersion:   "HTTP/1.1",
-		ResponseContentType:   result.Replay.Headers.Get("Content-Type"),
-		ResponseContentLength: int64(result.Replay.ResponseLen),
-		RawResponse:           raw,
-		ResponseHash:          result.Replay.ContentHash,
-		ResponseTimeMs:        result.Replay.ResponseTimeMs,
+	sent = sent.WithResponse(httpmsg.NewHttpResponseWithDuration(x.Response, time.Duration(result.Replay.ResponseTimeMs)*time.Millisecond)).WithEvidence(x)
+	versionUUID, err := repo.SaveRecordVersion(ctx, src.RecordUUID, sent)
+	if err != nil {
+		return err
 	}
-	return repo.UpdateRecordResponse(ctx, src.RecordUUID, update)
+	// All following output/attribution refers to the exchange just persisted,
+	// while historical references retain the original UUID and original bytes.
+	src.RecordUUID = versionUUID
+	return nil
 }
 
 func saveReplayResultToBurp(
@@ -1302,6 +1307,9 @@ func emitReplayPretty(w io.Writer, out *replayOutput) error {
 	_, _ = fmt.Fprint(w, tbl.Render())
 	if r.Error != "" {
 		_, _ = fmt.Fprintf(w, "  %s replay error: %s\n", terminal.ErrorPrefix(), r.Error)
+	}
+	if policy := r.RequestTargetPolicy; policy != nil {
+		_, _ = fmt.Fprintf(w, "  %s request-target fidelity %s: %s\n", terminal.WarnPrefix(), policy.Fidelity, policy.Note)
 	}
 	if d.Interpretation != "" {
 		_, _ = fmt.Fprintf(w, "  %s %s\n", terminal.InfoSymbol(), d.Interpretation)

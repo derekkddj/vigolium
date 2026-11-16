@@ -1,11 +1,14 @@
 package source
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +16,7 @@ import (
 
 	"github.com/vigolium/vigolium/pkg/deparos/discovery"
 	deparosstorage "github.com/vigolium/vigolium/pkg/deparos/storage"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/terminal"
 	"go.uber.org/zap"
@@ -242,10 +246,11 @@ func (c *targetCollector) keepFuzz(rec collectedRecord) {
 }
 
 // readDiscoveredNode converts one siteMap node into a collected record: the
-// request as discovered (method, headers, body), its response when one was
-// captured (status stays 0 otherwise), and its provenance class. It also returns
-// the node URL and the response body exact dedup hashes. ok is false for a node
-// that cannot be turned into a request.
+// projected request (method, headers, body), its stored response observation
+// (status stays 0 otherwise), and its provenance class. Neither projection is a
+// wire capture: reconstructed nonempty messages have unknown fidelity. It also
+// returns the node URL and response body for exact dedup hashes. ok is false for
+// a node that cannot be turned into a request.
 func readDiscoveredNode(node *deparosstorage.DiscoveredNode) (rec collectedRecord, nodeURL string, body []byte, ok bool) {
 	u := node.URL()
 	if u == nil {
@@ -283,6 +288,7 @@ func readDiscoveredNode(node *deparosstorage.DiscoveredNode) (rec collectedRecor
 
 	resp := node.Response()
 	if resp == nil || resp.StatusCode <= 0 {
+		rec.rr = withDiscoveryProjectionEvidence(rec.rr)
 		return rec, nodeURL, nil, true
 	}
 	rawResp := httpmsg.BuildRawResponse(resp.StatusCode, resp.Headers, string(resp.Body))
@@ -292,7 +298,7 @@ func readDiscoveredNode(node *deparosstorage.DiscoveredNode) (rec collectedRecor
 	// "not measured" and is passed through as such.
 	httpResp := httpmsg.NewHttpResponseWithDuration(rawResp,
 		time.Duration(resp.DurationMs)*time.Millisecond)
-	rec.rr = rr.WithResponse(httpResp)
+	rec.rr = withDiscoveryProjectionEvidence(rr.WithResponse(httpResp))
 	rec.status = resp.StatusCode
 	rec.ctype = resp.MIMEType
 	rec.size = int64(len(resp.Body))
@@ -301,6 +307,36 @@ func readDiscoveredNode(node *deparosstorage.DiscoveredNode) (rec collectedRecor
 		rec.words = int64(len(strings.Fields(string(resp.Body))))
 	}
 	return rec, nodeURL, resp.Body, true
+}
+
+// withDiscoveryProjectionEvidence marks reconstructed discovery/template messages
+// as producer-supplied views, not captured executions. Header maps, normalized or
+// capped response bodies and template bodies cannot establish complete fidelity.
+// Call only after building the final pair with a nonnil request and service.
+// A valid existing receipt is retained only if both messages and the destination
+// match exactly; otherwise the projection gets a fresh unknown/missing receipt.
+func withDiscoveryProjectionEvidence(rr *httpmsg.HttpRequestResponse) *httpmsg.HttpRequestResponse {
+	request := rr.Request().Raw()
+	var response []byte
+	if rr.HasResponse() {
+		response = rr.Response().Raw()
+	}
+	service := rr.Service()
+	destination := service.Protocol() + "://" + net.JoinHostPort(service.Host(), strconv.Itoa(service.Port()))
+	if x := rr.Evidence(); x != nil && x.Validate() == nil && x.Service == destination &&
+		bytes.Equal(x.Request, request) && bytes.Equal(x.Response, response) {
+		return rr
+	}
+	x := evidence.NewExchange(destination, rr.Target(), request, response, evidence.ProvenanceSupplied)
+	x.RequestState, x.ResponseState = evidence.StateMissing, evidence.StateMissing
+	if len(request) > 0 {
+		x.RequestState = evidence.StateUnknown
+	}
+	if len(response) > 0 {
+		x.ResponseState = evidence.StateUnknown
+	}
+	x.ContentHash = x.Hash()
+	return rr.WithEvidence(x)
 }
 
 // fuzzDedupKey is a fuzz record's exact-dedup key, built on the response BODY

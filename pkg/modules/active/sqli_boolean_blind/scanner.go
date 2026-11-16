@@ -9,6 +9,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -189,6 +190,10 @@ ipScan:
 			continue
 		}
 		baselineFull, baselineBlocked := rb.full, rb.blocked
+		var baselineReceipts []*evidence.Exchange
+		if rb.receipt != nil {
+			baselineReceipts = append(baselineReceipts, rb.receipt)
+		}
 		var baselineSig responseSignature
 		if rb.status != 0 {
 			baselineSig = newResponseSignature(rb.status, rb.body, baseValue)
@@ -232,7 +237,7 @@ ipScan:
 			if runCtx.Err() != nil {
 				return results, nil
 			}
-			result, pairBlocked, err := m.testPayloadPairDetail(ctx, httpClient, ip, baseValue, pair, baselineSig, baselineFull)
+			result, pairBlocked, err := m.testPayloadPairDetail(ctx, httpClient, ip, baseValue, pair, baselineSig, baselineFull, baselineReceipts...)
 			if err != nil {
 				if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
 					return results, nil
@@ -256,9 +261,11 @@ ipScan:
 				// discard the request's earlier results too, since they rode on the
 				// same broken assumption. Memoized per record, so this costs nothing
 				// on the requests that never reach a candidate.
-				if modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+				guardProof := modkit.NewEvidenceCollector()
+				if modkit.EndpointVolatileWithEvidence(scanCtx, ctx, httpClient, guardProof) {
 					return nil, nil
 				}
+				appendStabilityEvidence(result, guardProof)
 				result.URL = urlx.String()
 				results = append(results, result)
 				continue ipScan
@@ -283,9 +290,11 @@ ipScan:
 			// Same endpoint-determinism gate as the direct differential above: HPP
 			// only changes how the payload is delivered, so it inherits the same
 			// coin-flip failure mode on a non-deterministic endpoint.
-			if modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+			guardProof := modkit.NewEvidenceCollector()
+			if modkit.EndpointVolatileWithEvidence(scanCtx, ctx, httpClient, guardProof) {
 				return nil, nil
 			}
+			appendStabilityEvidence(hpp, guardProof)
 			hpp.URL = urlx.String()
 			results = append(results, hpp)
 			continue ipScan
@@ -309,8 +318,9 @@ func (m *Module) testPayloadPair(
 	pair payloadPair,
 	baselineSig responseSignature,
 	baselineFull string,
+	baselineReceipts ...*evidence.Exchange,
 ) (*output.ResultEvent, error) {
-	res, _, err := m.testPayloadPairDetail(ctx, httpClient, ip, baseValue, pair, baselineSig, baselineFull)
+	res, _, err := m.testPayloadPairDetail(ctx, httpClient, ip, baseValue, pair, baselineSig, baselineFull, baselineReceipts...)
 	return res, err
 }
 
@@ -324,9 +334,10 @@ func (m *Module) testPayloadPairDetail(
 	pair payloadPair,
 	baselineSig responseSignature,
 	baselineFull string,
+	baselineReceipts ...*evidence.Exchange,
 ) (*output.ResultEvent, bool, error) {
 	var blocked bool
-	res, err := m.testPayloadPairBody(ctx, httpClient, ip, baseValue, pair, baselineSig, baselineFull, &blocked)
+	res, err := m.testPayloadPairBody(ctx, httpClient, ip, baseValue, pair, baselineSig, baselineFull, &blocked, baselineReceipts...)
 	return res, blocked, err
 }
 
@@ -339,18 +350,22 @@ func (m *Module) testPayloadPairBody(
 	baselineSig responseSignature,
 	baselineFull string,
 	blockedOut *bool,
+	baselineReceipts ...*evidence.Exchange,
 ) (*output.ResultEvent, error) {
 	truePayload := baseValue + pair.trueVal
 	falsePayload := baseValue + pair.falseVal
+	if len(baselineReceipts) == 0 {
+		baselineReceipts = []*evidence.Exchange{evidence.NewExchange("", "", ip.BuildRequest([]byte(baseValue)), []byte(baselineFull), evidence.ProvenanceSupplied)}
+	}
 
 	// Step 1: Send TRUE payload
-	trueFull, trueSig1, trueBlocked, err := m.sendPayload(ctx, httpClient, ip, truePayload)
+	trueFull, trueSig1, trueBlocked, trueReceipt, err := m.sendPayloadReceipt(ctx, httpClient, ip, truePayload)
 	if err != nil {
 		return nil, err
 	}
 
 	// Step 2: Send FALSE payload
-	falseFull, falseSig1, falseBlocked, err := m.sendPayload(ctx, httpClient, ip, falsePayload)
+	falseFull, falseSig1, falseBlocked, falseReceipt, err := m.sendPayloadReceipt(ctx, httpClient, ip, falsePayload)
 	if err != nil {
 		return nil, err
 	}
@@ -376,7 +391,7 @@ func (m *Module) testPayloadPairBody(
 	case modeReject:
 		return nil, nil
 	case modeStatusOracle:
-		return m.confirmStatusOracle(ctx, httpClient, ip, baseValue, pair, baselineSig, baselineFull, trueFull, falseFull, falseSig1)
+		return m.confirmStatusOracle(ctx, httpClient, ip, baseValue, pair, baselineSig, baselineFull, trueFull, falseFull, falseSig1, append(baselineReceipts, trueReceipt, falseReceipt)...)
 	}
 	prof := contentProfile(baselineSig.StatusCode)
 
@@ -420,7 +435,7 @@ func (m *Module) testPayloadPairBody(
 	}
 
 	// Step 5: Confirm TRUE is consistent across a retry (ratio-stable).
-	_, trueSig2, trueBlocked2, err := m.sendPayload(ctx, httpClient, ip, truePayload)
+	_, trueSig2, trueBlocked2, trueReplay, err := m.sendPayloadReceipt(ctx, httpClient, ip, truePayload)
 	if err != nil {
 		return nil, err
 	}
@@ -429,7 +444,7 @@ func (m *Module) testPayloadPairBody(
 	}
 
 	// Step 6: Confirm FALSE is consistent across a retry.
-	_, falseSig2, falseBlocked2, err := m.sendPayload(ctx, httpClient, ip, falsePayload)
+	_, falseSig2, falseBlocked2, falseReplay, err := m.sendPayloadReceipt(ctx, httpClient, ip, falsePayload)
 	if err != nil {
 		return nil, err
 	}
@@ -447,7 +462,8 @@ func (m *Module) testPayloadPairBody(
 	}
 
 	// Step 8: multi-round, multi-factor confirmation (see confirmBoolean).
-	confirmed, err := m.confirmBoolean(ctx, httpClient, ip, baseValue, pair, prof)
+	confirmation := modkit.NewEvidenceCollector()
+	confirmed, err := m.confirmBoolean(ctx, httpClient, ip, baseValue, pair, prof, confirmation)
 	if err != nil {
 		return nil, err
 	}
@@ -456,8 +472,12 @@ func (m *Module) testPayloadPairBody(
 	}
 
 	// All checks passed — confirmed blind SQLi.
-	return buildFinding(ip, baseValue, truePayload, falsePayload, baselineFull, trueFull, falseFull,
-		"Boolean-based blind SQL injection confirmed via TRUE/FALSE response differential with baseline verification"), nil
+	r := buildFinding(ip, baseValue, truePayload, falsePayload, baselineFull, trueFull, falseFull,
+		"Boolean-based blind SQL injection confirmed via TRUE/FALSE response differential with baseline verification",
+		append(baselineReceipts, trueReceipt, falseReceipt, trueReplay, falseReplay)...)
+	r.AdditionalEvidence = append(r.AdditionalEvidence, confirmation.Entries()...)
+	r.Evidence = append(r.Evidence, confirmation.Evidence()...)
+	return r, nil
 }
 
 // confirmBoolean runs step 8, the multi-round, multi-factor confirmation, under
@@ -479,12 +499,13 @@ func (m *Module) confirmBoolean(
 	baseValue string,
 	pair payloadPair,
 	prof branchProfile,
+	collectors ...*modkit.EvidenceCollector,
 ) (bool, error) {
 	if pair.boundaried {
-		return m.confirmLogic(ctx, httpClient, ip, baseValue, pair.prefix, pair.suffix, prof)
+		return m.confirmLogic(ctx, httpClient, ip, baseValue, pair.prefix, pair.suffix, prof, collectors...)
 	}
 	requireOperands := ip.Type() == httpmsg.INS_HEADER || prof.isStatusOracle()
-	return m.confirmRandomized(ctx, httpClient, ip, baseValue+pair.trueVal, baseValue+pair.falseVal, requireOperands, prof)
+	return m.confirmRandomized(ctx, httpClient, ip, baseValue+pair.trueVal, baseValue+pair.falseVal, requireOperands, prof, collectors...)
 }
 
 // confirmStatusOracle confirms a status-flip differential (baseline and TRUE
@@ -510,17 +531,27 @@ func (m *Module) confirmStatusOracle(
 	baselineSig responseSignature,
 	baselineFull, trueFull, falseFull string,
 	falseSig responseSignature,
+	receipts ...*evidence.Exchange,
 ) (*output.ResultEvent, error) {
 	truePayload := baseValue + pair.trueVal
 	falsePayload := baseValue + pair.falseVal
+	// Direct helper callers supply comparison strings, not transport receipts.
+	// Reserve the same baseline/TRUE/FALSE slots before adding actual replays.
+	if len(receipts) == 0 {
+		receipts = []*evidence.Exchange{
+			evidence.NewExchange("", "", ip.BuildRequest([]byte(baseValue)), []byte(baselineFull), evidence.ProvenanceSupplied),
+			evidence.NewExchange("", "", ip.BuildRequest([]byte(truePayload)), []byte(trueFull), evidence.ProvenanceSupplied),
+			evidence.NewExchange("", "", ip.BuildRequest([]byte(falsePayload)), []byte(falseFull), evidence.ProvenanceSupplied),
+		}
+	}
 	prof := statusOracleProfile(baselineSig.StatusCode, falseSig.StatusCode)
 
 	// (a) Reproduce the split, and prove the baseline status itself is stable.
-	_, trueSig2, trueBlocked2, err := m.sendPayload(ctx, httpClient, ip, truePayload)
+	_, trueSig2, trueBlocked2, trueReplay, err := m.sendPayloadReceipt(ctx, httpClient, ip, truePayload)
 	if err != nil {
 		return nil, err
 	}
-	_, falseSig2, falseBlocked2, err := m.sendPayload(ctx, httpClient, ip, falsePayload)
+	_, falseSig2, falseBlocked2, falseReplay, err := m.sendPayloadReceipt(ctx, httpClient, ip, falsePayload)
 	if err != nil {
 		return nil, err
 	}
@@ -537,7 +568,7 @@ func (m *Module) confirmStatusOracle(
 
 	// (b) Syntax-break control: malformed input must not land on the FALSE status.
 	breakPayload := baseValue + syntaxBreakSuffix
-	breakFull, breakSig, breakBlocked, err := m.sendPayload(ctx, httpClient, ip, breakPayload)
+	_, breakSig, breakBlocked, breakReceipt, err := m.sendPayloadReceipt(ctx, httpClient, ip, breakPayload)
 	if err != nil {
 		return nil, err
 	}
@@ -546,7 +577,8 @@ func (m *Module) confirmStatusOracle(
 	}
 
 	// (c) Random-operand battery with status as the comparator.
-	confirmed, err := m.confirmBoolean(ctx, httpClient, ip, baseValue, pair, prof)
+	confirmation := modkit.NewEvidenceCollector()
+	confirmed, err := m.confirmBoolean(ctx, httpClient, ip, baseValue, pair, prof, confirmation)
 	if err != nil || !confirmed {
 		return nil, err
 	}
@@ -556,7 +588,7 @@ func (m *Module) confirmStatusOracle(
 	r := buildFinding(ip, baseValue, truePayload, falsePayload, baselineFull, trueFull, falseFull,
 		"Boolean-based blind SQL injection confirmed via a TRUE/FALSE HTTP status differential ("+statuses+
 			"): TRUE keeps the original status, FALSE reproducibly returns another, the split follows random operands, "+
-			"and malformed SQL does not produce the FALSE status")
+			"and malformed SQL does not produce the FALSE status", append(receipts, trueReplay, falseReplay)...)
 	r.Info.Confidence = severity.Firm
 	if r.Metadata == nil {
 		r.Metadata = map[string]interface{}{}
@@ -564,9 +596,11 @@ func (m *Module) confirmStatusOracle(
 	r.Metadata["differential"] = modeStatusOracle.String()
 	r.Metadata["statuses"] = statuses
 	ev := modkit.NewEvidenceCollector()
-	ev.Add(fmt.Sprintf("syntax-break control (status %d)", breakSig.StatusCode),
-		string(ip.BuildRequest([]byte(breakPayload))), breakFull)
+	ev.AddExchange(breakReceipt, evidence.RoleControl, fmt.Sprintf("syntax-break control (status %d)", breakSig.StatusCode))
 	r.AdditionalEvidence = append(r.AdditionalEvidence, ev.Entries()...)
+	r.Evidence = append(r.Evidence, ev.Evidence()...)
+	r.AdditionalEvidence = append(r.AdditionalEvidence, confirmation.Entries()...)
+	r.Evidence = append(r.Evidence, confirmation.Evidence()...)
 	r.AdditionalEvidence = append(r.AdditionalEvidence, "# [status-oracle] "+statuses)
 	return r, nil
 }
@@ -580,20 +614,36 @@ func buildFinding(
 	baseValue, truePayload, falsePayload string,
 	baselineFull, trueFull, falseFull string,
 	description string,
+	receipts ...*evidence.Exchange,
 ) *output.ResultEvent {
 	ev := modkit.NewEvidenceCollector()
-	ev.Add("baseline (unmodified value)", string(ip.BuildRequest([]byte(baseValue))), baselineFull)
-	ev.Add("false-payload", string(ip.BuildRequest([]byte(falsePayload))), falseFull)
-	return &output.ResultEvent{
+	ev.AddBaseline("baseline (unmodified value)", string(ip.BuildRequest([]byte(baseValue))), baselineFull)
+	ev.AddControl("false-payload", string(ip.BuildRequest([]byte(falsePayload))), falseFull)
+	r := &output.ResultEvent{
 		Request:            string(ip.BuildRequest([]byte(truePayload))),
 		Response:           trueFull,
 		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.ForResult(string(ip.BuildRequest([]byte(truePayload))), trueFull),
 		FuzzingParameter:   ip.Name(),
 		ExtractedResults:   []string{truePayload, falsePayload},
 		Info: output.Info{
 			Description: description,
 		},
 	}
+	if len(receipts) >= 3 {
+		actual := modkit.NewEvidenceCollector()
+		actual.AddExchange(receipts[0], evidence.RoleBaseline, "baseline (unmodified value)")
+		actual.AddExchange(receipts[2], evidence.RoleControl, "false-payload")
+		if len(receipts) > 3 {
+			actual.AddExchange(receipts[3], evidence.RoleConfirmation, "TRUE payload replay")
+		}
+		if len(receipts) > 4 {
+			actual.AddExchange(receipts[4], evidence.RoleControl, "FALSE payload replay")
+		}
+		r.AdditionalEvidence, r.Evidence = actual.Entries(), actual.Evidence()
+		modkit.SetPrimaryEvidence(r, receipts[1], evidence.RoleAttack, "TRUE boolean payload")
+	}
+	return r
 }
 
 // sendPayload sends a payload through an insertion point and returns the response
@@ -609,6 +659,17 @@ func (m *Module) sendPayload(
 	ip httpmsg.InsertionPoint,
 	payload string,
 ) (string, responseSignature, bool, error) {
+	full, sig, blocked, _, err := m.sendPayloadReceipt(ctx, httpClient, ip, payload)
+	return full, sig, blocked, err
+}
+
+// sendPayloadReceipt returns the owned exchange alongside body-only comparison data.
+func (m *Module) sendPayloadReceipt(
+	ctx *httpmsg.HttpRequestResponse,
+	httpClient *http.Requester,
+	ip httpmsg.InsertionPoint,
+	payload string,
+) (string, responseSignature, bool, *evidence.Exchange, error) {
 	fuzzedRaw := ip.BuildRequest([]byte(payload))
 
 	// BuildRequest produces well-formed raw, so wrap directly instead of
@@ -624,15 +685,16 @@ func (m *Module) sendPayload(
 	// endpoint — silently defeating the module's core false-positive defenses.
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true, NoClustering: true})
 	if err != nil {
-		return "", responseSignature{}, false, err
+		return "", responseSignature{}, false, nil, err
 	}
 	defer resp.Close()
+	receipt := http.CaptureEvidence(resp)
 
 	// Classify the block status while the response chain is still open.
 	blocked := infra.IsBlockedResponse(resp)
 
 	if resp.Response() == nil {
-		return "", responseSignature{}, blocked, nil
+		return "", responseSignature{}, blocked, receipt, nil
 	}
 
 	// The boolean differential (TRUE vs FALSE vs baseline ratio) must be computed
@@ -643,5 +705,5 @@ func (m *Module) sendPayload(
 	// one. The full response string is kept solely as the reported evidence.
 	fullResp := resp.FullResponseString()
 	sig := newResponseSignature(resp.Response().StatusCode, resp.Body().String(), payload)
-	return fullResp, sig, blocked, nil
+	return fullResp, sig, blocked, receipt, nil
 }
