@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
 
 	"github.com/vigolium/vigolium/pkg/apicontract"
 
@@ -205,30 +206,96 @@ func (r *Repository) DeleteProject(ctx context.Context, uuid string) error {
 	return nil
 }
 
+// ProjectSessionDir identifies a project-owned session directory. Kind is either
+// "native" or "agent" and Root is the configured session root used to derive Path.
+type ProjectSessionDir struct {
+	Kind string
+	UUID string
+	Root string
+	Path string
+}
+
+// ProjectSessionDirs returns native and agent session directories associated with
+// projectUUID. Paths are derived from each row's UUID under the configured roots;
+// persisted session_dir values are deliberately not trusted as filesystem paths.
+func (r *Repository) ProjectSessionDirs(ctx context.Context, projectUUID, nativeSessionsDir, agentSessionsDir string) ([]ProjectSessionDir, error) {
+	type sessionUUID struct {
+		UUID string `bun:"uuid"`
+	}
+	var scans []sessionUUID
+	if err := r.db.NewSelect().Model((*Scan)(nil)).Column("uuid").
+		Where("project_uuid = ?", projectUUID).Scan(ctx, &scans); err != nil {
+		return nil, fmt.Errorf("failed to list project scans for session cleanup: %w", err)
+	}
+	var runs []sessionUUID
+	if err := r.db.NewSelect().Model((*AgenticScan)(nil)).Column("uuid").
+		Where("project_uuid = ?", projectUUID).Scan(ctx, &runs); err != nil {
+		return nil, fmt.Errorf("failed to list project agent runs for session cleanup: %w", err)
+	}
+
+	dirs := make([]ProjectSessionDir, 0, len(scans)+len(runs))
+	for _, scan := range scans {
+		dirs = append(dirs, ProjectSessionDir{
+			Kind: "native", UUID: scan.UUID, Root: nativeSessionsDir,
+			Path: filepath.Join(nativeSessionsDir, scan.UUID),
+		})
+	}
+	for _, run := range runs {
+		dirs = append(dirs, ProjectSessionDir{
+			Kind: "agent", UUID: run.UUID, Root: agentSessionsDir,
+			Path: filepath.Join(agentSessionsDir, run.UUID),
+		})
+	}
+	return dirs, nil
+}
+
 // PurgeProjectData deletes every row tied to projectUUID across all per-project
 // tables. finding_records has no project_uuid, so it's pruned via a subquery on
 // findings.id before the findings rows themselves are removed. Runs in a single
 // transaction so a partial failure leaves the project intact.
 func (r *Repository) PurgeProjectData(ctx context.Context, projectUUID string) error {
-	return r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+	_, err := r.PurgeProjectDataWithCounts(ctx, projectUUID)
+	return err
+}
+
+// PurgeProjectDataWithCounts purges project-owned rows and returns the number of
+// rows removed per table. Counts and deletes share one transaction, so the
+// summary describes the rows actually removed and any failure rolls back both.
+func (r *Repository) PurgeProjectDataWithCounts(ctx context.Context, projectUUID string) (map[string]int64, error) {
+	counts := make(map[string]int64, len(findingChildTables)+len(projectOwnedTables))
+	err := r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
 		for _, table := range findingChildTables {
-			if _, err := tx.NewDelete().
-				TableExpr(table).
-				Where("finding_id IN (SELECT id FROM findings WHERE project_uuid = ?)", projectUUID).
-				Exec(ctx); err != nil {
+			where := "finding_id IN (SELECT id FROM findings WHERE project_uuid = ?)"
+			result, err := tx.NewDelete().TableExpr(table).Where(where, projectUUID).Exec(ctx)
+			if err != nil {
 				return fmt.Errorf("failed to delete %s: %w", table, err)
 			}
+			count, err := result.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("failed to count deleted %s rows: %w", table, err)
+			}
+			counts[table] += count
 		}
 		// Same central table list as reassignment, so the two can't drift.
 		for _, table := range projectOwnedTables {
-			if _, err := tx.ExecContext(ctx,
+			result, err := tx.ExecContext(ctx,
 				fmt.Sprintf("DELETE FROM %s WHERE project_uuid = ?", table),
-				projectUUID); err != nil {
+				projectUUID)
+			if err != nil {
 				return fmt.Errorf("failed to purge %s: %w", table, err)
 			}
+			count, err := result.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("failed to count purged %s rows: %w", table, err)
+			}
+			counts[table] += count
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return counts, nil
 }
 
 // ProjectStatsRow holds per-project aggregated counts used by GetAllProjectsStats.

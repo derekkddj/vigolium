@@ -27,10 +27,12 @@ func (h *Handlers) settingsForProject(projectUUID string) (*config.Settings, err
 	var settings *config.Settings
 	if h.settings == nil {
 		settings = config.DefaultSettings()
-	} else {
+	} else if h.configWatcher != nil {
 		h.configWatcher.RLock()
 		settings = config.CloneSettings(h.settings)
 		h.configWatcher.RUnlock()
+	} else {
+		settings = config.CloneSettings(h.settings)
 	}
 	if err := config.ApplyProjectOverlay(settings, projectUUID); err != nil {
 		return nil, fmt.Errorf("project config: %w", err)
