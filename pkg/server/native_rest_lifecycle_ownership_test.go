@@ -180,7 +180,7 @@ func TestRunScanRESTLifecycleOwnsProjectAcrossRequestReuse(t *testing.T) {
 	h := newBasicHandlers(t, ServerConfig{Concurrency: 2}, &fakeQueue{}, db, repo, settings)
 
 	gates := map[string]*nativeLifecycleGate{}
-	for _, scanID := range []string{"lifecycle-success-a", "lifecycle-cancel-b"} {
+	for _, scanID := range []string{"11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"} {
 		gate := &nativeLifecycleGate{
 			arrived: make(chan struct{}), release: make(chan struct{}),
 			cancelled: make(chan struct{}, 1),
@@ -268,7 +268,7 @@ func TestRunScanRESTLifecycleOwnsProjectAcrossRequestReuse(t *testing.T) {
 		t.Helper()
 		target := targets[scanID]
 		if target == nil {
-			target = targets["lifecycle-success-a"] // rejected same-project retry never reaches the target
+			target = targets["11111111-1111-4111-8111-111111111111"] // rejected same-project retry never reaches the target
 		}
 		body := fmt.Sprintf(`{"targets":[%q],"modules":[%q],"only":"discovery,dynamic-assessment","timeout":%q,"scan_uuid":%q}`,
 			target.URL+"/seed/"+scanID, nativeLifecycleModuleID, nativeLifecycleRequestTimeout, scanID)
@@ -281,17 +281,17 @@ func TestRunScanRESTLifecycleOwnsProjectAcrossRequestReuse(t *testing.T) {
 		return resp.StatusCode
 	}
 
-	respA := startScan(projectA, "lifecycle-success-a")
+	respA := startScan(projectA, "11111111-1111-4111-8111-111111111111")
 	require.Equal(t, http.StatusAccepted, respA)
-	respConflict := startScan(projectA, "lifecycle-same-project-rejected")
+	respConflict := startScan(projectA, "33333333-3333-4333-8333-333333333333")
 	require.Equal(t, http.StatusConflict, respConflict, "same-project concurrent admission must be rejected")
-	if _, err := repo.GetScanByUUID(ctx, "lifecycle-same-project-rejected"); err == nil {
+	if _, err := repo.GetScanByUUID(ctx, "33333333-3333-4333-8333-333333333333"); err == nil {
 		t.Fatal("rejected same-project submission persisted a scan row")
 	}
 
-	respB := startScan(projectB, "lifecycle-cancel-b")
+	respB := startScan(projectB, "22222222-2222-4222-8222-222222222222")
 	require.Equal(t, http.StatusAccepted, respB, "a different project may scan concurrently")
-	for _, id := range []string{"lifecycle-success-a", "lifecycle-cancel-b"} {
+	for _, id := range []string{"11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"} {
 		select {
 		case <-gates[id].arrived:
 		case <-time.After(nativeLifecycleBarrierWait):
@@ -304,15 +304,15 @@ func TestRunScanRESTLifecycleOwnsProjectAcrossRequestReuse(t *testing.T) {
 	var scanStatusA ScanStatusResponse
 	require.NoError(t, json.Unmarshal(bodyA, &scanStatusA))
 	require.True(t, scanStatusA.Running)
-	require.Equal(t, "lifecycle-success-a", scanStatusA.ScanUUID)
+	require.Equal(t, "11111111-1111-4111-8111-111111111111", scanStatusA.ScanUUID)
 	statusB, bodyB := doGet(t, app, "/api/scan/status", map[string]string{"X-Project-UUID": projectB})
 	require.Equal(t, http.StatusOK, statusB)
 	var scanStatusB ScanStatusResponse
 	require.NoError(t, json.Unmarshal(bodyB, &scanStatusB))
 	require.True(t, scanStatusB.Running)
-	require.Equal(t, "lifecycle-cancel-b", scanStatusB.ScanUUID)
+	require.Equal(t, "22222222-2222-4222-8222-222222222222", scanStatusB.ScanUUID)
 
-	for id, project := range map[string]string{"lifecycle-success-a": projectA, "lifecycle-cancel-b": projectB} {
+	for id, project := range map[string]string{"11111111-1111-4111-8111-111111111111": projectA, "22222222-2222-4222-8222-222222222222": projectB} {
 		scan, err := repo.GetScanByUUID(ctx, id)
 		require.NoError(t, err)
 		require.Equal(t, project, scan.ProjectUUID, "scan row must retain the admitted project after header reuse")
@@ -321,16 +321,16 @@ func TestRunScanRESTLifecycleOwnsProjectAcrossRequestReuse(t *testing.T) {
 
 	// Stop through the owner project only. The different-project request cannot
 	// stop A, while B's own stop cancels its active runner and blocked HTTP call.
-	wrongOwner, _ := doReq2(t, app, http.MethodPost, "/api/scans/lifecycle-success-a/stop", "", map[string]string{"X-Project-UUID": projectB})
+	wrongOwner, _ := doReq2(t, app, http.MethodPost, "/api/scans/11111111-1111-4111-8111-111111111111/stop", "", map[string]string{"X-Project-UUID": projectB})
 	require.Equal(t, http.StatusConflict, wrongOwner.StatusCode)
-	stopB, _ := doReq2(t, app, http.MethodPost, "/api/scans/lifecycle-cancel-b/stop", "", map[string]string{"X-Project-UUID": projectB})
+	stopB, _ := doReq2(t, app, http.MethodPost, "/api/scans/22222222-2222-4222-8222-222222222222/stop", "", map[string]string{"X-Project-UUID": projectB})
 	require.Equal(t, http.StatusOK, stopB.StatusCode)
 	select {
-	case <-gates["lifecycle-cancel-b"].cancelled:
+	case <-gates["22222222-2222-4222-8222-222222222222"].cancelled:
 	case <-time.After(nativeLifecycleBarrierWait):
 		t.Fatal("stop did not cancel the loopback request held at the module barrier")
 	}
-	gates["lifecycle-success-a"].open()
+	gates["11111111-1111-4111-8111-111111111111"].open()
 
 	awaitScanTerminal := func(scanID, wantStatus string) *database.Scan {
 		t.Helper()
@@ -346,10 +346,10 @@ func TestRunScanRESTLifecycleOwnsProjectAcrossRequestReuse(t *testing.T) {
 		t.Fatalf("scan %s did not finalize as %s: row=%+v err=%v", scanID, wantStatus, scan, err)
 		return nil
 	}
-	scanA := awaitScanTerminal("lifecycle-success-a", "completed")
+	scanA := awaitScanTerminal("11111111-1111-4111-8111-111111111111", "completed")
 	// Native REST cancellation has separate durable and session representations:
 	// the scan row is failed with error "cancelled", while status.json says cancelled.
-	scanB := awaitScanTerminal("lifecycle-cancel-b", "failed")
+	scanB := awaitScanTerminal("22222222-2222-4222-8222-222222222222", "failed")
 	require.Equal(t, "cancelled", scanB.ErrorMessage)
 	require.False(t, scanB.FinishedAt.IsZero(), "cancelled scan row must be finalized")
 	require.Equal(t, projectA, scanA.ProjectUUID)
@@ -358,7 +358,7 @@ func TestRunScanRESTLifecycleOwnsProjectAcrossRequestReuse(t *testing.T) {
 	require.NotNil(t, scanB.HeartbeatAt)
 
 	logCounts := map[string]int{}
-	for id, project := range map[string]string{"lifecycle-success-a": projectA, "lifecycle-cancel-b": projectB} {
+	for id, project := range map[string]string{"11111111-1111-4111-8111-111111111111": projectA, "22222222-2222-4222-8222-222222222222": projectB} {
 		var logs []*database.ScanLog
 		require.NoError(t, db.NewSelect().Model(&logs).Where("scan_uuid = ?", id).Scan(ctx))
 		require.NotEmpty(t, logs, "native runtime should persist scan logs")
@@ -384,22 +384,22 @@ func TestRunScanRESTLifecycleOwnsProjectAcrossRequestReuse(t *testing.T) {
 		}, nativeLifecycleBarrierWait, 10*time.Millisecond, "session status must finalize after its scan row")
 		require.Equal(t, wantStatus, sessionStatus.Status)
 	}
-	require.Positive(t, logCounts["lifecycle-success-a"])
-	require.Positive(t, logCounts["lifecycle-cancel-b"])
+	require.Positive(t, logCounts["11111111-1111-4111-8111-111111111111"])
+	require.Positive(t, logCounts["22222222-2222-4222-8222-222222222222"])
 
 	var records []*database.HTTPRecord
-	require.NoError(t, db.NewSelect().Model(&records).Where("scan_uuid IN (?, ?)", "lifecycle-success-a", "lifecycle-cancel-b").Scan(ctx))
+	require.NoError(t, db.NewSelect().Model(&records).Where("scan_uuid IN (?, ?)", "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222").Scan(ctx))
 	require.NotEmpty(t, records, "native loopback scans should exercise record persistence")
 	recordCounts := map[string]int{}
-	cancelledTargetURL, err := url.Parse(targets["lifecycle-cancel-b"].URL)
+	cancelledTargetURL, err := url.Parse(targets["22222222-2222-4222-8222-222222222222"].URL)
 	require.NoError(t, err)
 	cancelledTargetRecord := false
 	for _, record := range records {
 		want := projectA
 		switch record.ScanUUID {
-		case "lifecycle-success-a":
+		case "11111111-1111-4111-8111-111111111111":
 			recordCounts[record.ScanUUID]++
-		case "lifecycle-cancel-b":
+		case "22222222-2222-4222-8222-222222222222":
 			want = projectB
 			recordCounts[record.ScanUUID]++
 			cancelledTargetRecord = cancelledTargetRecord || record.Hostname == cancelledTargetURL.Hostname()
@@ -408,16 +408,16 @@ func TestRunScanRESTLifecycleOwnsProjectAcrossRequestReuse(t *testing.T) {
 		}
 		require.Equal(t, want, record.ProjectUUID, "record ownership must follow its scan")
 	}
-	require.Positive(t, recordCounts["lifecycle-success-a"])
-	require.Positive(t, recordCounts["lifecycle-cancel-b"], "cancelled scan traffic must still persist in its project")
+	require.Positive(t, recordCounts["11111111-1111-4111-8111-111111111111"])
+	require.Positive(t, recordCounts["22222222-2222-4222-8222-222222222222"], "cancelled scan traffic must still persist in its project")
 	require.True(t, cancelledTargetRecord, "cancelled scan's target HTTP traffic must persist under project B")
 
 	var findings []*database.Finding
-	require.NoError(t, db.NewSelect().Model(&findings).Where("scan_uuid IN (?, ?)", "lifecycle-success-a", "lifecycle-cancel-b").Scan(ctx))
+	require.NoError(t, db.NewSelect().Model(&findings).Where("scan_uuid IN (?, ?)", "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222").Scan(ctx))
 	require.Len(t, findings, 1, "duplicate result occurrences should group into one finding")
 	var successFinding *database.Finding
 	for _, finding := range findings {
-		require.Equal(t, "lifecycle-success-a", finding.ScanUUID, "cancelled scan must not persist a finding")
+		require.Equal(t, "11111111-1111-4111-8111-111111111111", finding.ScanUUID, "cancelled scan must not persist a finding")
 		require.Equal(t, projectA, finding.ProjectUUID, "finding ownership must follow its scan")
 		if successFinding == nil {
 			successFinding = finding
@@ -428,15 +428,15 @@ func TestRunScanRESTLifecycleOwnsProjectAcrossRequestReuse(t *testing.T) {
 	require.NoError(t, repo.HydrateFindingEvidenceManifest(ctx, []*database.Finding{successFinding}))
 	require.NotEmpty(t, successFinding.Evidence, "persisted finding must retain its evidence associations")
 
-	expectedEvidenceValue, ok := nativeLifecycleEvidence.Load("lifecycle-success-a")
+	expectedEvidenceValue, ok := nativeLifecycleEvidence.Load("11111111-1111-4111-8111-111111111111")
 	require.True(t, ok, "successful loopback module must retain its actual captured exchange receipt")
 	expectedEvidence := expectedEvidenceValue.(*evidence.Exchange)
 	require.NoError(t, expectedEvidence.Validate())
 	require.Equal(t, evidence.ProvenanceCaptured, expectedEvidence.Provenance)
 	require.Equal(t, evidence.StateComplete, expectedEvidence.RequestState)
 	require.Equal(t, evidence.StateComplete, expectedEvidence.ResponseState)
-	require.Equal(t, targets["lifecycle-success-a"].URL+"/barrier/lifecycle-success-a", expectedEvidence.URL)
-	require.True(t, bytes.Contains(expectedEvidence.Request, []byte("/barrier/lifecycle-success-a")))
+	require.Equal(t, targets["11111111-1111-4111-8111-111111111111"].URL+"/barrier/11111111-1111-4111-8111-111111111111", expectedEvidence.URL)
+	require.True(t, bytes.Contains(expectedEvidence.Request, []byte("/barrier/11111111-1111-4111-8111-111111111111")))
 	require.True(t, bytes.Contains(expectedEvidence.Response, []byte("released\x00\xff-native-lifecycle")))
 	var selectedEvidence []*evidence.Entry
 	for i := range successFinding.Evidence {
@@ -452,8 +452,8 @@ func TestRunScanRESTLifecycleOwnsProjectAcrossRequestReuse(t *testing.T) {
 		require.Equal(t, evidence.RoleObservation, entry.Role)
 		require.True(t, entry.Primary)
 		require.NotEmpty(t, entry.OccurrenceID, "finding evidence must retain its occurrence identity")
-		require.Equal(t, targets["lifecycle-success-a"].URL+"/barrier/lifecycle-success-a", entry.FindingURL)
-		require.Equal(t, "lifecycle-success-a", entry.ScanUUID)
+		require.Equal(t, targets["11111111-1111-4111-8111-111111111111"].URL+"/barrier/11111111-1111-4111-8111-111111111111", entry.FindingURL)
+		require.Equal(t, "11111111-1111-4111-8111-111111111111", entry.ScanUUID)
 		occurrences[entry.OccurrenceID] = struct{}{}
 		labels[entry.Label] = struct{}{}
 	}
@@ -490,10 +490,10 @@ func TestRunScanRESTLifecycleOwnsProjectAcrossRequestReuse(t *testing.T) {
 	for _, observation := range observations {
 		require.Equal(t, projectA, observation.ProjectUUID)
 		require.Equal(t, successFinding.FindingHash, observation.FindingHash)
-		if observation.ScanUUID == "lifecycle-success-a" {
+		if observation.ScanUUID == "11111111-1111-4111-8111-111111111111" {
 			observedInSuccessScan = true
 		}
-		require.NotEqual(t, "lifecycle-cancel-b", observation.ScanUUID, "cancelled scan must not own a finding observation")
+		require.NotEqual(t, "22222222-2222-4222-8222-222222222222", observation.ScanUUID, "cancelled scan must not own a finding observation")
 	}
 	require.True(t, observedInSuccessScan, "finding observation must be associated with the successful scan")
 	foreignObservations, err := repo.ListFindingObservations(ctx, projectB, successFinding.ID)
@@ -518,25 +518,25 @@ func TestRunScanRESTLifecycleOwnsProjectAcrossRequestReuse(t *testing.T) {
 		project, scanID string
 		wantFindings    int64
 	}{
-		{projectA, "lifecycle-success-a", 1},
-		{projectA, "lifecycle-cancel-b", 0},
-		{projectB, "lifecycle-success-a", 0},
-		{projectB, "lifecycle-cancel-b", 0},
+		{projectA, "11111111-1111-4111-8111-111111111111", 1},
+		{projectA, "22222222-2222-4222-8222-222222222222", 0},
+		{projectB, "11111111-1111-4111-8111-111111111111", 0},
+		{projectB, "22222222-2222-4222-8222-222222222222", 0},
 	} {
 		status, body := doGet(t, app, "/api/findings?scan_uuid="+tc.scanID, map[string]string{"X-Project-UUID": tc.project})
 		require.Equal(t, http.StatusOK, status)
 		var listed PaginatedResponse
 		require.NoError(t, json.Unmarshal(body, &listed))
-		if tc.project == projectA && tc.scanID == "lifecycle-success-a" {
+		if tc.project == projectA && tc.scanID == "11111111-1111-4111-8111-111111111111" {
 			require.GreaterOrEqual(t, listed.Total, tc.wantFindings)
 		} else {
 			require.Zero(t, listed.Total, "foreign or cancelled findings must not appear")
 		}
 	}
-	logsResp, logsBody := doGet(t, app, "/api/scans/lifecycle-success-a/logs", map[string]string{"X-Project-UUID": projectA})
+	logsResp, logsBody := doGet(t, app, "/api/scans/11111111-1111-4111-8111-111111111111/logs", map[string]string{"X-Project-UUID": projectA})
 	require.Equal(t, http.StatusOK, logsResp)
 	require.NotEmpty(t, logsBody)
-	foreignLogs, _ := doGet(t, app, "/api/scans/lifecycle-success-a/logs", map[string]string{"X-Project-UUID": projectB})
+	foreignLogs, _ := doGet(t, app, "/api/scans/11111111-1111-4111-8111-111111111111/logs", map[string]string{"X-Project-UUID": projectB})
 	require.Equal(t, http.StatusNotFound, foreignLogs)
 
 	scanStatusA = awaitProjectScanIdle(t, app, projectA)
@@ -569,10 +569,10 @@ func awaitProjectScanIdle(t *testing.T, app *fiber.App, projectUUID string) Scan
 }
 
 func wantSessionStatus(completed, cancelled *database.Scan, scanID string) string {
-	if scanID == "lifecycle-success-a" && completed != nil && completed.Status == "completed" {
+	if scanID == "11111111-1111-4111-8111-111111111111" && completed != nil && completed.Status == "completed" {
 		return runner.SessionCompleted
 	}
-	if scanID == "lifecycle-cancel-b" && cancelled != nil && cancelled.Status == "failed" && cancelled.ErrorMessage == "cancelled" {
+	if scanID == "22222222-2222-4222-8222-222222222222" && cancelled != nil && cancelled.Status == "failed" && cancelled.ErrorMessage == "cancelled" {
 		return runner.SessionCancelled
 	}
 	return ""

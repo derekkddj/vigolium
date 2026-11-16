@@ -23,6 +23,19 @@ func TestEnsureSessionDir(t *testing.T) {
 		}
 	})
 
+	t.Run("rejects unsafe ID without creating outside the sessions root", func(t *testing.T) {
+		root := t.TempDir()
+		base := filepath.Join(root, "sessions")
+		for _, id := range []string{"../escaped", "..", "nested/run", filepath.Join(string(filepath.Separator), "absolute")} {
+			if _, err := EnsureSessionDir(base, id); err == nil {
+				t.Errorf("EnsureSessionDir accepted unsafe ID %q", id)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(root, "escaped")); !os.IsNotExist(err) {
+			t.Errorf("unsafe ID created a directory outside the session root: stat err=%v", err)
+		}
+	})
+
 	t.Run("idempotent on existing dir", func(t *testing.T) {
 		base := t.TempDir()
 		if _, err := EnsureSessionDir(base, "run-x"); err != nil {

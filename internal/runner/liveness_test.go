@@ -41,6 +41,23 @@ func readStatus(t *testing.T, dir, uuid string) *SessionStatus {
 	return st
 }
 
+func TestSessionStatusPathRejectsUnsafeRunID(t *testing.T) {
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "sessions")
+	if got := SessionStatusPath(sessionsDir, "../escaped"); got != "" {
+		t.Fatalf("SessionStatusPath returned unsafe path %q", got)
+	}
+
+	h := StartHeartbeat(HeartbeatConfig{ScanUUID: "../escaped", SessionsDir: sessionsDir, Interval: time.Hour})
+	h.Finish(SessionCompleted)
+	if _, err := os.Stat(filepath.Join(root, "escaped")); !os.IsNotExist(err) {
+		t.Fatalf("unsafe run ID created a directory outside sessions root: stat err=%v", err)
+	}
+	if _, err := os.Stat(sessionsDir); !os.IsNotExist(err) {
+		t.Fatalf("unsafe run ID created sessions root: stat err=%v", err)
+	}
+}
+
 func TestHeartbeatLifecycle(t *testing.T) {
 	dir := t.TempDir()
 	clock := &fakeClock{now: time.Date(2026, 10, 10, 9, 0, 0, 0, time.UTC)}

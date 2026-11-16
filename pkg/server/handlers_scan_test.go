@@ -205,8 +205,9 @@ func TestHandleRunScan_ResolvedInResponse(t *testing.T) {
 	app.Use(ProjectUUIDMiddleware(nil))
 	app.Post("/api/scans/run", h.HandleRunScan)
 
+	const pinnedScanUUID = "3af56732-9c75-4fc2-8ace-a2e5655b725c"
 	resp, body := mustPostJSON(t, app, "/api/scans/run", map[string]any{
-		"targets": []string{"http://example.test/"}, "strategy": "lite", "dry_run": true,
+		"targets": []string{"http://example.test/"}, "strategy": "lite", "dry_run": true, "scan_uuid": pinnedScanUUID,
 	})
 	if resp.StatusCode != fiber.StatusOK {
 		t.Fatalf("status = %d (%s)", resp.StatusCode, body)
@@ -218,6 +219,9 @@ func TestHandleRunScan_ResolvedInResponse(t *testing.T) {
 	want := ScanResolved{Strategy: "lite", Concurrency: 10, RateLimit: 20, MaxPerHost: 10}
 	if got.Resolved == nil || *got.Resolved != want {
 		t.Fatalf("resolved = %+v, want %+v", got.Resolved, want)
+	}
+	if got.ScanUUID != pinnedScanUUID {
+		t.Fatalf("scan_uuid = %q, want pinned %q", got.ScanUUID, pinnedScanUUID)
 	}
 }
 

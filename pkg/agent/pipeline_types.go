@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/vigolium/vigolium/internal/sessionpath"
 	"github.com/vigolium/vigolium/pkg/modules"
 	"go.uber.org/zap"
 )
@@ -100,7 +101,10 @@ func EnsureSessionDir(baseDir, agenticScanUUID string) (string, error) {
 		}
 		baseDir = filepath.Join(home, ".vigolium", "agent-sessions")
 	}
-	dir := filepath.Join(baseDir, agenticScanUUID)
+	dir, err := sessionpath.RunDir(baseDir, agenticScanUUID)
+	if err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("failed to create session dir: %w", err)
 	}

@@ -94,6 +94,20 @@ func TestValidateRunScanRequest(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 func TestHandleRunScan_Validation(t *testing.T) {
+	t.Run("non-canonical scan UUID is rejected", func(t *testing.T) {
+		for _, scanUUID := range []string{"../outside", "/absolute", "abc/def", "   ", strings.Repeat("a", 300), "3AF56732-9C75-4FC2-8ACE-A2E5655B725C"} {
+			if err := validateRunScanRequest(RunScanRequest{ScanUUID: scanUUID}); err == nil {
+				t.Errorf("validateRunScanRequest(%q) accepted invalid scan UUID", scanUUID)
+			}
+		}
+		if err := validateRunScanRequest(RunScanRequest{ScanUUID: "3af56732-9c75-4fc2-8ace-a2e5655b725c"}); err != nil {
+			t.Errorf("canonical scan UUID rejected: %v", err)
+		}
+		if err := validateRunScanRequest(RunScanRequest{}); err != nil {
+			t.Errorf("empty optional scan UUID rejected: %v", err)
+		}
+	})
+
 	t.Run("nil db → 400", func(t *testing.T) {
 		h := newBasicHandlers(t, ServerConfig{}, &fakeQueue{}, nil, nil, nil)
 		app := fiber.New()
