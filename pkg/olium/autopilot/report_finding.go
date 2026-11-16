@@ -42,7 +42,7 @@ type FindingSink interface {
 type ReportFindingContext struct {
 	Repo            FindingSink
 	ProjectUUID     string
-	ScanUUID        string // legacy scan id (may be empty for pure-agent runs)
+	ScanUUID        string // native scan id; absent uses AgenticScanUUID as a soft correlation
 	AgenticScanUUID string // vigolium AgenticScan row id
 	Target          string // default URL/host for findings missing one
 	Count           atomic.Int64
@@ -230,10 +230,17 @@ func (c *ReportFindingContext) PersistFromArgs(ctx context.Context, args map[str
 		findingHash = hashFinding(title, severity, sourceFile, url, description)
 	}
 
+	// Agent-only runs have no native Scan row, but still need a stable scan
+	// correlation for finding observations and evidence provenance. Keep an
+	// explicit native ID when supplied; never manufacture a native scan row.
+	scanUUID := c.ScanUUID
+	if scanUUID == "" {
+		scanUUID = c.AgenticScanUUID
+	}
 	finding := &database.Finding{
 		ProjectUUID:     c.ProjectUUID,
 		HTTPRecordUUIDs: recordUUIDs, // evidence records the model linked (may be empty)
-		ScanUUID:        c.ScanUUID,
+		ScanUUID:        scanUUID,
 		AgenticScanUUID: c.AgenticScanUUID,
 		URL:             url,
 		Hostname:        hostname,
