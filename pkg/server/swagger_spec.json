@@ -5875,7 +5875,7 @@
     },
     "/api/findings": {
       "get": {
-        "description": "Returns a paginated list of vulnerability findings for the current project. Supports extensive filtering by severity, domain, module, scan, and text search. Results can be sorted by any field.",
+        "description": "Returns a paginated list of vulnerability findings for the current project. Supports extensive filtering by severity, domain, module, scan, and text search. Results can be sorted by found_at (or found), created_at (or created), severity, module_name (or module), module_id, or confidence. Invalid sort and order values return HTTP 400.",
         "operationId": "listFindings",
         "parameters": [
           {
@@ -5969,10 +5969,21 @@
             }
           },
           {
-            "description": "Field to sort by",
+            "description": "Finding sort field",
             "in": "query",
             "name": "sort",
             "schema": {
+              "enum": [
+                "found_at",
+                "found",
+                "created_at",
+                "created",
+                "severity",
+                "module_name",
+                "module",
+                "module_id",
+                "confidence"
+              ],
               "type": "string"
             }
           },
@@ -6000,6 +6011,16 @@
               }
             },
             "description": "Paginated findings list"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid sort or order value"
           },
           "401": {
             "content": {

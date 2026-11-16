@@ -126,10 +126,20 @@ func (h *findingsHandlers) HandleListFindings(c fiber.Ctx) error {
 
 	// Sorting
 	if sort := c.Query("sort"); sort != "" {
+		if err := database.ValidateFindingSort(sort); err != nil {
+			return respondErrorMsg(c, fiber.StatusBadRequest, err.Error())
+		}
 		filters.SortBy = sort
 	}
-	if order := c.Query("order"); strings.EqualFold(order, "asc") {
-		filters.SortAsc = true
+	if order := c.Query("order"); order != "" {
+		switch strings.ToLower(order) {
+		case "asc":
+			filters.SortAsc = true
+		case "desc":
+			filters.SortAsc = false
+		default:
+			return respondErrorMsg(c, fiber.StatusBadRequest, "invalid order: must be asc or desc")
+		}
 	}
 
 	// Pagination
