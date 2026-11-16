@@ -867,6 +867,11 @@ export interface ProjectWithStats extends Project {
 export interface DeleteProjectResponse {
   message: string;
   uuid: string;
+  mode?: 'reassign_to_default' | 'purge';
+  rows_deleted?: Record<string, number>;
+  config_dir_deleted?: boolean;
+  session_dirs_deleted?: number;
+  disk_deletion_failures?: string[];
 }
 
 // Scan log types

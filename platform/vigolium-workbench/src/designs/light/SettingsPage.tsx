@@ -16,8 +16,10 @@ import { COLOR_SCHEMES, type ColorScheme } from '@/lib/colorSchemes';
 import { isStaticBuild } from '@/lib/buildMode';
 import { TOGGLEABLE_PAGES, useHiddenPages, setHiddenPages } from '@/lib/nav-settings';
 import { useConfig, useUpdateConfig, useProjects, useDeleteProject, useCreateProject, useProjectStats, useCurrentUser, useCredits, useTeamMembers, useInviteMember, useRemoveMember } from '@/api/hooks';
-import type { ConfigEntry, Project } from '@/api/types';
+import type { ConfigEntry, DeleteProjectResponse, Project } from '@/api/types';
 import { useToast } from '@/contexts/ToastContext';
+import ProjectDeleteConfirmation from '@/designs/shared/ProjectDeleteConfirmation';
+import { summarizeProjectDeletion } from '@/lib/projectDeletion';
 import { useProjectContext } from '@/contexts/ProjectContext';
 import PageShell from './PageShell';
 
@@ -242,12 +244,13 @@ export default function SettingsPage({ initialTab }: { initialTab?: string }) {
     });
   };
 
-  const handleDeleteProject = (uuid: string) => {
-    deleteProjectMutation.mutate(uuid, {
-      onSuccess: () => {
-        toast('project deleted', 'success');
+  const handleDeleteProject = (uuid: string, deleteData: boolean) => {
+    deleteProjectMutation.mutate({ uuid, deleteData }, {
+      onSuccess: (response: DeleteProjectResponse) => {
+        const summary = summarizeProjectDeletion(response);
+        toast(summary.successMessage, 'success');
+        if (summary.diskFailureMessage) toast(summary.diskFailureMessage, 'error');
         setConfirmDeleteUUID(null);
-        if (projectUUID === uuid) setProject(null);
       },
       onError: () => toast('error deleting project', 'error'),
     });
@@ -570,7 +573,8 @@ export default function SettingsPage({ initialTab }: { initialTab?: string }) {
                     onSelect={() => setProject(project.uuid)}
                     onAskDelete={() => setConfirmDeleteUUID(project.uuid)}
                     onCancelDelete={() => setConfirmDeleteUUID(null)}
-                    onConfirmDelete={() => handleDeleteProject(project.uuid)}
+                    onDelete={(deleteData) => handleDeleteProject(project.uuid, deleteData)}
+                    isDeletePending={deleteProjectMutation.isPending}
                   />
                 ))}
                 {filteredProjects.length === 0 && (
@@ -837,10 +841,11 @@ interface ProjectRowProps {
   onSelect: () => void;
   onAskDelete: () => void;
   onCancelDelete: () => void;
-  onConfirmDelete: () => void;
+  onDelete: (deleteData: boolean) => void;
+  isDeletePending: boolean;
 }
 
-function ProjectRow({ project, isCurrent, isDefault, isConfirmingDelete, onSelect, onAskDelete, onCancelDelete, onConfirmDelete }: ProjectRowProps) {
+function ProjectRow({ project, isCurrent, isDefault, isConfirmingDelete, onSelect, onAskDelete, onCancelDelete, onDelete, isDeletePending }: ProjectRowProps) {
   const { data: s } = useProjectStats(project.uuid);
   const { toast } = useToast();
   const handleCopyUUID = async () => {
@@ -898,17 +903,20 @@ function ProjectRow({ project, isCurrent, isDefault, isConfirmingDelete, onSelec
             [use]
           </button>
         )}
-        {!isDefault && (
-          isConfirmingDelete ? (
-            <div className="flex items-center gap-0.5">
-              <button onClick={onConfirmDelete} className="text-[10px] font-bold px-1" style={{ color: 'var(--v-error)' }}>[yes]</button>
-              <button onClick={onCancelDelete} className="text-[10px] font-bold px-1" style={{ color: 'var(--v-text-muted)' }}>[no]</button>
-            </div>
-          ) : (
-            <button onClick={onAskDelete} className="text-[10px] font-bold px-1" style={{ color: 'var(--v-text-muted)' }}>[del]</button>
-          )
+        {!isDefault && !isConfirmingDelete && (
+          <button onClick={onAskDelete} className="text-[10px] font-bold px-1" style={{ color: 'var(--v-text-muted)' }}>[del]</button>
         )}
       </div>
+      {!isDefault && isConfirmingDelete && (
+        <div className="col-span-full mt-1">
+          <ProjectDeleteConfirmation
+            projectName={project.name}
+            onDelete={onDelete}
+            onCancel={onCancelDelete}
+            isPending={isDeletePending}
+          />
+        </div>
+      )}
     </div>
   );
 }

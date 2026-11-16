@@ -1,11 +1,15 @@
 package server
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
+	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/database"
 )
 
@@ -194,26 +198,175 @@ func buildProjectStats(row *database.ProjectStatsRow) ProjectStats {
 	}
 }
 
-// HandleDeleteProject handles DELETE /api/projects/:uuid
+// DeleteProjectResponse describes the selected project-deletion mode and its outcome.
+type DeleteProjectResponse struct {
+	Message              string           `json:"message"`
+	UUID                 string           `json:"uuid"`
+	Mode                 string           `json:"mode"`
+	RowsDeleted          map[string]int64 `json:"rows_deleted,omitempty"`
+	ConfigDirDeleted     bool             `json:"config_dir_deleted"`
+	SessionDirsDeleted   int              `json:"session_dirs_deleted"`
+	DiskDeletionFailures []string         `json:"disk_deletion_failures"`
+}
+
+// HandleDeleteProject handles DELETE /api/projects/:uuid. By default it
+// reassigns the project's rows to DefaultProjectUUID for compatibility;
+// ?delete_data=true explicitly purges its rows and owned on-disk directories.
 func (h *Handlers) HandleDeleteProject(c fiber.Ctx) error {
 	if h.db == nil {
 		return respondError(c, fiber.StatusServiceUnavailable, ErrDatabaseRequired)
 	}
 
 	projectUUID := c.Params("uuid")
-
 	if projectUUID == database.DefaultProjectUUID {
 		return respondErrorMsg(c, fiber.StatusBadRequest, "cannot delete the default project")
 	}
 
-	// Reassign all data from this project to the default project before deletion
-	if err := h.repo.ReassignProjectData(c.Context(), projectUUID, database.DefaultProjectUUID); err != nil {
-		return respondError(c, fiber.StatusInternalServerError, fmt.Errorf("failed to reassign project data: %w", err))
+	deleteData := false
+	if value := c.Query("delete_data"); value != "" {
+		switch value {
+		case "true":
+			deleteData = true
+		case "false":
+		default:
+			return respondErrorMsg(c, fiber.StatusBadRequest, "delete_data must be true or false")
+		}
 	}
 
+	if !deleteData {
+		// Preserve the existing default: move all data to Default before deleting.
+		if err := h.repo.ReassignProjectData(c.Context(), projectUUID, database.DefaultProjectUUID); err != nil {
+			return respondError(c, fiber.StatusInternalServerError, fmt.Errorf("failed to reassign project data: %w", err))
+		}
+		if err := h.repo.DeleteProject(c.Context(), projectUUID); err != nil {
+			return respondError(c, fiber.StatusInternalServerError, fmt.Errorf("failed to delete project: %w", err))
+		}
+		return c.JSON(DeleteProjectResponse{
+			Message:              "project deleted; data reassigned to the default project",
+			UUID:                 projectUUID,
+			Mode:                 "reassign_to_default",
+			DiskDeletionFailures: []string{},
+		})
+	}
+
+	if !database.ValidRunID(projectUUID) {
+		return respondErrorMsg(c, fiber.StatusBadRequest, "uuid must be a canonical UUID")
+	}
+	if _, err := h.repo.GetProjectByUUID(c.Context(), projectUUID); err != nil {
+		return respondError(c, fiber.StatusNotFound, ErrProjectNotFound)
+	}
+
+	settings, err := h.settingsForProject(projectUUID)
+	if err != nil {
+		return respondError(c, fiber.StatusInternalServerError, fmt.Errorf("failed to load project settings: %w", err))
+	}
+	sessionDirs, err := h.repo.ProjectSessionDirs(
+		c.Context(),
+		projectUUID,
+		settings.ScanningStrategy.ScanLogs.EffectiveSessionsDir(),
+		settings.Agent.EffectiveSessionsDir(),
+	)
+	if err != nil {
+		return respondError(c, fiber.StatusInternalServerError, fmt.Errorf("failed to collect project session directories: %w", err))
+	}
+
+	rowsDeleted, err := h.repo.PurgeProjectDataWithCounts(c.Context(), projectUUID)
+	if err != nil {
+		return respondError(c, fiber.StatusInternalServerError, fmt.Errorf("failed to purge project data: %w", err))
+	}
 	if err := h.repo.DeleteProject(c.Context(), projectUUID); err != nil {
 		return respondError(c, fiber.StatusInternalServerError, fmt.Errorf("failed to delete project: %w", err))
 	}
+	rowsDeleted["projects"] = 1
 
-	return c.JSON(fiber.Map{"message": "project deleted", "uuid": projectUUID})
+	removeAll := h.removeAll
+	if removeAll == nil {
+		removeAll = os.RemoveAll
+	}
+	response := DeleteProjectResponse{
+		Message:              "project and its data purged",
+		UUID:                 projectUUID,
+		Mode:                 "purge",
+		RowsDeleted:          rowsDeleted,
+		DiskDeletionFailures: make([]string, 0),
+	}
+
+	configDir := config.ProjectConfigDir(projectUUID)
+	if removed, removeErr := removeProjectPurgeDir(configDir, filepath.Dir(configDir), projectUUID, removeAll); removeErr != nil {
+		response.DiskDeletionFailures = append(response.DiskDeletionFailures, configDir)
+	} else {
+		response.ConfigDirDeleted = removed
+	}
+	for _, sessionDir := range sessionDirs {
+		if removed, removeErr := removeProjectPurgeDir(sessionDir.Path, sessionDir.Root, sessionDir.UUID, removeAll); removeErr != nil {
+			response.DiskDeletionFailures = append(response.DiskDeletionFailures, sessionDir.Path)
+		} else if removed {
+			response.SessionDirsDeleted++
+		}
+	}
+
+	return c.JSON(response)
+}
+
+// removeProjectPurgeDir removes only a canonical UUID directory that is a direct
+// child of its expected root. Both the lexical path and its symlink-resolved form
+// are checked before RemoveAll so persisted identifiers cannot escape the root.
+func removeProjectPurgeDir(path, root, expectedUUID string, removeAll func(string) error) (bool, error) {
+	if !database.ValidRunID(expectedUUID) {
+		return false, fmt.Errorf("directory identifier is not a canonical UUID")
+	}
+	cleanPath := filepath.Clean(path)
+	cleanRoot := filepath.Clean(root)
+	if filepath.Base(cleanPath) != expectedUUID {
+		return false, fmt.Errorf("directory basename does not match UUID")
+	}
+	absPath, err := filepath.Abs(cleanPath)
+	if err != nil {
+		return false, fmt.Errorf("resolve target path: %w", err)
+	}
+	absRoot, err := filepath.Abs(cleanRoot)
+	if err != nil {
+		return false, fmt.Errorf("resolve root path: %w", err)
+	}
+	if filepath.Dir(absPath) != absRoot {
+		return false, fmt.Errorf("directory is not a direct child of its expected root")
+	}
+
+	resolvedRoot, err := resolvePurgePath(absRoot)
+	if err != nil {
+		return false, fmt.Errorf("resolve expected root: %w", err)
+	}
+	resolvedPath, err := filepath.EvalSymlinks(absPath)
+	if errors.Is(err, os.ErrNotExist) {
+		resolvedPath = filepath.Join(resolvedRoot, expectedUUID)
+	} else if err != nil {
+		return false, fmt.Errorf("resolve target path: %w", err)
+	} else if resolvedPath, err = filepath.Abs(resolvedPath); err != nil {
+		return false, fmt.Errorf("resolve target path: %w", err)
+	}
+	if filepath.Base(resolvedPath) != expectedUUID || !pathIsUnderDir(resolvedPath, resolvedRoot) || resolvedPath == resolvedRoot {
+		return false, fmt.Errorf("resolved directory escapes its expected root")
+	}
+
+	if _, err := os.Lstat(absPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("inspect target directory: %w", err)
+	}
+	if err := removeAll(absPath); err != nil {
+		return false, fmt.Errorf("remove target directory: %w", err)
+	}
+	return true, nil
+}
+
+func resolvePurgePath(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err == nil {
+		return filepath.Abs(resolved)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	return filepath.Abs(filepath.Clean(path))
 }
