@@ -510,11 +510,15 @@ func (r *Repository) appendRecordsToFinding(ctx context.Context, idb bun.IDB, in
 		{"cwe_id", existing.CWEID, incoming.CWEID},
 		{"origin_record_uuid", existing.OriginRecordUUID, incoming.OriginRecordUUID},
 		{"agentic_scan_uuid", existing.AgenticScanUUID, incoming.AgenticScanUUID},
-		{"evidence_status", existing.EvidenceStatus, incoming.EvidenceStatus},
 	} {
 		if field.old == "" && field.value != "" {
 			q = q.Set(field.column+" = ?", field.value)
 		}
+	}
+	// evidence_status describes the latest observation, unlike inline request /
+	// response and replay context, which remain the first observation's sample.
+	if incoming.EvidenceStatus != "" {
+		q = q.Set("evidence_status = ?", incoming.EvidenceStatus)
 	}
 	if existing.CVSSScore == 0 && incoming.CVSSScore != 0 {
 		q = q.Set("cvss_score = ?", incoming.CVSSScore)

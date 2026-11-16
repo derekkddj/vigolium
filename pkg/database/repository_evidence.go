@@ -236,6 +236,92 @@ func (r *Repository) HydrateFindingEvidenceManifest(ctx context.Context, finding
 	return nil
 }
 
+// HydrateFindingOccurrences adds detail-only occurrence groups to one finding.
+// The finding's evidence manifest must already be hydrated. Receipts remain
+// lazy, and observations without typed associations are surfaced as empty
+// synthetic groups so scans with missing evidence are still visible.
+func (r *Repository) HydrateFindingOccurrences(ctx context.Context, finding *Finding) error {
+	if finding == nil || finding.ID == 0 {
+		return nil
+	}
+	finding.InlineEvidenceScanUUID = ""
+	finding.Occurrences = nil
+	observations, err := r.ListFindingObservations(ctx, finding.ProjectUUID, finding.ID)
+	if err != nil {
+		return err
+	}
+	if len(observations) > 0 {
+		finding.InlineEvidenceScanUUID = observations[0].ScanUUID
+	}
+
+	indices := make(map[string]int)
+	representedScans := make(map[string]bool)
+	for i, entry := range finding.Evidence {
+		occurrenceID := entry.OccurrenceID
+		if occurrenceID == "" {
+			occurrenceID = fmt.Sprintf("unscoped-evidence:%d", i)
+		}
+		index, ok := indices[occurrenceID]
+		if !ok {
+			index = len(finding.Occurrences)
+			indices[occurrenceID] = index
+			finding.Occurrences = append(finding.Occurrences, FindingOccurrence{
+				OccurrenceID: occurrenceID,
+				ScanUUID:     entry.ScanUUID,
+			})
+		} else if finding.Occurrences[index].ScanUUID != entry.ScanUUID {
+			// An occurrence cannot truthfully claim two scans; leave its scan
+			// attribution blank rather than choosing one association arbitrarily.
+			finding.Occurrences[index].ScanUUID = ""
+		}
+		finding.Occurrences[index].Entries = append(finding.Occurrences[index].Entries, entry.Manifest())
+		if entry.ScanUUID != "" {
+			representedScans[entry.ScanUUID] = true
+		}
+	}
+
+	for _, observation := range observations {
+		if observation.ScanUUID == "" || representedScans[observation.ScanUUID] {
+			continue
+		}
+		occurrenceID := "observation:" + observation.ScanUUID
+		finding.Occurrences = append(finding.Occurrences, FindingOccurrence{
+			OccurrenceID:   occurrenceID,
+			ScanUUID:       observation.ScanUUID,
+			Entries:        []evidence.Entry{},
+			EvidenceStatus: "missing",
+		})
+	}
+	for i := range finding.Occurrences {
+		if finding.Occurrences[i].EvidenceStatus == "" {
+			finding.Occurrences[i].EvidenceStatus = occurrenceEvidenceStatus(finding.Occurrences[i].Entries)
+		}
+	}
+	return nil
+}
+
+func occurrenceEvidenceStatus(entries []evidence.Entry) string {
+	var primary *evidence.Entry
+	for i := range entries {
+		if !entries[i].Primary {
+			continue
+		}
+		if primary != nil {
+			return "missing" // ambiguous selection
+		}
+		primary = &entries[i]
+	}
+	if primary == nil || primary.ExchangeID == "" {
+		return "missing"
+	}
+	switch primary.Role {
+	case evidence.RoleAttack, evidence.RoleConfirmation, evidence.RoleObservation:
+		return "selected"
+	default:
+		return "unclassified"
+	}
+}
+
 // HydrateFindingEvidenceForExport loads receipts for ONE selected finding. An
 // unavailable receipt remains a manifest entry rather than fabricated bytes.
 // Exporters can stream findings and release each finding's bytes afterwards.

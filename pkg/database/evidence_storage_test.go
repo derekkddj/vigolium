@@ -164,8 +164,8 @@ func TestEvidenceStorageDuplicateAndGroupedOccurrenceRoles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Evidence) != len(roles) || got.EvidenceStatus != "unclassified" {
-		t.Fatalf("history/status lost: %+v", got)
+	if len(got.Evidence) != len(roles) || got.EvidenceStatus != "selected" {
+		t.Fatalf("history lost or latest occurrence status not reflected: %+v", got)
 	}
 	for i, e := range got.Evidence {
 		if e.Role != roles[i] || !e.Primary || e.OccurrenceID != fmt.Sprintf("occurrence-%d", i) || e.Label != fmt.Sprintf("label-%d", i) || e.ScanUUID != fmt.Sprintf("scan-%d", i) || e.FindingURL != fmt.Sprintf("https://example.com/%d", i) {

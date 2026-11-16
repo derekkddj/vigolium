@@ -295,6 +295,9 @@ func (h *findingsHandlers) HandleGetFinding(c fiber.Ctx) error {
 	if err := h.repo.HydrateFindingRecordRefs(c.Context(), []*database.Finding{finding}); err != nil {
 		return respondQueryError(c, err)
 	}
+	if err := h.repo.HydrateFindingOccurrences(c.Context(), finding); err != nil {
+		return respondQueryError(c, err)
+	}
 	// Ordinary detail returns the reference inventory, not the uncapped linked
 	// traffic corpus. Bodies are loaded lazily via /http-records/:uuid.
 	available, err := h.repo.GetFindingRecordUUIDsScoped(c.Context(), finding.ProjectUUID, finding.HTTPRecordUUIDs)
