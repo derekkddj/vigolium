@@ -4,10 +4,48 @@ import (
 	"context"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/projectdiscovery/interactsh/pkg/server"
+	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/oast/oastclass"
 )
+
+func TestOASTServiceOwnsProjectAndScanIdentityForDelayedCallbacks(t *testing.T) {
+	ctx := context.Background()
+	repo := newOASTTestRepo(t)
+	projectBytes := []byte("project-a")
+	scanBytes := []byte("scan-a")
+	project := unsafe.String(unsafe.SliceData(projectBytes), len(projectBytes))
+	scan := unsafe.String(unsafe.SliceData(scanBytes), len(scanBytes))
+
+	svc, err := New(&config.OASTConfig{Enabled: true, OastURL: "https://callbacks.example/{nonce}"}, nil, repo, scan, project, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	copy(projectBytes, "project-b")
+	copy(scanBytes, "scan-b")
+
+	// The poller callback can run after the request that supplied these strings
+	// has released/reused its backing storage.
+	svc.recordInteraction(&server.Interaction{UniqueID: "callback-1", Protocol: "dns", Timestamp: time.Unix(1, 0)}, PayloadContext{})
+
+	rows, err := repo.GetOASTInteractionsByScan(ctx, "scan-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ProjectUUID != "project-a" || rows[0].ScanUUID != "scan-a" {
+		t.Fatalf("delayed callback lost admitted identity: %+v", rows)
+	}
+	foreign, err := repo.GetOASTInteractionsByScan(ctx, "scan-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(foreign) != 0 {
+		t.Fatalf("callback was written into reused identity: %+v", foreign)
+	}
+}
 
 func TestIngestReceiptIdentityRetainsResponseAndNanoseconds(t *testing.T) {
 	repo, ctx := newOASTTestRepo(t), context.Background()

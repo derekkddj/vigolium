@@ -1,6 +1,8 @@
 package jsext
 
 import (
+	"strings"
+
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/agent/llm"
 	"github.com/vigolium/vigolium/pkg/database"
@@ -25,4 +27,12 @@ type EngineOptions struct {
 
 	// OASTService enables vigolium.oast.* API (nil = disabled)
 	OASTService *oast.Service
+}
+
+// ownAPIIdentity snapshots identities retained by VM handlers and pools. Empty
+// project/scan values keep their existing default/stateless semantics.
+func ownAPIIdentity(opts APIOptions) APIOptions {
+	opts.ProjectUUID = strings.Clone(opts.ProjectUUID)
+	opts.ScanUUID = strings.Clone(opts.ScanUUID)
+	return opts
 }

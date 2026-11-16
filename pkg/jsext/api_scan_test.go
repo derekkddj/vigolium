@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/output"
 )
 
@@ -154,6 +155,40 @@ func TestGetCurrentScan(t *testing.T) {
 	val, err := vm.RunString(`vigolium.scan.getCurrentScan().uuid`)
 	require.NoError(t, err)
 	assert.Equal(t, "test-uuid-123", val.String())
+}
+
+func TestScanRecordsRejectsForeignProjectAdmission(t *testing.T) {
+	ctx := context.Background()
+	repo := newTestRepo(t)
+	record, err := httpmsg.GetRawRequestFromURL("https://foreign.example/private")
+	require.NoError(t, err)
+	recordUUID, err := repo.SaveRecord(ctx, record, "test-import", "project-b")
+	require.NoError(t, err)
+	localRecord, err := httpmsg.GetRawRequestFromURL("https://local.example/allowed")
+	require.NoError(t, err)
+	localRecordUUID, err := repo.SaveRecord(ctx, localRecord, "test-import", "project-a")
+	require.NoError(t, err)
+
+	vm := setupScanTestVM(t, APIOptions{Repository: repo, ProjectUUID: "project-a"})
+	val, err := vm.RunString(`vigolium.scan.scanRecords({uuids: ["` + recordUUID + `"]})`)
+	require.NoError(t, err)
+	obj := val.ToObject(vm)
+
+	require.Equal(t, int64(0), obj.Get("record_count").ToInteger(), "foreign record must not be admitted")
+	require.Empty(t, obj.Get("scan_uuid").String(), "foreign record must not create a project-a scan")
+	errs := obj.Get("errors").ToObject(vm)
+	require.Greater(t, errs.Get("length").ToInteger(), int64(0), "rejection should be visible")
+
+	scans, _, err := repo.ListScans(ctx, "project-a", 10, 0)
+	require.NoError(t, err)
+	require.Empty(t, scans, "rejected cross-project input must leave no queued scan")
+
+	// A record in the admitted project still queues as before.
+	val, err = vm.RunString(`vigolium.scan.scanRecords({uuids: ["` + localRecordUUID + `"]})`)
+	require.NoError(t, err)
+	obj = val.ToObject(vm)
+	require.Equal(t, int64(1), obj.Get("record_count").ToInteger())
+	require.NotEmpty(t, obj.Get("scan_uuid").String())
 }
 
 func TestStartNewScanBasic(t *testing.T) {

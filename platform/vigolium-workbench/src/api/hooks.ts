@@ -1,4 +1,4 @@
-import { useQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useEffect } from 'react';
 import {
   apiGet, apiPost, apiPut, apiPatch, apiDelete, apiUpload, getProjectUUID, setDemoMode, assertNotDemo, withDemoKey } from './client';
@@ -228,11 +228,13 @@ export function useFindings(params: FindingsQueryParams) {
 }
 
 export function useHttpRecords(params: HttpRecordsQueryParams) {
+  const key = projectKey('http-records', params);
   return useQuery({
-    queryKey: projectKey('http-records', params),
+    queryKey: key,
     queryFn: () =>
       apiGet<PaginatedResponse<HTTPRecord>>('/api/http-records', params as Record<string, string | number | undefined>),
-    placeholderData: keepPreviousData,
+    placeholderData: (previousData, previousQuery) =>
+      previousQuery?.queryKey[0] === key[0] ? previousData : undefined,
   });
 }
 
@@ -291,11 +293,13 @@ export function useFinding(id: number | null) {
 }
 
 export function useOASTInteractions(params: OASTInteractionsQueryParams) {
+  const key = projectKey('oast-interactions', params);
   return useQuery({
-    queryKey: projectKey('oast-interactions', params),
+    queryKey: key,
     queryFn: () =>
       apiGet<PaginatedResponse<OASTInteraction>>('/api/oast-interactions', params as Record<string, string | number | undefined>),
-    placeholderData: keepPreviousData,
+    placeholderData: (previousData, previousQuery) =>
+      previousQuery?.queryKey[0] === key[0] ? previousData : undefined,
   });
 }
 
@@ -422,11 +426,13 @@ export function useUploadRepo() {
 // Polls every 30s only while at least one row is in a non-terminal state.
 // Idle history pages (everything completed) refetch on window focus instead.
 export function useScans(params: ScansQueryParams) {
+  const key = projectKey('scans', params);
   return useQuery({
-    queryKey: projectKey('scans', params),
+    queryKey: key,
     queryFn: () =>
       apiGet<PaginatedResponse<Scan>>('/api/scans', params as Record<string, string | number | undefined>),
-    placeholderData: keepPreviousData,
+    placeholderData: (previousData, previousQuery) =>
+      previousQuery?.queryKey[0] === key[0] ? previousData : undefined,
     refetchInterval: (query) => {
       const data = query.state.data as PaginatedResponse<Scan> | undefined;
       if (!data?.data) return false;
@@ -575,10 +581,12 @@ export function useExtensionDocs(search?: string) {
 // Polls only while at least one session is running; otherwise refetches on
 // window focus.
 export function useAgentSessions(params: AgentSessionsQueryParams) {
+  const key = projectKey('agent-sessions', params);
   return useQuery({
-    queryKey: projectKey('agent-sessions', params),
+    queryKey: key,
     queryFn: () => apiGet<PaginatedResponse<AgentSession>>('/api/agent/sessions', params as Record<string, string | number | undefined>),
-    placeholderData: keepPreviousData,
+    placeholderData: (previousData, previousQuery) =>
+      previousQuery?.queryKey[0] === key[0] ? previousData : undefined,
     refetchInterval: (query) => {
       const data = query.state.data as PaginatedResponse<AgentSession> | undefined;
       if (!data?.data) return false;
@@ -671,12 +679,14 @@ export function useDbRecord(table: string | null, id: string | null) {
 }
 
 export function useDbRecords(table: string | null, params: DbRecordsQueryParams) {
+  const key = projectKey('db-records', table, params);
   return useQuery({
-    queryKey: projectKey('db-records', table, params),
+    queryKey: key,
     queryFn: () =>
       apiGet<DbRecordsResponse>(`/api/db/tables/${table}/records`, params as Record<string, string | number | undefined>),
     enabled: table !== null,
-    placeholderData: keepPreviousData,
+    placeholderData: (previousData, previousQuery) =>
+      previousQuery?.queryKey[0] === key[0] ? previousData : undefined,
   });
 }
 

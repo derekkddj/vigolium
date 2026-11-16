@@ -544,12 +544,18 @@ func (s nativeScanScope) identityError(err error) error {
 // are read before any INSERT; managed rows must exist. Empty project always
 // means default, never permission to adopt the project's value from the row.
 func (r *Runner) initializeNativeScan(ctx context.Context) (nativeScanScope, error) {
-	project := r.options.ProjectUUID
+	// Detach the invocation snapshot again at the admission boundary. This also
+	// protects runners constructed internally (without NewWithInputSource) and
+	// ensures validate can distinguish an intentional Options reassignment from
+	// mutation of borrowed string storage.
+	project := strings.Clone(r.options.ProjectUUID)
+	scanUUID := strings.Clone(r.options.ScanUUID)
 	if project == "" {
 		project = database.DefaultProjectUUID
 	}
 	r.options.ProjectUUID = project
-	s := nativeScanScope{repo: r.repository, scanUUID: r.options.ScanUUID, projectUUID: project}
+	r.options.ScanUUID = scanUUID
+	s := nativeScanScope{repo: r.repository, scanUUID: scanUUID, projectUUID: project}
 	managed := r.options.ManagedScanRecord || r.options.ScanOnReceive
 	if managed && (s.repo == nil || s.scanUUID == "") {
 		return s, s.identityError(sql.ErrNoRows)

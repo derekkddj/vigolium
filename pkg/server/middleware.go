@@ -17,7 +17,10 @@ import (
 	"go.uber.org/zap"
 )
 
-const projectUUIDLocalsKey = "project_uuid"
+const (
+	projectUUIDLocalsKey             = "project_uuid"
+	projectMiddlewareConfigLocalsKey = "project_middleware_config"
+)
 
 // ProjectMiddlewareConfig tunes ProjectUUIDMiddleware.
 type ProjectMiddlewareConfig struct {
@@ -59,39 +62,67 @@ func ProjectUUIDMiddleware(repo *database.Repository, cfg ...ProjectMiddlewareCo
 			projectUUID = database.DefaultProjectUUID
 		}
 		c.Locals(projectUUIDLocalsKey, projectUUID)
+		c.Locals(projectMiddlewareConfigLocalsKey, conf)
 
 		if projectUUID == database.DefaultProjectUUID || isProjectHeaderExemptPath(c.Path()) {
 			return c.Next()
 		}
-		if !validProjectUUID(projectUUID) {
-			return respondError(c, fiber.StatusBadRequest, ErrInvalidProjectUUID,
-				fmt.Sprintf("got %q; send a UUID such as one from GET /api/projects", projectUUID))
+		answered, err := validateSelectedProjectUUID(c, projectUUID, repo, conf)
+		if answered {
+			return err
 		}
-		if repo == nil {
-			return c.Next()
-		}
+		return c.Next()
+	}
+}
 
-		lookup := repo
-		if conf.Reader != nil {
-			lookup = conf.Reader
+// resolveAndValidateAgentProjectUUID preserves agent request-body precedence,
+// falls back to the middleware-selected header/default project, and applies the
+// same REST UUID/existence/create contract used for X-Project-UUID.
+func resolveAndValidateAgentProjectUUID(c fiber.Ctx, bodyProjectUUID string, repo *database.Repository) (string, bool, error) {
+	projectUUID := bodyProjectUUID
+	if projectUUID == "" {
+		projectUUID = getProjectUUID(c)
+	}
+	conf, _ := c.Locals(projectMiddlewareConfigLocalsKey).(ProjectMiddlewareConfig)
+	answered, err := validateSelectedProjectUUID(c, projectUUID, repo, conf)
+	return projectUUID, answered, err
+}
+
+// validateSelectedProjectUUID shares the project admission contract between
+// header middleware and agent body-selected scopes. answered reports that an
+// HTTP response was written, including when its write returned nil.
+func validateSelectedProjectUUID(c fiber.Ctx, projectUUID string, repo *database.Repository, conf ProjectMiddlewareConfig) (answered bool, err error) {
+	if projectUUID == database.DefaultProjectUUID {
+		return false, nil
+	}
+	if !validProjectUUID(projectUUID) {
+		return true, respondError(c, fiber.StatusBadRequest, ErrInvalidProjectUUID,
+			fmt.Sprintf("got %q; send a UUID such as one from GET /api/projects", projectUUID))
+	}
+	if repo == nil {
+		return false, nil
+	}
+
+	lookup := repo
+	if conf.Reader != nil {
+		lookup = conf.Reader
+	}
+	_, err = lookup.GetProjectByUUID(c.Context(), projectUUID)
+	switch {
+	case err == nil:
+		return false, nil
+	case !errors.Is(err, sql.ErrNoRows):
+		return true, respondErrorCode(c, fiber.StatusServiceUnavailable, apicontract.CodeDatabaseUnavailable,
+			"project lookup failed: "+err.Error())
+	case conf.AutoCreate || projectCreateRequested(c):
+		if err := createProjectStub(c, repo, projectUUID); err != nil {
+			return true, respondErrorCode(c, fiber.StatusServiceUnavailable, apicontract.CodeDatabaseUnavailable,
+				"failed to create project: "+err.Error())
 		}
-		_, err := lookup.GetProjectByUUID(c.Context(), projectUUID)
-		switch {
-		case err == nil:
-			return c.Next()
-		case !errors.Is(err, sql.ErrNoRows):
-			return respondErrorCode(c, fiber.StatusServiceUnavailable, apicontract.CodeDatabaseUnavailable,
-				"project lookup failed: "+err.Error())
-		case conf.AutoCreate || projectCreateRequested(c):
-			if err := createProjectStub(c, repo, projectUUID); err != nil {
-				return respondErrorCode(c, fiber.StatusServiceUnavailable, apicontract.CodeDatabaseUnavailable,
-					"failed to create project: "+err.Error())
-			}
-			return c.Next()
-		default:
-			return respondError(c, fiber.StatusNotFound, ErrProjectNotFound,
-				"no project has UUID "+projectUUID+"; pass "+apicontract.ProjectCreateHeader+": 1 or ?create=1 to create it")
-		}
+		return false, nil
+	default:
+		return true, respondError(c, fiber.StatusNotFound, ErrProjectNotFound,
+			"no project has UUID "+projectUUID+"; pass "+apicontract.ProjectCreateHeader+": 1 or ?create=1 to create it")
 	}
 }
 

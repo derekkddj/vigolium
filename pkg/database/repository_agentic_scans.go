@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"slices"
@@ -14,21 +15,65 @@ import (
 // already exists, the call is a no-op as long as the existing project_uuid
 // matches — this is the get-or-create path used for cross-node sync via
 // --scan-uuid. Returns ErrScanProjectMismatch when the existing row belongs
-// to a different project.
+// to a different project. On a same-project UUID collision, submitted metadata
+// is ignored.
 func (r *Repository) CreateAgenticScan(ctx context.Context, run *AgenticScan) error {
 	run.ProjectUUID = defaultProjectUUID(run.ProjectUUID)
-	res, err := r.db.NewInsert().Model(run).On("CONFLICT (uuid) DO NOTHING").Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to insert agent run: %w", err)
-	}
-	if n, _ := res.RowsAffected(); n == 0 && run.UUID != "" {
-		existing := &AgenticScan{}
-		if getErr := r.db.NewSelect().Model(existing).Where("uuid = ?", run.UUID).Scan(ctx); getErr == nil {
-			if existing.ProjectUUID != run.ProjectUUID {
-				return fmt.Errorf("%w: agentic scan %s belongs to project %s, not %s",
-					ErrScanProjectMismatch, run.UUID, existing.ProjectUUID, run.ProjectUUID)
+	return r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+		res, err := tx.NewInsert().Model(run).On("CONFLICT (uuid) DO NOTHING").Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to insert agent run: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 && run.UUID != "" {
+			existing := &AgenticScan{}
+			query := tx.NewSelect().Model(existing).Column("project_uuid").Where("uuid = ?", run.UUID)
+			if r.db.Driver() == driverPostgres {
+				query = query.For("UPDATE")
+			}
+			if getErr := query.Scan(ctx); getErr == nil {
+				existingProject := defaultProjectUUID(existing.ProjectUUID)
+				if existingProject != run.ProjectUUID {
+					return fmt.Errorf("%w: agentic scan %s belongs to project %s, not %s",
+						ErrScanProjectMismatch, run.UUID, existingProject, run.ProjectUUID)
+				}
+				// The same UUID/project is an idempotent no-op; do not validate
+				// stale parent metadata or attach any submitted fields.
+				return nil
+			} else if !errors.Is(getErr, sql.ErrNoRows) {
+				return fmt.Errorf("failed to verify existing agent run: %w", getErr)
 			}
 		}
+		if err := checkAgenticParentProject(ctx, tx, run.ProjectUUID, run.ParentAgenticScanUUID, r.db.Driver()); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+// checkAgenticParentProject rejects a known parent run owned by another project.
+// Missing parent IDs remain valid soft references for legacy and out-of-band data.
+// Callers run this inside the write transaction so the checked owner remains
+// stable through admission; PostgreSQL locks a resolved parent row until commit.
+func checkAgenticParentProject(ctx context.Context, idb bun.IDB, project, parentUUID, driver string) error {
+	if parentUUID == "" {
+		return nil
+	}
+	query := idb.NewSelect().Model((*AgenticScan)(nil)).Column("project_uuid").Where("uuid = ?", parentUUID)
+	if driver == driverPostgres {
+		query = query.For("UPDATE")
+	}
+	var owner string
+	if err := query.Scan(ctx, &owner); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("check agentic parent project: %w", err)
+	}
+	owner = defaultProjectUUID(owner)
+	project = defaultProjectUUID(project)
+	if owner != project {
+		return fmt.Errorf("%w: agentic parent %s belongs to project %s, not %s",
+			ErrScanProjectMismatch, parentUUID, owner, project)
 	}
 	return nil
 }
@@ -109,11 +154,31 @@ func (r *Repository) GetAgenticScan(ctx context.Context, uuid string) (*AgenticS
 // pass partial structs without zeroing fields they don't intend to touch.
 // To explicitly clear a field, use a column-list update via NewUpdate().
 func (r *Repository) UpdateAgenticScan(ctx context.Context, run *AgenticScan) error {
-	_, err := r.db.NewUpdate().Model(run).OmitZero().Where("uuid = ?", run.UUID).Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to update agent run: %w", err)
-	}
-	return nil
+	return r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+		existing := &AgenticScan{}
+		query := tx.NewSelect().Model(existing).Column("project_uuid").Where("uuid = ?", run.UUID)
+		if r.db.Driver() == driverPostgres {
+			query = query.For("UPDATE")
+		}
+		if err := query.Scan(ctx); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("failed to validate agent run update: %w", err)
+		} else if err == nil {
+			project := defaultProjectUUID(existing.ProjectUUID)
+			if run.ProjectUUID != "" && defaultProjectUUID(run.ProjectUUID) != project {
+				return fmt.Errorf("%w: agentic scan %s belongs to project %s, not %s",
+					ErrScanProjectMismatch, run.UUID, project, defaultProjectUUID(run.ProjectUUID))
+			}
+			if run.ParentAgenticScanUUID != "" {
+				if err := checkAgenticParentProject(ctx, tx, project, run.ParentAgenticScanUUID, r.db.Driver()); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := tx.NewUpdate().Model(run).OmitZero().Where("uuid = ?", run.UUID).Exec(ctx); err != nil {
+			return fmt.Errorf("failed to update agent run: %w", err)
+		}
+		return nil
+	})
 }
 
 // agenticScanBlobColumns are the agentic_scans columns holding uncapped
