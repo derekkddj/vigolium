@@ -129,6 +129,39 @@ for (const theme of ['dark', 'light'] as const) {
   });
 }
 
+for (const theme of ['dark', 'light'] as const) {
+  describe(`${theme} controlled artifact selection`, () => {
+    it('waits for the listing before opening a deep link and follows controlled close/file changes', async () => {
+      const pending = deferred<Response>();
+      const onSelectArtifact = vi.fn();
+      vi.mocked(fetch).mockReturnValueOnce(pending.promise).mockResolvedValueOnce(page('head')).mockResolvedValueOnce(page('next'));
+      const panel = (selectedArtifact: string | null) => <AgentArtifactsPanel runUUID="run-a" theme={theme} selectedArtifact={selectedArtifact} onSelectArtifact={onSelectArtifact} />;
+      const { rerender } = render(panel(item.name));
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(fetch).toHaveBeenCalledTimes(1);
+      await act(async () => { pending.resolve(list([item, { name: 'second.txt', kind: 'text', size: 4 }])); });
+      const dialog = await screen.findByRole('dialog');
+      expect(await within(dialog).findByText('head', { exact: true })).toBeInTheDocument();
+      fireEvent.click(within(dialog).getByRole('button', { name: 'second.txt' }));
+      expect(onSelectArtifact).toHaveBeenLastCalledWith('second.txt');
+      rerender(panel('second.txt'));
+      expect(await screen.findByText('next', { exact: true })).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: 'Close artifacts workspace' }));
+      expect(onSelectArtifact).toHaveBeenLastCalledWith(null);
+      rerender(panel(null));
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(fetch).toHaveBeenCalledTimes(3);
+    });
+    it('does not read a deep link absent from the listing and reports the missing artifact', async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(list());
+      render(<AgentArtifactsPanel runUUID="run-a" theme={theme} selectedArtifact="missing.txt" onSelectArtifact={vi.fn()} />);
+      expect(await screen.findByText('Artifact not found in this run.')).toHaveAttribute('role', 'status');
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+  });
+}
+
 describe('identity resets and stale asynchronous work', () => {
   it('aborts project/run list requests and ignores responses from the old identity', async () => {
     const first = deferred<Response>();

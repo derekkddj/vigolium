@@ -1,4 +1,5 @@
-import type { ReactNode } from 'react';
+import { useEffect, type ReactNode } from 'react';
+import type { AgentArtifactsPanelProps } from '@/components/shared/AgentArtifactsPanel';
 import type { AgentSession, AgentSessionDetail, AgentRunStatusResponse, PaginatedResponse } from '@/api/types';
 import { act, fireEvent, render, renderHook, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -17,14 +18,24 @@ const mocks = vi.hoisted(() => ({
   tail: { logs: 'retained unrelated console', connection: 'complete', error: '', truncated: false, logSize: 120, retry: vi.fn() },
   detailCalls: vi.fn(),
   listCalls: vi.fn(),
+  requestEffects: vi.fn(),
 }));
 vi.mock('@/contexts/ProjectContext', () => ({ useProjectContext: () => mocks.project }));
 vi.mock('@/lib/useAgentSessionLogs', () => ({ useAgentSessionLogs: () => mocks.tail }));
-vi.mock('@/components/shared/AgentArtifactsPanel', () => ({ default: () => <div>Run artifacts preserved</div> }));
+vi.mock('@/components/shared/AgentArtifactsPanel', () => ({ default: ({ selectedArtifact, onSelectArtifact }: AgentArtifactsPanelProps) => <div>
+  Run artifacts preserved<span data-testid="controlled-artifact">{selectedArtifact}</span>
+  <button onClick={() => onSelectArtifact?.('auth-config.yaml')}>Mock open artifact</button>
+  <button onClick={() => onSelectArtifact?.(null)}>Mock close artifact</button>
+</div> }));
 vi.mock('@/components/shared/AgentRuntimeLogPanel', () => ({ default: () => <div>Full runtime log preserved</div> }));
 vi.mock('@/api/hooks', () => ({
   useAgentSessions: (params: unknown) => { mocks.listCalls(mocks.project.projectUUID, params); return mocks.sessions; },
-  useAgentSessionDetail: (uuid: string | null) => { mocks.detailCalls(mocks.project.projectUUID, uuid); return mocks.detail; },
+  useAgentSessionDetail: (uuid: string | null) => {
+    const project = mocks.project.projectUUID;
+    mocks.detailCalls(project, uuid);
+    useEffect(() => { mocks.requestEffects(project, uuid, window.location.search); }, [project, uuid]);
+    return mocks.detail;
+  },
   useAgentRunStatus: (uuid: string | null) => uuid ? mocks.status : {},
   useUploadRepo: () => ({ mutate: vi.fn() }),
   useStartAutopilotRun: () => ({ mutate: vi.fn() }),
@@ -162,6 +173,47 @@ describe('agent session selection and history queries', () => {
   });
 });
 
+describe('artifact URL selection', () => {
+  it('pushes artifact links, preserves URL fields/state, closes and follows popstate', () => {
+    window.history.replaceState({ keep: true }, '', '/agentic-scan?session=linked&demo=keep#console');
+    const push = vi.spyOn(window.history, 'pushState');
+    const { result } = renderHook(() => useAgentsLogic());
+    act(() => result.current.setSelectedArtifact('commands/a + b.jsonl'));
+    expect(push).toHaveBeenCalledOnce();
+    expect(new URLSearchParams(window.location.search).get('artifact')).toBe('commands/a + b.jsonl');
+    expect(window.history.state).toEqual({ keep: true });
+    expect(window.location.hash).toBe('#console');
+    act(() => result.current.setSelectedArtifact(null));
+    expect(window.location.search).toBe('?session=linked&demo=keep');
+    act(() => popTo('/agentic-scan?session=linked&artifact=second.txt'));
+    expect(result.current.selectedArtifact).toBe('second.txt');
+    act(() => popTo('/agentic-scan?session=linked'));
+    expect(result.current.selectedArtifact).toBeNull();
+  });
+
+  it('hydrates the artifact with its session and clears it before switching sessions/projects', () => {
+    window.history.replaceState({}, '', '/agentic-scan?session=linked&artifact=auth-config.yaml&demo=keep');
+    const { result, rerender } = renderHook(() => useAgentsLogic());
+    expect(result.current.selectedArtifact).toBe('auth-config.yaml');
+    act(() => result.current.setExpandedSessionUuid('other'));
+    expect(result.current.selectedArtifact).toBeNull();
+    expect(window.location.search).toBe('?session=other&demo=keep');
+    expect(mocks.requestEffects.mock.calls.filter(([, uuid]) => uuid === 'other').every(([, , url]) => !url.includes('artifact='))).toBe(true);
+    act(() => result.current.setSelectedArtifact('second.txt'));
+    const staleSelect = result.current.setSelectedArtifact;
+    mocks.project.projectUUID = 'project-b'; rerender();
+    expect(result.current.selectedArtifact).toBeNull();
+    expect(window.location.search).toBe('?demo=keep');
+    expect(mocks.requestEffects.mock.calls.filter(([project]) => project === 'project-b').every(([, , url]) => !url.includes('artifact='))).toBe(true);
+    act(() => staleSelect('old.txt'));
+    expect(window.location.search).toBe('?demo=keep');
+    mocks.project.projectUUID = 'project-a'; rerender();
+    act(() => result.current.setExpandedSessionUuid('other'));
+    act(() => staleSelect('old.txt'));
+    expect(result.current.selectedArtifact).toBeNull();
+  });
+});
+
 describe('agent runtime failure scoping', () => {
   it('surfaces status/cancel failures without clearing a different selected console', () => {
     const { result, rerender } = renderHook(() => useAgentsLogic());
@@ -215,6 +267,20 @@ describe('agent runtime failure scoping', () => {
 });
 
 describe.each([['dark', DarkAgentsPage], ['light', LightAgentsPage]] as const)('%s agent observability views', (_theme, Page) => {
+  it('connects artifact URL selection to the controlled panel in the mounted page', () => {
+    window.history.replaceState({}, '', '/agentic-scan?session=selected&artifact=second.txt');
+    mocks.detail.data = { ...sessions(1)[0], uuid: 'selected' };
+    render(<Page />);
+    expect(screen.getByTestId('controlled-artifact')).toHaveTextContent('second.txt');
+    fireEvent.click(screen.getByRole('button', { name: 'Mock open artifact' }));
+    expect(new URLSearchParams(window.location.search).get('artifact')).toBe('auth-config.yaml');
+    act(() => popTo('/agentic-scan?session=selected'));
+    expect(screen.getByTestId('controlled-artifact')).toBeEmptyDOMElement();
+    fireEvent.click(screen.getByRole('button', { name: 'Mock open artifact' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Mock close artifact' }));
+    expect(window.location.search).toBe('?session=selected');
+  });
+
   it.each([false, true])('keeps full-width session history and a single detail scroll owner (selected: %s)', (selected) => {
     mocks.sessions.data = { data: sessions(1) };
     if (selected) {

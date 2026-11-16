@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef, useCallback, useEffect, useMemo, type SetStateAction } from 'react';
+import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo, type SetStateAction } from 'react';
 import { useFollowTail } from '@/lib/useFollowTail';
 import { zipSync } from 'fflate';
 import { useAgentSessions, useAgentSessionDetail, useUploadRepo, useStartAutopilotRun, useStartAgentRun, useCancelAgentRun, useAgentRunStatus } from '@/api/hooks';
@@ -79,8 +79,21 @@ const SESSION_PAGE_SIZE = 20;
 
 function writeSessionURL(uuid: string | null, replace = false) {
   const url = new URL(window.location.href);
+  // A file belongs to one session only; clear it atomically with a session change.
+  if (url.searchParams.get('session') !== uuid) url.searchParams.delete('artifact');
   if (uuid) url.searchParams.set('session', uuid);
   else url.searchParams.delete('session');
+  const href = url.pathname + url.search + url.hash;
+  if (href !== window.location.pathname + window.location.search + window.location.hash) {
+    if (replace) window.history.replaceState(window.history.state, '', href);
+    else window.history.pushState(window.history.state, '', href);
+  }
+}
+
+function writeArtifactURL(name: string | null, replace = false) {
+  const url = new URL(window.location.href);
+  if (name) url.searchParams.set('artifact', name);
+  else url.searchParams.delete('artifact');
   const href = url.pathname + url.search + url.hash;
   if (href !== window.location.pathname + window.location.search + window.location.hash) {
     if (replace) window.history.replaceState(window.history.state, '', href);
@@ -255,6 +268,8 @@ export function useAgentsLogic() {
   // so a project switch never requests the old UUID against the new project.
   const [selection, setSelection] = useState<{ projectUUID: typeof projectUUID; uuid: string | null }>({ projectUUID, uuid: null });
   const expandedSessionUuid = selection.projectUUID === projectUUID ? selection.uuid : null;
+  const [artifactSelection, setArtifactSelection] = useState<{ projectUUID: typeof projectUUID; uuid: string | null; name: string | null }>({ projectUUID, uuid: null, name: null });
+  const selectedArtifact = artifactSelection.projectUUID === projectUUID && artifactSelection.uuid === expandedSessionUuid ? artifactSelection.name : null;
   const selectedSessionRef = useRef(expandedSessionUuid);
   selectedSessionRef.current = expandedSessionUuid;
   const setExpandedSessionUuid = useCallback((value: SetStateAction<string | null>) => {
@@ -262,8 +277,15 @@ export function useAgentsLogic() {
     const uuid = typeof value === 'function' ? value(selectedSessionRef.current) : value;
     selectedSessionRef.current = uuid;
     writeSessionURL(uuid);
+    if (uuid !== expandedSessionUuid) setArtifactSelection({ projectUUID, uuid, name: null });
     setSelection({ projectUUID, uuid });
-  }, [projectUUID]);
+  }, [projectUUID, expandedSessionUuid]);
+  const artifactGeneration = projectGenerationRef.current;
+  const setSelectedArtifact = useCallback((name: string | null) => {
+    if (currentProjectRef.current !== projectUUID || projectGenerationRef.current !== artifactGeneration || selectedSessionRef.current !== expandedSessionUuid || !expandedSessionUuid) return;
+    writeArtifactURL(name);
+    setArtifactSelection({ projectUUID, uuid: expandedSessionUuid, name });
+  }, [projectUUID, expandedSessionUuid, artifactGeneration]);
 
   const [history, setHistory] = useState({ projectUUID, offset: 0 });
   const sessionsOffset = history.projectUUID === projectUUID ? history.offset : 0;
@@ -294,11 +316,16 @@ export function useAgentsLogic() {
   const sessionLog = useAgentSessionLogs(consoleMode === 'tail' && contextProjectUUID ? expandedSessionUuid : null, sessionDetail?.status);
   const sessionLogs = sessionLog.logs;
 
-  useEffect(() => {
+  // Layout synchronization clears old URL identity before passive request effects run.
+  useLayoutEffect(() => {
     const syncFromURL = () => {
-      const uuid = new URLSearchParams(window.location.search).get('session')?.trim() || null;
+      const params = new URLSearchParams(window.location.search);
+      const uuid = params.get('session')?.trim() || null;
+      const name = uuid ? params.get('artifact') || null : null;
+      if (!uuid) writeArtifactURL(null, true);
       selectedSessionRef.current = uuid;
       setSelection({ projectUUID, uuid });
+      setArtifactSelection({ projectUUID, uuid, name });
     };
     if (lastProjectRef.current !== projectUUID) {
       lastProjectRef.current = projectUUID;
@@ -306,6 +333,7 @@ export function useAgentsLogic() {
       writeSessionURL(null, true);
       selectedSessionRef.current = null;
       setSelection({ projectUUID, uuid: null });
+      setArtifactSelection({ projectUUID, uuid: null, name: null });
       setHistory({ projectUUID, offset: 0 });
       setActiveRun({ projectUUID, uuid: null });
       setCancelFailure(null);
@@ -790,6 +818,7 @@ export function useAgentsLogic() {
 
     // Sessions
     expandedSessionUuid, setExpandedSessionUuid,
+    selectedArtifact, setSelectedArtifact,
     sessionsData, sessionsLoading, sessionsBusy, sessionsError,
     sessionsOffset, sessionsCount, sessionsTotal, sessionsHasNext, sessionsPrevious, sessionsNext,
     sessionsRetry: () => sessionsQuery.refetch?.(),
