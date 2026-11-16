@@ -148,6 +148,7 @@ func registerRoutes(app *fiber.App, handlers *Handlers, cfg ServerConfig) {
 		demo.Get("/http-records", handlers.HandleListRecords)
 		demo.Get("/http-records/:uuid", handlers.HandleGetRecord)
 		demo.Get("/findings", handlers.findingsHandler().HandleListFindings)
+		demo.Get("/findings/hosts", handlers.findingsHandler().HandleListFindingHosts)
 		demo.Get("/findings/:id", handlers.findingsHandler().HandleGetFinding)
 		demo.Get("/findings/:id/evidence/:exchange_id", handlers.findingsHandler().HandleGetFindingEvidence)
 		demo.Get("/extensions/docs", handlers.HandleListExtensionAPI) // must precede :name
@@ -168,6 +169,7 @@ func registerRoutes(app *fiber.App, handlers *Handlers, cfg ServerConfig) {
 	viewer.Get("/http-records", handlers.HandleListRecords)
 	viewer.Get("/http-records/:uuid", handlers.HandleGetRecord)
 	viewer.Get("/findings", handlers.findingsHandler().HandleListFindings)
+	viewer.Get("/findings/hosts", handlers.findingsHandler().HandleListFindingHosts)
 	viewer.Get("/findings/:id", handlers.findingsHandler().HandleGetFinding)
 	viewer.Get("/findings/:id/evidence/:exchange_id", handlers.findingsHandler().HandleGetFindingEvidence)
 	viewer.Get("/stats", handlers.HandleStats)

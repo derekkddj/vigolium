@@ -484,6 +484,48 @@ func assertFindingSortOrder(t *testing.T, db *DB, field string, asc, desc []int6
 	}
 }
 
+func TestFindingsQueryBuilder_GroupByHostnameIgnoresPaginationAndScopesFilters(t *testing.T) {
+	db := newTestDB(t)
+	repo := NewRepository(db)
+	for i := 0; i < 150; i++ {
+		hosts := []string{"alpha.example", "bravo.example", "charlie.example"}
+		severity := SeverityLow
+		if i%2 == 0 {
+			severity = SeverityHigh
+		}
+		finding := &Finding{
+			FindingHash: fmt.Sprintf("host-group-%d", i),
+			ModuleID:    "host-group-test",
+			ModuleName:  "Host group test",
+			Hostname:    hosts[i%len(hosts)],
+			Severity:    severity,
+		}
+		saveFindingFull(t, repo, finding)
+	}
+	for i := 0; i < 5; i++ {
+		finding := &Finding{ProjectUUID: "other-project", FindingHash: fmt.Sprintf("other-host-%d", i), ModuleID: "other", ModuleName: "other", Hostname: "other.example", Severity: SeverityHigh}
+		saveFindingFull(t, repo, finding)
+	}
+
+	groups, err := NewFindingsQueryBuilder(db, QueryFilters{
+		ProjectUUID: DefaultProjectUUID,
+		Severity:    []string{SeverityHigh},
+		Limit:       1,
+		Offset:      99,
+	}).GroupByHostname(context.Background())
+	if err != nil {
+		t.Fatalf("GroupByHostname: %v", err)
+	}
+	if len(groups) != 3 {
+		t.Fatalf("got %d host groups, want 3: %+v", len(groups), groups)
+	}
+	for i, hostname := range []string{"alpha.example", "bravo.example", "charlie.example"} {
+		if groups[i].Hostname != hostname || groups[i].Total != 25 {
+			t.Errorf("group %d = %+v, want hostname=%s total=25", i, groups[i], hostname)
+		}
+	}
+}
+
 func TestFindingsQueryBuilder_ConfidenceSortRanks(t *testing.T) {
 	assertFindingsConfidenceSortRanks(t, newTestDB(t))
 }

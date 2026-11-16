@@ -42,54 +42,25 @@ func (h *Handlers) findingsHandler() *findingsHandlers {
 	return h.findings
 }
 
-// HandleListFindings handles GET /api/findings
-func (h *findingsHandlers) HandleListFindings(c fiber.Ctx) error {
-	if h.db == nil {
-		return respondError(c, fiber.StatusServiceUnavailable, ErrDatabaseRequired)
-	}
+// parseFindingQueryFilters keeps filters shared by finding lists and host aggregates.
+func parseFindingQueryFilters(c fiber.Ctx) (database.QueryFilters, error) {
+	filters := database.QueryFilters{ProjectUUID: getProjectUUID(c)}
 
-	projectUUID := getProjectUUID(c)
-	filters := database.QueryFilters{
-		ProjectUUID: projectUUID,
-	}
-
-	// Domain (join http_records)
 	if domain := c.Query("domain"); domain != "" {
 		filters.HostPattern = domain
 	}
-
-	// Severity (comma-separated)
 	if sev := c.Query("severity"); sev != "" {
-		for _, s := range strings.Split(sev, ",") {
-			s = strings.TrimSpace(strings.ToLower(s))
-			if s != "" {
-				filters.Severity = append(filters.Severity, s)
+		for _, value := range strings.Split(sev, ",") {
+			value = strings.TrimSpace(strings.ToLower(value))
+			if value != "" {
+				filters.Severity = append(filters.Severity, value)
 			}
 		}
 	}
-
-	// Scan ID
-	if scanID := c.Query("scan_uuid"); scanID != "" {
-		filters.ScanUUID = scanID
-	}
-
-	// Module name
-	if mn := c.Query("module_name"); mn != "" {
-		filters.ModuleName = mn
-	}
-
-	// Module type
-	if mt := c.Query("module_type"); mt != "" {
-		filters.ModuleType = mt
-	}
-
-	// Finding source
-	if fs := c.Query("finding_source"); fs != "" {
-		filters.FindingSource = fs
-	}
-
-	// Record kind. Vulnerabilities remain the default; callers may explicitly
-	// request retained candidates/observations for triage and orchestration.
+	filters.ScanUUID = c.Query("scan_uuid")
+	filters.ModuleName = c.Query("module_name")
+	filters.ModuleType = c.Query("module_type")
+	filters.FindingSource = c.Query("finding_source")
 	if kinds := c.Query("record_kind"); kinds != "" {
 		for _, raw := range strings.Split(kinds, ",") {
 			kind := strings.TrimSpace(strings.ToLower(raw))
@@ -99,35 +70,24 @@ func (h *findingsHandlers) HandleListFindings(c fiber.Ctx) error {
 			case "":
 				continue
 			default:
-				return respondErrorMsg(c, fiber.StatusBadRequest, "invalid record_kind: "+raw)
+				return database.QueryFilters{}, fmt.Errorf("invalid record_kind: %s", raw)
 			}
 		}
 	}
-
-	// Repo name
-	if rn := c.Query("repo_name"); rn != "" {
-		filters.RepoName = rn
-	}
-
-	// Status (comma-separated, e.g. ?status=draft,triaged)
-	if st := c.Query("status"); st != "" {
-		for _, s := range strings.Split(st, ",") {
-			s = strings.TrimSpace(strings.ToLower(s))
-			if s != "" {
-				filters.Status = append(filters.Status, s)
+	filters.RepoName = c.Query("repo_name")
+	if statuses := c.Query("status"); statuses != "" {
+		for _, value := range strings.Split(statuses, ",") {
+			value = strings.TrimSpace(strings.ToLower(value))
+			if value != "" {
+				filters.Status = append(filters.Status, value)
 			}
 		}
 	}
+	filters.SearchTerm = c.Query("search")
 
-	// Search
-	if s := c.Query("search"); s != "" {
-		filters.SearchTerm = s
-	}
-
-	// Sorting
 	if sort := c.Query("sort"); sort != "" {
 		if err := database.ValidateFindingSort(sort); err != nil {
-			return respondErrorMsg(c, fiber.StatusBadRequest, err.Error())
+			return database.QueryFilters{}, err
 		}
 		filters.SortBy = sort
 	}
@@ -138,28 +98,35 @@ func (h *findingsHandlers) HandleListFindings(c fiber.Ctx) error {
 		case "desc":
 			filters.SortAsc = false
 		default:
-			return respondErrorMsg(c, fiber.StatusBadRequest, "invalid order: must be asc or desc")
+			return database.QueryFilters{}, fmt.Errorf("invalid order: must be asc or desc")
 		}
 	}
 
-	// Pagination
 	limit := 50
-	if l := c.Query("limit"); l != "" {
-		if v, err := strconv.Atoi(l); err == nil && v > 0 {
-			limit = v
-		}
+	if value, err := strconv.Atoi(c.Query("limit")); err == nil && value > 0 {
+		limit = value
 	}
 	if limit > 500 {
 		limit = 500
 	}
 	filters.Limit = limit
+	if value, err := strconv.Atoi(c.Query("offset")); err == nil && value >= 0 {
+		filters.Offset = value
+	}
+	return filters, nil
+}
 
-	if o := c.Query("offset"); o != "" {
-		if v, err := strconv.Atoi(o); err == nil && v >= 0 {
-			filters.Offset = v
-		}
+// HandleListFindings handles GET /api/findings
+func (h *findingsHandlers) HandleListFindings(c fiber.Ctx) error {
+	if h.db == nil {
+		return respondError(c, fiber.StatusServiceUnavailable, ErrDatabaseRequired)
 	}
 
+	filters, err := parseFindingQueryFilters(c)
+	if err != nil {
+		return respondErrorMsg(c, fiber.StatusBadRequest, err.Error())
+	}
+	projectUUID := filters.ProjectUUID
 	fqb := database.NewFindingsQueryBuilder(h.reader(), filters)
 	ctx := c.Context()
 
@@ -186,6 +153,35 @@ func (h *findingsHandlers) HandleListFindings(c fiber.Ctx) error {
 		Limit:       filters.Limit,
 		Offset:      filters.Offset,
 		HasMore:     int64(filters.Offset+filters.Limit) < total,
+	})
+}
+
+// HandleListFindingHosts handles GET /api/findings/hosts and returns complete
+// hostname counts for the active project and finding filters, independent of the
+// current finding page.
+func (h *findingsHandlers) HandleListFindingHosts(c fiber.Ctx) error {
+	if h.db == nil {
+		return respondError(c, fiber.StatusServiceUnavailable, ErrDatabaseRequired)
+	}
+	filters, err := parseFindingQueryFilters(c)
+	if err != nil {
+		return respondErrorMsg(c, fiber.StatusBadRequest, err.Error())
+	}
+	var hosts []database.FindingHostCount
+	if err := retryRead(c.Context(), func() error {
+		var queryErr error
+		hosts, queryErr = database.NewFindingsQueryBuilder(h.reader(), filters).GroupByHostname(c.Context())
+		return queryErr
+	}); err != nil {
+		return respondQueryError(c, err)
+	}
+	return respondList(c, PaginatedResponse{
+		ProjectUUID: filters.ProjectUUID,
+		Data:        hosts,
+		Total:       int64(len(hosts)),
+		Limit:       len(hosts),
+		Offset:      0,
+		HasMore:     false,
 	})
 }
 
