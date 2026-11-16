@@ -39,8 +39,8 @@ var agentAdmissionRoutes = []agentAdmissionRoute{
 // compatibility: repositories intentionally accept arbitrary project IDs, but
 // the REST-selected project should receive the same UUID/existence checks as
 // X-Project-UUID. A minimal fix can select a non-empty body ProjectUUID first,
-// otherwise use getProjectUUID(c), then apply validProjectUUID and
-// GetProjectByUUID before admission. Preserve body-over-header precedence and
+// otherwise use getProjectUUID(c), then apply canonical UUID/existence checks
+// before admission. Preserve body-over-header precedence and
 // run this check before swarm's optional base64 traffic ingestion; do not add a
 // project lookup to general database write APIs.
 func newAgentBodyProjectAdmissionApp(t *testing.T) (*Handlers, *database.Repository, *fiber.App) {
@@ -246,6 +246,10 @@ func TestAgentBodyProjectAdmission_ValidBodyOverridesHeaderAndEmptyFallsBack(t *
 		t.Run(route.name+"/empty-body-falls-back-to-header", func(t *testing.T) {
 			h, repo, app := newAgentBodyProjectAdmissionApp(t)
 			assertAgentAdmissionSelectedProject(t, h, repo, app, route, admissionHeaderProject, "")
+		})
+		t.Run(route.name+"/noncanonical-body-resolves-canonical-row", func(t *testing.T) {
+			h, repo, app := newAgentBodyProjectAdmissionApp(t)
+			assertAgentAdmissionSelectedProject(t, h, repo, app, route, admissionBodyProject, strings.ToUpper(admissionBodyProject))
 		})
 	}
 }

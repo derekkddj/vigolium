@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
@@ -90,12 +91,54 @@ func TestProjectUUIDMiddleware_Contract(t *testing.T) {
 		assert.Equal(t, 200, resp.StatusCode)
 		assert.Equal(t, unknown, string(body))
 	})
+	t.Run("exact legacy spelling takes precedence over canonical lookup", func(t *testing.T) {
+		legacy := strings.ToUpper(unknown)
+		app, repo := newApp(t, ProjectMiddlewareConfig{})
+		require.NoError(t, repo.CreateProject(context.Background(), &database.Project{UUID: legacy, Name: "legacy spelling", OwnerUUID: database.DefaultUserUUID}))
+		resp, body := doReq2(t, app, http.MethodGet, "/api/findings", "", hdr("X-Project-UUID", legacy))
+		assert.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+		assert.Equal(t, legacy, string(body), "exact legacy project row should remain addressable")
+	})
+	t.Run("noncanonical forms resolve an existing canonical project", func(t *testing.T) {
+		for name, selected := range map[string]string{
+			"uppercase": strings.ToUpper(unknown),
+			"braces":    "{" + unknown + "}",
+			"urn":       "urn:uuid:" + unknown,
+			"compact":   strings.ReplaceAll(unknown, "-", ""),
+		} {
+			t.Run(name, func(t *testing.T) {
+				app, repo := newApp(t, ProjectMiddlewareConfig{})
+				require.NoError(t, repo.CreateProject(context.Background(), &database.Project{UUID: unknown, Name: "canonical", OwnerUUID: database.DefaultUserUUID}))
+				resp, body := doReq2(t, app, http.MethodGet, "/api/findings", "", hdr("X-Project-UUID", selected))
+				assert.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+				assert.Equal(t, unknown, string(body), "middleware must pin the canonical stored UUID")
+				assert.False(t, exists(repo, selected), "noncanonical spelling must not create an alias row")
+			})
+		}
+	})
 	t.Run("malformed → 400 invalid_project_uuid", func(t *testing.T) {
 		app, _ := newApp(t, ProjectMiddlewareConfig{AutoCreate: true})
-		for _, bad := range []string{"proj-a", "{" + unknown + "}", "urn:uuid:" + unknown, unknown + "0"} {
+		for _, bad := range []string{"proj-a", unknown + "0"} {
 			resp, body := doReq2(t, app, http.MethodGet, "/api/findings", "", hdr("X-Project-UUID", bad))
 			assert.Equal(t, 400, resp.StatusCode, bad)
 			assert.Contains(t, string(body), `"error_code":"invalid_project_uuid"`, bad)
+		}
+	})
+	t.Run("noncanonical opt-in creation persists only the canonical UUID", func(t *testing.T) {
+		for name, selected := range map[string]string{
+			"uppercase": strings.ToUpper(unknown),
+			"braces":    "{" + unknown + "}",
+			"urn":       "urn:uuid:" + unknown,
+			"compact":   strings.ReplaceAll(unknown, "-", ""),
+		} {
+			t.Run(name, func(t *testing.T) {
+				app, repo := newApp(t, ProjectMiddlewareConfig{})
+				resp, body := doReq2(t, app, http.MethodGet, "/api/findings", "", hdr("X-Project-UUID", selected, "X-Project-Create", "1"))
+				assert.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+				assert.Equal(t, unknown, string(body))
+				assert.True(t, exists(repo, unknown), "canonical row should be created")
+				assert.False(t, exists(repo, selected), "noncanonical spelling must not be stored")
+			})
 		}
 	})
 	t.Run("default project untouched", func(t *testing.T) {
