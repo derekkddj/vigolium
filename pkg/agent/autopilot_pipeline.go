@@ -160,6 +160,8 @@ type AutopilotPipelineConfig struct {
 type AutopilotPipelineRunner struct {
 	engine *Engine
 	repo   *database.Repository
+	// Tests substitute a deterministic persisted receipt, without scanning.
+	launchNativeScan func(context.Context, runner.LaunchParams) (*runner.LaunchResult, error)
 }
 
 // NewAutopilotPipelineRunner creates a new autopilot pipeline runner.
@@ -176,7 +178,17 @@ type auditContextStruct struct {
 // 1. Run vigolium-audit first when source context is available
 // 2. Freeze context into native plan + artifacts
 // 3. Launch the autonomous operator agent with full tool access
-func (r *AutopilotPipelineRunner) RunAutonomous(ctx context.Context, cfg AutopilotPipelineConfig) (*AutopilotPipelineResult, error) {
+func (r *AutopilotPipelineRunner) RunAutonomous(ctx context.Context, cfg AutopilotPipelineConfig) (finalResult *AutopilotPipelineResult, finalErr error) {
+	// Reconcile only after all producers have joined, including verification.
+	// Failure/cancellation still returns the persisted partial total.
+	defer func() {
+		if cfg.ParentAgenticScanUUID != "" {
+			if finalResult == nil {
+				finalResult = &AutopilotPipelineResult{SessionDir: cfg.SessionDir}
+			}
+			r.reconcileAutopilotFindings(ctx, cfg, finalResult)
+		}
+	}()
 	// Every producer must share this same wrapper, including concurrent audit
 	// and auth/source-analysis work. Later wrappers preserve its block lock.
 	cfg.StreamWriter = NewSynchronizedWriter(cfg.StreamWriter)
@@ -403,7 +415,7 @@ func (r *AutopilotPipelineRunner) RunAutonomous(ctx context.Context, cfg Autopil
 	}
 	effectiveExtraBody, err := oliumCfg.CustomProvider.EffectiveExtraBody()
 	if err != nil {
-		return nil, fmt.Errorf("olium custom_provider: %w", err)
+		return result, fmt.Errorf("olium custom_provider: %w", err)
 	}
 	prov, _, model, provErr := olium.ResolveProvider(olium.Options{
 		Provider:            oliumCfg.Provider,
@@ -421,7 +433,7 @@ func (r *AutopilotPipelineRunner) RunAutonomous(ctx context.Context, cfg Autopil
 		CustomExtraBody:     effectiveExtraBody,
 	})
 	if provErr != nil {
-		return nil, fmt.Errorf("autonomous agent: resolve olium provider: %w", provErr)
+		return result, fmt.Errorf("autonomous agent: resolve olium provider: %w", provErr)
 	}
 	// Same gate as the CLI path — autopilot bypasses runOliumOnEngine so
 	// we wrap the provider explicitly here.
@@ -480,15 +492,16 @@ func (r *AutopilotPipelineRunner) RunAutonomous(ctx context.Context, cfg Autopil
 		autopilotOpts.CoverageProbe = postHaltProbe
 	}
 	autopilotResult, err := oautopilot.Run(ctx, autopilotOpts)
-	if err != nil {
-		return nil, fmt.Errorf("autonomous agent failed: %w", err)
-	}
 	if autopilotResult != nil {
 		if autopilotResult.RecordingError != "" {
 			result.Warnings = append(result.Warnings, autopilotResult.RecordingError)
 			result.Degraded = true
 		}
-		result.OperatorFindingsCount = int(autopilotResult.FindingCount)
+		result.OperatorFindingsCount = int(autopilotResult.ReportedFindingCount)
+		if autopilotResult.FindingCountError != "" {
+			result.Warnings = append(result.Warnings, autopilotResult.FindingCountError)
+			result.Degraded = true
+		}
 		result.Reentries = autopilotResult.Reentries
 		result.BudgetStop = autopilotResult.BudgetStop
 		result.InputTokens = autopilotResult.InputTokens
@@ -499,6 +512,10 @@ func (r *AutopilotPipelineRunner) RunAutonomous(ctx context.Context, cfg Autopil
 		if d := autopilotResult.Diagnosis(); d != "" {
 			result.Warnings = append(result.Warnings, d)
 		}
+	}
+	if err != nil {
+		result.Duration = time.Since(start)
+		return result, fmt.Errorf("autonomous agent failed: %w", err)
 	}
 
 	if auditRunner != nil {
@@ -601,7 +618,11 @@ func (r *AutopilotPipelineRunner) runBlackboxFallback(
 		Warnings:   []string{warn},
 	}
 
-	res, scanErr := runner.LaunchScan(ctx, runner.LaunchParams{
+	launch := r.launchNativeScan
+	if launch == nil {
+		launch = runner.LaunchScan
+	}
+	res, scanErr := launch(ctx, runner.LaunchParams{
 		Targets:          []string{target},
 		ProjectUUID:      cfg.ProjectUUID,
 		Repository:       r.repo,
@@ -609,13 +630,18 @@ func (r *AutopilotPipelineRunner) runBlackboxFallback(
 		EnableDiscovery:  true,
 		EnableSpidering:  true,
 	})
+	// A failed/cancelled scan may already have committed findings. Attribute
+	// its initialized receipt before either return, never a rejected identity.
+	if attrErr := r.attributeAutopilotFallback(ctx, cfg, res, scanErr); attrErr != nil {
+		result.Warnings = append(result.Warnings, "native fallback attribution unavailable: "+attrErr.Error())
+	}
 	result.Duration = time.Since(start)
 	if scanErr != nil {
 		result.Warnings = append(result.Warnings, "native fallback scan failed: "+scanErr.Error())
 		return result, fmt.Errorf("autopilot preflight failed and the native fallback scan also failed (%w): %w", preflightErr, scanErr)
 	}
 	if res != nil {
-		result.OperatorFindingsCount = int(res.FindingCount)
+		result.NativeFindingsCount = int(res.FindingCount)
 		printPhaseLine(agenttypes.AutopilotPhaseAutopilot, fmt.Sprintf(
 			"native blackbox scan complete  scan=%s requests=%d findings=%d",
 			res.ScanUUID, res.TotalRequests, res.FindingCount))

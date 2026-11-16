@@ -316,8 +316,13 @@ const (
 type Result struct {
 	Halted       bool
 	HaltReason   string
-	FindingCount int64
-	Elapsed      time.Duration
+	FindingCount int64 // persisted run-tree total when available; -1 on reconciliation failure
+	// ReportedFindingCount remains the main report_finding tool's insert-only
+	// tally. It must not become the rate-limit counter for other phases.
+	ReportedFindingCount  int64
+	FindingCountAvailable bool
+	FindingCountError     string
+	Elapsed               time.Duration
 
 	// Cumulative token usage across every turn the engine emitted. Sourced
 	// from the provider's per-turn Usage events; zero on providers that
@@ -588,7 +593,21 @@ func preflightSkillPicks(ctx context.Context, opts Options, all *skill.Registry)
 // calling tools, because halt_scan fired, or because MaxTurns was hit.
 //
 // Blocking. Honors ctx cancellation (engine teardown propagates).
-func Run(ctx context.Context, opts Options) (*Result, error) {
+func Run(ctx context.Context, opts Options) (finalResult *Result, finalErr error) {
+	var reportCtx *ReportFindingContext
+	defer func() {
+		// Existing persisted work also survives validation/startup errors and
+		// resumes. Library calls without a store retain their legacy nil result.
+		if finalResult == nil && opts.Repo != nil && opts.AgenticScanUUID != "" {
+			finalResult = &Result{}
+		}
+		if finalResult != nil {
+			if reportCtx != nil {
+				finalResult.ReportedFindingCount = reportCtx.Count.Load()
+			}
+			reconcileRunFindingCount(ctx, opts, finalResult)
+		}
+	}()
 	if opts.Provider == nil {
 		return nil, fmt.Errorf("autopilot: Provider is required")
 	}
@@ -621,7 +640,7 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 
 	// Autopilot-specific tool wiring.
 	halt := &HaltSignal{}
-	reportCtx := &ReportFindingContext{
+	reportCtx = &ReportFindingContext{
 		Repo:            opts.Repo,
 		ProjectUUID:     opts.ProjectUUID,
 		ScanUUID:        opts.ScanUUID,
