@@ -30,8 +30,9 @@ test.describe('AuthGate — auth required', () => {
   test.beforeEach(async ({ page }) => {
     await page.route('**/server-info', async (route) => {
       const auth = route.request().headers()['authorization'] ?? '';
-      const expected = `Bearer ${FIXTURE_API_KEY}`;
-      if (auth === expected) {
+      // Accept both the API key and the token issued by the login fixture;
+      // otherwise the dashboard's first server-info poll logs the user out.
+      if (auth === `Bearer ${FIXTURE_API_KEY}` || auth === 'Bearer e2e-issued-token') {
         await route.fulfill({
           status: 200,
           contentType: 'application/json',
