@@ -51,7 +51,14 @@ export default function FindingEvidence(props: Props) {
   if (projectUUID && props.finding.project_uuid && projectUUID !== props.finding.project_uuid) {
     return <p role="alert" style={{ color: evidencePalette[props.theme].warning }}>Finding belongs to a different captured project. Reload the finding in the selected project; no evidence scope recovery is attempted.</p>;
   }
-  return <EvidenceContent key={JSON.stringify([projectUUID, props.finding.project_uuid, props.finding.id, props.finding.evidence?.map((entry) => [entry.exchange_id, entry.role, entry.primary, entry.occurrence_id, entry.label, entry.finding_url, entry.scan_uuid])])} {...props} />;
+  const occurrenceKey = props.finding.occurrences?.length
+    ? props.finding.occurrences.map((occurrence) => [occurrence.occurrence_id, occurrence.scan_uuid, occurrence.evidence_status, occurrence.entries.map(evidenceEntryKey)])
+    : (props.finding.evidence ?? []).map(evidenceEntryKey);
+  return <EvidenceContent key={JSON.stringify([projectUUID, props.finding.project_uuid, props.finding.id, occurrenceKey])} {...props} />;
+}
+
+function evidenceEntryKey(entry: NonNullable<Finding['evidence']>[number]) {
+  return [entry.exchange_id, entry.role, entry.primary, entry.occurrence_id, entry.label, entry.finding_url, entry.scan_uuid];
 }
 
 function EvidenceContent({ finding, theme, RecordInspector }: Props) {
@@ -74,6 +81,7 @@ function EvidenceContent({ finding, theme, RecordInspector }: Props) {
       <section className="space-y-2" aria-label="Inline finding evidence">
         <h3 className="font-semibold">Legacy inline evidence — role unknown (not proof)</h3>
         <p style={{ color: colors.muted }}>Legacy strings and producer labels have no classified role. They never substitute for a selected exchange; text downloads are not authoritative captured bytes.</p>
+        {finding.inline_evidence_scan_uuid && <p style={{ color: colors.muted }}>Inline request/response source: first observed scan {finding.inline_evidence_scan_uuid}{finding.scan_uuid && finding.scan_uuid !== finding.inline_evidence_scan_uuid ? ` (latest finding scan: ${finding.scan_uuid})` : ''}.</p>}
         {!hasInline && <p style={{ color: colors.muted }}>No inline request, response, or additional evidence stored. Linked references below are separate; they do not by themselves establish direct proof.</p>}
         {hasInline && <>
           <HttpMessage theme={theme} label="Inline request" value={finding.request} requestURLs={finding.url ? [finding.url] : undefined} />

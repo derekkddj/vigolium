@@ -25,6 +25,64 @@ for (const theme of ['dark', 'light'] as const) describe(`${theme} selected evid
     await waitFor(() => expect(state.fetchEvidence).toHaveBeenCalledWith(7, 'baseline-id', 'project-a', expect.any(AbortSignal)));
     expect(screen.getAllByText(/role: baseline/).length).toBeGreaterThan(0);
   });
+  it('groups each scan occurrence and auto-selects the newest unambiguous primary', async () => {
+    const occurrences = [
+      {
+        occurrence_id: 'occurrence-old', scan_uuid: 'scan-a', evidence_status: 'selected', entries: [
+          { exchange_id: 'old-primary', role: 'attack', primary: true, occurrence_id: 'occurrence-old', scan_uuid: 'scan-a' },
+          { exchange_id: 'old-control', role: 'control', occurrence_id: 'occurrence-old', scan_uuid: 'scan-a' },
+          { exchange_id: 'old-baseline', role: 'baseline', occurrence_id: 'occurrence-old', scan_uuid: 'scan-a' },
+        ],
+      },
+      {
+        occurrence_id: 'occurrence-new', scan_uuid: 'scan-b', evidence_status: 'selected', entries: [
+          { exchange_id: 'new-primary', role: 'attack', primary: true, occurrence_id: 'occurrence-new', scan_uuid: 'scan-b' },
+          { exchange_id: 'new-confirmation', role: 'confirmation', occurrence_id: 'occurrence-new', scan_uuid: 'scan-b' },
+          { exchange_id: 'new-control', role: 'control', occurrence_id: 'occurrence-new', scan_uuid: 'scan-b' },
+          { exchange_id: 'new-baseline', role: 'baseline', occurrence_id: 'occurrence-new', scan_uuid: 'scan-b' },
+        ],
+      },
+    ] as NonNullable<Finding['occurrences']>;
+    render(view({ ...finding, evidence: occurrences.flatMap((occurrence) => occurrence.entries), occurrences }));
+
+    const groups = screen.getAllByRole('group', { name: /Finding occurrence/ });
+    expect(groups).toHaveLength(2);
+    expect(groups[0]).toHaveAccessibleName(/scan-b.*occurrence-new/);
+    expect(groups[1]).toHaveAccessibleName(/scan-a.*occurrence-old/);
+    expect(await screen.findByText(/proof bytes/)).toBeInTheDocument();
+    expect(state.fetchEvidence).toHaveBeenCalledTimes(1);
+    expect(state.fetchEvidence).toHaveBeenCalledWith(7, 'new-primary', 'project-a', expect.any(AbortSignal));
+    expect(within(groups[0]).getByRole('button', { name: /new-primary/ })).toHaveAttribute('aria-pressed', 'true');
+    expect(within(groups[1]).getByRole('button', { name: /old-primary/ })).toHaveAttribute('aria-pressed', 'false');
+
+    const headings = within(groups[0]).getAllByRole('heading').map((heading) => heading.textContent);
+    expect(headings.indexOf('Explicit primary selections')).toBeLessThan(headings.indexOf('Confirmations'));
+    expect(headings.indexOf('Confirmations')).toBeLessThan(headings.indexOf('Controls'));
+    expect(headings.indexOf('Controls')).toBeLessThan(headings.indexOf('Baseline context (not proof)'));
+  });
+  it('labels inline request/response bytes with their first-observation scan', () => {
+    render(view({ ...finding, scan_uuid: 'scan-b', inline_evidence_scan_uuid: 'scan-a', request: 'first request', response: 'first response' }));
+    expect(screen.getByText('Inline request/response source: first observed scan scan-a (latest finding scan: scan-b).')).toBeInTheDocument();
+  });
+  it('does not auto-select an older primary when the newest occurrence is ambiguous', () => {
+    const occurrences = [
+      { occurrence_id: 'occurrence-old', scan_uuid: 'scan-a', evidence_status: 'selected', entries: [
+        { exchange_id: 'old-primary', role: 'attack', primary: true, occurrence_id: 'occurrence-old', scan_uuid: 'scan-a' },
+      ] },
+      { occurrence_id: 'occurrence-new', scan_uuid: 'scan-b', evidence_status: 'missing', entries: [
+        { exchange_id: 'new-primary-a', role: 'attack', primary: true, occurrence_id: 'occurrence-new', scan_uuid: 'scan-b' },
+        { exchange_id: 'new-primary-b', role: 'confirmation', primary: true, occurrence_id: 'occurrence-new', scan_uuid: 'scan-b' },
+      ] },
+    ] as NonNullable<Finding['occurrences']>;
+    render(view({ ...finding, evidence: occurrences.flatMap((occurrence) => occurrence.entries), occurrences }));
+
+    expect(screen.getByRole('group', { name: /scan-b.*occurrence-new/ })).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent(/Ambiguous primary declarations.*occurrence-new/);
+    expect(screen.getByRole('button', { name: /old-primary/ })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByRole('button', { name: /new-primary-a/ })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByRole('button', { name: /new-primary-b/ })).toHaveAttribute('aria-pressed', 'false');
+    expect(state.fetchEvidence).not.toHaveBeenCalled();
+  });
   it('keeps an explicit primary cached observation distinct from sent capture and legacy fidelity', async () => {
     state.fetchEvidence.mockResolvedValue({ ...exchange, provenance: 'cached_observation', request_state: 'unknown', response_state: 'unknown' });
     render(view({ ...finding, evidence: [entries[2]], evidence_status: 'selected' }));
@@ -51,16 +109,21 @@ for (const theme of ['dark', 'light'] as const) describe(`${theme} selected evid
     expect(screen.queryByText(/proof bytes/)).not.toBeInTheDocument();
     expect(screen.queryByText('Linked inspector')).not.toBeInTheDocument();
   });
-  it.each(['same', 'later'])('does not auto-select past a malformed competing declaration in occurrence %s', async (occurrence_id) => {
+  it.each(['same', 'later'])('blocks fallback within an ambiguous occurrence and selects a distinct newer one (%s)', async (occurrence_id) => {
     const malformed: EvidenceEntry = { exchange_id: '', role: 'attack', primary: true, occurrence_id: 'same' };
     const valid = { ...entries[2], occurrence_id };
     render(view({ ...finding, evidence: [malformed, valid], evidence_status: 'missing' }));
     expect(screen.getByRole('heading', { name: 'Invalid / unavailable primary declarations' })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Explicit primary selections' })).toBeInTheDocument();
-    expect(state.fetchEvidence).not.toHaveBeenCalled();
-    if (occurrence_id === 'same') expect(screen.getByRole('alert')).toHaveTextContent(/Ambiguous primary declarations/);
-    else expect(screen.queryByText(/Ambiguous primary declarations/)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'role: observation · primary declaration: yes — exchange: proof-id' }));
+    if (occurrence_id === 'same') {
+      expect(screen.getByRole('alert')).toHaveTextContent(/Ambiguous primary declarations/);
+      expect(state.fetchEvidence).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole('button', { name: 'role: observation · primary declaration: yes — exchange: proof-id' }));
+    } else {
+      expect(screen.queryByText(/Ambiguous primary declarations/)).not.toBeInTheDocument();
+      expect(await screen.findByText(/proof bytes/)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'role: observation · primary declaration: yes — exchange: proof-id' })).toHaveAttribute('aria-pressed', 'true');
+    }
     expect(await screen.findByText(/proof bytes/)).toBeInTheDocument();
     expect(state.fetchEvidence).toHaveBeenCalledTimes(1);
     expect(state.fetchEvidence).toHaveBeenCalledWith(7, 'proof-id', 'project-a', expect.any(AbortSignal));
@@ -97,13 +160,17 @@ for (const theme of ['dark', 'light'] as const) describe(`${theme} selected evid
     expect(state.fetchEvidence).toHaveBeenCalledWith(7, 'proof-id', 'project-a', expect.any(AbortSignal));
   });
   it.each(['unclassified', 'missing'])('retains historical %s status while inspecting the later classified occurrence', async (status) => {
-    const historical = { ...entries[1], occurrence_id: 'historic-occurrence', label: 'Historical unknown' };
-    const later = { ...entries[2], occurrence_id: 'later-occurrence' };
-    const value = { ...finding, evidence_status: status, evidence: [historical, later], request: 'legacy historical bytes' };
+    const historical = { ...entries[1], primary: status === 'unclassified', occurrence_id: 'historic-occurrence', label: 'Historical unknown', scan_uuid: 'scan-a' };
+    const later = { ...entries[2], occurrence_id: 'later-occurrence', scan_uuid: 'scan-b' };
+    const occurrences = [
+      { occurrence_id: 'historic-occurrence', scan_uuid: 'scan-a', evidence_status: status, entries: [historical] },
+      { occurrence_id: 'later-occurrence', scan_uuid: 'scan-b', evidence_status: 'selected', entries: [later] },
+    ] as NonNullable<Finding['occurrences']>;
+    const value = { ...finding, evidence_status: status, evidence: [historical, later], occurrences, request: 'legacy historical bytes' };
     const { rerender } = render(view(value));
     expect(await screen.findByText(/proof bytes/)).toBeInTheDocument();
     expect(screen.getByText(`Stored finding evidence status: ${status}`)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'role: unknown · primary declaration: yes — exchange: unknown-id' })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByRole('button', { name: `role: unknown · primary declaration: ${status === 'unclassified' ? 'yes' : 'no'} — exchange: unknown-id` })).toHaveAttribute('aria-pressed', 'false');
     expect(screen.getByRole('button', { name: 'role: observation · primary declaration: yes — exchange: proof-id' })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByText(/later selected evidence does not reclassify historical/)).toBeInTheDocument();
     expect(screen.getByText('legacy historical bytes')).toBeInTheDocument();
@@ -111,8 +178,8 @@ for (const theme of ['dark', 'light'] as const) describe(`${theme} selected evid
     expect(screen.getByRole('button', { name: 'role: observation · primary declaration: yes — exchange: proof-id' })).toHaveAttribute('aria-pressed', 'true');
     expect(state.fetchEvidence).toHaveBeenCalledTimes(1);
     rerender(view({ ...value, evidence: [later, historical] }));
-    await waitFor(() => expect(state.fetchEvidence).toHaveBeenCalledTimes(2));
-    expect(state.fetchEvidence).toHaveBeenLastCalledWith(7, 'proof-id', 'project-a', expect.any(AbortSignal));
+    expect(screen.getByRole('button', { name: 'role: observation · primary declaration: yes — exchange: proof-id' })).toHaveAttribute('aria-pressed', 'true');
+    expect(state.fetchEvidence).toHaveBeenCalledTimes(1);
     expect(screen.getByText(`Stored finding evidence status: ${status}`)).toBeInTheDocument();
   });
   it('never infers proof from inline legacy bytes or first link, and does not pick among multiple primary occurrences', () => {
@@ -121,14 +188,18 @@ for (const theme of ['dark', 'light'] as const) describe(`${theme} selected evid
     expect(state.fetchEvidence).not.toHaveBeenCalled();
     rerender(view({ ...finding, evidence: [entries[2], { exchange_id: 'other-proof', role: 'confirmation', primary: true }] }));
     expect(screen.getByText(/Multiple primary declarations/)).toBeInTheDocument();
-    expect(screen.getByRole('alert')).toHaveTextContent(/Ambiguous primary declarations within one occurrence/);
+    expect(screen.getByRole('alert')).toHaveTextContent(/Ambiguous primary declarations within occurrence/);
     expect(state.fetchEvidence).not.toHaveBeenCalled();
   });
-  it('keeps independent historical primaries selectable without calling them same-occurrence ambiguity', () => {
+  it('keeps independent historical primaries distinct and preselects the newest occurrence', async () => {
     render(view({ ...finding, evidence_status: 'unclassified', evidence: [{ ...entries[2], occurrence_id: 'first' }, { exchange_id: 'other', role: 'confirmation', primary: true, occurrence_id: 'later' }] }));
     expect(screen.getByText(/Multiple primary declarations/)).toBeInTheDocument();
     expect(screen.queryByText(/Ambiguous primary declarations/)).not.toBeInTheDocument();
-    expect(state.fetchEvidence).not.toHaveBeenCalled();
+    expect(await screen.findByText(/proof bytes/)).toBeInTheDocument();
+    expect(state.fetchEvidence).toHaveBeenCalledTimes(1);
+    expect(state.fetchEvidence).toHaveBeenCalledWith(7, 'other', 'project-a', expect.any(AbortSignal));
+    expect(screen.getByRole('button', { name: /exchange: other/ })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: /exchange: proof-id/ })).toHaveAttribute('aria-pressed', 'false');
     expect(screen.getByText('Stored finding evidence status: unclassified')).toBeInTheDocument();
   });
   it('shows missing receipt/state without substituting legacy evidence or recovering scope', async () => {
