@@ -16,12 +16,18 @@ import (
 // projects that received traffic and have no receiver yet.
 const projectReceiverInterval = 30 * time.Second
 
+// newServerReceiveScanUUID returns a canonical UUID for a receive-scan receipt.
+func newServerReceiveScanUUID() string {
+	return uuid.NewString()
+}
+
+
 // newScanOnReceiveRow builds the persistent scan row one scan-on-receive
 // receiver tracks its cursor on, in projectUUID.
 func newScanOnReceiveRow(projectUUID, target, modules string, threads int) *database.Scan {
-	id := uuid.New().String()
+	id := newServerReceiveScanUUID()
 	return &database.Scan{
-		UUID:        fmt.Sprintf("scan-%s", id),
+		UUID:        id,
 		ProjectUUID: projectUUID,
 		Name:        fmt.Sprintf("server-scan-on-receive-%s", id[:8]),
 		Status:      "running",

@@ -67,7 +67,7 @@ func TestCreateServerReceiveScanResumesLegacyReceipts(t *testing.T) {
 			const project = "receive-project"
 			at := serverReceiveTestTime()
 			before := insertServerReceiveTestScan(t, repo, &Scan{
-				UUID: "legacy-receipt", ProjectUUID: project, Status: status,
+				UUID: "scan-11111111-1111-4111-8111-111111111111", ProjectUUID: project, Status: status,
 				ScanSource: "scan-on-receive", ScanMode: "incremental", Modules: "passive-headers,passive-cookies",
 				CursorAt: at, CursorUUID: "record-444", ProcessedCount: 444, ErrorMessage: "service stopped",
 			})
