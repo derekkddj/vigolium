@@ -7,6 +7,7 @@ import {
   requiresStreamingDownload, type ArtifactPage, type RunArtifact, type RunArtifactScope,
 } from '@/lib/runArtifacts';
 import { evidencePalette, type EvidenceTheme } from './HttpMessage';
+import { filterArtifacts } from '@/lib/artifactFilter';
 
 interface AgentArtifactWorkspaceProps {
   scope: RunArtifactScope; theme: EvidenceTheme; artifacts: RunArtifact[]; truncated: boolean;
@@ -21,6 +22,7 @@ export default function AgentArtifactWorkspace({ scope, theme, artifacts, trunca
   const closeButton = useRef<HTMLButtonElement>(null);
   const [filter, setFilter] = useState('');
   const artifact = artifacts.find(item => item.name === selected);
+  const filtered = filterArtifacts(artifacts, filter);
 
   useEffect(() => {
     const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -53,7 +55,8 @@ export default function AgentArtifactWorkspace({ scope, theme, artifacts, trunca
       <nav aria-label="Workspace artifact files" className="min-h-0 overflow-y-auto border-r p-3 space-y-2" style={{ borderColor: colors.border }}>
         <label className="block">Filter workspace artifact files<input type="search" className="block border p-2 w-full" style={{ borderColor: colors.border, background: colors.background }} value={filter} onChange={event => setFilter(event.target.value)} /></label>
         {truncated && <p role="status" style={{ color: colors.warning }}>Artifact listing truncated at 500 files; this is not a complete inventory. Listing pagination is not available on this endpoint.</p>}
-        <ul className="space-y-1">{artifacts.filter(item => item.name.toLowerCase().includes(filter.toLowerCase())).map(item => <li key={item.name}>
+        {!filtered.length && <p role="status">No artifact files match this filter.</p>}
+        <ul className="space-y-1">{filtered.map(item => <li key={item.name}>
           <button className="w-full text-left break-all border p-2" style={{ borderColor: colors.border, color: colors.accent, fontWeight: item.name === selected ? 'bold' : 'normal' }} aria-pressed={item.name === selected} onClick={() => onSelect(item.name)}>{item.name}</button>
         </li>)}</ul>
       </nav>
