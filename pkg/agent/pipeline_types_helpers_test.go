@@ -1,11 +1,28 @@
 package agent
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
 	"testing"
 )
+
+func TestCreateExclusiveSessionDirRejectsCollision(t *testing.T) {
+	base := t.TempDir()
+	const runID = "api-1234abcd"
+
+	first, err := CreateExclusiveSessionDir(base, runID)
+	if err != nil {
+		t.Fatalf("CreateExclusiveSessionDir first call: %v", err)
+	}
+	if want := filepath.Join(base, runID); first != want {
+		t.Fatalf("first dir = %q, want %q", first, want)
+	}
+	if _, err := CreateExclusiveSessionDir(base, runID); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("second CreateExclusiveSessionDir error = %v, want os.ErrExist", err)
+	}
+}
 
 func TestEnsureSessionDir(t *testing.T) {
 	t.Run("creates dir under explicit base", func(t *testing.T) {
