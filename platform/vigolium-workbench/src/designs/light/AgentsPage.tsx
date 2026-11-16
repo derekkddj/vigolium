@@ -1,10 +1,10 @@
 'use client';
 
-import { useState } from 'react';
+import { Fragment, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { Square, Send, Bot, Terminal, Clock, CheckCircle, XCircle, Loader2, Zap, Layers, Bug, ScrollText, Copy, Check, Upload, ChevronDown, Play, Settings2, Crosshair, Scale, ShieldCheck } from 'lucide-react';
 import type { AgentSession, AgentSessionDetail } from '@/api/types';
-import { agentStatusTone, type AgentStatusTone } from '@/api/types';
+import { agentStatusTone, isTerminalAgentStatus, type AgentStatusTone } from '@/api/types';
 import { formatDate, formatDuration, truncate } from '@/lib/formatters';
 import PageShell from './PageShell';
 import Dropdown from './Dropdown';
@@ -684,27 +684,57 @@ export default function AgentsPage() {
                       <th className="text-right px-2 py-1 font-bold">FINDINGS</th>
                       <th className="text-right px-2 py-1 font-bold">SAVED</th>
                       <th className="text-right px-2 py-1 font-bold">DURATION</th>
+                      <th className="text-right px-2 py-1 font-bold">ACTIONS</th>
                     </tr>
                   </thead>
                   <tbody>
                     {h.sessionsData?.data && h.sessionsData.data.length > 0 ? (
-                      h.sessionsData.data.map((s: AgentSession) => (
-                        <tr
-                          key={s.uuid}
-                          onClick={() => h.setExpandedSessionUuid(prev => prev === s.uuid ? null : s.uuid)}
-                          className={`border-b border-[#bbc3c4]/50 hover:bg-[#ede4d1]/50 cursor-pointer ${h.expandedSessionUuid === s.uuid ? 'bg-[#ede4d1]' : ''}`}
-                        >
-                          <td className="px-2 py-1"><StatusBadge status={s.status} /></td>
-                          <td className="px-2 py-1 text-[#0078c8] font-mono">{s.uuid.slice(0, 8)}</td>
-                          <td className="px-2 py-1 text-[#708e8e]">{s.mode}</td>
-                          <td className="px-2 py-1 text-[#005661]">{s.target_url ? truncate(s.target_url, 30) : '\u2014'}</td>
-                          <td className="px-2 py-1 text-right text-[#005661]">{formatAgentRunCount(s.finding_count)}</td>
-                          <td className="px-2 py-1 text-right text-[#00b368]">{formatAgentRunCount(s.saved_count)}</td>
-                          <td className="px-2 py-1 text-right text-[#005661]">{formatDuration(s.duration_ms)}</td>
-                        </tr>
-                      ))
+                      h.sessionsData.data.map((s: AgentSession) => {
+                        const canceling = h.cancelingUuids.has(s.uuid);
+                        const cancelError = h.cancelErrorForUuid(s.uuid);
+                        return (
+                          <Fragment key={s.uuid}>
+                            <tr
+                              onClick={() => h.setExpandedSessionUuid(prev => prev === s.uuid ? null : s.uuid)}
+                              className={`border-b border-[#bbc3c4]/50 hover:bg-[#ede4d1]/50 cursor-pointer ${h.expandedSessionUuid === s.uuid ? 'bg-[#ede4d1]' : ''}`}
+                            >
+                              <td className="px-2 py-1"><StatusBadge status={s.status} /></td>
+                              <td className="px-2 py-1 text-[#0078c8] font-mono">{s.uuid.slice(0, 8)}</td>
+                              <td className="px-2 py-1 text-[#708e8e]">{s.mode}</td>
+                              <td className="px-2 py-1 text-[#005661]">{s.target_url ? truncate(s.target_url, 30) : '\u2014'}</td>
+                              <td className="px-2 py-1 text-right text-[#005661]">{formatAgentRunCount(s.finding_count)}</td>
+                              <td className="px-2 py-1 text-right text-[#00b368]">{formatAgentRunCount(s.saved_count)}</td>
+                              <td className="px-2 py-1 text-right text-[#005661]">{formatDuration(s.duration_ms)}</td>
+                              <td className="px-2 py-1 text-right">
+                                {!isTerminalAgentStatus(s.status) ? (
+                                  <button
+                                    type="button"
+                                    aria-label={`Stop run ${s.uuid}`}
+                                    disabled={canceling}
+                                    onClick={(e) => { e.stopPropagation(); h.cancelRunByUuid(s.uuid); }}
+                                    className="ml-auto px-4 py-1 text-xs font-bold bg-[#e34e1c]/10 text-[#e34e1c] border border-[#e34e1c]/30 hover:bg-[#e34e1c]/20 transition-colors flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:cursor-wait"
+                                  >
+                                    {canceling ? <Loader2 className="w-3 h-3 animate-spin" /> : <Square className="w-3 h-3" />}
+                                    {canceling ? 'STOPPING…' : 'STOP'}
+                                  </button>
+                                ) : <span className="text-[#708e8e]">—</span>}
+                              </td>
+                            </tr>
+                            {cancelError && (
+                              <tr>
+                                <td colSpan={8} className="px-3 py-2 text-[#b42318] border-b border-[#bbc3c4]">
+                                  <div role="alert" className="break-words">
+                                    Could not stop run <span className="font-mono break-all">{s.uuid}</span>: {cancelError}
+                                    {cancelError.includes('run not found or already finished') && ' — The server may no longer track this run (for example, after a restart), or it may already have finished. It cannot be stopped here if it is no longer tracked.'}
+                                  </div>
+                                </td>
+                              </tr>
+                            )}
+                          </Fragment>
+                        );
+                      })
                     ) : (
-                      <tr><td colSpan={7} className="px-3 py-3 text-center text-[#708e8e]">{h.sessionsLoading ? 'Loading session history…' : h.sessionsError ? 'Could not load session history' : h.sessionsOffset ? 'No sessions on this page' : 'No session history in the active project'}</td></tr>
+                      <tr><td colSpan={8} className="px-3 py-3 text-center text-[#708e8e]">{h.sessionsLoading ? 'Loading session history…' : h.sessionsError ? 'Could not load session history' : h.sessionsOffset ? 'No sessions on this page' : 'No session history in the active project'}</td></tr>
                     )}
                   </tbody>
                 </table>
