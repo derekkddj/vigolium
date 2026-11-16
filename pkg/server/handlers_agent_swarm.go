@@ -507,6 +507,7 @@ func (h *Handlers) buildServerAgentSwarmFunc(targetURL, projectUUID, scanUUID, o
 
 		scanRunner.SetSettings(&settingsCopy)
 		scanRunner.SetRepository(h.repo)
+		attachSwarmNativeRuntimeOutput(ctx, scanRunner)
 		return scanRunner.RunNativeScan()
 	}
 }
@@ -554,6 +555,7 @@ func (h *Handlers) buildServerSwarmDiscoverFunc(targetURL, projectUUID, scanUUID
 
 		scanRunner.SetSettings(settings)
 		scanRunner.SetRepository(h.repo)
+		attachSwarmNativeRuntimeOutput(ctx, scanRunner)
 		return scanRunner.RunNativeScan()
 	}
 }
@@ -691,10 +693,11 @@ func (h *Handlers) handleSwarmSSE(c fiber.Ctx, agenticScanUUID string, req Agent
 		pr, pw := io.Pipe()
 		var streamWriter io.Writer = pw
 		if logFile := h.openSessionRuntimeLog(sessionDir, agenticScanUUID); logFile != nil {
-			streamWriter = io.MultiWriter(logFile, pw)
+			streamWriter = &swarmRuntimeTee{log: logFile, stream: pw}
 			defer func() { _ = logFile.Close() }()
 		}
-		cfg.StreamWriter = streamWriter
+		cfg.StreamWriter = agent.NewSynchronizedWriter(streamWriter)
+		ctx = withSwarmRuntimeOutput(ctx, cfg.StreamWriter)
 
 		type swarmRunResult struct {
 			result *agent.SwarmResult
@@ -823,6 +826,8 @@ func (h *Handlers) runBackgroundAgentSwarm(agenticScanUUID string, req AgentSwar
 	if streamCloser != nil {
 		defer func() { _ = streamCloser.Close() }()
 	}
+	cfg.StreamWriter = agent.NewSynchronizedWriter(cfg.StreamWriter)
+	ctx = withSwarmRuntimeOutput(ctx, cfg.StreamWriter)
 
 	// Populate the row with request-time + session-dir info before kicking
 	// off the run, so the session detail endpoint shows useful state during

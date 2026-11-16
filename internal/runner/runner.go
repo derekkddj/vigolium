@@ -24,6 +24,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/notify"
 	"github.com/vigolium/vigolium/pkg/oast"
 	"github.com/vigolium/vigolium/pkg/output"
+	"github.com/vigolium/vigolium/pkg/scanevents"
 	"github.com/vigolium/vigolium/pkg/terminal"
 
 	"github.com/pkg/errors"
@@ -138,6 +139,16 @@ type Runner struct {
 	// eventObserverAttached guards attachEventObserver against wrapping the
 	// writer's OnEvent again on a reused Runner.
 	eventObserverAttached atomic.Bool
+
+	// eventCallback is configured before RunNativeScan, then immutable. The
+	// separate emit lock serializes callbacks, their runner-local sequence and
+	// the permanent terminal delivery barrier (eventCallbackClosed).
+	eventCallbackMu     sync.Mutex
+	eventCallback       func(scanevents.Event)
+	eventCallbackFrozen bool
+	eventEmitMu         sync.Mutex
+	eventSeq            uint64
+	eventCallbackClosed bool // guarded by eventEmitMu; callback remains retained
 
 	// phaseRunners replaces defaultPhaseRunners when non-nil (tests stub
 	// phases through it); see phaseRunnerFor.
