@@ -6,6 +6,8 @@ import { ambiguousPrimaryOccurrences, evidenceLoadMessage, hasExchangeIdentity, 
 import { fetchSelectedEvidence } from '@/lib/selectedEvidenceApi';
 import HttpMessage, { evidencePalette, type EvidenceTheme } from './HttpMessage';
 
+const SCAN_INPUT_CONTEXT_LABEL = 'Scan input / context';
+
 type EvidenceOccurrenceGroup = Pick<FindingOccurrence, 'occurrence_id' | 'scan_uuid' | 'evidence_status'> & { entries: EvidenceEntry[] };
 
 /** Roles and primary flags describe declarations, not confirmation; hydrate one exact selection. */
@@ -28,15 +30,26 @@ export default function SelectedEvidence({ finding, theme }: { finding: Finding;
       const occurrenceDeclarations = primaryEvidenceDeclarations(occurrence.entries);
       const occurrencePrimaries = primaryEvidence(occurrence.entries);
       const invalidPrimaries = occurrence.entries.filter((entry) => entry.primary && !hasExchangeIdentity(entry));
+      const scanInputContexts = occurrence.entries.filter((entry) => entry.role === 'baseline' && entry.label === SCAN_INPUT_CONTEXT_LABEL && !invalidPrimaries.includes(entry));
       const ambiguous = ambiguousPrimaryOccurrences(occurrence.entries);
       const roleGroups = [
         { title: 'Explicit primary selections', entries: occurrencePrimaries },
         { title: 'Invalid / unavailable primary declarations', entries: invalidPrimaries },
         { title: 'Confirmations', entries: occurrence.entries.filter((entry) => entry.role === 'confirmation' && !occurrencePrimaries.includes(entry) && !invalidPrimaries.includes(entry)) },
         { title: 'Controls', entries: occurrence.entries.filter((entry) => entry.role === 'control' && !invalidPrimaries.includes(entry)) },
-        { title: 'Baseline context (not proof)', entries: occurrence.entries.filter((entry) => entry.role === 'baseline' && !invalidPrimaries.includes(entry)) },
+        { title: 'Baseline context (not proof)', entries: occurrence.entries.filter((entry) => entry.role === 'baseline' && entry.label !== SCAN_INPUT_CONTEXT_LABEL && !invalidPrimaries.includes(entry)) },
         { title: 'Supporting / unclassified exchanges', entries: occurrence.entries.filter((entry) => !occurrencePrimaries.includes(entry) && !invalidPrimaries.includes(entry) && entry.role !== 'confirmation' && entry.role !== 'control' && entry.role !== 'baseline') },
       ];
+      const renderEntry = (entry: EvidenceEntry, index: number) => <div key={`${entry.exchange_id}:${entry.occurrence_id}:${index}`}>
+        <button className="underline break-all text-left" style={{ color: colors.accent }} disabled={!hasExchangeIdentity(entry)} aria-pressed={selectedKey === associationKey(entry)} onClick={() => setSelectedKey(associationKey(entry))}>
+          role: {entry.role || 'unknown'} · primary declaration: {entry.primary ? 'yes' : 'no'} — exchange: {hasExchangeIdentity(entry) ? entry.exchange_id : 'Missing exchange identity'}
+        </button>
+        {entry.label && <div className="break-all">Producer label: {entry.label}</div>}
+        {!hasExchangeIdentity(entry) && <p style={{ color: colors.warning }}>Exchange identity missing or empty; unavailable for inspection. No URL or linked-record fallback is attempted.</p>}
+        {entry.occurrence_id && <div className="break-all">occurrence: {entry.occurrence_id}</div>}
+        {entry.finding_url && <div className="break-all">occurrence finding URL: {entry.finding_url}</div>}
+        {entry.scan_uuid && <div className="break-all">scan: {entry.scan_uuid}</div>}
+      </div>;
       const label = `Finding occurrence ${occurrence.scan_uuid || 'scan unavailable'} ${occurrence.occurrence_id}`;
       return <div key={occurrence.occurrence_id} role="group" aria-label={label} className="space-y-1 border p-2">
         <h4 className="font-semibold">Occurrence · scan: {occurrence.scan_uuid || 'not stored'} · id: {occurrence.occurrence_id}</h4>
@@ -44,18 +57,14 @@ export default function SelectedEvidence({ finding, theme }: { finding: Finding;
         {occurrence.entries.length === 0 && <p style={{ color: colors.warning }}>No typed evidence associations are available for this occurrence.</p>}
         {occurrenceDeclarations.length === 0 && occurrence.entries.length > 0 && <p style={{ color: colors.warning }}>No inspectable explicit primary selection in this occurrence.</p>}
         {ambiguous.length > 0 && <p role="alert" style={{ color: colors.warning }}>Ambiguous primary declarations within occurrence {occurrence.occurrence_id}: {ambiguous.join(', ')}. Inspecting bytes does not resolve the ambiguity or select a proof.</p>}
-        {roleGroups.map((group) => group.entries.length > 0 && <div key={group.title} className="space-y-1">
+        {roleGroups.map((group) => (group.entries.length > 0 || group.title === 'Baseline context (not proof)' && scanInputContexts.length > 0) && <div key={group.title} className="space-y-1">
           <h5 style={{ color: colors.muted }}>{group.title}</h5>
-          {group.entries.map((entry, index) => <div key={`${entry.exchange_id}:${entry.occurrence_id}:${index}`}>
-            <button className="underline break-all text-left" style={{ color: colors.accent }} disabled={!hasExchangeIdentity(entry)} aria-pressed={selectedKey === associationKey(entry)} onClick={() => setSelectedKey(associationKey(entry))}>
-              role: {entry.role || 'unknown'} · primary declaration: {entry.primary ? 'yes' : 'no'} — exchange: {hasExchangeIdentity(entry) ? entry.exchange_id : 'Missing exchange identity'}
-            </button>
-            {entry.label && <div className="break-all">Producer label: {entry.label}</div>}
-            {!hasExchangeIdentity(entry) && <p style={{ color: colors.warning }}>Exchange identity missing or empty; unavailable for inspection. No URL or linked-record fallback is attempted.</p>}
-            {entry.occurrence_id && <div className="break-all">occurrence: {entry.occurrence_id}</div>}
-            {entry.finding_url && <div className="break-all">occurrence finding URL: {entry.finding_url}</div>}
-            {entry.scan_uuid && <div className="break-all">scan: {entry.scan_uuid}</div>}
-          </div>)}
+          {group.entries.map(renderEntry)}
+          {group.title === 'Baseline context (not proof)' && scanInputContexts.length > 0 && <details className="ml-3 border-l pl-2">
+            <summary className="cursor-pointer">{SCAN_INPUT_CONTEXT_LABEL} (context only)</summary>
+            <p style={{ color: colors.muted }}>Retained scan input is folded separately from the module baseline; it is context, not vulnerability proof.</p>
+            {scanInputContexts.map(renderEntry)}
+          </details>}
         </div>)}
       </div>;
     })}

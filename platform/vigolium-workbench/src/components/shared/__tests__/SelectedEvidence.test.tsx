@@ -25,6 +25,25 @@ for (const theme of ['dark', 'light'] as const) describe(`${theme} selected evid
     await waitFor(() => expect(state.fetchEvidence).toHaveBeenCalledWith(7, 'baseline-id', 'project-a', expect.any(AbortSignal)));
     expect(screen.getAllByText(/role: baseline/).length).toBeGreaterThan(0);
   });
+  it('keeps the module baseline visible and folds the duplicate scan input into context', async () => {
+    const entries: EvidenceEntry[] = [
+      { exchange_id: 'module-baseline', role: 'baseline', label: 'Module baseline', occurrence_id: 'scan-occurrence', scan_uuid: 'scan-a' },
+      { exchange_id: 'scan-input', role: 'baseline', label: 'Scan input / context', occurrence_id: 'scan-occurrence', scan_uuid: 'scan-a' },
+    ];
+    const occurrences = [{ occurrence_id: 'scan-occurrence', scan_uuid: 'scan-a', evidence_status: 'unclassified', entries }];
+    render(view({ ...finding, evidence: entries, occurrences }));
+
+    const occurrence = screen.getByRole('group', { name: /scan-a.*scan-occurrence/ });
+    expect(within(occurrence).getByRole('button', { name: /exchange: module-baseline/ })).toBeVisible();
+    const details = within(occurrence).getByText('Scan input / context (context only)').closest('details');
+    expect(details).not.toBeNull();
+    expect(details).not.toHaveAttribute('open');
+    expect(within(details!).getByRole('button', { name: /exchange: scan-input/ })).not.toBeVisible();
+
+    fireEvent.click(within(details!).getByText('Scan input / context (context only)'));
+    expect(within(details!).getByRole('button', { name: /exchange: scan-input/ })).toBeVisible();
+    expect(state.fetchEvidence).not.toHaveBeenCalled();
+  });
   it('groups each scan occurrence and auto-selects the newest unambiguous primary', async () => {
     const occurrences = [
       {
