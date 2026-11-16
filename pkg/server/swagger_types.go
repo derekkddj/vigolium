@@ -80,15 +80,16 @@ var SwaggerSchemaTypes = map[string]any{
 	"StatsResponse":        StatsResponse{},
 
 	// Scope / config / projects
-	"ScopeConfig":          config.ScopeConfig{},
-	"ScopeRule":            config.ScopeRule{},
-	"ScopeUpdateResponse":  ScopeUpdateResponse{},
-	"ConfigListResponse":   ConfigListResponse{},
-	"ConfigEntryResponse":  ConfigEntryResponse{},
-	"ConfigUpdateRequest":  ConfigUpdateRequest{},
-	"ConfigUpdateResponse": ConfigUpdateResponse{},
-	"ProjectRequest":       ProjectRequest{},
-	"ProjectStats":         ProjectStats{},
+	"ScopeConfig":           config.ScopeConfig{},
+	"ScopeRule":             config.ScopeRule{},
+	"ScopeUpdateResponse":   ScopeUpdateResponse{},
+	"ConfigListResponse":    ConfigListResponse{},
+	"ConfigEntryResponse":   ConfigEntryResponse{},
+	"ConfigUpdateRequest":   ConfigUpdateRequest{},
+	"ConfigUpdateResponse":  ConfigUpdateResponse{},
+	"ProjectRequest":        ProjectRequest{},
+	"ProjectStats":          ProjectStats{},
+	"DeleteProjectResponse": DeleteProjectResponse{},
 
 	// Extensions
 	"ExtensionInfo":        ExtensionInfo{},

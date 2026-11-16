@@ -1791,6 +1791,39 @@
         },
         "type": "object"
       },
+      "DeleteProjectResponse": {
+        "properties": {
+          "config_dir_deleted": {
+            "type": "boolean"
+          },
+          "disk_deletion_failures": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "rows_deleted": {
+            "additionalProperties": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "type": "object"
+          },
+          "session_dirs_deleted": {
+            "type": "integer"
+          },
+          "uuid": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "EmbeddedParam": {
         "properties": {
           "hidden": {
@@ -7438,7 +7471,7 @@
     },
     "/api/projects/{uuid}": {
       "delete": {
-        "description": "Deletes a non-default project and reassigns its data to the default project. Requires admin role.",
+        "description": "Deletes a non-default project. By default, its data is reassigned to the default project. Set delete_data=true to irreversibly purge project rows and owned config/session directories from disk. Requires admin role.",
         "operationId": "deleteProject",
         "parameters": [
           {
@@ -7450,6 +7483,16 @@
               "format": "uuid",
               "type": "string"
             }
+          },
+          {
+            "description": "When true, irreversibly deletes this project's data from the database and its config/session directories from disk. Omit or set false to reassign data to the default project.",
+            "in": "query",
+            "name": "delete_data",
+            "required": false,
+            "schema": {
+              "default": false,
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -7457,16 +7500,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "properties": {
-                    "message": {
-                      "type": "string"
-                    }
-                  },
-                  "type": "object"
+                  "$ref": "#/components/schemas/DeleteProjectResponse"
                 }
               }
             },
-            "description": "Project deleted"
+            "description": "Project deleted, with the applied mode and deletion summary"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid UUID or delete_data value, or attempt to delete the default project"
           },
           "401": {
             "content": {

@@ -124,6 +124,7 @@ type Handlers struct {
 	recordWriter  *database.RecordWriter
 	config        ServerConfig
 	settings      *config.Settings
+	removeAll     func(string) error // injectable for project-purge filesystem tests
 	httpRequester *http.Requester
 	services      *services.Services // shared with httpRequester; may be nil
 	// mirrorDropped reports the --mirror-fs drop counter for /server-info;
