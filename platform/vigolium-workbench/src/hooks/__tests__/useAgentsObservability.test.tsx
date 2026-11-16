@@ -323,7 +323,7 @@ describe.each([['dark', DarkAgentsPage], ['light', LightAgentsPage]] as const)('
     render(<Page />);
     const stop = screen.getByRole('button', { name: 'Stop run session-0' });
     fireEvent.click(stop); fireEvent.click(stop);
-    expect(mocks.cancel.mutateAsync).toHaveBeenCalledExactlyOnceWith('session-0');
+    expect(mocks.cancel.mutateAsync).toHaveBeenCalledExactlyOnceWith({ runId: 'session-0', projectUUID: 'project-a', isCurrent: expect.any(Function) });
     expect(stop).toBeDisabled(); expect(stop).toHaveTextContent('STOPPING…');
     expect(screen.getByRole('button', { name: 'Stop run session-1' })).toBeEnabled();
     expect(window.location.search).toBe('');

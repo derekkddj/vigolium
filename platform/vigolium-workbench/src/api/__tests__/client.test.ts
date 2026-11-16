@@ -216,6 +216,20 @@ describe('project_not_found recovery', () => {
     expect(seen).toEqual(['aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee']);
   });
 
+  it('pins POST scope and does not retry or clear a different selected project on project_not_found', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      error: 'project not found', code: 404, error_code: 'project_not_found',
+    }), { status: 404 }));
+    const client = await loadClient();
+    client.setProjectUUID('project-b');
+    const notify = vi.fn(); client.onProjectNotFound(notify);
+    await expect(client.apiPost('/api/agent/scans/run/cancel', undefined, { projectUUID: 'project-a' })).rejects.toMatchObject({ code: 'project_not_found' });
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    expect(fetchSpy.mock.calls[0]?.[1]?.headers).toMatchObject({ 'X-Project-UUID': 'project-a' });
+    expect(client.getProjectUUID()).toBe('project-b');
+    expect(notify).not.toHaveBeenCalled();
+  });
+
   it('does not retry other 404s', async () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(JSON.stringify({ error: 'scan not found', code: 404, error_code: 'scan_not_found' }), { status: 404 }),
