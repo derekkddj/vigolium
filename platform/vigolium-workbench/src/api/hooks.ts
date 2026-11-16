@@ -180,11 +180,17 @@ export function useUpdateProject() {
 
 export function useDeleteProject() {
   const qc = useQueryClient();
+  const { setProject } = useProjectContext();
   return useMutation({
-    mutationFn: (uuid: string) =>
-      apiDelete<DeleteProjectResponse>(`/api/projects/${uuid}`),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['projects'] });
+    mutationFn: ({ uuid, deleteData }: { uuid: string; deleteData: boolean }) =>
+      apiDelete<DeleteProjectResponse>(
+        `/api/projects/${encodeURIComponent(uuid)}${deleteData ? '?delete_data=true' : ''}`,
+      ),
+    onSuccess: async (_response, variables) => {
+      await qc.invalidateQueries({ queryKey: ['projects'] });
+      // Read the current selection at completion, not the value captured when the
+      // mutation started; the user may switch projects while the request is in flight.
+      if (getProjectUUID() === variables.uuid) setProject(null);
     },
   });
 }
