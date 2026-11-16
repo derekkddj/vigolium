@@ -280,7 +280,9 @@ export default function FindingsPage({ initialId }: { initialId?: number | null 
       { field: 'severity', headerName: 'SEV', width: 80, cellRenderer: SeverityRenderer },
       { field: 'confidence', headerName: 'CONF', width: 100, cellRenderer: ConfidenceRenderer },
       { field: 'module_name', headerName: 'MODULE', flex: 1, minWidth: 140 },
+      { field: 'url', headerName: 'URL', flex: 1, minWidth: 180 },
       { field: 'module_type', headerName: 'TYPE', width: 80, cellRenderer: ModuleTypeRenderer },
+      { field: 'status', headerName: 'STATUS', width: 110 },
       { field: 'description', headerName: 'DESCRIPTION', flex: 2, minWidth: 200 },
       {
         field: 'matched_at',
