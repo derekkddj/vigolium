@@ -46,7 +46,7 @@ function tryPrettyJson(s: string | undefined): string {
   try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; }
 }
 
-function SessionDetailPanel({ session, onClose }: { session: AgentSessionDetail; onClose: () => void }) {
+function SessionDetailPanel({ session, onClose, selectedArtifact, onSelectArtifact }: { session: AgentSessionDetail; onClose: () => void; selectedArtifact: string | null; onSelectArtifact: (name: string | null) => void }) {
   const [copied, setCopied] = useState<string | null>(null);
   const copyToClipboard = (text: string, key: string) => {
     navigator.clipboard.writeText(text).then(() => {
@@ -96,7 +96,7 @@ function SessionDetailPanel({ session, onClose }: { session: AgentSessionDetail;
       </div>
       <div className="text-xs">
         <AgentRunContext session={session} theme="light" />
-        <AgentArtifactsPanel runUUID={session.uuid} theme="light" />
+        <AgentArtifactsPanel runUUID={session.uuid} theme="light" selectedArtifact={selectedArtifact} onSelectArtifact={onSelectArtifact} />
         {session.prompt_sent && (
           <details className="border-b border-[#bbc3c4]">
             <summary className="px-3 py-1.5 cursor-pointer text-[#0078c8] font-bold hover:bg-[#ede4d1] flex items-center gap-1.5">
@@ -718,7 +718,7 @@ export default function AgentsPage() {
                     </div>
                   )}
                   {h.sessionDetail ? (
-                    <SessionDetailPanel session={h.sessionDetail} onClose={() => h.setExpandedSessionUuid(null)} />
+                    <SessionDetailPanel session={h.sessionDetail} onClose={() => h.setExpandedSessionUuid(null)} selectedArtifact={h.selectedArtifact} onSelectArtifact={h.setSelectedArtifact} />
                   ) : (
                     <div className="px-3 py-2 text-xs text-[#708e8e]">
                       <div className="flex justify-between gap-2">

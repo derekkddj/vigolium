@@ -9,28 +9,36 @@ import { filterArtifacts } from '@/lib/artifactFilter';
 
 const ARTIFACT_INLINE_ROWS = 12;
 
-export interface AgentArtifactsPanelProps { runUUID: string; theme: 'dark' | 'light' }
+export interface AgentArtifactsPanelProps {
+  runUUID: string; theme: EvidenceTheme;
+  selectedArtifact?: string | null; onSelectArtifact?: (name: string | null) => void;
+}
 const errorText = (error: unknown) => error instanceof Error ? error.message : 'Artifact request failed.';
 const formatSize = (size: number | null) => size === null ? 'size unknown' : `${size.toLocaleString()} bytes`;
 
 /** Mountable in either theme; all selections, reads and downloads are scoped to this identity. */
-export default function AgentArtifactsPanel({ runUUID, theme }: AgentArtifactsPanelProps) {
+export default function AgentArtifactsPanel({ runUUID, theme, selectedArtifact, onSelectArtifact }: AgentArtifactsPanelProps) {
   const { projectUUID } = useProjectContext();
   const colors = evidencePalette[theme];
   if (!projectUUID || !runUUID) return <section aria-label="Run artifacts" className="border p-3 text-xs" style={{ borderColor: colors.border, color: colors.muted }}>
     <h3 className="font-semibold">Run artifacts</h3>
     <p>Artifact access disabled: {!projectUUID ? 'select an active project' : 'select a run'}.</p>
   </section>;
-  return <ArtifactsContent key={JSON.stringify([projectUUID, runUUID])} scope={{ projectUUID, runUUID }} theme={theme} />;
+  return <ArtifactsContent key={JSON.stringify([projectUUID, runUUID])} scope={{ projectUUID, runUUID }} theme={theme} selectedArtifact={selectedArtifact} onSelectArtifact={onSelectArtifact} />;
 }
 
-function ArtifactsContent({ scope, theme }: { scope: RunArtifactScope; theme: EvidenceTheme }) {
+function ArtifactsContent({ scope, theme, selectedArtifact, onSelectArtifact }: Omit<AgentArtifactsPanelProps, 'runUUID'> & { scope: RunArtifactScope }) {
   const colors = evidencePalette[theme];
   const [listing, setListing] = useState<RunArtifactList | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
   const [reload, setReload] = useState(0);
-  const [selection, setSelection] = useState<string | null>(null);
+  const [localSelection, setLocalSelection] = useState<string | null>(null);
+  const selection = selectedArtifact === undefined ? localSelection : selectedArtifact;
+  const setSelection = (name: string | null) => {
+    if (selectedArtifact === undefined) setLocalSelection(name);
+    onSelectArtifact?.(name);
+  };
   const [expanded, setExpanded] = useState(false);
   const [filter, setFilter] = useState('');
   const { projectUUID, runUUID } = scope;
@@ -58,6 +66,7 @@ function ArtifactsContent({ scope, theme }: { scope: RunArtifactScope; theme: Ev
     {loading && <p role="status">Loading artifact listing…</p>}
     {error && <p role="alert" style={{ color: colors.warning }}>{error} The active project has not been changed.</p>}
     {listing?.truncated && <p role="status" style={{ color: colors.warning }}>Artifact listing truncated at 500 files; this is not a complete inventory. Listing pagination is not available on this endpoint.</p>}
+    {listing && selection && !selected && <p role="status" style={{ color: colors.warning }}>Artifact not found in this run.</p>}
     {listing && listing.artifacts.length === 0 && <p style={{ color: colors.muted }}>No artifact files stored for this run.</p>}
     {!!listing?.artifacts.length && <>
       {listing.artifacts.length > ARTIFACT_INLINE_ROWS && <label className="block">Filter artifact files<input type="search" className="block border p-2 w-full" style={{ borderColor: colors.border, background: colors.background }} value={filter} onChange={event => setFilter(event.target.value)} /></label>}
