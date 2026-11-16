@@ -145,6 +145,31 @@ func TestHandleListFindings_SuccessAndFilters(t *testing.T) {
 		}
 	})
 
+	t.Run("invalid sort rejected", func(t *testing.T) {
+		status, _ := doGet(t, app, "/api/findings?sort=nope", nil)
+		if status != http.StatusBadRequest {
+			t.Errorf("status = %d, want 400", status)
+		}
+	})
+
+	t.Run("invalid order rejected", func(t *testing.T) {
+		status, _ := doGet(t, app, "/api/findings?order=sideways", nil)
+		if status != http.StatusBadRequest {
+			t.Errorf("status = %d, want 400", status)
+		}
+	})
+
+	t.Run("all documented sort fields accepted", func(t *testing.T) {
+		for _, field := range database.FindingSortFields {
+			t.Run(field, func(t *testing.T) {
+				status, body := doGet(t, app, "/api/findings?sort="+field, nil)
+				if status != http.StatusOK {
+					t.Errorf("sort=%s status = %d, want 200; body %s", field, status, body)
+				}
+			})
+		}
+	})
+
 	t.Run("severity + sort + pagination params accepted", func(t *testing.T) {
 		// Exercise the many filter branches in HandleListFindings.
 		status, _ := doGet(t, app, "/api/findings?severity=high,low&status=draft&sort=severity&order=asc&limit=600&offset=0&search=test&module_name=Test&module_type=active&finding_source=dast&domain=example&scan_uuid=s1&repo_name=r1", nil)

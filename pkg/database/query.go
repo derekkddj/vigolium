@@ -252,6 +252,24 @@ const severitySortRankExpr = "CASE f.severity" +
 const confidenceSortRankExpr = "CASE f.confidence" +
 	" WHEN 'certain' THEN 3 WHEN 'firm' THEN 2 WHEN 'tentative' THEN 1 ELSE 0 END"
 
+// FindingSortFields are the sort values accepted by the findings REST API,
+// including historical aliases also used by the query builder.
+var FindingSortFields = []string{"found_at", "found", "created_at", "created", "severity", "module_name", "module", "module_id", "confidence"}
+
+// ValidateFindingSort reports whether sortBy is an accepted public finding sort.
+// An empty value means the caller did not request an explicit sort.
+func ValidateFindingSort(sortBy string) error {
+	if sortBy == "" {
+		return nil
+	}
+	for _, field := range FindingSortFields {
+		if sortBy == field {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid finding sort %q; supported: %s", sortBy, strings.Join(FindingSortFields, ", "))
+}
+
 var (
 	// recordSearchPredicate scans http_records: URL, path, and the raw
 	// request/response corpus (headers + body). Four ? placeholders.
