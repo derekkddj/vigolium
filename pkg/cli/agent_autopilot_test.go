@@ -69,7 +69,7 @@ func TestBuildPrescanInstruction_Gating(t *testing.T) {
 	// --no-prescan suppresses regardless of other state.
 	autopilotNoPrescan = true
 	autopilotTarget = "https://example.com"
-	assert.Empty(t, buildPrescanInstruction(context.Background(), nil, ""),
+	assert.Empty(t, buildPrescanInstruction(context.Background(), nil, "", ""),
 		"--no-prescan must suppress the pre-scan")
 
 	// Empty target suppresses (source-only autopilot path takes over via
@@ -77,12 +77,12 @@ func TestBuildPrescanInstruction_Gating(t *testing.T) {
 	// in-depth: a stray invocation with empty target stays a no-op).
 	autopilotNoPrescan = false
 	autopilotTarget = "   "
-	assert.Empty(t, buildPrescanInstruction(context.Background(), nil, ""),
+	assert.Empty(t, buildPrescanInstruction(context.Background(), nil, "", ""),
 		"empty/whitespace target must suppress the pre-scan")
 
 	// nil repo suppresses (results would have nowhere to land).
 	autopilotTarget = "https://example.com"
-	assert.Empty(t, buildPrescanInstruction(context.Background(), nil, ""),
+	assert.Empty(t, buildPrescanInstruction(context.Background(), nil, "", ""),
 		"missing repo must suppress the pre-scan")
 }
 

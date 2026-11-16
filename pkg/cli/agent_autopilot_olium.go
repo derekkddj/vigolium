@@ -294,8 +294,7 @@ func runAutopilotOlium(parentCtx context.Context, settings *config.Settings, rep
 	if !autopilotPreflight.skip && !autopilotDryRun {
 		if perr := agent.NewEngine(settings, repo).Preflight(ctx); perr != nil {
 			end := database.AgenticRunEnd{Err: perr}
-			dbStatus, _ := agentRunStatus(end)
-			finishAgenticScanRow(repo, parentAgenticScanUUID, startedAt, agenticScanRowFinish{Status: dbStatus, ErrorMessage: perr.Error()})
+			finalizeOliumAutopilotRun(repo, projectUUID, parentAgenticScanUUID, model, startedAt, nil, perr, end)
 			return perr
 		}
 	}
@@ -306,7 +305,7 @@ func runAutopilotOlium(parentCtx context.Context, settings *config.Settings, rep
 	// the target is empty (source-only run, which auditCfg above already
 	// caught), or when no DB repo is wired (results would have nowhere to
 	// land). Failures here degrade — the agent loop still runs.
-	prescanCtx := buildPrescanInstruction(ctx, repo, projectUUID)
+	prescanCtx := buildPrescanInstruction(ctx, repo, projectUUID, parentAgenticScanUUID)
 	mergedInstruction := instruction
 	if prescanCtx != "" {
 		if mergedInstruction != "" {
@@ -377,7 +376,7 @@ func runAutopilotOlium(parentCtx context.Context, settings *config.Settings, rep
 	}
 
 	end := autopilotRunEnd(ctx, runErr, autopilotBudgetStop(result), result.Diagnosis() != "")
-	finalizeOliumAutopilotRun(repo, parentAgenticScanUUID, model, startedAt, result, runErr, end)
+	finalizeOliumAutopilotRun(repo, projectUUID, parentAgenticScanUUID, model, startedAt, result, runErr, end)
 	walledOut := end.TimedOut
 	if walledOut {
 		_, _ = fmt.Fprintf(streamWriter, "[autopilot] wall reached after %s — finalizing partial results\n", autopilotMaxDuration)
@@ -403,6 +402,9 @@ func runAutopilotOlium(parentCtx context.Context, settings *config.Settings, rep
 	if result != nil {
 		outcome.HaltReason = result.HaltReason
 		outcome.FindingCount = result.FindingCount
+		if result.FindingCountError != "" {
+			outcome.Warnings = append(outcome.Warnings, result.FindingCountError)
+		}
 		outcome.Usage = agentRunUsage{InputTokens: result.InputTokens, OutputTokens: result.OutputTokens, CostUSD: result.CostUSD}
 		outcome.Budget.Stop = result.BudgetStop
 		outcome.Budget.Exhausted = end.BudgetExhausted || end.TimedOut
@@ -421,7 +423,7 @@ func runAutopilotOlium(parentCtx context.Context, settings *config.Settings, rep
 			docErr = err
 		}
 	} else {
-		printOliumAutopilotSummary(result, sessionDir, repo, parentAgenticScanUUID)
+		printOliumAutopilotSummary(result, sessionDir, repo, projectUUID, parentAgenticScanUUID)
 	}
 
 	if autopilotUploadResults && end.Err == nil {
@@ -563,7 +565,11 @@ func isWallTimeout(ctx context.Context, runErr error) bool {
 //   - autopilotTarget empty (source-only run; pipeline path already took it)
 //   - repo nil (no DB → results would have nowhere to land)
 //   - intensity unrecognized (defensive — runAgentAutopilot already validated)
-func buildPrescanInstruction(ctx context.Context, repo *database.Repository, projectUUID string) string {
+func buildPrescanInstruction(ctx context.Context, repo *database.Repository, projectUUID, parentAgenticScanUUID string) string {
+	return buildPrescanInstructionWithLaunch(ctx, repo, projectUUID, parentAgenticScanUUID, runner.LaunchScan)
+}
+
+func buildPrescanInstructionWithLaunch(ctx context.Context, repo *database.Repository, projectUUID, parentAgenticScanUUID string, launch func(context.Context, runner.LaunchParams) (*runner.LaunchResult, error)) string {
 	if autopilotNoPrescan {
 		return ""
 	}
@@ -607,7 +613,10 @@ func buildPrescanInstruction(ctx context.Context, repo *database.Repository, pro
 		ScanMaxDuration:  preScanBudget,
 		AuthFiles:        autopilotAuthFiles,
 	}
-	res, err := runner.LaunchScan(ctx, params)
+	res, err := launch(ctx, params)
+	if attrErr := agent.AttributeAutopilotNativeScan(ctx, repo, projectUUID, parentAgenticScanUUID, res, err); attrErr != nil {
+		fmt.Fprintf(os.Stderr, "%s Pre-scan attribution unavailable: %v\n", terminal.WarningSymbol(), attrErr)
+	}
 	if err != nil {
 		uuid := ""
 		if res != nil {
@@ -822,7 +831,7 @@ func runAutopilotOliumPipeline(
 		degraded = result.Degraded
 	}
 	end := autopilotRunEnd(ctx, runErr, budgetStop, degraded)
-	finalizeOliumAutopilotPipelineRun(repo, parentAgenticScanUUID, startedAt, result, runErr, end)
+	finalizeOliumAutopilotPipelineRun(repo, projectUUID, parentAgenticScanUUID, startedAt, result, runErr, end)
 	if end.TimedOut {
 		_, _ = fmt.Fprintf(streamWriter, "[autopilot] wall reached after %s — finalizing partial results\n", autopilotMaxDuration)
 	}
@@ -831,7 +840,7 @@ func runAutopilotOliumPipeline(
 	outcome.Budget.Stop = budgetStop
 	outcome.Budget.Exhausted = end.BudgetExhausted || end.TimedOut
 	if result != nil {
-		outcome.FindingCount = int64(max(result.FindingsCount, result.OperatorFindingsCount, result.VerifiedFindingCount))
+		outcome.FindingCount = int64(result.TotalFindings)
 		outcome.Usage = agentRunUsage{InputTokens: result.InputTokens, OutputTokens: result.OutputTokens, CostUSD: result.CostUSD}
 		outcome.Warnings = append(outcome.Warnings, result.Warnings...)
 	}
@@ -843,7 +852,7 @@ func runAutopilotOliumPipeline(
 			return docErr
 		}
 	} else {
-		printOliumAutopilotPipelineSummary(result, sessionDir, repo, parentAgenticScanUUID)
+		printOliumAutopilotPipelineSummary(result, sessionDir, repo, projectUUID, parentAgenticScanUUID)
 	}
 
 	if autopilotUploadResults && end.Err == nil {
@@ -860,9 +869,9 @@ func runAutopilotOliumPipeline(
 
 // finalizeOliumAutopilotPipelineRun closes out the parent AgenticScan row when
 // the run went through the pipeline runner. The pipeline result exposes
-// audit/operator/verified finding counts but not per-call token usage, so the
-// finding_count column reflects the highest-fidelity available number.
-func finalizeOliumAutopilotPipelineRun(repo *database.Repository, agenticScanUUID string, startedAt time.Time, result *agent.AutopilotPipelineResult, runErr error, end database.AgenticRunEnd) {
+// phase counters may overlap; the finding_count column uses the persisted
+// run-tree total, including partial results on failure/cancellation.
+func finalizeOliumAutopilotPipelineRun(repo *database.Repository, projectUUID, agenticScanUUID string, startedAt time.Time, result *agent.AutopilotPipelineResult, runErr error, end database.AgenticRunEnd) {
 	if repo == nil || agenticScanUUID == "" {
 		return
 	}
@@ -873,16 +882,17 @@ func finalizeOliumAutopilotPipelineRun(repo *database.Repository, agenticScanUUI
 		Set("status = ?", status).
 		Set("completed_at = ?", completedAt).
 		Set("duration_ms = ?", completedAt.Sub(startedAt).Milliseconds()).
-		Where("uuid = ?", agenticScanUUID)
+		Where("uuid = ?", agenticScanUUID).
+		Where("project_uuid = ?", firstNonEmptyString(projectUUID, database.DefaultProjectUUID))
 
+	findingCount, _, available := findingCountForRun(repo, projectUUID, agenticScanUUID)
+	if !available {
+		findingCount = -1
+	}
+	q = q.Set("finding_count = ?", findingCount)
 	if result != nil {
-		findingCount := result.FindingsCount
-		if result.VerifiedFindingCount > 0 {
-			findingCount = result.VerifiedFindingCount
-		} else if result.OperatorFindingsCount > findingCount {
-			findingCount = result.OperatorFindingsCount
-		}
-		q = q.Set("finding_count = ?", findingCount)
+		result.TotalFindings = int(findingCount)
+		result.FindingCountAvailable = available
 	}
 	if runErr != nil {
 		q = q.Set("error_message = ?", runErr.Error())
@@ -897,44 +907,31 @@ func finalizeOliumAutopilotPipelineRun(repo *database.Repository, agenticScanUUI
 // printOliumAutopilotPipelineSummary mirrors printOliumAutopilotSummary's shape
 // but pulls fields from the pipeline result (which has separate counts for
 // audit, operator, and verified findings).
-func printOliumAutopilotPipelineSummary(result *agent.AutopilotPipelineResult, sessionDir string, repo *database.Repository, agenticScanUUID string) {
+func printOliumAutopilotPipelineSummary(result *agent.AutopilotPipelineResult, sessionDir string, repo *database.Repository, projectUUID, agenticScanUUID string) {
 	if result == nil {
 		return
 	}
 	fmt.Println()
 	fmt.Printf("%s autopilot complete\n", terminal.InfoSymbol())
-	// Compute the severity breakdown once — the run wrote into one
-	// agentic_scan_uuid bucket, so the same suffix annotates whichever
-	// of audit/operator/verified is the canonical headline number.
-	_, breakdown, _ := findingCountForRun(repo, agenticScanUUID)
-	headlineShown := false
+	// The persisted total is separate from phase-local (possibly overlapping)
+	// counters. Its severity breakdown must not annotate an audit-only count.
+	if total, breakdown, ok := findingCountForRun(repo, projectUUID, agenticScanUUID); ok {
+		fmt.Printf("  persisted: %s findings%s\n", terminal.BoldGreen(fmt.Sprintf("%d", total)), breakdown)
+	} else {
+		fmt.Printf("  persisted: unavailable\n")
+	}
 	if result.FindingsCount > 0 {
-		fmt.Printf("  audit:    %s findings (saved: %d)%s\n",
-			terminal.BoldGreen(fmt.Sprintf("%d", result.FindingsCount)),
-			result.FindingsSaved,
-			breakdown)
-		headlineShown = true
+		fmt.Printf("  audit:    %s findings (saved: %d)\n",
+			terminal.BoldGreen(fmt.Sprintf("%d", result.FindingsCount)), result.FindingsSaved)
 	}
 	if result.OperatorFindingsCount > 0 {
-		// Only attach the breakdown to the highest-fidelity line so the
-		// same per-severity counts don't repeat under multiple headers.
-		suffix := ""
-		if !headlineShown {
-			suffix = breakdown
-		}
-		fmt.Printf("  operator:  %s findings%s\n",
-			terminal.BoldGreen(fmt.Sprintf("%d", result.OperatorFindingsCount)),
-			suffix)
-		headlineShown = true
+		fmt.Printf("  operator:  %s findings\n", terminal.BoldGreen(fmt.Sprintf("%d", result.OperatorFindingsCount)))
 	}
 	if result.VerifiedFindingCount > 0 {
-		suffix := ""
-		if !headlineShown {
-			suffix = breakdown
-		}
-		fmt.Printf("  verified:  %s%s\n",
-			terminal.BoldGreen(fmt.Sprintf("%d", result.VerifiedFindingCount)),
-			suffix)
+		fmt.Printf("  verified:  %s\n", terminal.BoldGreen(fmt.Sprintf("%d", result.VerifiedFindingCount)))
+	}
+	if result.NativeFindingsCount > 0 {
+		fmt.Printf("  native:    %s findings\n", terminal.BoldGreen(fmt.Sprintf("%d", result.NativeFindingsCount)))
 	}
 	fmt.Printf("  duration:  %s\n", result.Duration.Round(time.Second))
 	if result.Reentries > 0 {
@@ -952,7 +949,7 @@ func printOliumAutopilotPipelineSummary(result *agent.AutopilotPipelineResult, s
 // finalizeOliumAutopilotRun closes out the parent AgenticScan row with
 // the run's final state. Done as a field-level UPDATE so we don't clobber
 // other columns that were set at CreateAgenticScan time.
-func finalizeOliumAutopilotRun(repo *database.Repository, agenticScanUUID, model string, startedAt time.Time, result *autopilot.Result, runErr error, end database.AgenticRunEnd) {
+func finalizeOliumAutopilotRun(repo *database.Repository, projectUUID, agenticScanUUID, model string, startedAt time.Time, result *autopilot.Result, runErr error, end database.AgenticRunEnd) {
 	if repo == nil || agenticScanUUID == "" {
 		return
 	}
@@ -964,9 +961,20 @@ func finalizeOliumAutopilotRun(repo *database.Repository, agenticScanUUID, model
 		Set("status = ?", status).
 		Set("completed_at = ?", completedAt).
 		Set("duration_ms = ?", completedAt.Sub(startedAt).Milliseconds()).
-		Where("uuid = ?", agenticScanUUID)
+		Where("uuid = ?", agenticScanUUID).
+		Where("project_uuid = ?", firstNonEmptyString(projectUUID, database.DefaultProjectUUID))
+	findingCount, _, available := findingCountForRun(repo, projectUUID, agenticScanUUID)
+	if !available {
+		findingCount = -1
+	}
+	q = q.Set("finding_count = ?", findingCount)
 	if result != nil {
-		q = q.Set("finding_count = ?", result.FindingCount)
+		result.FindingCount = findingCount
+		result.FindingCountAvailable = available
+		result.FindingCountError = ""
+		if !available {
+			result.FindingCountError = "persisted finding count unavailable"
+		}
 		// Persist token usage and estimated cost — the engine emits
 		// per-turn usage events that autopilot.Run accumulates; without
 		// this update the row defaults to 0/0/$0 even on real runs.
@@ -1134,24 +1142,24 @@ func printAutopilotBanner(in autopilotBannerInputs) {
 // printOliumAutopilotSummary renders a concise operator-facing summary
 // of how the run went. Mirrors printAutopilotSummary's shape so the
 // two modes look the same in a terminal.
-func printOliumAutopilotSummary(result *autopilot.Result, sessionDir string, repo *database.Repository, agenticScanUUID string) {
+func printOliumAutopilotSummary(result *autopilot.Result, sessionDir string, repo *database.Repository, projectUUID, agenticScanUUID string) {
 	if result == nil {
 		return
 	}
-	// Headline count from the DB reflects every finding persisted for this
-	// run (operator report_finding + audit-prep imports), not just the
-	// operator's runtime counter. ok=false on dry-run / no-repo paths.
-	total, breakdown, ok := findingCountForRun(repo, agenticScanUUID)
-	if !ok {
-		total = result.FindingCount
-	}
+	// Persisted total and insert-only tool tally describe different sets.
+	total, breakdown, ok := findingCountForRun(repo, projectUUID, agenticScanUUID)
 	fmt.Println()
 	fmt.Printf("%s autopilot complete\n", terminal.InfoSymbol())
 	// Labels padded to a 12-char field so the longest ("transcript:") still
 	// leaves a space before its value and the whole column stays aligned.
-	fmt.Printf("  findings:   %s%s\n",
-		terminal.BoldGreen(fmt.Sprintf("%d", total)),
-		breakdown)
+	if ok {
+		fmt.Printf("  persisted:  %s%s\n", terminal.BoldGreen(fmt.Sprintf("%d", total)), breakdown)
+	} else {
+		fmt.Printf("  persisted:  unavailable\n")
+	}
+	if result.ReportedFindingCount > 0 {
+		fmt.Printf("  operator:   %d findings\n", result.ReportedFindingCount)
+	}
 	fmt.Printf("  duration:   %s\n", result.Elapsed.Round(time.Second))
 	switch d := result.Diagnosis(); {
 	case result.Halted:
@@ -1195,22 +1203,20 @@ var severityColors = map[string]func(string) string{
 	"suspect":  terminal.BoldCyan,
 }
 
-// findingCountForRun returns the total findings persisted under the run's
-// agentic_scan_uuid, a colored `(critical=N high=M …)` suffix, and ok=true
-// when the count came from the DB. ok=false signals the caller to fall back
-// to its own runtime counter (dry-run / no-repo / query error paths).
+// findingCountForRun returns the distinct findings persisted under the run and
+// its same-project agentic/native children, a colored severity suffix, and ok=true
+// when the count came from the DB. ok=false means unavailable, never a zero
+// persisted total or permission to substitute a phase-local tally.
 // Zero-count severities are omitted from the suffix.
-func findingCountForRun(repo *database.Repository, agenticScanUUID string) (int64, string, bool) {
+func findingCountForRun(repo *database.Repository, projectUUID, agenticScanUUID string) (int64, string, bool) {
 	if repo == nil || agenticScanUUID == "" {
 		return 0, "", false
 	}
-	counts, err := database.CountFindingsByAgenticScan(context.Background(), repo.DB(), agenticScanUUID)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	total, counts, err := repo.CountAgenticScanFindings(ctx, projectUUID, agenticScanUUID)
 	if err != nil {
 		return 0, "", false
-	}
-	var total int64
-	for _, n := range counts {
-		total += n
 	}
 	// Render most-severe-first; AllNames() is least-to-most-severe.
 	names := severity.AllNames()
