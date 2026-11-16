@@ -11,6 +11,33 @@ import (
 	"github.com/vigolium/vigolium/pkg/output"
 )
 
+func TestFindingPersistsWithUnavailableManifestForEvidenceWithoutIdentity(t *testing.T) {
+	e, db := newRepoExecutor(t)
+	ctx := context.Background()
+	result := &output.ResultEvent{
+		ModuleID: "missing-evidence-identity",
+		URL:      "https://probe.test/vulnerable",
+		Info:     output.Info{Name: "Missing evidence identity"},
+		Evidence: []evidence.Entry{evidence.Select(nil, evidence.RoleControl, false, "unavailable control")},
+	}
+
+	emitted := e.emitResult(ctx, result, nil, nil)
+	require.Equal(t, emissionFinding, emitted.outcome)
+	stored := loadFindings(t, db)
+	require.Len(t, stored, 1, "missing evidence identity must not discard the finding")
+	require.NoError(t, e.repo.HydrateFindingEvidenceManifest(ctx, stored))
+	require.Len(t, stored[0].Evidence, 1)
+	entry := stored[0].Evidence[0]
+	require.Equal(t, "missing", stored[0].EvidenceStatus)
+	require.True(t, strings.HasPrefix(entry.ExchangeID, "rejected-evidence:"))
+	require.Contains(t, entry.Label, "exchange identity missing")
+	require.Nil(t, entry.Exchange, "unavailable manifests must not invent a receipt")
+	require.Equal(t, evidence.RoleControl, entry.Role)
+	require.False(t, entry.Primary)
+	require.Contains(t, emitted.event.Error, "evidence exchange identity missing")
+	require.Zero(t, countRecords(t, db), "unavailable evidence must not create a linked HTTP record")
+}
+
 func TestEvidenceRejectedPrimaryCannotRecoverStaleInlineOrStoredIdentity(t *testing.T) {
 	for _, mismatch := range []bool{false, true} {
 		t.Run(map[bool]string{false: "stale hash", true: "association mismatch"}[mismatch], func(t *testing.T) {
