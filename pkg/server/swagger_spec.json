@@ -2355,6 +2355,9 @@
             "format": "int64",
             "type": "integer"
           },
+          "inline_evidence_scan_uuid": {
+            "type": "string"
+          },
           "insertion_point": {
             "nullable": true,
             "properties": {
@@ -2395,6 +2398,29 @@
               "passive"
             ],
             "type": "string"
+          },
+          "occurrences": {
+            "items": {
+              "properties": {
+                "entries": {
+                  "items": {
+                    "$ref": "#/components/schemas/EvidenceEntry"
+                  },
+                  "type": "array"
+                },
+                "evidence_status": {
+                  "type": "string"
+                },
+                "occurrence_id": {
+                  "type": "string"
+                },
+                "scan_uuid": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
           },
           "origin_record_uuid": {
             "type": "string"
