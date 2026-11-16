@@ -47,7 +47,12 @@ for (const theme of ['dark', 'light'] as const) {
     test.use({ viewport: { width: 1440, height: 760 } });
     test.beforeEach(async ({ page }) => {
       await seedAuth(page);
-      await page.addInitScript(scheme => localStorage.setItem('vigolium_scheme', scheme), `default-${theme}`);
+      await page.addInitScript(scheme => {
+        localStorage.setItem('vigolium_scheme', scheme);
+        // Match production HTTP capabilities: exercise the bounded Blob download,
+        // not localhost's native File System Access picker.
+        Object.defineProperty(window, 'showSaveFilePicker', { configurable: true, value: undefined });
+      }, `default-${theme}`);
       await mockRun(page);
     });
 
@@ -80,6 +85,16 @@ for (const theme of ['dark', 'light'] as const) {
       await sidebar.getByRole('searchbox').fill('EVIDENCE-29');
       await expect(sidebar.getByRole('button')).toHaveCount(1);
       await expect(page).toHaveURL(new RegExp(`session=${RUN_UUID}.*artifact=auth-config.yaml`));
+      const downloadEvent = page.waitForEvent('download');
+      await dialog.getByRole('button', { name: 'Download exact bytes' }).click();
+      const download = await downloadEvent;
+      expect(await download.failure()).toBeNull();
+      await expect(dialog.getByRole('status')).toContainText('Complete response verified:');
+      await page.keyboard.press('Escape');
+      await expect(dialog).toHaveCount(0);
+      await expect(page.getByRole('button', { name: FILE, exact: true })).toBeFocused();
+      await page.getByRole('button', { name: FILE, exact: true }).click();
+      await expect(dialog.getByLabel('Artifact content')).toContainText('tool: fixture evidence');
       await page.goBack();
       await expect(dialog).toHaveCount(0);
       await expect(page).toHaveURL(new RegExp(`session=${RUN_UUID}$`));

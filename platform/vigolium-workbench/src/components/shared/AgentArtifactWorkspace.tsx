@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   ARTIFACT_PREVIEW_BYTES, artifactCurlTemplate, artifactSavePicker, downloadRunArtifact, loadArtifactPage,
@@ -19,6 +19,7 @@ const formatSize = (size: number | null) => size === null ? 'size unknown' : `${
 /** Portal keeps the two sibling scroll owners outside every page-level scroller. */
 export default function AgentArtifactWorkspace({ scope, theme, artifacts, truncated, selected, onSelect, onClose }: AgentArtifactWorkspaceProps) {
   const colors = evidencePalette[theme];
+  const workspace = useRef<HTMLDivElement>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
   const [filter, setFilter] = useState('');
   const artifact = artifacts.find(item => item.name === selected);
@@ -35,17 +36,28 @@ export default function AgentArtifactWorkspace({ scope, theme, artifacts, trunca
     };
   }, []);
 
-  const keyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); onClose(); }
-    if (event.key !== 'Tab') return;
-    const focusable = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), input, summary, [tabindex="0"]'))
-      .filter(el => !el.closest('details:not([open])') || el.tagName === 'SUMMARY');
-    const first = focusable[0]; const last = focusable.at(-1);
-    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
-    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
-  };
+  useEffect(() => {
+    // Disabling a focused action (download/paging) can move browser focus to body.
+    // Keep Escape and Tab owned by the modal even when events start outside it.
+    const keyDown = (event: KeyboardEvent) => {
+      const dialog = workspace.current;
+      if (!dialog) return;
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); onClose(); return; }
+      if (event.key !== 'Tab') return;
+      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>('button:not(:disabled), input, summary, [tabindex="0"]'))
+        .filter(el => !el.closest('details:not([open])') || el.tagName === 'SUMMARY');
+      const first = focusable[0]; const last = focusable.at(-1);
+      const outside = !dialog.contains(document.activeElement);
+      if (outside || (event.shiftKey ? document.activeElement === first : document.activeElement === last)) {
+        event.preventDefault(); event.stopPropagation();
+        (event.shiftKey ? last : first)?.focus();
+      }
+    };
+    document.addEventListener('keydown', keyDown, true);
+    return () => document.removeEventListener('keydown', keyDown, true);
+  }, [onClose]);
 
-  return createPortal(<div role="dialog" aria-label="Run artifacts workspace" aria-modal="true" onKeyDown={keyDown}
+  return createPortal(<div ref={workspace} role="dialog" aria-label="Run artifacts workspace" aria-modal="true"
     className="fixed inset-0 z-50 flex flex-col text-xs" style={{ background: colors.background, color: colors.text }}>
     <header className="shrink-0 border-b p-3 flex items-center gap-3" style={{ borderColor: colors.border }}>
       <div className="min-w-0 flex-1"><p style={{ color: colors.muted }}>Run {scope.runUUID}</p><h3 className="font-semibold break-all">{selected}</h3></div>
