@@ -222,6 +222,11 @@ export interface ErrorResponse {
   details?: string;
 }
 
+export interface FindingHostCount {
+  hostname: string;
+  total: number;
+}
+
 export interface FindingsQueryParams {
   limit?: number;
   offset?: number;

@@ -23,6 +23,7 @@ import type {
   ModulesResponse,
   PaginatedResponse,
   FindingsQueryParams,
+  FindingHostCount,
   HttpRecordsQueryParams,
   OASTInteractionsQueryParams,
   ConfigResponse,
@@ -215,15 +216,29 @@ export function useScanStatus() {
   return query;
 }
 
-export function useFindings(params: FindingsQueryParams) {
+export function useFindings(
+  params: FindingsQueryParams,
+  options: { enabled?: boolean; preservePreviousData?: boolean } = {},
+) {
   const key = projectKey('findings', params);
   return useQuery({
     queryKey: key,
     queryFn: () =>
       apiGet<PaginatedResponse<Finding>>('/api/findings', params as Record<string, string | number | undefined>),
+    enabled: options.enabled ?? true,
     // Retain page metadata while fetching, but never borrow another project's rows.
-    placeholderData: (previousData, previousQuery) =>
+    // Expanded host sections opt out so rows from a previous host/filter are never shown.
+    placeholderData: options.preservePreviousData === false ? undefined : (previousData, previousQuery) =>
       previousQuery?.queryKey[0] === key[0] ? previousData : undefined,
+  });
+}
+
+export function useFindingHosts(params: FindingsQueryParams) {
+  const key = projectKey('finding-hosts', params);
+  return useQuery({
+    queryKey: key,
+    queryFn: () =>
+      apiGet<PaginatedResponse<FindingHostCount>>('/api/findings/hosts', params as Record<string, string | number | undefined>),
   });
 }
 

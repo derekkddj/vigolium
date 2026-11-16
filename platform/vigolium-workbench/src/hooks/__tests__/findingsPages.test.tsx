@@ -8,7 +8,7 @@ import DarkFindingsPage from '@/designs/dark/FindingsPage';
 import LightFindingsPage from '@/designs/light/FindingsPage';
 
 const mocks = vi.hoisted(() => ({
-  project: 'project-a', params: vi.fn(), fetching: false, placeholder: false, error: false,
+  project: 'project-a', params: vi.fn(), hostParams: vi.fn(), fetching: false, placeholder: false, error: false,
   grid: {} as AgGridReactProps<Finding>,
 }));
 const findings = Array.from({ length: 260 }, (_, index) => ({
@@ -17,19 +17,30 @@ const findings = Array.from({ length: 260 }, (_, index) => ({
   module_name: `Module ${index}`, confidence: 'high', matched_at: ['https://example.test/path'],
   found_at: String(260 - index),
 })) as Finding[];
+let responseRows = findings;
 const rank: Record<string, number> = { info: 0, suspect: 1, low: 2, medium: 3, high: 4, critical: 5 };
 vi.mock('@/contexts/ProjectContext', () => ({ useProjectContext: () => ({ projectUUID: mocks.project }) }));
 vi.mock('@/contexts/ToastContext', () => ({ useToast: () => ({ toast: vi.fn() }) }));
 vi.mock('@/api/hooks', () => ({
-  useFindings: (params: FindingsQueryParams) => {
-    mocks.params(params);
-    const rows = findings.filter(row => !params.severity || row.severity === params.severity);
+  useFindings: (params: FindingsQueryParams, options?: { enabled?: boolean; preservePreviousData?: boolean }) => {
+    if (options?.enabled !== false) mocks.params(params);
+    const rows = responseRows
+      .filter(row => !params.severity || row.severity === params.severity)
+      .filter(row => !params.domain || row.hostname === params.domain);
     if (params.sort === 'severity') rows.sort((a, b) => (rank[a.severity] - rank[b.severity]) * (params.order === 'asc' ? 1 : -1));
     const offset = params.offset || 0;
     return {
       data: { data: rows.slice(offset, offset + 100), total: rows.length, offset, limit: 100, has_more: offset + 100 < rows.length },
-      isLoading: false, isFetching: mocks.fetching, isPlaceholderData: mocks.placeholder, isError: mocks.error, refetch: vi.fn(),
+      isLoading: false, isFetching: mocks.fetching, isPlaceholderData: options?.preservePreviousData === false ? false : mocks.placeholder, isError: mocks.error, refetch: vi.fn(),
     };
+  },
+  useFindingHosts: (params: FindingsQueryParams) => {
+    mocks.hostParams(params);
+    const matching = responseRows.filter(row => !params.severity || row.severity === params.severity);
+    const counts = new Map<string, number>();
+    for (const row of matching) counts.set(row.hostname || '(unknown)', (counts.get(row.hostname || '(unknown)') || 0) + 1);
+    const data = [...counts.entries()].map(([hostname, total]) => ({ hostname, total })).sort((a, b) => b.total - a.total || a.hostname.localeCompare(b.hostname));
+    return { data: { data, total: data.length, offset: 0, limit: data.length, has_more: false }, isLoading: false, isFetching: false, isError: false };
   },
   useDeleteFinding: () => ({}),
 }));
@@ -57,6 +68,8 @@ vi.mock('@/designs/light/FindingDetailPanel', () => ({ default: () => null }));
 
 const lastParams = () => mocks.params.mock.calls.at(-1)![0] as FindingsQueryParams;
 beforeEach(() => {
+  responseRows = findings;
+  mocks.params.mockReset(); mocks.hostParams.mockReset();
   mocks.project = 'project-a'; mocks.fetching = false; mocks.placeholder = false; mocks.error = false;
   localStorage.setItem('vigolium_project_uuid', mocks.project);
   window.history.replaceState({}, '', '/findings/');
@@ -103,12 +116,53 @@ describe.each([['dark', DarkFindingsPage], ['light', LightFindingsPage]] as cons
     expect(lastParams()).toMatchObject({ offset: 0, sort: undefined, order: undefined });
   });
 
+  it('shows complete host totals for all findings, not just this page or matched_at URLs', () => {
+    const hosts = ['alpha.example', 'bravo.example', 'charlie.example'];
+    responseRows = Array.from({ length: 150 }, (_, index) => ({
+      ...findings[index],
+      id: index + 1,
+      hostname: hosts[index % hosts.length],
+      matched_at: [`https://decoy.example/path/${index}`],
+    }));
+    render(<Page />);
+    expect(screen.getByText('1–100 of 150 findings')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'By Host' }));
+    for (const host of hosts) {
+      expect(screen.getByRole('button', { name: new RegExp(`${host}.*50`) })).toBeInTheDocument();
+    }
+    expect(mocks.hostParams.mock.calls.at(-1)?.[0]).not.toHaveProperty('offset');
+    expect(mocks.hostParams.mock.calls.at(-1)?.[0]).not.toHaveProperty('limit');
+    fireEvent.click(screen.getByRole('button', { name: /alpha\.example.*50/ }));
+    const hostRequest = mocks.params.mock.calls.find(([params]) => params.domain === 'alpha.example')?.[0];
+    expect(hostRequest).toMatchObject({ domain: 'alpha.example', limit: 100, offset: 0 });
+    expect(screen.getAllByTestId('host-finding-row')).toHaveLength(50);
+  });
+
+  it('paginates findings separately inside an expanded host', () => {
+    responseRows = Array.from({ length: 205 }, (_, index) => ({
+      ...findings[index % findings.length],
+      id: index + 1,
+      hostname: 'pagination.example',
+      matched_at: [`https://decoy.example/path/${index}`],
+    }));
+    render(<Page />);
+    fireEvent.click(screen.getByRole('button', { name: 'By Host' }));
+    fireEvent.click(screen.getByRole('button', { name: /pagination\.example.*205/ }));
+    expect(screen.getAllByTestId('host-finding-row')).toHaveLength(100);
+    expect(screen.getByText('Page 1 of 3')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    const hostRequest = mocks.params.mock.calls.filter(([params]) => params.domain === 'pagination.example').at(-1)?.[0];
+    expect(hostRequest).toMatchObject({ domain: 'pagination.example', limit: 100, offset: 100 });
+    expect(screen.getAllByTestId('host-finding-row')).toHaveLength(100);
+    expect(screen.getByText('Page 2 of 3')).toBeInTheDocument();
+  });
+
   it('retains sort arrows and pagination after By Host, and filters HIGH across the entire project', () => {
     render(<Page />);
     fireEvent.click(screen.getByRole('button', { name: 'Sort SEV descending' }));
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     fireEvent.click(screen.getByRole('button', { name: 'By Host' }));
-    expect(screen.getByText('Page 2 of 3')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /\(unknown\).*260/ })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Table' }));
     expect(lastParams()).toMatchObject({ sort: 'severity', order: 'desc', offset: 100 });
     expect(mocks.grid.columnDefs?.find(column => 'field' in column && column.field === 'severity')).toMatchObject({ sort: 'desc', sortable: true });

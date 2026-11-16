@@ -3,11 +3,12 @@
 import { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import { AgGridReact } from 'ag-grid-react';
 import type { ColDef, RowClickedEvent, SelectionChangedEvent, SortChangedEvent } from 'ag-grid-community';
-import { Shield, Globe, Box, Search, RefreshCw, List, Layers, ChevronRight, ChevronDown, X } from 'lucide-react';
+import { Shield, Globe, Box, Search, RefreshCw, List, Layers, X } from 'lucide-react';
 import { useFindings, useDeleteFinding } from '@/api/hooks';
 import { useDetailSelection } from '@/hooks/useDetailSelection';
 import { DETAIL_LINK_CONTEXT } from '@/lib/detailSelection';
 import FindingsPagination from '@/components/shared/FindingsPagination';
+import FindingsByHost from '@/components/shared/FindingsByHost';
 import { FINDING_SORT_FIELDS, FINDINGS_DEFAULT_COL_DEF, findingSortParams, preserveFindingResponseOrder } from '@/lib/findingsSorting';
 import { useToast } from '@/contexts/ToastContext';
 import type { Finding, FindingsQueryParams } from '@/api/types';
@@ -29,97 +30,21 @@ type ViewTab = 'table' | 'by-host';
 
 /* ── Grouped-by-host view ─────────────────────────────────────────── */
 function GroupedByHostView({
-  findings,
+  filters,
   onSelectFinding,
   selectedFindingId,
 }: {
-  findings: Finding[];
+  filters: FindingsQueryParams;
   onSelectFinding: (id: number) => void;
   selectedFindingId: number | null;
 }) {
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
-
-  const grouped = useMemo(() => {
-    const map = new Map<string, Finding[]>();
-    for (const f of findings) {
-      let host = '(unknown)';
-      if (f.matched_at && f.matched_at.length > 0) {
-        try {
-          host = new URL(f.matched_at[0]).hostname;
-        } catch {
-          host = '(unknown)';
-        }
-      }
-      if (!map.has(host)) map.set(host, []);
-      map.get(host)!.push(f);
-    }
-    return [...map.entries()].sort((a, b) => b[1].length - a[1].length);
-  }, [findings]);
-
-  const toggle = (host: string) => {
-    setCollapsed((prev) => {
-      const next = new Set(prev);
-      if (next.has(host)) next.delete(host);
-      else next.add(host);
-      return next;
-    });
-  };
-
   return (
-    <div className="overflow-y-auto flex-1">
-      {/* Column headers */}
-      <div className="flex items-center gap-2 px-3 pl-7 py-1 border-b border-[#2e2b26] text-[#918175] text-xs font-bold sticky top-0 bg-[#1c1b19] z-10">
-        <span className="w-16 shrink-0">SEV</span>
-        <span className="w-16 shrink-0">CONF</span>
-        <span className="w-40 shrink-0">MODULE</span>
-        <span className="flex-1">DESCRIPTION</span>
-        <span className="w-52 shrink-0 text-right">MATCHED_AT</span>
-        <span className="w-28 shrink-0 text-right">TIME</span>
-      </div>
-      {grouped.map(([host, items]) => (
-        <div key={host}>
-          <button
-            onClick={() => toggle(host)}
-            className="w-full flex items-center gap-1.5 px-3 py-1.5 border-b border-[#2e2b26] hover:bg-[#272520] text-left"
-          >
-            {collapsed.has(host) ? (
-              <ChevronRight className="w-3 h-3 text-[#918175] shrink-0" />
-            ) : (
-              <ChevronDown className="w-3 h-3 text-[#918175] shrink-0" />
-            )}
-            <span className="text-[#68a8e4] text-xs font-bold truncate">{host}</span>
-            <span className="text-[#918175] text-xs ml-auto shrink-0">{items.length}</span>
-          </button>
-          {!collapsed.has(host) && (
-            <div>
-              {items.map((f) => (
-                <button
-                  key={f.id}
-                  onClick={() => onSelectFinding(f.id)}
-                  className={`w-full flex items-center gap-2 px-3 pl-7 py-1 border-b border-[#2e2b26]/50 hover:bg-[#272520] text-left text-xs ${
-                    selectedFindingId === f.id ? 'bg-[#272520]' : ''
-                  }`}
-                >
-                  <span className="font-bold w-16 shrink-0 uppercase" style={{ color: SEVERITY_COLORS[f.severity] || '#918175' }}>
-                    {f.severity}
-                  </span>
-                  <span className="w-16 shrink-0" style={{ color: CONFIDENCE_COLORS[f.confidence] || '#918175' }}>
-                    {f.confidence}
-                  </span>
-                  <span className="text-[#918175] w-40 shrink-0 truncate">{f.module_name}</span>
-                  <span className="text-[#fce8c3] truncate flex-1 min-w-0">{f.description || '—'}</span>
-                  <span className="text-[#918175] w-52 shrink-0 text-right truncate">{f.matched_at?.join(', ') || '—'}</span>
-                  <span className="text-[#918175] w-28 shrink-0 text-right">{f.found_at ? formatDate(f.found_at) : '—'}</span>
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-      ))}
-      {grouped.length === 0 && (
-        <div className="p-3 text-xs text-[#403d38] text-center">no findings</div>
-      )}
-    </div>
+    <FindingsByHost
+      filters={filters}
+      theme="dark"
+      onSelectFinding={onSelectFinding}
+      selectedFindingId={selectedFindingId}
+    />
   );
 }
 
@@ -538,28 +463,11 @@ export default function FindingsPage({ initialId }: { initialId?: number | null 
 
           {/* Grouped by host view */}
           {viewTab === 'by-host' && (
-            <>
-              {pageLoading ? (
-                <div className="p-3 text-xs text-[#918175]">loading...</div>
-              ) : (
-                <GroupedByHostView
-                  findings={rows}
-                  onSelectFinding={(id) => navigateToFinding(selectedFindingId === id ? null : id)}
-                  selectedFindingId={selectedFindingId}
-                />
-              )}
-              {data && (data.total > 0 || data.has_more) && (
-                <FindingsPagination
-                  offset={queryParams.offset || 0}
-                  pageSize={PAGE_SIZE}
-                  returned={rows.length}
-                  total={data.total}
-                  hasMore={data.has_more}
-                  busy={isFetching || pageLoading}
-                  onPageChange={goToPage}
-                />
-              )}
-            </>
+            <GroupedByHostView
+              filters={queryParams}
+              onSelectFinding={(id) => navigateToFinding(selectedFindingId === id ? null : id)}
+              selectedFindingId={selectedFindingId}
+            />
           )}
         </div>
 

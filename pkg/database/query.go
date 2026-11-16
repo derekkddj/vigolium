@@ -1110,6 +1110,13 @@ func AllTablesDeleteOrder() []string {
 	return allTablesDeleteOrder
 }
 
+// FindingHostCount reports the number of matching findings associated with one
+// stored hostname.
+type FindingHostCount struct {
+	Hostname string `bun:"hostname" json:"hostname"`
+	Total    int64  `bun:"total" json:"total"`
+}
+
 // FindingsQueryBuilder builds filtered queries for the findings table
 type FindingsQueryBuilder struct {
 	db      *DB
@@ -1130,6 +1137,25 @@ func (fqb *FindingsQueryBuilder) Count(ctx context.Context) (int64, error) {
 	fqb.applyFindingFilters(query)
 	count, err := query.Count(ctx)
 	return int64(count), err
+}
+
+// GroupByHostname returns complete host counts for the builder's filters. It
+// intentionally ignores list pagination and ordering so host totals do not vary
+// with the current page.
+func (fqb *FindingsQueryBuilder) GroupByHostname(ctx context.Context) ([]FindingHostCount, error) {
+	const hostnameExpr = "COALESCE(NULLIF(f.hostname, ''), '(unknown)')"
+	groups := make([]FindingHostCount, 0)
+	query := fqb.db.NewSelect().Model((*Finding)(nil)).
+		ColumnExpr(hostnameExpr + " AS hostname").
+		ColumnExpr("COUNT(*) AS total").
+		GroupExpr(hostnameExpr).
+		OrderExpr("total DESC").
+		OrderExpr("hostname ASC")
+	fqb.applyFindingFilters(query)
+	if err := query.Scan(ctx, &groups); err != nil {
+		return nil, err
+	}
+	return groups, nil
 }
 
 // Execute executes the query and returns findings

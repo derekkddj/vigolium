@@ -67,6 +67,7 @@ var SwaggerSchemaTypes = map[string]any{
 
 	// Data
 	"Finding":          database.Finding{},
+	"FindingHostCount": database.FindingHostCount{},
 	"EvidenceEntry":    evidence.Entry{},
 	"EvidenceExchange": evidence.Exchange{},
 	// POST /api/findings/:id/verify

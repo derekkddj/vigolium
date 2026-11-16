@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -177,6 +178,77 @@ func TestHandleListFindings_SuccessAndFilters(t *testing.T) {
 			t.Errorf("filtered list status = %d, want 200", status)
 		}
 	})
+}
+
+func TestHandleListFindingHosts_CountsFiltersAndProjectScope(t *testing.T) {
+	db, repo := newPinnedTestDB(t)
+	hosts := []string{"alpha.example", "bravo.example", "charlie.example"}
+	for i := 0; i < 150; i++ {
+		finding := &database.Finding{
+			ProjectUUID:     database.DefaultProjectUUID,
+			HTTPRecordUUIDs: []string{"rec-x"},
+			ModuleID:        "host-aggregate-test",
+			ModuleName:      "Host aggregate test",
+			Severity:        database.SeverityLow,
+			Confidence:      "firm",
+			Status:          database.StatusDraft,
+			FindingHash:     fmt.Sprintf("host-aggregate-%d", i),
+			Hostname:        hosts[i%len(hosts)],
+			FoundAt:         time.Now().UTC(),
+		}
+		if i%2 == 0 {
+			finding.Severity = database.SeverityHigh
+		}
+		if _, err := db.NewInsert().Model(finding).Exec(t.Context()); err != nil {
+			t.Fatalf("insert finding %d: %v", i, err)
+		}
+	}
+	for i := 0; i < 4; i++ {
+		finding := &database.Finding{
+			ProjectUUID:     "other-project",
+			HTTPRecordUUIDs: []string{"rec-x"},
+			ModuleID:        "other-project-test",
+			ModuleName:      "Other project test",
+			Severity:        database.SeverityHigh,
+			Confidence:      "firm",
+			Status:          database.StatusDraft,
+			FindingHash:     fmt.Sprintf("other-project-host-%d", i),
+			Hostname:        "other-project.example",
+			FoundAt:         time.Now().UTC(),
+		}
+		if _, err := db.NewInsert().Model(finding).Exec(t.Context()); err != nil {
+			t.Fatalf("insert other-project finding %d: %v", i, err)
+		}
+	}
+
+	h := newBasicHandlers(t, ServerConfig{}, &fakeQueue{}, db, repo, nil)
+	app := fiber.New()
+	app.Get("/api/findings/hosts", h.findingsHandler().HandleListFindingHosts)
+
+	status, body := doGet(t, app, "/api/findings/hosts?severity=high&limit=1&offset=99", nil)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", status, body)
+	}
+	var resp PaginatedResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, body)
+	}
+	var groups []database.FindingHostCount
+	data, err := json.Marshal(resp.Data)
+	if err != nil {
+		t.Fatalf("marshal host groups: %v", err)
+	}
+	if err := json.Unmarshal(data, &groups); err != nil {
+		t.Fatalf("unmarshal host groups: %v", err)
+	}
+	if resp.Total != 3 || len(groups) != 3 {
+		t.Fatalf("total/groups = %d/%d, want 3/3: %+v", resp.Total, len(groups), groups)
+	}
+	for i, hostname := range hosts {
+		if groups[i].Hostname != hostname || groups[i].Total != 25 {
+			t.Errorf("group %d = %+v, want hostname=%s total=25", i, groups[i], hostname)
+		}
+	}
 }
 
 func TestHandleGetFinding(t *testing.T) {
