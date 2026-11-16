@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"unsafe"
 
 	"github.com/grafana/sobek"
 	"github.com/stretchr/testify/assert"
@@ -55,6 +56,23 @@ func TestIngestURL(t *testing.T) {
 	assert.Equal(t, int64(0), obj.Get("skipped").ToInteger())
 	assert.NotEmpty(t, obj.Get("uuid").String())
 	assert.Equal(t, "", obj.Get("error").String())
+}
+
+func TestIngestURLOwnsProjectIdentityAfterAPIRegistration(t *testing.T) {
+	repo := newTestRepo(t)
+	projectBytes := []byte("project-a")
+	project := unsafe.String(unsafe.SliceData(projectBytes), len(projectBytes))
+	vm := setupIngestTestVM(t, APIOptions{Repository: repo, ProjectUUID: project})
+	copy(projectBytes, "project-b")
+
+	val, err := vm.RunString(`vigolium.ingest.url("https://example.com/api/test")`)
+	require.NoError(t, err)
+	obj := val.ToObject(vm)
+	require.Equal(t, int64(1), obj.Get("imported").ToInteger())
+
+	record, err := repo.GetRecordByUUID(context.Background(), obj.Get("uuid").String())
+	require.NoError(t, err)
+	require.Equal(t, "project-a", record.ProjectUUID)
 }
 
 func TestIngestURLEmpty(t *testing.T) {

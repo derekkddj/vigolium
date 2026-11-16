@@ -58,12 +58,17 @@ func (h *Handlers) HandleCreateProject(c fiber.Ctx) error {
 	projectUUID := req.UUID
 	if projectUUID == "" {
 		projectUUID = uuid.NewString()
-	} else if _, err := uuid.Parse(projectUUID); err != nil {
-		return respondErrorMsg(c, fiber.StatusBadRequest, "uuid is not a valid UUID")
-	} else if existing, err := h.repo.GetProjectByUUID(c.Context(), projectUUID); err == nil && existing.UUID != "" {
-		// Idempotent: if the row already exists with this UUID, return it as-is.
-		// This makes the eager-ensure flow safe to retry on the cloud side.
-		return c.Status(fiber.StatusOK).JSON(existing)
+	} else {
+		canonicalUUID, err := database.CanonicalUUID(projectUUID)
+		if err != nil {
+			return respondErrorMsg(c, fiber.StatusBadRequest, "uuid is not a valid UUID")
+		}
+		projectUUID = canonicalUUID
+		if existing, err := h.repo.GetProjectByUUID(c.Context(), projectUUID); err == nil && existing.UUID != "" {
+			// Idempotent: if the canonical row already exists, return it as-is.
+			// This makes the eager-ensure flow safe to retry on the cloud side.
+			return c.Status(fiber.StatusOK).JSON(existing)
+		}
 	}
 
 	now := time.Now()

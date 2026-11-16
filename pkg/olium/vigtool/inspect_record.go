@@ -101,7 +101,7 @@ func (i *inspectRecordTool) Execute(ctx context.Context, args map[string]any, _ 
 		}, nil
 	}
 
-	rec, err := i.ctx.Repo.GetRecordByUUIDOrPrefix(ctx, uuid)
+	rec, err := resolveRecordInProject(ctx, i.ctx.Repo, uuid, i.ctx.ProjectUUID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		// An ambiguous prefix names its candidates; surface that verbatim.
 		return tool.Result{Content: "inspect_record: " + err.Error(), IsError: true}, nil
@@ -123,7 +123,7 @@ func (i *inspectRecordTool) Execute(ctx context.Context, args map[string]any, _ 
 	// records via a leaked UUID. The repository accepts any UUID; we enforce
 	// project-uuid match at the tool boundary so SessionsContext acts as the
 	// authorization barrier.
-	if i.ctx.ProjectUUID != "" && rec.ProjectUUID != i.ctx.ProjectUUID {
+	if rec.ProjectUUID != effectiveRecordProjectUUID(i.ctx.ProjectUUID) {
 		return tool.Result{
 			Content: fmt.Sprintf("inspect_record: record %q does not belong to the current project", uuid),
 			IsError: true,

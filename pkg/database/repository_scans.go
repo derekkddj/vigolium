@@ -17,35 +17,89 @@ import (
 // exists, the call is a no-op as long as the existing project_uuid matches —
 // this is the get-or-create path used for cross-node sync via --scan-uuid.
 // Returns ErrScanProjectMismatch when the existing row belongs to a different
-// project.
+// project. On a same-project UUID collision, submitted metadata is ignored.
 func (r *Repository) CreateScan(ctx context.Context, scan *Scan) error {
 	if scan == nil {
 		return fmt.Errorf("invalid Scan")
 	}
 	scan.ProjectUUID = defaultProjectUUID(scan.ProjectUUID)
-	res, err := r.db.NewInsert().Model(scan).On("CONFLICT (uuid) DO NOTHING").Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to insert scan: %w", err)
-	}
-	if n, _ := res.RowsAffected(); n == 0 && scan.UUID != "" {
-		existing, getErr := r.GetScanByUUID(ctx, scan.UUID)
-		if getErr == nil && existing != nil && existing.ProjectUUID != scan.ProjectUUID {
-			return fmt.Errorf("%w: scan %s belongs to project %s, not %s",
-				ErrScanProjectMismatch, scan.UUID, existing.ProjectUUID, scan.ProjectUUID)
+	return r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+		res, err := tx.NewInsert().Model(scan).On("CONFLICT (uuid) DO NOTHING").Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to insert scan: %w", err)
 		}
-	}
-	return nil
+		if n, _ := res.RowsAffected(); n == 0 && scan.UUID != "" {
+			existing := &Scan{}
+			query := tx.NewSelect().Model(existing).Column("project_uuid").Where("uuid = ?", scan.UUID)
+			if r.db.Driver() == driverPostgres {
+				query = query.For("UPDATE")
+			}
+			if getErr := query.Scan(ctx); getErr == nil {
+				existingProject := defaultProjectUUID(existing.ProjectUUID)
+				if existingProject != scan.ProjectUUID {
+					return fmt.Errorf("%w: scan %s belongs to project %s, not %s",
+						ErrScanProjectMismatch, scan.UUID, existingProject, scan.ProjectUUID)
+				}
+				// This UUID/project already exists. The submitted payload is stale
+				// sync metadata, so neither parent validation nor row mutation applies.
+				return nil
+			} else if !errors.Is(getErr, sql.ErrNoRows) {
+				return fmt.Errorf("failed to verify existing scan: %w", getErr)
+			}
+		}
+		if err := checkAgenticParentProject(ctx, tx, scan.ProjectUUID, scan.AgenticScanUUID, r.db.Driver()); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
-// UpdateScan updates an existing scan record
+// UpdateScan updates an existing scan record without changing its project
+// ownership or attaching it to a known agentic run from another project.
 func (r *Repository) UpdateScan(ctx context.Context, scan *Scan) error {
 	if scan == nil {
 		return fmt.Errorf("invalid Scan")
 	}
-	if _, err := r.db.NewUpdate().Model(scan).WherePK().Exec(ctx); err != nil {
-		return fmt.Errorf("failed to update scan: %w", err)
-	}
-	return nil
+	return r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+		existing := &Scan{}
+		if err := tx.NewSelect().Model(existing).Column("project_uuid").Where("uuid = ?", scan.UUID).Scan(ctx); err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("failed to validate scan update: %w", err)
+			}
+			if _, err := tx.NewUpdate().Model(scan).WherePK().Exec(ctx); err != nil {
+				return fmt.Errorf("failed to update scan: %w", err)
+			}
+			return nil
+		}
+
+		project := defaultProjectUUID(scan.ProjectUUID)
+		if err := checkAgenticParentProject(ctx, tx, project, scan.AgenticScanUUID, r.db.Driver()); err != nil {
+			return err
+		}
+		locked := &Scan{}
+		query := tx.NewSelect().Model(locked).Column("project_uuid").Where("uuid = ?", scan.UUID)
+		if r.db.Driver() == driverPostgres {
+			query = query.For("UPDATE")
+		}
+		if err := query.Scan(ctx); err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("failed to validate scan update: %w", err)
+			}
+			if _, err := tx.NewUpdate().Model(scan).WherePK().Exec(ctx); err != nil {
+				return fmt.Errorf("failed to update scan: %w", err)
+			}
+			return nil
+		}
+		if currentProject := defaultProjectUUID(locked.ProjectUUID); currentProject != project {
+			return fmt.Errorf("%w: scan %s belongs to project %s, not %s",
+				ErrScanProjectMismatch, scan.UUID, currentProject, project)
+		}
+		scan.ProjectUUID = project
+		if _, err := tx.NewUpdate().Model(scan).WherePK().Exec(ctx); err != nil {
+			return fmt.Errorf("failed to update scan: %w", err)
+		}
+		return nil
+	})
 }
 
 // UpdateScanPartial updates a scan row by UUID, skipping fields whose Go value
@@ -56,10 +110,57 @@ func (r *Repository) UpdateScanPartial(ctx context.Context, scan *Scan) error {
 	if scan == nil || scan.UUID == "" {
 		return fmt.Errorf("invalid Scan: uuid is required")
 	}
-	if _, err := r.db.NewUpdate().Model(scan).OmitZero().Where("uuid = ?", scan.UUID).Exec(ctx); err != nil {
-		return fmt.Errorf("failed to update scan: %w", err)
-	}
-	return nil
+	return r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+		initial := &Scan{}
+		if err := tx.NewSelect().Model(initial).Column("project_uuid").Where("uuid = ?", scan.UUID).Scan(ctx); err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("failed to validate scan update: %w", err)
+			}
+			if _, err := tx.NewUpdate().Model(scan).OmitZero().Where("uuid = ?", scan.UUID).Exec(ctx); err != nil {
+				return fmt.Errorf("failed to update scan: %w", err)
+			}
+			return nil
+		}
+
+		initialProject := defaultProjectUUID(initial.ProjectUUID)
+		parentProject := initialProject
+		if scan.ProjectUUID != "" {
+			parentProject = defaultProjectUUID(scan.ProjectUUID)
+		}
+		if scan.AgenticScanUUID != "" {
+			if err := checkAgenticParentProject(ctx, tx, parentProject, scan.AgenticScanUUID, r.db.Driver()); err != nil {
+				return err
+			}
+		}
+
+		locked := &Scan{}
+		query := tx.NewSelect().Model(locked).Column("project_uuid").Where("uuid = ?", scan.UUID)
+		if r.db.Driver() == driverPostgres {
+			query = query.For("UPDATE")
+		}
+		if err := query.Scan(ctx); err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("failed to validate scan update: %w", err)
+			}
+			if _, err := tx.NewUpdate().Model(scan).OmitZero().Where("uuid = ?", scan.UUID).Exec(ctx); err != nil {
+				return fmt.Errorf("failed to update scan: %w", err)
+			}
+			return nil
+		}
+		currentProject := defaultProjectUUID(locked.ProjectUUID)
+		if scan.ProjectUUID != "" && defaultProjectUUID(scan.ProjectUUID) != currentProject {
+			return fmt.Errorf("%w: scan %s belongs to project %s, not %s",
+				ErrScanProjectMismatch, scan.UUID, currentProject, defaultProjectUUID(scan.ProjectUUID))
+		}
+		if scan.AgenticScanUUID != "" && scan.ProjectUUID == "" && currentProject != initialProject {
+			return fmt.Errorf("%w: scan %s project changed during update from %s to %s",
+				ErrScanProjectMismatch, scan.UUID, initialProject, currentProject)
+		}
+		if _, err := tx.NewUpdate().Model(scan).OmitZero().Where("uuid = ?", scan.UUID).Exec(ctx); err != nil {
+			return fmt.Errorf("failed to update scan: %w", err)
+		}
+		return nil
+	})
 }
 
 // UpdateScanStorageURL sets the storage_url field on a scan record.

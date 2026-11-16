@@ -14,6 +14,7 @@ import (
 	"github.com/vigolium/vigolium/internal/atomicfile"
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/internal/paths"
+	"github.com/vigolium/vigolium/internal/sessionpath"
 	"github.com/vigolium/vigolium/pkg/database"
 	"go.uber.org/zap"
 )
@@ -90,9 +91,14 @@ type SessionStatus struct {
 	ScanMaxDurationMS int64 `json:"scan_max_duration_ms,omitempty"`
 }
 
-// SessionStatusPath is where the heartbeat writes scanUUID's status.json.
+// SessionStatusPath is where the heartbeat writes scanUUID's status.json. It
+// returns an empty path when scanUUID is not a safe single path segment.
 func SessionStatusPath(sessionsDir, scanUUID string) string {
-	return filepath.Join(sessionsDir, scanUUID, SessionStatusFilename)
+	sessionDir, err := sessionpath.RunDir(sessionsDir, scanUUID)
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(sessionDir, SessionStatusFilename)
 }
 
 // ReadSessionStatus parses a status.json. A missing file is (nil, nil): most

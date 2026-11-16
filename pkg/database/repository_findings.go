@@ -123,6 +123,12 @@ func (r *Repository) SaveFindingsBatchResults(ctx context.Context, writes []Find
 // a new finding row was written (false on a dedup-append to an existing finding),
 // so callers fire the OnFindingSaved hook exactly once per genuinely new finding.
 func (r *Repository) saveFindingIDB(ctx context.Context, idb bun.IDB, finding *Finding, httpRecordUUIDs []string) (bool, error) {
+	if err := checkAgenticParentProject(ctx, idb, finding.ProjectUUID, finding.AgenticScanUUID, r.db.Driver()); err != nil {
+		return false, err
+	}
+	if err := checkFindingScanProject(ctx, idb, finding.ProjectUUID, finding.ScanUUID, r.db.Driver()); err != nil {
+		return false, err
+	}
 	// Missing records are soft references (imports can arrive out of order), but
 	// an existing record owned by another project must never become proof here.
 	refs := append(append([]string{}, httpRecordUUIDs...), finding.OriginRecordUUID)
@@ -516,6 +522,33 @@ func (r *Repository) appendRecordsToFinding(ctx context.Context, idb bun.IDB, in
 
 	if _, err := q.Exec(ctx); err != nil {
 		return fmt.Errorf("failed to update finding record UUIDs: %w", err)
+	}
+	return nil
+}
+
+// checkFindingScanProject rejects a known scan whose stored owner differs from
+// the finding project. Missing scan IDs remain valid correlation references for
+// imports and out-of-band callers.
+func checkFindingScanProject(ctx context.Context, idb bun.IDB, project, scanUUID, driver string) error {
+	if scanUUID == "" {
+		return nil
+	}
+	query := idb.NewSelect().Model((*Scan)(nil)).Column("project_uuid").Where("uuid = ?", scanUUID)
+	if driver == driverPostgres {
+		// Keep the checked owner stable through the finding transaction on PG.
+		query = query.For("UPDATE")
+	}
+	var owner string
+	if err := query.Scan(ctx, &owner); err != nil {
+		if err == sql.ErrNoRows {
+			return nil
+		}
+		return fmt.Errorf("check finding scan project: %w", err)
+	}
+	owner = defaultProjectUUID(owner)
+	project = defaultProjectUUID(project)
+	if owner != project {
+		return fmt.Errorf("%w: scan %s belongs to project %s, not %s", ErrScanProjectMismatch, scanUUID, owner, project)
 	}
 	return nil
 }

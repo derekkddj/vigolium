@@ -107,6 +107,44 @@ func requireMutation(t *testing.T, doc map[string]any, command string, changed b
 	return items
 }
 
+func TestProjectUUIDInputsAreCanonicalized(t *testing.T) {
+	e := newB5Env(t)
+
+	for name, toInput := range map[string]func(string) string{
+		"uppercase": func(id string) string { return strings.ToUpper(id) },
+		"braces":    func(id string) string { return "{" + id + "}" },
+		"urn":       func(id string) string { return "urn:uuid:" + id },
+		"compact":   func(id string) string { return strings.ReplaceAll(id, "-", "") },
+	} {
+		t.Run("create/"+name, func(t *testing.T) {
+			id := uuid.NewString()
+			code, stdout, stderr := e.run(t, nil, "project", "create", "canonical-create", "--project-uuid", toInput(id), "-j")
+			require.Equal(t, 0, code, stderr)
+			created := oneDoc(t, stdout, stderr)
+			createdItems := requireMutation(t, created, "project create", true)
+			require.Equal(t, id, createdItems[0].(map[string]any)["uuid"], "project create must store and report canonical UUID spelling")
+			require.Equal(t, id, created["project_uuid"])
+		})
+	}
+
+	useID := uuid.NewString()
+	useInput := "urn:uuid:" + useID
+	code, stdout, stderr := e.run(t, nil, "project", "use", useInput, "--create", "--name", "canonical-use", "-j")
+	require.Equal(t, 0, code, stderr)
+	used := oneDoc(t, stdout, stderr)
+	usedItems := requireMutation(t, used, "project use", true)
+	require.Equal(t, useID, usedItems[0].(map[string]any)["uuid"], "project use --create must store and report canonical UUID spelling")
+	require.Equal(t, useID, used["project_uuid"])
+
+	// A noncanonical spelling of an existing canonical project resolves to that
+	// row instead of creating or activating a second spelling.
+	code, stdout, stderr = e.run(t, nil, "project", "use", strings.ToUpper(useID), "-j")
+	require.Equal(t, 0, code, stderr)
+	noop := oneDoc(t, stdout, stderr)
+	requireMutation(t, noop, "project use", false)
+	require.Equal(t, useID, noop["project_uuid"])
+}
+
 func TestProjectUseUnknownUUIDIsNotFound(t *testing.T) {
 	e := newB5Env(t)
 	id := uuid.NewString()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	goruntime "runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -285,6 +286,13 @@ func NewExecutor(
 	activeModules []modules.ActiveModule,
 	passiveModules []modules.PassiveModule,
 ) *Executor {
+	// ExecutorConfig is passed by value, but an identity string can still be a
+	// view over caller-owned mutable bytes (for example, a reused HTTP header
+	// buffer). Own these before cfg is retained by callbacks/workers or copied
+	// into the persistence identity fields below.
+	cfg.ProjectUUID = strings.Clone(cfg.ProjectUUID)
+	cfg.ScanUUID = strings.Clone(cfg.ScanUUID)
+
 	if cfg.Workers <= 0 {
 		cfg.Workers = goruntime.NumCPU()
 	}

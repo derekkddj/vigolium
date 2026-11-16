@@ -46,10 +46,9 @@ func (r *Repository) emitFindingSaved(f *Finding) {
 	}
 }
 
-// ErrScanProjectMismatch is returned by CreateScan / CreateAgenticScan when
-// the caller pins a UUID that already exists under a different project. This
-// guards against cross-project record corruption when remote nodes sync via
-// --scan-uuid.
+// ErrScanProjectMismatch is returned when a caller pins an existing scan/run
+// UUID under a different project, or a finding names a known scan owned by a
+// different project. This prevents adopting cross-project identity ownership.
 var ErrScanProjectMismatch = errors.New("scan UUID exists under a different project")
 
 // NewRepository creates a new repository instance

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -222,7 +223,9 @@ func (w *FindingWriter) Save(ctx context.Context, event *output.ResultEvent, rec
 		}
 	}()
 	event = snapshotFindingEvent(event)
-	recordUUIDs = append([]string(nil), recordUUIDs...)
+	recordUUIDs = cloneFindingUUIDs(recordUUIDs)
+	scanUUID = strings.Clone(scanUUID)
+	projectUUID = strings.Clone(projectUUID)
 	fw = findingWrite{event: event, recordUUIDs: recordUUIDs, scanUUID: scanUUID, projectUUID: projectUUID, pendingBytes: pendingBytes}
 
 	w.mu.RLock()
@@ -247,15 +250,51 @@ func (w *FindingWriter) Save(ctx context.Context, event *output.ResultEvent, rec
 	}
 }
 
+func cloneFindingUUIDs(uuids []string) []string {
+	if uuids == nil {
+		return nil
+	}
+	owned := make([]string, len(uuids))
+	for i, uuid := range uuids {
+		owned[i] = strings.Clone(uuid)
+	}
+	return owned
+}
+
 // snapshotFindingEvent preserves the producer ownership contract. Metadata is
 // deliberately not marshalled/unmarshalled: typed values keep their identity and
 // the same shallow-copy contract as before byte admission was added.
 func snapshotFindingEvent(event *output.ResultEvent) *output.ResultEvent {
 	snapshot := *event
+	// These strings participate in finding identity/attribution or persist as the
+	// module/record identity. Own their bytes before the event can outlive Save.
+	snapshot.ModuleID = strings.Clone(event.ModuleID)
+	snapshot.Info.Name = strings.Clone(event.Info.Name)
+	snapshot.Info.Description = strings.Clone(event.Info.Description)
+	snapshot.Matched = strings.Clone(event.Matched)
+	snapshot.DedupKey = strings.Clone(event.DedupKey)
+	snapshot.OriginRecordUUID = strings.Clone(event.OriginRecordUUID)
+	snapshot.RecordKind = output.RecordKind(strings.Clone(string(event.RecordKind)))
+	snapshot.EvidenceGrade = output.EvidenceGrade(strings.Clone(string(event.EvidenceGrade)))
 	snapshot.Info.Tags = append([]string(nil), event.Info.Tags...)
 	snapshot.ExtractedResults = append([]string(nil), event.ExtractedResults...)
 	snapshot.AdditionalEvidence = append([]string(nil), event.AdditionalEvidence...)
 	snapshot.Evidence = evidence.CloneEntries(event.Evidence)
+	for i := range snapshot.Evidence {
+		entry := &snapshot.Evidence[i]
+		entry.ExchangeID = strings.Clone(entry.ExchangeID)
+		entry.OccurrenceID = strings.Clone(entry.OccurrenceID)
+		entry.ScanUUID = strings.Clone(entry.ScanUUID)
+		if entry.Exchange != nil {
+			entry.Exchange.ID = strings.Clone(entry.Exchange.ID)
+			entry.Exchange.ContentHash = strings.Clone(entry.Exchange.ContentHash)
+			// Service and URL are inputs to Exchange.Hash. Own them with the
+			// captured hash so queued validation sees the same receipt identity;
+			// CloneEntries already owns the potentially large request/response bytes.
+			entry.Exchange.Service = strings.Clone(entry.Exchange.Service)
+			entry.Exchange.URL = strings.Clone(entry.Exchange.URL)
+		}
+	}
 	if event.Metadata != nil {
 		snapshot.Metadata = make(map[string]interface{}, len(event.Metadata))
 		for key, value := range event.Metadata {

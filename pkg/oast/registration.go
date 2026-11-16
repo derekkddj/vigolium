@@ -85,6 +85,11 @@ func New(cfg *config.OASTConfig, emitResult func(*output.ResultEvent), repo *dat
 		return nil, nil
 	}
 
+	// The interactsh callback can outlive the caller that admitted this scope.
+	// Own both identities before either fixed-mode state or the poller retains them.
+	scanUUID = strings.Clone(scanUUID)
+	projectUUID = strings.Clone(projectUUID)
+
 	// Fixed URL mode: skip interactsh client entirely
 	if cfg.OastURL != "" {
 		ready := make(chan struct{})

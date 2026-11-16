@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -70,7 +71,7 @@ type ScanLogger struct {
 // row must pass that row's ProjectUUID, not the process's current project.
 func NewScanLogger(repo *Repository, scanUUID, projectUUID string) *ScanLogger {
 	l := &ScanLogger{
-		repo: repo, scanUUID: scanUUID, projectUUID: defaultProjectUUID(projectUUID),
+		repo: repo, scanUUID: strings.Clone(scanUUID), projectUUID: strings.Clone(defaultProjectUUID(projectUUID)),
 		flushInterval: 2 * time.Second, stopCh: make(chan struct{}),
 		batchDone: make(chan struct{}), closeDone: make(chan struct{}),
 		flushGate: make(chan struct{}, 1),

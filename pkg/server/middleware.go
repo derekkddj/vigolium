@@ -10,14 +10,16 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
-	"github.com/google/uuid"
 	"github.com/vigolium/vigolium/pkg/apicontract"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/utils"
 	"go.uber.org/zap"
 )
 
-const projectUUIDLocalsKey = "project_uuid"
+const (
+	projectUUIDLocalsKey             = "project_uuid"
+	projectMiddlewareConfigLocalsKey = "project_middleware_config"
+)
 
 // ProjectMiddlewareConfig tunes ProjectUUIDMiddleware.
 type ProjectMiddlewareConfig struct {
@@ -58,51 +60,82 @@ func ProjectUUIDMiddleware(repo *database.Repository, cfg ...ProjectMiddlewareCo
 		if projectUUID == "" {
 			projectUUID = database.DefaultProjectUUID
 		}
-		c.Locals(projectUUIDLocalsKey, projectUUID)
+		c.Locals(projectMiddlewareConfigLocalsKey, conf)
 
-		if projectUUID == database.DefaultProjectUUID || isProjectHeaderExemptPath(c.Path()) {
+		if isProjectHeaderExemptPath(c.Path()) {
+			c.Locals(projectUUIDLocalsKey, projectUUID)
 			return c.Next()
 		}
-		if !validProjectUUID(projectUUID) {
-			return respondError(c, fiber.StatusBadRequest, ErrInvalidProjectUUID,
-				fmt.Sprintf("got %q; send a UUID such as one from GET /api/projects", projectUUID))
+		resolvedUUID, answered, err := resolveSelectedProjectUUID(c, projectUUID, repo, conf)
+		if answered {
+			return err
 		}
-		if repo == nil {
-			return c.Next()
-		}
-
-		lookup := repo
-		if conf.Reader != nil {
-			lookup = conf.Reader
-		}
-		_, err := lookup.GetProjectByUUID(c.Context(), projectUUID)
-		switch {
-		case err == nil:
-			return c.Next()
-		case !errors.Is(err, sql.ErrNoRows):
-			return respondErrorCode(c, fiber.StatusServiceUnavailable, apicontract.CodeDatabaseUnavailable,
-				"project lookup failed: "+err.Error())
-		case conf.AutoCreate || projectCreateRequested(c):
-			if err := createProjectStub(c, repo, projectUUID); err != nil {
-				return respondErrorCode(c, fiber.StatusServiceUnavailable, apicontract.CodeDatabaseUnavailable,
-					"failed to create project: "+err.Error())
-			}
-			return c.Next()
-		default:
-			return respondError(c, fiber.StatusNotFound, ErrProjectNotFound,
-				"no project has UUID "+projectUUID+"; pass "+apicontract.ProjectCreateHeader+": 1 or ?create=1 to create it")
-		}
+		c.Locals(projectUUIDLocalsKey, resolvedUUID)
+		return c.Next()
 	}
 }
 
-// validProjectUUID accepts the canonical 36-character form only (no braces
-// or urn: prefix), so the value stored in locals is the value in the DB.
-func validProjectUUID(s string) bool {
-	if len(s) != 36 {
-		return false
+// resolveAndValidateAgentProjectUUID preserves agent request-body precedence,
+// falls back to the middleware-selected header/default project, and applies the
+// same REST UUID/existence/create contract used for X-Project-UUID.
+func resolveAndValidateAgentProjectUUID(c fiber.Ctx, bodyProjectUUID string, repo *database.Repository) (string, bool, error) {
+	projectUUID := bodyProjectUUID
+	if projectUUID == "" {
+		projectUUID = getProjectUUID(c)
 	}
-	_, err := uuid.Parse(s)
-	return err == nil
+	conf, _ := c.Locals(projectMiddlewareConfigLocalsKey).(ProjectMiddlewareConfig)
+	return resolveSelectedProjectUUID(c, projectUUID, repo, conf)
+}
+
+// resolveSelectedProjectUUID shares project admission between header middleware
+// and agent body-selected scopes. It checks the exact spelling first so a
+// pre-existing legacy project remains addressable, then checks the canonical
+// UUID form. New rows are always created with the canonical spelling.
+// answered reports that an HTTP response was written, including when its write
+// returned nil.
+func resolveSelectedProjectUUID(c fiber.Ctx, projectUUID string, repo *database.Repository, conf ProjectMiddlewareConfig) (resolvedUUID string, answered bool, err error) {
+	canonicalUUID, parseErr := database.CanonicalUUID(projectUUID)
+	if parseErr != nil {
+		return "", true, respondError(c, fiber.StatusBadRequest, ErrInvalidProjectUUID,
+			fmt.Sprintf("got %q; send a UUID such as one from GET /api/projects", projectUUID))
+	}
+	if projectUUID == database.DefaultProjectUUID {
+		return database.DefaultProjectUUID, false, nil
+	}
+	if repo == nil {
+		return canonicalUUID, false, nil
+	}
+
+	lookup := repo
+	if conf.Reader != nil {
+		lookup = conf.Reader
+	}
+	if _, err := lookup.GetProjectByUUID(c.Context(), projectUUID); err == nil {
+		return projectUUID, false, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return "", true, respondErrorCode(c, fiber.StatusServiceUnavailable, apicontract.CodeDatabaseUnavailable,
+			"project lookup failed: "+err.Error())
+	}
+	if canonicalUUID == database.DefaultProjectUUID {
+		return database.DefaultProjectUUID, false, nil
+	}
+	if canonicalUUID != projectUUID {
+		if _, err := lookup.GetProjectByUUID(c.Context(), canonicalUUID); err == nil {
+			return canonicalUUID, false, nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return "", true, respondErrorCode(c, fiber.StatusServiceUnavailable, apicontract.CodeDatabaseUnavailable,
+				"project lookup failed: "+err.Error())
+		}
+	}
+	if conf.AutoCreate || projectCreateRequested(c) {
+		if err := createProjectStub(c, repo, canonicalUUID); err != nil {
+			return "", true, respondErrorCode(c, fiber.StatusServiceUnavailable, apicontract.CodeDatabaseUnavailable,
+				"failed to create project: "+err.Error())
+		}
+		return canonicalUUID, false, nil
+	}
+	return "", true, respondError(c, fiber.StatusNotFound, ErrProjectNotFound,
+		"no project has UUID "+canonicalUUID+"; pass "+apicontract.ProjectCreateHeader+": 1 or ?create=1 to create it")
 }
 
 // projectCreateRequested reports whether the request opted in to creating

@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/internal/runner"
+	"github.com/vigolium/vigolium/internal/sessionpath"
 	"github.com/vigolium/vigolium/pkg/apicontract"
 	"github.com/vigolium/vigolium/pkg/core"
 	"github.com/vigolium/vigolium/pkg/database"
@@ -59,7 +60,11 @@ func openScanSessionLog(scanID string, settings *config.Settings) *scanSessionLo
 	} else {
 		sessionsDir = config.ExpandPath("~/.vigolium/native-sessions/")
 	}
-	dir := filepath.Join(sessionsDir, scanID)
+	dir, err := sessionpath.RunDir(sessionsDir, scanID)
+	if err != nil {
+		zap.L().Warn("refusing unsafe scan session ID", zap.String("scan_uuid", scanID), zap.Error(err))
+		return nil
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		zap.L().Warn("failed to create scan session dir",
 			zap.String("scan_uuid", scanID), zap.String("dir", dir), zap.Error(err))

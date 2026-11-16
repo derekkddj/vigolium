@@ -88,6 +88,14 @@ func (h *Handlers) HandleAgentAudit(c fiber.Ctx) error {
 	if err := c.Bind().JSON(&req); err != nil {
 		return respondError(c, fiber.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
 	}
+	if err := validateOptionalRunUUID(req.ScanUUID); err != nil {
+		return respondError(c, fiber.StatusBadRequest, err)
+	}
+	projectUUID, answered, projectErr := resolveAndValidateAgentProjectUUID(c, req.ProjectUUID, h.repo)
+	if answered {
+		return projectErr
+	}
+	req.ProjectUUID = projectUUID
 
 	if strings.TrimSpace(req.Source) == "" {
 		return respondErrorMsg(c, fiber.StatusBadRequest, "source is required (local path or git URL)")

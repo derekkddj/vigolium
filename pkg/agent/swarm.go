@@ -280,6 +280,10 @@ func (s *SwarmRunner) initializeSwarmRun(ctx context.Context, cfg *SwarmConfig, 
 	if cfg.ProjectUUID == "" {
 		cfg.ProjectUUID = database.DefaultProjectUUID
 	}
+	cfg.ProjectUUID = strings.Clone(cfg.ProjectUUID)
+	cfg.ScanUUID = strings.Clone(cfg.ScanUUID)
+	cfg.AgenticScanUUID = strings.Clone(cfg.AgenticScanUUID)
+	run.UUID = strings.Clone(run.UUID)
 	run.ProjectUUID = cfg.ProjectUUID
 	cfg.AgenticScanUUID = run.UUID
 	if s.repo == nil {
@@ -371,6 +375,11 @@ func (s *SwarmRunner) initializeSwarmRun(ctx context.Context, cfg *SwarmConfig, 
 // Run executes the full agent swarm pipeline.
 func (s *SwarmRunner) Run(ctx context.Context, cfg SwarmConfig) (*SwarmResult, error) {
 	start := time.Now()
+	// Snapshot caller-owned identities before any run state or phase callback
+	// retains them. Initialization repeats this at its own direct-call boundary.
+	cfg.ProjectUUID = strings.Clone(cfg.ProjectUUID)
+	cfg.ScanUUID = strings.Clone(cfg.ScanUUID)
+	cfg.AgenticScanUUID = strings.Clone(cfg.AgenticScanUUID)
 	cfg.StreamWriter = NewSynchronizedWriter(cfg.StreamWriter)
 
 	// Set up context cache for DB enrichment across phases. ttl=0 means

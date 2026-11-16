@@ -382,6 +382,17 @@ func NewWithInputSource(options *types.Options, inputSource source.InputSource) 
 	// even for a caller that skipped the shared resolution.
 	config.CeilOptionsPace(options)
 
+	// Preserve constructor setup semantics (including target normalization on
+	// the caller's Options) but do not retain the caller's mutable struct or
+	// borrowed UUID string storage for the lifetime of the Runner. All other
+	// fields are copied verbatim; nested slices/maps/pointers retain their prior
+	// shared semantics. Project/scan identity bytes are the values asynchronous
+	// producers and persistence callbacks must own.
+	ownedOptions := *options
+	ownedOptions.ProjectUUID = strings.Clone(options.ProjectUUID)
+	ownedOptions.ScanUUID = strings.Clone(options.ScanUUID)
+	options = &ownedOptions
+
 	if err := network.Init(options); err != nil {
 		return nil, errors.Wrap(err, "failed to initialize network")
 	}

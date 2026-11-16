@@ -12,17 +12,19 @@ export function formatBytes(bytes: number): string {
   return `${val.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
-export function formatDate(iso: string): string {
-  try {
-    return new Date(iso).toLocaleString(undefined, {
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-    });
-  } catch {
-    return iso;
-  }
+const GO_ZERO_TIME_MS = Date.parse('0001-01-01T00:00:00Z');
+
+export function formatDate(iso: string | null | undefined): string {
+  if (typeof iso !== 'string' || iso.trim() === '') return '—';
+  const date = new Date(iso);
+  const timestamp = date.getTime();
+  if (!Number.isFinite(timestamp) || timestamp === GO_ZERO_TIME_MS) return '—';
+  return date.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
 }
 
 export function formatDuration(ms: unknown): string {

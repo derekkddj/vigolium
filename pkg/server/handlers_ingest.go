@@ -102,7 +102,7 @@ func ingestSource(c fiber.Ctx) string {
 		return database.RecordSourceIngestServer
 	}
 	if database.IsBridgeRecordSource(declared) {
-		return declared
+		return strings.Clone(declared)
 	}
 	zap.L().Debug("ignoring unrecognised ingest source header",
 		zap.String("header", IngestSourceHeader), zap.String("declared", declared))

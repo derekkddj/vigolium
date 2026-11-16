@@ -22,6 +22,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/internal/sessionpath"
 	"github.com/vigolium/vigolium/pkg/agent"
 	"github.com/vigolium/vigolium/pkg/database"
 	"go.uber.org/zap"
@@ -141,6 +142,13 @@ func (h *Handlers) HandleAgentQuery(c fiber.Ctx) error {
 	if err := c.Bind().JSON(&req); err != nil {
 		return respondError(c, fiber.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
 	}
+	if err := validateOptionalRunUUID(req.ScanUUID); err != nil {
+		return respondError(c, fiber.StatusBadRequest, err)
+	}
+	projectUUID, answered, projectErr := resolveAndValidateAgentProjectUUID(c, req.ProjectUUID, h.repo)
+	if answered {
+		return projectErr
+	}
 
 	if req.PromptTemplate == "" && req.PromptFile == "" && req.Prompt == "" {
 		return respondError(c, fiber.StatusBadRequest, ErrMissingPrompt)
@@ -153,11 +161,6 @@ func (h *Handlers) HandleAgentQuery(c fiber.Ctx) error {
 
 	opts := h.buildQueryOpts(req)
 	timeout := 10 * time.Minute
-
-	projectUUID := req.ProjectUUID
-	if projectUUID == "" {
-		projectUUID = getProjectUUID(c)
-	}
 
 	return h.startAgenticScan(c, "query", req.Stream, opts, timeout, projectUUID, req.UploadResults, eng, cleanup)
 }
@@ -827,7 +830,7 @@ func (h *Handlers) resolveSessionDirForRun(c fiber.Ctx) (sessionDir, agenticScan
 	if h.repo == nil {
 		return "", "", true, respondError(c, fiber.StatusServiceUnavailable, ErrDatabaseRequired)
 	}
-	agenticScanUUID = c.Params("id")
+	agenticScanUUID = strings.Clone(c.Params("id"))
 	if agenticScanUUID == "" {
 		return "", "", true, respondErrorMsg(c, fiber.StatusBadRequest, "missing session id")
 	}
@@ -842,7 +845,11 @@ func (h *Handlers) resolveSessionDirForRun(c fiber.Ctx) (sessionDir, agenticScan
 	}
 	sessionDir = run.SessionDir
 	if sessionDir == "" {
-		sessionDir = filepath.Join(h.settings.Agent.EffectiveSessionsDir(), agenticScanUUID)
+		var pathErr error
+		sessionDir, pathErr = sessionpath.RunDir(h.settings.Agent.EffectiveSessionsDir(), agenticScanUUID)
+		if pathErr != nil {
+			return "", "", true, respondErrorMsg(c, fiber.StatusNotFound, "session directory not found")
+		}
 	}
 	if info, statErr := os.Stat(sessionDir); statErr != nil || !info.IsDir() {
 		return "", "", true, respondErrorMsg(c, fiber.StatusNotFound, "session directory not found")

@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/vigolium/vigolium/pkg/database"
 )
@@ -182,6 +183,35 @@ func TestSwarmInitializationSameProjectResumeIdempotent(t *testing.T) {
 				t.Fatalf("resume created extra rows: count=%d err=%v", n, err)
 			}
 		})
+	}
+}
+
+func TestSwarmInitializationOwnsIdentityForSubsequentPhases(t *testing.T) {
+	ctx := context.Background()
+	repo := newAuditTestRepo(t)
+	projectBytes := []byte("project-a")
+	scanBytes := []byte("native-a")
+	runBytes := []byte("agent-run-a")
+	project := unsafe.String(unsafe.SliceData(projectBytes), len(projectBytes))
+	scan := unsafe.String(unsafe.SliceData(scanBytes), len(scanBytes))
+	runUUID := unsafe.String(unsafe.SliceData(runBytes), len(runBytes))
+	cfg := SwarmConfig{AgenticScanUUID: runUUID, ProjectUUID: project, ScanUUID: scan}
+	run := &database.AgenticScan{UUID: runUUID, Mode: "swarm", Status: "running", StartedAt: time.Unix(100, 0).UTC()}
+
+	if err := NewSwarmRunner(nil, repo).initializeSwarmRun(ctx, &cfg, run); err != nil {
+		t.Fatal(err)
+	}
+	copy(projectBytes, "project-b")
+	copy(scanBytes, "native-b")
+	copy(runBytes, "agent-run-b")
+
+	if cfg.ProjectUUID != "project-a" || cfg.ScanUUID != "native-a" || cfg.AgenticScanUUID != "agent-run-a" ||
+		run.ProjectUUID != "project-a" || run.ScanUUID != "native-a" || run.UUID != "agent-run-a" {
+		t.Fatalf("initialized run retained borrowed identity for later phases: cfg=%+v run=%+v", cfg, run)
+	}
+	stored, err := repo.GetAgenticScan(ctx, "agent-run-a")
+	if err != nil || stored.ProjectUUID != "project-a" || stored.ScanUUID != "native-a" {
+		t.Fatalf("stored admission scope changed: row=%+v err=%v", stored, err)
 	}
 }
 
