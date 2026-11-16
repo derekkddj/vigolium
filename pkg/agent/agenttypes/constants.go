@@ -27,10 +27,15 @@ const (
 
 // AutopilotPipelineResult holds the outcome of an autopilot pipeline run.
 type AutopilotPipelineResult struct {
+	// TotalFindings is the distinct persisted run-tree total across phases.
+	// Phase counters below may overlap and must not be added. -1 is unavailable.
+	TotalFindings         int
+	FindingCountAvailable bool
 	FindingsCount         int
 	FindingsSaved         int
 	FindingsBySeverity    map[string]int
-	OperatorFindingsCount int // findings reported by the autonomous operator via report_finding
+	OperatorFindingsCount int // new findings inserted by the autonomous operator via report_finding
+	NativeFindingsCount   int // native fallback receipt; not the operator's tool-local count
 	VerifiedFindingCount  int
 	Degraded              bool
 	Warnings              []string

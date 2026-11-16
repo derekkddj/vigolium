@@ -11,6 +11,14 @@ import (
 	"github.com/vigolium/vigolium/pkg/utils"
 )
 
+// browserAuthPhaseMaxTurns is the turn budget for the browser auth phase. The
+// generic swarm-phase default (agent.max_turns, 32) is too low here: this phase
+// drives a real browser — navigate, locate the form, fill it, submit, read the
+// result, and often try several login surfaces — so 32 turns can run out before
+// a legitimate login completes and the phase fails with "exceeded max turns". A
+// larger configured agent.max_turns still wins (see runAuthPhase).
+const browserAuthPhaseMaxTurns = 80
+
 // runAuthPhase executes the browser-based authentication phase using agent-browser.
 func (s *SwarmRunner) runAuthPhase(ctx context.Context, cfg SwarmConfig, targetURL string, sessionDir string) (string, error) {
 	hostname := hostnameFromURL(targetURL)
@@ -39,6 +47,15 @@ func (s *SwarmRunner) runAuthPhase(ctx context.Context, cfg SwarmConfig, targetU
 		extra["BrowserHeaded"] = "1"
 	}
 
+	// Give the browser auth phase a budget suited to a multi-step login, but
+	// never below a larger agent.max_turns an operator configured on purpose.
+	maxTurns := browserAuthPhaseMaxTurns
+	if s.engine != nil && s.engine.settings != nil {
+		if configured := s.engine.settings.Agent.Olium.MaxTurns; configured > maxTurns {
+			maxTurns = configured
+		}
+	}
+
 	opts := Options{
 		AgentName:      cfg.AgentName,
 		PromptTemplate: SwarmPromptAuth,
@@ -51,6 +68,7 @@ func (s *SwarmRunner) runAuthPhase(ctx context.Context, cfg SwarmConfig, targetU
 		ScanUUID:       cfg.ScanUUID,
 		ProjectUUID:    cfg.ProjectUUID,
 		StreamWriter:   cfg.StreamWriter,
+		MaxTurns:       maxTurns,
 	}
 
 	agentResult, runErr := s.engine.RunWithExtra(ctx, opts, extra)

@@ -52,6 +52,12 @@ type Options struct {
 	StreamWriter io.Writer `json:"-"` // when non-nil, agent output is streamed here in real-time
 	SessionDir   string    `json:"-"` // session directory for artifacts (transcripts, generated extensions, etc.)
 	Verbose      bool      `json:"-"` // when true, the toollog renders a per-tool result preview alongside the standard one-liner
+	// MaxTurns, when positive, caps the engine loop for this single run,
+	// overriding the config default (agent.max_turns). A phase that legitimately
+	// needs a bigger budget than the generic default — e.g. the browser auth
+	// phase — sets this so it is not cut short with "exceeded max turns". Zero
+	// means use the configured/bounded default.
+	MaxTurns int `json:"-"`
 
 	// Extra template data (injected into {{.Extra}} in prompt templates)
 	Extra map[string]string `json:"-"`

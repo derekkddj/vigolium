@@ -232,7 +232,8 @@ func emitAgentRunDocument(o *agentRunOutcome) error {
 // agentRunEnvelope builds the document.
 func agentRunEnvelope(o *agentRunOutcome) *agentEnvelope {
 	_, jsonStatus := agentRunStatus(o.End)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
 	counts := map[string]int64{}
 	for _, sev := range severityOrder {
@@ -240,27 +241,50 @@ func agentRunEnvelope(o *agentRunOutcome) *agentEnvelope {
 	}
 	total := o.FindingCount
 	items := []map[string]any{}
+	findingCountAvailable := false
 	persisted := o.Repo != nil && o.AgenticScanUUID != "" && !globalStateless
 	if o.Repo != nil && o.AgenticScanUUID != "" {
 		db := o.Repo.DB()
-		uuids := resolveAgenticScanTree(ctx, db, o.AgenticScanUUID)
-		if byScan, err := database.CountFindingsByAgenticScans(ctx, db, uuids); err == nil {
-			total = 0
-			for sev, n := range byScan {
-				counts[sev] += n
-				total += n
+		var findings []*database.Finding
+		if o.Mode == "autopilot" {
+			// Autopilot phase counters can overlap. Count and select the same
+			// project-validated persisted tree, including native child work.
+			n, byScan, err := o.Repo.CountAgenticScanFindings(ctx, o.ProjectUUID, o.AgenticScanUUID)
+			if err != nil {
+				total, counts = -1, nil
+				o.addError(fmt.Errorf("count findings: %w", err))
+			} else {
+				total, findingCountAvailable = n, true
+				for sev, count := range byScan {
+					counts[sev] += count
+				}
+				findings, err = o.Repo.ListAgenticScanFindings(ctx, o.ProjectUUID, o.AgenticScanUUID, agentRunTopFindings)
+				if err != nil {
+					o.addError(fmt.Errorf("read findings: %w", err))
+				}
 			}
 		} else {
-			o.addError(fmt.Errorf("count findings: %w", err))
-		}
-		findings, err := database.NewFindingsQueryBuilder(db, database.QueryFilters{
-			ProjectUUID:      o.ProjectUUID,
-			AgenticScanUUIDs: uuids,
-			Limit:            agentRunScanCap,
-			SortBy:           "found_at",
-		}).Execute(ctx)
-		if err != nil {
-			o.addError(fmt.Errorf("read findings: %w", err))
+			// Other run modes retain their existing document accounting contract.
+			uuids := resolveAgenticScanTree(ctx, db, o.AgenticScanUUID)
+			if byScan, err := database.CountFindingsByAgenticScans(ctx, db, uuids); err == nil {
+				total = 0
+				for sev, n := range byScan {
+					counts[sev] += n
+					total += n
+				}
+			} else {
+				o.addError(fmt.Errorf("count findings: %w", err))
+			}
+			var err error
+			findings, err = database.NewFindingsQueryBuilder(db, database.QueryFilters{
+				ProjectUUID:      o.ProjectUUID,
+				AgenticScanUUIDs: uuids,
+				Limit:            agentRunScanCap,
+				SortBy:           "found_at",
+			}).Execute(ctx)
+			if err != nil {
+				o.addError(fmt.Errorf("read findings: %w", err))
+			}
 		}
 		sort.SliceStable(findings, func(i, j int) bool {
 			return severityRank(findings[i].Severity) > severityRank(findings[j].Severity)
@@ -316,6 +340,9 @@ func agentRunEnvelope(o *agentRunOutcome) *agentEnvelope {
 		With("duration_ms", now.Sub(started).Milliseconds()).
 		With("started_at", agentTimestamp(started)).
 		With("finished_at", agentTimestamp(now))
+	if o.Mode == "autopilot" {
+		env.With("finding_count_available", findingCountAvailable)
+	}
 	if sr := agentRunStopReason(jsonStatus); sr != "" {
 		env.With("stop_reason", sr)
 	}
