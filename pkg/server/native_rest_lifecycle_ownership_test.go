@@ -347,10 +347,8 @@ func TestRunScanRESTLifecycleOwnsProjectAcrossRequestReuse(t *testing.T) {
 		return nil
 	}
 	scanA := awaitScanTerminal("11111111-1111-4111-8111-111111111111", "completed")
-	// Native REST cancellation has separate durable and session representations:
-	// the scan row is failed with error "cancelled", while status.json says cancelled.
-	scanB := awaitScanTerminal("22222222-2222-4222-8222-222222222222", "failed")
-	require.Equal(t, "cancelled", scanB.ErrorMessage)
+	// A stopped native REST scan finalizes its row as cancelled, like status.json.
+	scanB := awaitScanTerminal("22222222-2222-4222-8222-222222222222", "cancelled")
 	require.False(t, scanB.FinishedAt.IsZero(), "cancelled scan row must be finalized")
 	require.Equal(t, projectA, scanA.ProjectUUID)
 	require.Equal(t, projectB, scanB.ProjectUUID)
@@ -572,7 +570,7 @@ func wantSessionStatus(completed, cancelled *database.Scan, scanID string) strin
 	if scanID == "11111111-1111-4111-8111-111111111111" && completed != nil && completed.Status == "completed" {
 		return runner.SessionCompleted
 	}
-	if scanID == "22222222-2222-4222-8222-222222222222" && cancelled != nil && cancelled.Status == "failed" && cancelled.ErrorMessage == "cancelled" {
+	if scanID == "22222222-2222-4222-8222-222222222222" && cancelled != nil && cancelled.Status == "cancelled" {
 		return runner.SessionCancelled
 	}
 	return ""

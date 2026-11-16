@@ -100,14 +100,14 @@ func awaitAgentAdmissionPersistence(t *testing.T, h *Handlers, repo *database.Re
 		h.agentMu.Lock()
 		memoryTerminal := make([]string, 0, len(pending))
 		for uuid := range pending {
-			if state := h.agenticScanStatus[uuid]; state != nil && isTerminalAgentStatus(state.Status) {
+			if state := h.agenticScanStatus[uuid]; state != nil && database.IsTerminalAgenticScanStatus(state.Status) {
 				memoryTerminal = append(memoryTerminal, uuid)
 			}
 		}
 		h.agentMu.Unlock()
 		for _, uuid := range memoryTerminal {
 			run, err := repo.GetAgenticScan(context.Background(), uuid)
-			if err != nil || !isTerminalAgentStatus(run.Status) || run.CompletedAt.IsZero() {
+			if err != nil || !database.IsTerminalAgenticScanStatus(run.Status) || run.CompletedAt.IsZero() {
 				continue
 			}
 			h.runCancelMu.Lock()

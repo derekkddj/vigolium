@@ -21,7 +21,6 @@ func newServerReceiveScanUUID() string {
 	return uuid.NewString()
 }
 
-
 // newScanOnReceiveRow builds the persistent scan row one scan-on-receive
 // receiver tracks its cursor on, in projectUUID.
 func newScanOnReceiveRow(projectUUID, target, modules string, threads int) *database.Scan {

@@ -35,7 +35,7 @@ func resolveRecordInProject(ctx context.Context, repo *database.Repository, id, 
 	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
-	if len(id) < database.MinRecordUUIDPrefix {
+	if len(id) < database.MinUUIDPrefix {
 		return nil, sql.ErrNoRows
 	}
 
