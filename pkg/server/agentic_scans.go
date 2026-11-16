@@ -106,10 +106,13 @@ func (h *Handlers) effectiveAgentName(agentName string) string {
 	return "olium"
 }
 
-// respondScanPinError translates database scan-pin errors into HTTP responses:
-// ErrScanProjectMismatch becomes 409 Conflict (clean fail-fast for cross-node
-// sync). Anything else is a 500.
+// respondScanPinError translates scan-pin errors into HTTP responses: invalid
+// UUIDs are 400, ErrScanProjectMismatch is 409 (clean fail-fast for cross-node
+// sync), and unexpected persistence errors are 500.
 func respondScanPinError(c fiber.Ctx, err error) error {
+	if errors.Is(err, errInvalidRunUUID) {
+		return respondError(c, fiber.StatusBadRequest, err)
+	}
 	if errors.Is(err, database.ErrScanProjectMismatch) {
 		return respondError(c, fiber.StatusConflict, err)
 	}
@@ -119,9 +122,12 @@ func respondScanPinError(c fiber.Ctx, err error) error {
 // registerRunningAgenticScan creates the in-memory + DB tracking for a new
 // agent run. When pinUUID is non-empty it becomes the run's UUID — used to
 // attach a remote-created scan record across nodes; otherwise a fresh UUID is
-// minted. Returns ErrScanProjectMismatch when pinUUID belongs to a different
-// project, which the caller should surface as HTTP 409.
+// minted. Invalid pinned UUIDs are rejected before persistence; a UUID owned by
+// a different project returns ErrScanProjectMismatch for HTTP 409.
 func (h *Handlers) registerRunningAgenticScan(mode, agentName, pinUUID, projectUUID string) (string, error) {
+	if err := validateOptionalRunUUID(pinUUID); err != nil {
+		return "", err
+	}
 	agenticScanUUID := pinUUID
 	if agenticScanUUID == "" {
 		agenticScanUUID = uuid.New().String()

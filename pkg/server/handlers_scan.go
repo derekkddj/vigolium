@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/internal/runner"
+	"github.com/vigolium/vigolium/internal/sessionpath"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/modules"
 	"github.com/vigolium/vigolium/pkg/notify/webhook"
@@ -84,6 +85,9 @@ func applyAPIModuleSelection(opts *types.Options, modulePatterns, moduleTags []s
 
 // validateRunScanRequest validates the RunScanRequest fields.
 func validateRunScanRequest(req RunScanRequest) error {
+	if err := validateOptionalRunUUID(req.ScanUUID); err != nil {
+		return err
+	}
 	if req.Strategy != "" {
 		switch req.Strategy {
 		case "lite", "balanced", "deep":
@@ -361,12 +365,12 @@ func (h *Handlers) HandleRunScan(c fiber.Ctx) error {
 	if len(formats) > 0 {
 		// Output base path is fixed under the scan's session dir so the post-scan
 		// renderer and uploadNativeScanResults know where each format's file is.
+		sessionDir, err := sessionpath.RunDir(settings.ScanningStrategy.ScanLogs.EffectiveSessionsDir(), scanID)
+		if err != nil {
+			return respondError(c, fiber.StatusBadRequest, err)
+		}
 		outputs = scanOutputs{
-			base: filepath.Join(
-				settings.ScanningStrategy.ScanLogs.EffectiveSessionsDir(),
-				scanID,
-				"output",
-			),
+			base:    filepath.Join(sessionDir, "output"),
 			formats: formats,
 		}
 		opts.OutputFormats = formats
@@ -867,8 +871,10 @@ func (h *Handlers) HandleGetScanLogs(c fiber.Ctx) error {
 	if h.settings != nil {
 		sessionsDir = h.settings.ScanningStrategy.ScanLogs.EffectiveSessionsDir()
 	}
-	if logPath := resolveRuntimeLogPath(filepath.Join(sessionsDir, scanUUID)); logPath != "" {
-		return sendLogTail(c, logPath, parseBoolParam(c.Query("strip")))
+	if sessionDir, pathErr := sessionpath.RunDir(sessionsDir, scanUUID); pathErr == nil {
+		if logPath := resolveRuntimeLogPath(sessionDir); logPath != "" {
+			return sendLogTail(c, logPath, parseBoolParam(c.Query("strip")))
+		}
 	}
 
 	// Fallback: structured DB logs. Preserved for clients that relied on the

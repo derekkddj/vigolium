@@ -22,6 +22,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/internal/sessionpath"
 	"github.com/vigolium/vigolium/pkg/agent"
 	"github.com/vigolium/vigolium/pkg/database"
 	"go.uber.org/zap"
@@ -140,6 +141,9 @@ func (h *Handlers) HandleAgentQuery(c fiber.Ctx) error {
 	var req AgenticScanRequest
 	if err := c.Bind().JSON(&req); err != nil {
 		return respondError(c, fiber.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
+	}
+	if err := validateOptionalRunUUID(req.ScanUUID); err != nil {
+		return respondError(c, fiber.StatusBadRequest, err)
 	}
 	projectUUID, answered, projectErr := resolveAndValidateAgentProjectUUID(c, req.ProjectUUID, h.repo)
 	if answered {
@@ -841,7 +845,11 @@ func (h *Handlers) resolveSessionDirForRun(c fiber.Ctx) (sessionDir, agenticScan
 	}
 	sessionDir = run.SessionDir
 	if sessionDir == "" {
-		sessionDir = filepath.Join(h.settings.Agent.EffectiveSessionsDir(), agenticScanUUID)
+		var pathErr error
+		sessionDir, pathErr = sessionpath.RunDir(h.settings.Agent.EffectiveSessionsDir(), agenticScanUUID)
+		if pathErr != nil {
+			return "", "", true, respondErrorMsg(c, fiber.StatusNotFound, "session directory not found")
+		}
 	}
 	if info, statErr := os.Stat(sessionDir); statErr != nil || !info.IsDir() {
 		return "", "", true, respondErrorMsg(c, fiber.StatusNotFound, "session directory not found")

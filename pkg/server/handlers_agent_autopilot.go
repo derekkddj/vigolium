@@ -30,6 +30,9 @@ func (h *Handlers) HandleAgentAutopilot(c fiber.Ctx) error {
 	if err := c.Bind().JSON(&req); err != nil {
 		return respondError(c, fiber.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
 	}
+	if err := validateOptionalRunUUID(req.ScanUUID); err != nil {
+		return respondError(c, fiber.StatusBadRequest, err)
+	}
 	projectUUID, answered, projectErr := resolveAndValidateAgentProjectUUID(c, req.ProjectUUID, h.repo)
 	if answered {
 		return projectErr

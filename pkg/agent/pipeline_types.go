@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/internal/paths"
+	"github.com/vigolium/vigolium/internal/sessionpath"
 	"github.com/vigolium/vigolium/pkg/modules"
 	"go.uber.org/zap"
 )
@@ -100,7 +101,10 @@ func EnsureSessionDir(baseDir, agenticScanUUID string) (string, error) {
 			return "", fmt.Errorf("failed to resolve the state directory: no home directory and no %s", paths.StateDirEnv)
 		}
 	}
-	dir := filepath.Join(baseDir, agenticScanUUID)
+	dir, err := sessionpath.RunDir(baseDir, agenticScanUUID)
+	if err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("failed to create session dir: %w", err)
 	}
