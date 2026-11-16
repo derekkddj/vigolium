@@ -360,6 +360,7 @@ type routeContract struct {
 // is born on the envelope.
 var restRouteContracts = map[string]routeContract{
 	"GET /api/findings":                     {Command: "finding", ProjectScoped: true},
+	"GET /api/findings/hosts":               {Command: "finding", ProjectScoped: true},
 	"GET /api/http-records":                 {Command: "traffic", ProjectScoped: true},
 	"GET /api/scans":                        {Command: "log ls", ProjectScoped: true},
 	"GET /api/scans/:uuid/logs":             {ProjectScoped: true},

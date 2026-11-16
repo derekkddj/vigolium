@@ -3,7 +3,9 @@ package autopilot
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -27,8 +29,11 @@ const (
 // tool needs. Keeping this narrow lets us swap in a test double and keeps
 // the tool's import surface tight. SaveFindingReported reports whether a new
 // row was inserted (vs a dedup) so the tool only counts distinct findings.
+// ResolveRecordUUIDInProject expands one exact UUID or unambiguous prefix and
+// never exposes records from another project.
 type FindingSink interface {
 	SaveFindingReported(ctx context.Context, finding *database.Finding) (inserted bool, err error)
+	ResolveRecordUUIDInProject(ctx context.Context, prefix, projectUUID string) (string, []database.RecordRefCandidate, error)
 }
 
 // ReportFindingContext pins the scope under which findings are recorded.
@@ -206,13 +211,17 @@ func (c *ReportFindingContext) PersistFromArgs(ctx context.Context, args map[str
 		}
 	}
 
-	// Evidence linkage: the http_records that prove this finding. The model
-	// only ever learns valid UUIDs from project-scoped tools (query_records,
-	// inspect_record, replay_request, web_fetch), so these are in-project by
-	// construction — no DB round-trip to re-verify here (the narrow FindingSink
-	// deliberately has no record-read capability). Deduped and bounded so a
-	// looping model can't attach an unbounded list.
-	recordUUIDs := parseRecordUUIDs(args["record_uuids"])
+	// Resolve evidence references before creating the finding. Models may
+	// truncate UUIDs to a prefix or invent a reference; accepting either as a
+	// soft link would leave the finding without reproducible proof. Resolution
+	// is project-scoped so foreign records and candidates are never disclosed.
+	recordUUIDs, resolutionErrors := resolveFindingRecordUUIDs(ctx, c.Repo, c.ProjectUUID, parseRecordUUIDs(args["record_uuids"]))
+	if len(resolutionErrors) > 0 {
+		return PersistResult{
+			Message: "report_finding: could not resolve record_uuids: " + strings.Join(resolutionErrors, "; "),
+			IsError: true,
+		}
+	}
 
 	var findingHash string
 	if trimmed := strings.TrimSpace(dedupKey); trimmed != "" {
@@ -286,6 +295,45 @@ func (c *ReportFindingContext) PersistFromArgs(ctx context.Context, args map[str
 			"total_so_far": n,
 		},
 	}
+}
+
+func resolveFindingRecordUUIDs(ctx context.Context, sink FindingSink, projectUUID string, references []string) ([]string, []string) {
+	if projectUUID == "" {
+		projectUUID = database.DefaultProjectUUID
+	}
+
+	resolved := make([]string, 0, len(references))
+	seen := make(map[string]struct{}, len(references))
+	var failures []string
+	for _, reference := range references {
+		fullUUID, candidates, err := sink.ResolveRecordUUIDInProject(ctx, reference, projectUUID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				failures = append(failures, fmt.Sprintf("%q does not resolve in the current project", reference))
+			} else {
+				failures = append(failures, fmt.Sprintf("%q could not be resolved: %v", reference, err))
+			}
+			continue
+		}
+		if len(candidates) > 0 {
+			uuids := make([]string, len(candidates))
+			for i, candidate := range candidates {
+				uuids[i] = candidate.UUID
+			}
+			failures = append(failures, fmt.Sprintf("%q is ambiguous (matches %s)", reference, strings.Join(uuids, ", ")))
+			continue
+		}
+		if fullUUID == "" {
+			failures = append(failures, fmt.Sprintf("%q does not resolve in the current project", reference))
+			continue
+		}
+		if _, exists := seen[fullUUID]; exists {
+			continue
+		}
+		seen[fullUUID] = struct{}{}
+		resolved = append(resolved, fullUUID)
+	}
+	return resolved, failures
 }
 
 // PersistResult carries the outcome of PersistFromArgs.

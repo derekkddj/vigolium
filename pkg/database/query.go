@@ -245,6 +245,30 @@ const severitySortRankExpr = "CASE f.severity" +
 	" WHEN 'critical' THEN 6 WHEN 'high' THEN 5 WHEN 'medium' THEN 4" +
 	" WHEN 'low' THEN 3 WHEN 'suspect' THEN 2 WHEN 'info' THEN 1 ELSE 0 END"
 
+const confidenceSortRankExpr = "CASE f.confidence" +
+	" WHEN 'certain' THEN 3 WHEN 'firm' THEN 2 WHEN 'tentative' THEN 1 ELSE 0 END"
+
+// FindingSortFields are the sort values accepted by the findings REST API,
+// including historical aliases also used by the query builder.
+var FindingSortFields = []string{
+	"found_at", "found", "created_at", "created", "severity", "module_name", "module", "module_id", "confidence",
+	"id", "module_type", "finding_source", "status", "url", "scan_uuid", "repo_name", "source_file",
+}
+
+// ValidateFindingSort reports whether sortBy is an accepted public finding sort.
+// An empty value means the caller did not request an explicit sort.
+func ValidateFindingSort(sortBy string) error {
+	if sortBy == "" {
+		return nil
+	}
+	for _, field := range FindingSortFields {
+		if sortBy == field {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid finding sort %q; supported: %s", sortBy, strings.Join(FindingSortFields, ", "))
+}
+
 var (
 	// recordSearchPredicate scans http_records: URL, path, and the raw
 	// request/response corpus (headers + body). Four ? placeholders.
@@ -1086,6 +1110,13 @@ func AllTablesDeleteOrder() []string {
 	return allTablesDeleteOrder
 }
 
+// FindingHostCount reports the number of matching findings associated with one
+// stored hostname.
+type FindingHostCount struct {
+	Hostname string `bun:"hostname" json:"hostname"`
+	Total    int64  `bun:"total" json:"total"`
+}
+
 // FindingsQueryBuilder builds filtered queries for the findings table
 type FindingsQueryBuilder struct {
 	db      *DB
@@ -1106,6 +1137,25 @@ func (fqb *FindingsQueryBuilder) Count(ctx context.Context) (int64, error) {
 	fqb.applyFindingFilters(query)
 	count, err := query.Count(ctx)
 	return int64(count), err
+}
+
+// GroupByHostname returns complete host counts for the builder's filters. It
+// intentionally ignores list pagination and ordering so host totals do not vary
+// with the current page.
+func (fqb *FindingsQueryBuilder) GroupByHostname(ctx context.Context) ([]FindingHostCount, error) {
+	const hostnameExpr = "COALESCE(NULLIF(f.hostname, ''), '(unknown)')"
+	groups := make([]FindingHostCount, 0)
+	query := fqb.db.NewSelect().Model((*Finding)(nil)).
+		ColumnExpr(hostnameExpr + " AS hostname").
+		ColumnExpr("COUNT(*) AS total").
+		GroupExpr(hostnameExpr).
+		OrderExpr("total DESC").
+		OrderExpr("hostname ASC")
+	fqb.applyFindingFilters(query)
+	if err := query.Scan(ctx, &groups); err != nil {
+		return nil, err
+	}
+	return groups, nil
 }
 
 // Execute executes the query and returns findings
@@ -1384,7 +1434,23 @@ func (fqb *FindingsQueryBuilder) mapFindingSortColumn(name string) string {
 	case "module_id":
 		return "f.module_id"
 	case "confidence":
-		return "f.confidence"
+		return confidenceSortRankExpr
+	case "id":
+		return "f.id"
+	case "module_type":
+		return "f.module_type"
+	case "finding_source":
+		return "f.finding_source"
+	case "status":
+		return "f.status"
+	case "url":
+		return "f.url"
+	case "scan_uuid":
+		return "f.scan_uuid"
+	case "repo_name":
+		return "f.repo_name"
+	case "source_file":
+		return "f.source_file"
 	default:
 		return "f.found_at"
 	}
