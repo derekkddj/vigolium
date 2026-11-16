@@ -276,14 +276,19 @@ func (h *Handlers) buildAutopilotPipelineConfig(req AgentAutopilotRequest, proje
 
 	// Resolve source (git URL, archive, local path) and diff context
 	if sourcePath != "" || req.Diff != "" || req.LastCommits > 0 {
-		sessionDir := filepath.Join(h.settings.Agent.EffectiveSessionsDir(), "api-"+uuid.New().String()[:8])
-		resolved, resolvedFiles, dc, err := agent.ResolveSourceAndDiff(sourcePath, req.Diff, req.LastCommits, files, sessionDir)
+		sessionDir, err := agent.CreateExclusiveSessionDir(h.settings.Agent.EffectiveSessionsDir(), "api-"+uuid.NewString())
 		if err != nil {
-			zap.L().Warn("Source/diff resolution failed, proceeding with original values", zap.Error(err))
+			zap.L().Warn("Failed to allocate source resolution session directory", zap.Error(err))
 		} else {
-			sourcePath = resolved
-			files = resolvedFiles
-			diffCtx = dc
+			resolved, resolvedFiles, dc, err := agent.ResolveSourceAndDiff(sourcePath, req.Diff, req.LastCommits, files, sessionDir)
+			_ = os.Remove(sessionDir) // remove the reservation when local resolution left it empty
+			if err != nil {
+				zap.L().Warn("Source/diff resolution failed, proceeding with original values", zap.Error(err))
+			} else {
+				sourcePath = resolved
+				files = resolvedFiles
+				diffCtx = dc
+			}
 		}
 	}
 

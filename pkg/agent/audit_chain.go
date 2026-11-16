@@ -453,14 +453,17 @@ func (p *PioliumChainScanner) finalizeAggregateRow(chainErr error) error {
 // AgenticScan UUID, shared by NewAuditAgenticScanner and the chain
 // scanner: an explicit ForceAgenticScanUUID wins (the chain pins every
 // inner runner to its aggregate row); otherwise a standalone run reuses
-// {sessions_dir}/{uuid}/ via filepath.Base(SessionDir) so `vigolium log`
-// resolves runtime.log; a nested/no-session run gets a fresh UUID.
+// {sessions_dir}/{uuid}/ via filepath.Base(SessionDir) only when that basename
+// is a canonical UUID, so `vigolium log` resolves runtime.log. A non-UUID
+// directory name, nested run, or no-session run gets a fresh UUID.
 func deriveAuditScanUUID(cfg AuditAgentConfig) string {
 	if cfg.ForceAgenticScanUUID != "" {
 		return cfg.ForceAgenticScanUUID
 	}
 	if cfg.SessionDir != "" && cfg.ParentAgenticScanUUID == "" {
-		return filepath.Base(cfg.SessionDir)
+		if sessionUUID := filepath.Base(cfg.SessionDir); database.ValidRunID(sessionUUID) {
+			return sessionUUID
+		}
 	}
 	return uuid.New().String()
 }
