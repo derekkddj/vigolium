@@ -19,7 +19,6 @@ import (
 	"github.com/vigolium/vigolium/pkg/input/source"
 	"github.com/vigolium/vigolium/pkg/modules"
 	"github.com/vigolium/vigolium/pkg/output"
-	"github.com/vigolium/vigolium/pkg/scanevents"
 	"github.com/vigolium/vigolium/pkg/terminal"
 	"go.uber.org/zap"
 )
@@ -114,14 +113,14 @@ func (r *Runner) attachWAFBlockNotifier(requester *http.Requester) {
 		return
 	}
 	console := !r.options.Silent
-	if !console && !scanevents.On() {
+	if !console && !r.eventsOn() {
 		return
 	}
 	requester.SetBlockNotifier(func(n http.BlockNotice) {
 		if console {
 			r.emitNoticeLine(FormatBlockNoticeLine(n))
 		}
-		emitBlockEvent(n)
+		r.emitBlockEvent(n)
 	})
 }
 
@@ -177,14 +176,14 @@ func (r *Runner) attachWAFPacingNotifier(limiter *hostlimit.HostRateLimiter) {
 		return
 	}
 	console := !r.options.Silent
-	if !console && !scanevents.On() {
+	if !console && !r.eventsOn() {
 		return
 	}
 	limiter.SetPreArmNotifier(func(n hostlimit.PreArmNotice) {
 		if console {
 			r.emitNoticeLine(FormatEdgePaceLine(n))
 		}
-		emitPacingEvent(n.Host, n.Vendor, n.From, n.Start)
+		r.emitPacingEvent(n.Host, n.Vendor, n.From, n.Start)
 	})
 }
 

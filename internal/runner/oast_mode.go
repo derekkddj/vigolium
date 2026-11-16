@@ -25,7 +25,7 @@ func (r *Runner) reportOASTMode(svc *oast.Service) {
 	}
 	zap.L().Warn("OAST: fixed URL without {nonce}; callbacks cannot be correlated",
 		zap.String("oast.mode", oast.ModeFixedUncorrelated), zap.String("oast_url", svc.ServerURL()))
-	scanevents.Emit(scanevents.Event{
+	r.emitEvent(scanevents.Event{
 		Type:    scanevents.TypeError,
 		Phase:   string(PhaseDynamicAssessment),
 		Message: oastUncorrelatedMessage,

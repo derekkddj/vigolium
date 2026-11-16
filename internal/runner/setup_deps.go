@@ -54,7 +54,7 @@ type setupStep struct {
 func (r *Runner) beginSetup(component, label, eta string) *setupStep {
 	s := &setupStep{r: r, component: component, label: label, start: time.Now()}
 	r.printPhaseDetail(fmt.Sprintf("Setup: %s — %s", terminal.HiTeal(label), eta))
-	scanevents.Emit(scanevents.Event{
+	r.emitEvent(scanevents.Event{
 		Type:      scanevents.TypeScanSetup,
 		Phase:     r.currentPhaseName(),
 		Component: component,
@@ -104,7 +104,7 @@ func (s *setupStep) finish(bytes int64, err error) {
 		}
 		s.r.printPhaseDetail(fmt.Sprintf("Setup: %s ready (%s%s)", s.label, size, fmtDuration(elapsed)))
 	}
-	scanevents.Emit(ev)
+	s.r.emitEvent(ev)
 }
 
 // provisionSpideringBrowser downloads Chrome for Testing when the crawl would

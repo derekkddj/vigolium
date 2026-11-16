@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/vigolium/vigolium/pkg/agent/parsing"
 	"github.com/vigolium/vigolium/pkg/database"
@@ -52,7 +53,7 @@ func (s *SwarmRunner) runTriageLoop(ctx context.Context, cfg SwarmConfig, agenti
 		BatchConcurrency:          cfg.BatchConcurrency,
 		ResumeFromRound:           triageResumeRound,
 		ProgressCallback:          cfg.ProgressCallback,
-		ScanFunc:                  cfg.ScanFunc,
+		ScanFunc:                  swarmRescanFunc(cfg),
 		SessionDir:                sessionDir,
 		ExtensionDir:              extensionDir,
 		InitialFindingIDFloor:     triageFindingFloor,
@@ -68,6 +69,7 @@ func (s *SwarmRunner) runTriageLoop(ctx context.Context, cfg SwarmConfig, agenti
 		OnTriageRoundComplete: func(round int) {
 			if cpErr := s.writeSwarmCheckpoint(sessionDir, cfg.ProjectUUID, completedPhases, agenticScan.TargetURL, result.TotalRecords, result.SwarmPlan, extensionDir, round+1, extensionRenames, result, swarmRecordStats{}); cpErr != nil {
 				zap.L().Warn("Failed to write checkpoint after triage round", zap.Int("round", round), zap.Error(cpErr))
+				_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", SwarmPhaseTriage, "warning: failed to write checkpoint; see run details")
 			}
 		},
 	}
@@ -90,6 +92,24 @@ func (s *SwarmRunner) runTriageLoop(ctx context.Context, cfg SwarmConfig, agenti
 	}
 
 	return nil
+}
+
+// swarmRescanFunc pairs the existing OnRescan start event with a completion
+// event, without changing the native callback's return value or streaming data.
+func swarmRescanFunc(cfg SwarmConfig) ScanFunc {
+	if cfg.ScanFunc == nil {
+		return nil
+	}
+	return func(ctx context.Context, req ScanRequest) error {
+		started := time.Now()
+		err := cfg.ScanFunc(ctx, req)
+		if err != nil {
+			_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", SwarmPhaseRescan, "warning: rescan failed; see run details")
+		}
+		_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", SwarmPhaseRescan, fmt.Sprintf(
+			"phase finished: duration=%s", time.Since(started).Round(time.Millisecond)))
+		return err
+	}
 }
 
 // runSASTReview spawns a sub-agent to review SAST findings and validate extracted routes.

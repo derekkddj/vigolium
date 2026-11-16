@@ -22,7 +22,7 @@ import (
 // probe is re-admitted after twice the request timeout.
 //
 // phase names the phase a transition happened in, for the event; it may be nil.
-func newHostErrorCache(opts *types.Options, settings *config.Settings, phase func() string) *hosterrors.Cache {
+func newHostErrorCache(opts *types.Options, settings *config.Settings, phase func() string, emit func(scanevents.Event)) *hosterrors.Cache {
 	if !opts.ShouldUseHostError() {
 		return nil
 	}
@@ -37,15 +37,15 @@ func newHostErrorCache(opts *types.Options, settings *config.Settings, phase fun
 	}
 	cache := hosterrors.NewWithConfig(cfg)
 	cache.SetVerbose(opts.Verbose)
-	cache.SetObserver(func(tr hosterrors.Transition) { emitHostTransition(tr, phase) })
+	cache.SetObserver(func(tr hosterrors.Transition) { emitHostTransition(tr, phase, emit) })
 	return cache
 }
 
 // emitHostTransition maps a breaker transition onto the host.* events. A failed
 // probe that re-opens the breaker is not an event: the host was quarantined
 // before and still is.
-func emitHostTransition(tr hosterrors.Transition, phase func() string) {
-	if !scanevents.On() {
+func emitHostTransition(tr hosterrors.Transition, phase func() string, emit func(scanevents.Event)) {
+	if emit == nil {
 		return
 	}
 	ev := scanevents.Event{Host: tr.Key}
@@ -70,7 +70,7 @@ func emitHostTransition(tr hosterrors.Transition, phase func() string) {
 	if tr.Err != nil {
 		ev.Message = tr.Err.Error()
 	}
-	scanevents.Emit(ev)
+	emit(ev)
 }
 
 // currentPhaseName is the canonical id of the running phase ("" outside one),
