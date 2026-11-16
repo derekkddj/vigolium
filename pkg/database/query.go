@@ -245,6 +245,9 @@ const severitySortRankExpr = "CASE f.severity" +
 	" WHEN 'critical' THEN 6 WHEN 'high' THEN 5 WHEN 'medium' THEN 4" +
 	" WHEN 'low' THEN 3 WHEN 'suspect' THEN 2 WHEN 'info' THEN 1 ELSE 0 END"
 
+const confidenceSortRankExpr = "CASE f.confidence" +
+	" WHEN 'certain' THEN 3 WHEN 'firm' THEN 2 WHEN 'tentative' THEN 1 ELSE 0 END"
+
 var (
 	// recordSearchPredicate scans http_records: URL, path, and the raw
 	// request/response corpus (headers + body). Four ? placeholders.
@@ -1384,7 +1387,7 @@ func (fqb *FindingsQueryBuilder) mapFindingSortColumn(name string) string {
 	case "module_id":
 		return "f.module_id"
 	case "confidence":
-		return "f.confidence"
+		return confidenceSortRankExpr
 	default:
 		return "f.found_at"
 	}

@@ -416,6 +416,52 @@ func TestFindingsQueryBuilder_SeverityAndModuleFilter(t *testing.T) {
 	}
 }
 
+func TestFindingsQueryBuilder_ConfidenceSortRanks(t *testing.T) {
+	assertFindingsConfidenceSortRanks(t, newTestDB(t))
+}
+
+func assertFindingsConfidenceSortRanks(t *testing.T, db *DB) {
+	t.Helper()
+	repo := NewRepository(db)
+	ctx := context.Background()
+	insert := func(hash, confidence string) int64 {
+		t.Helper()
+		return saveFindingFull(t, repo, &Finding{FindingHash: hash, ModuleID: hash, ModuleName: hash, Confidence: confidence})
+	}
+	tentativeID := insert("confidence-tentative", "tentative")
+	firmFirstID := insert("confidence-firm-first", "firm")
+	firmSecondID := insert("confidence-firm-second", "firm")
+	certainID := insert("confidence-certain", "certain")
+
+	for _, tc := range []struct {
+		name string
+		asc  bool
+		want []int64
+	}{
+		{name: "descending risk rank", want: []int64{certainID, firmSecondID, firmFirstID, tentativeID}},
+		{name: "ascending risk rank", asc: true, want: []int64{tentativeID, firmFirstID, firmSecondID, certainID}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			findings, err := NewFindingsQueryBuilder(db, QueryFilters{
+				ProjectUUID: DefaultProjectUUID,
+				SortBy:      "confidence",
+				SortAsc:     tc.asc,
+			}).Execute(ctx)
+			if err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+			if len(findings) != len(tc.want) {
+				t.Fatalf("got %d findings, want %d", len(findings), len(tc.want))
+			}
+			for i, finding := range findings {
+				if finding.ID != tc.want[i] {
+					t.Errorf("position %d: got id=%d confidence=%s, want id=%d", i, finding.ID, finding.Confidence, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestFindingsQueryBuilder_MapFindingSortColumn(t *testing.T) {
 	fqb := &FindingsQueryBuilder{}
 	tests := map[string]string{
@@ -427,7 +473,7 @@ func TestFindingsQueryBuilder_MapFindingSortColumn(t *testing.T) {
 		"module":      "f.module_name",
 		"module_name": "f.module_name",
 		"module_id":   "f.module_id",
-		"confidence":  "f.confidence",
+		"confidence":  confidenceSortRankExpr,
 		"bogus":       "f.found_at", // default fallback
 	}
 	for in, want := range tests {

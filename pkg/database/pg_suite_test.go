@@ -317,6 +317,10 @@ func scenarioProjectIsolation(t *testing.T, db *DB) {
 	}
 }
 
+func TestPg_FindingsConfidenceSortRanks(t *testing.T) {
+	assertFindingsConfidenceSortRanks(t, openPGTestDB(t))
+}
+
 // TestPg_LegacyBoolColumnsConverted: a Postgres store created before the
 // per-dialect templates holds bool columns as INTEGER. The readiness check
 // reports them, `db migrate` (CreateSchema) converts them in place keeping
