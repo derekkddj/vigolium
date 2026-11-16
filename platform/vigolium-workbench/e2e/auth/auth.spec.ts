@@ -60,16 +60,11 @@ test.describe('AuthGate — auth required', () => {
     await page.getByPlaceholder(/vgl_/).fill(FIXTURE_API_KEY);
     await page.getByRole('button', { name: /sign in/i }).click();
 
-    // Sign-in button disappears once we land in the "ready" branch.
-    await expect(page.getByRole('button', { name: /sign in/i })).toHaveCount(0, {
-      timeout: 5_000,
-    });
-
-    // Token is persisted for subsequent requests.
-    const stored = await page.evaluate(() =>
+    // Wait for persistence and the ready branch, not the temporary spinner.
+    await expect.poll(() => page.evaluate(() =>
       window.localStorage.getItem('vigolium_api_token'),
-    );
-    expect(stored).toBe(FIXTURE_API_KEY);
+    )).toBe(FIXTURE_API_KEY);
+    await expect(page.getByPlaceholder(/vgl_/)).toHaveCount(0);
   });
 
   test('invalid api key surfaces an error and stays on the login form', async ({ page }) => {
