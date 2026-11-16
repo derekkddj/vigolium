@@ -1,5 +1,5 @@
 import { test, expect, seedAuth, FIXTURE_PROJECT, FIXTURE_API_KEY } from '../fixtures';
-import type { Route } from '@playwright/test';
+import type { Locator, Route } from '@playwright/test';
 
 const RUN_UUID = '4769c042-e880-44e2-b221-4d1d33d8760a';
 const OTHER_UUID = '19b646d6-6f07-4561-8f49-6bfa1145655b';
@@ -9,6 +9,34 @@ const SESSION = {
   target_url: 'https://example.invalid', finding_count: 0, record_count: 0, saved_count: 0,
   duration_ms: 60000, started_at: '2026-11-13T12:00:00Z', created_at: '2026-11-13T12:00:00Z',
 };
+
+async function textContrast(button: Locator) {
+  return button.evaluate(element => {
+    // Canvas normalizes modern CSS color()/color-mix() as well as rgb().
+    const canvas = document.createElement('canvas'); canvas.width = canvas.height = 1;
+    const context = canvas.getContext('2d')!;
+    const rgb = (value: string) => {
+      context.clearRect(0, 0, 1, 1); context.fillStyle = value; context.fillRect(0, 0, 1, 1);
+      const pixel = context.getImageData(0, 0, 1, 1).data;
+      return [pixel[0], pixel[1], pixel[2], pixel[3] / 255];
+    };
+    const chain: Element[] = [];
+    for (let current: Element | null = element; current; current = current.parentElement) chain.push(current);
+    let background = [255, 255, 255];
+    for (const layer of chain.reverse()) {
+      const color = rgb(getComputedStyle(layer).backgroundColor);
+      const alpha = color[3] ?? 1;
+      background = background.map((channel, i) => color[i] * alpha + channel * (1 - alpha));
+    }
+    const luminance = (color: number[]) => color.slice(0, 3).map(channel => {
+      const value = channel / 255;
+      return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+    }).reduce((sum, channel, i) => sum + channel * [0.2126, 0.7152, 0.0722][i], 0);
+    const foreground = luminance(rgb(getComputedStyle(element).color));
+    const backdrop = luminance(background);
+    return (Math.max(foreground, backdrop) + 0.05) / (Math.min(foreground, backdrop) + 0.05);
+  });
+}
 
 function assertCancellation(route: Route) {
   expect(route.request().method()).toBe('POST');
@@ -49,6 +77,9 @@ for (const theme of ['dark', 'light'] as const) {
       const table = page.getByRole('columnheader', { name: 'ACTIONS' }).locator('xpath=ancestor::table');
       const width = await table.evaluate(el => ({ scroll: el.parentElement!.scrollWidth, client: el.parentElement!.clientWidth }));
       expect(width.scroll).toBeLessThanOrEqual(width.client);
+      expect(await textContrast(stop)).toBeGreaterThanOrEqual(4.5);
+      await stop.hover();
+      await expect.poll(() => textContrast(stop)).toBeGreaterThanOrEqual(4.5);
       const readsBefore = historyReads;
       await stop.click();
       // Five-second expectation: a successful POST invalidates the list, rather
