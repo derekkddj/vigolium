@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   detailStatus: 'running',
   tailCalls: vi.fn(),
 }));
+vi.mock('@tanstack/react-query', async importOriginal => ({ ...await importOriginal<typeof import('@tanstack/react-query')>(), useQueryClient: () => ({ invalidateQueries: vi.fn() }) }));
 vi.mock('@/contexts/ProjectContext', () => ({ useProjectContext: () => mocks.project }));
 vi.mock('@/lib/useAgentSessionLogs', () => ({ useAgentSessionLogs: (uuid: string | null) => { mocks.tailCalls(uuid); return mocks.tail; } }));
 vi.mock('@/api/hooks', () => ({

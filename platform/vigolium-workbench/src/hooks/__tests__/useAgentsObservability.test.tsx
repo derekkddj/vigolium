@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
   listCalls: vi.fn(),
   requestEffects: vi.fn(),
 }));
+vi.mock('@tanstack/react-query', async importOriginal => ({ ...await importOriginal<typeof import('@tanstack/react-query')>(), useQueryClient: () => ({ invalidateQueries: vi.fn() }) }));
 vi.mock('@/contexts/ProjectContext', () => ({ useProjectContext: () => mocks.project }));
 vi.mock('@/lib/useAgentSessionLogs', () => ({ useAgentSessionLogs: () => mocks.tail }));
 vi.mock('@/components/shared/AgentArtifactsPanel', () => ({ default: ({ selectedArtifact, onSelectArtifact }: AgentArtifactsPanelProps) => <div>
