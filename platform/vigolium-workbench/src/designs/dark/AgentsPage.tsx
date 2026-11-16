@@ -46,7 +46,7 @@ function tryPrettyJson(s: string | undefined): string {
   try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; }
 }
 
-function SessionDetailPanel({ session, onClose }: { session: AgentSessionDetail; onClose: () => void }) {
+function SessionDetailPanel({ session, onClose, selectedArtifact, onSelectArtifact }: { session: AgentSessionDetail; onClose: () => void; selectedArtifact: string | null; onSelectArtifact: (name: string | null) => void }) {
   const [copied, setCopied] = useState<string | null>(null);
   const copyToClipboard = (text: string, key: string) => {
     navigator.clipboard.writeText(text).then(() => {
@@ -56,7 +56,7 @@ function SessionDetailPanel({ session, onClose }: { session: AgentSessionDetail;
   };
 
   return (
-    <div className="border-l border-[#2e2b26] flex flex-col h-full min-h-0">
+    <div className="border-t border-[#2e2b26] flex flex-col">
       <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#2e2b26] shrink-0">
         <span className="text-xs font-bold text-[#7fd962]">SESSION DETAILS</span>
         <button aria-label="Close session details" onClick={onClose} className="text-[#918175] hover:text-[#fce8c3] text-xs font-bold px-1">&#10005;</button>
@@ -94,9 +94,9 @@ function SessionDetailPanel({ session, onClose }: { session: AgentSessionDetail;
           <div><span className="text-[#918175]">modules </span><span className="text-[#fce8c3]">{session.module_names.join(', ')}</span></div>
         )}
       </div>
-      <div className="flex-1 min-h-0 overflow-y-auto text-xs">
+      <div className="text-xs">
         <AgentRunContext session={session} theme="dark" />
-        <AgentArtifactsPanel runUUID={session.uuid} theme="dark" />
+        <AgentArtifactsPanel runUUID={session.uuid} theme="dark" selectedArtifact={selectedArtifact} onSelectArtifact={onSelectArtifact} />
         {session.prompt_sent && (
           <details className="border-b border-[#2e2b26]">
             <summary className="px-3 py-1.5 cursor-pointer text-[#7fd962] font-bold hover:bg-[#2e2b26] flex items-center gap-1.5">
@@ -672,8 +672,8 @@ export default function AgentsPage() {
                 <button type="button" onClick={h.sessionsRetry} className="ml-3 underline">Retry session history</button>
               </div>
             )}
-            <div className="flex max-h-[300px]" style={{ minHeight: h.expandedSessionUuid ? 280 : undefined }}>
-              <div className={`${h.expandedSessionUuid ? 'w-1/2' : 'w-full'} overflow-auto`}>
+            <div className="flex flex-col">
+              <div className="w-full overflow-x-auto">
                 <table className="w-full text-xs">
                   <thead>
                     <tr className="border-b border-[#2e2b26] text-[#706560]">
@@ -710,7 +710,7 @@ export default function AgentsPage() {
                 </table>
               </div>
               {h.expandedSessionUuid && (
-                <div key={h.sessionSelectionKey} className="w-1/2 min-w-0 overflow-auto">
+                <div key={h.sessionSelectionKey} className="w-full min-w-0">
                   {h.sessionDetailError && (
                     <div role="alert" className="px-3 py-2 text-xs text-[#ff6b6b] border-b border-[#2e2b26]">
                       Session details: {h.sessionDetailError}
@@ -718,7 +718,7 @@ export default function AgentsPage() {
                     </div>
                   )}
                   {h.sessionDetail ? (
-                    <SessionDetailPanel session={h.sessionDetail} onClose={() => h.setExpandedSessionUuid(null)} />
+                    <SessionDetailPanel session={h.sessionDetail} onClose={() => h.setExpandedSessionUuid(null)} selectedArtifact={h.selectedArtifact} onSelectArtifact={h.setSelectedArtifact} />
                   ) : (
                     <div className="px-3 py-2 text-xs text-[#918175]">
                       <div className="flex justify-between gap-2">

@@ -1,8 +1,9 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { setBaseUrl, setProjectUUID, setToken } from '@/api/client';
 import { ARTIFACT_BLOB_LIMIT, ARTIFACT_PREVIEW_BYTES } from '@/lib/runArtifacts';
 import AgentArtifactsPanel from '../AgentArtifactsPanel';
+import { scrollOwners } from './scrollContract';
 
 const context = vi.hoisted(() => ({ projectUUID: 'project-a' as string | null }));
 vi.mock('@/contexts/ProjectContext', () => ({ useProjectContext: () => context }));
@@ -49,9 +50,9 @@ for (const theme of ['dark', 'light'] as const) {
       const size = ARTIFACT_PREVIEW_BYTES + 4;
       const head = 'x'.repeat(ARTIFACT_PREVIEW_BYTES);
       vi.mocked(fetch).mockResolvedValueOnce(list([{ ...item, size }])).mockResolvedValueOnce(page(head, size)).mockResolvedValueOnce(page('tail', size, ARTIFACT_PREVIEW_BYTES)).mockResolvedValueOnce(page(head, size));
-      const { container } = render(view('run-a', theme));
+      render(view('run-a', theme));
       fireEvent.click(await screen.findByRole('button', { name: item.name }));
-      await waitFor(() => expect(container.querySelector('pre')?.textContent).toBe(head));
+      await waitFor(() => expect(screen.getByLabelText('Artifact content').textContent).toBe(head));
       fireEvent.click(screen.getByRole('button', { name: 'Later bytes' }));
       expect(await screen.findByText('tail', { exact: true })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Later bytes' })).toBeDisabled();
@@ -61,22 +62,102 @@ for (const theme of ['dark', 'light'] as const) {
       expect(await screen.findByText('Visible page copied (not the full file).')).toBeInTheDocument();
       expect(screen.queryByRole('button', { name: /Copy full/ })).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole('button', { name: 'Earlier bytes' }));
-      await waitFor(() => expect(container.querySelector('pre')?.textContent).toBe(head));
+      await waitFor(() => expect(screen.getByLabelText('Artifact content').textContent).toBe(head));
       expect(screen.getByText(/Partial preview — bytes have been omitted/)).toBeInTheDocument();
     });
     it('reports unsupported large downloads with a scoped secret-free template and no API anchor', async () => {
       const size = ARTIFACT_BLOB_LIMIT + 1;
       vi.mocked(fetch).mockResolvedValueOnce(list([{ ...item, size }])).mockResolvedValueOnce(page('head', size));
-      const { container } = render(view('run-a', theme));
+      render(view('run-a', theme));
       fireEvent.click(await screen.findByRole('button', { name: item.name }));
       expect(await screen.findByText('head', { exact: true })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Download exact bytes' })).toBeDisabled();
       expect(screen.getByText(/Streaming download unsupported in this browser/)).toBeInTheDocument();
-      expect(container.querySelectorAll('a')).toHaveLength(0);
-      expect(container.textContent).toContain('${VIGOLIUM_TOKEN:?Set token locally}');
-      expect(container.textContent).toContain('${VIGOLIUM_PROJECT_UUID:?Set active project UUID}');
-      expect(container.textContent).not.toContain('test-secret');
+      expect(screen.getByRole('dialog', { name: 'Run artifacts workspace' }).querySelectorAll('a')).toHaveLength(0);
+      expect(screen.getByRole('dialog', { name: 'Run artifacts workspace' }).textContent).toContain('${VIGOLIUM_TOKEN:?Set token locally}');
+      expect(screen.getByRole('dialog', { name: 'Run artifacts workspace' }).textContent).toContain('${VIGOLIUM_PROJECT_UUID:?Set active project UUID}');
+      expect(screen.getByRole('dialog', { name: 'Run artifacts workspace' }).textContent).not.toContain('test-secret');
       expect(fetch).toHaveBeenCalledTimes(2);
+    });
+  });
+}
+
+for (const theme of ['dark', 'light'] as const) {
+  describe(`${theme} compact inline artifact list`, () => {
+    const many = Array.from({ length: 30 }, (_, i) => ({ name: `file-${i}.TXT`, kind: 'text', size: 4 }));
+    it('shows 12 files initially, expands to 30 and collapses without an inline scroll owner', async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(list(many, true));
+      render(view('run-a', theme));
+      const table = await screen.findByRole('table', { name: 'Artifact files' });
+      expect(within(table).getAllByRole('button')).toHaveLength(12);
+      expect(scrollOwners(table)).toEqual([]);
+      expect(screen.getByText(/Artifact listing truncated at 500/)).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: 'Show all 30 files' }));
+      expect(within(table).getAllByRole('button')).toHaveLength(30);
+      fireEvent.click(screen.getByRole('button', { name: 'Show fewer files' }));
+      expect(within(table).getAllByRole('button')).toHaveLength(12);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+    it.each([1, 12])('omits the filter and expansion controls for %s files', async (count) => {
+      vi.mocked(fetch).mockResolvedValueOnce(list(many.slice(0, count)));
+      render(view('run-a', theme));
+      const table = await screen.findByRole('table', { name: 'Artifact files' });
+      expect(within(table).getAllByRole('button')).toHaveLength(count);
+      expect(scrollOwners(table)).toEqual([]);
+      expect(screen.queryByRole('searchbox', { name: 'Filter artifact files' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /Show all|Show fewer/ })).not.toBeInTheDocument();
+    });
+    it('filters the entire listing case-insensitively and reuses the filter in the workspace', async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(list(many)).mockResolvedValueOnce(page('head'));
+      render(view('run-a', theme));
+      await screen.findByRole('table', { name: 'Artifact files' });
+      const filter = screen.getByRole('searchbox', { name: 'Filter artifact files' });
+      fireEvent.change(filter, { target: { value: 'FILE-29.txt' } });
+      fireEvent.click(screen.getByRole('button', { name: 'file-29.TXT' }));
+      const dialog = screen.getByRole('dialog', { name: 'Run artifacts workspace' });
+      await within(dialog).findByText('head', { exact: true });
+      fireEvent.change(within(dialog).getByRole('searchbox', { name: 'Filter workspace artifact files' }), { target: { value: 'FiLe-28.TxT' } });
+      const sidebar = within(dialog).getByRole('navigation', { name: 'Workspace artifact files' });
+      expect(within(sidebar).getAllByRole('button')).toHaveLength(1);
+      expect(within(sidebar).getByRole('button', { name: 'file-28.TXT' })).toBeInTheDocument();
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Close artifacts workspace' }));
+      fireEvent.change(filter, { target: { value: 'does-not-exist' } });
+      expect(screen.getByText('No artifact files match this filter.')).toBeInTheDocument();
+      expect(within(screen.getByRole('table', { name: 'Artifact files' })).queryAllByRole('button')).toHaveLength(0);
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
+  });
+}
+
+for (const theme of ['dark', 'light'] as const) {
+  describe(`${theme} controlled artifact selection`, () => {
+    it('waits for the listing before opening a deep link and follows controlled close/file changes', async () => {
+      const pending = deferred<Response>();
+      const onSelectArtifact = vi.fn();
+      vi.mocked(fetch).mockReturnValueOnce(pending.promise).mockResolvedValueOnce(page('head')).mockResolvedValueOnce(page('next'));
+      const panel = (selectedArtifact: string | null) => <AgentArtifactsPanel runUUID="run-a" theme={theme} selectedArtifact={selectedArtifact} onSelectArtifact={onSelectArtifact} />;
+      const { rerender } = render(panel(item.name));
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(fetch).toHaveBeenCalledTimes(1);
+      await act(async () => { pending.resolve(list([item, { name: 'second.txt', kind: 'text', size: 4 }])); });
+      const dialog = await screen.findByRole('dialog');
+      expect(await within(dialog).findByText('head', { exact: true })).toBeInTheDocument();
+      fireEvent.click(within(dialog).getByRole('button', { name: 'second.txt' }));
+      expect(onSelectArtifact).toHaveBeenLastCalledWith('second.txt');
+      rerender(panel('second.txt'));
+      expect(await screen.findByText('next', { exact: true })).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: 'Close artifacts workspace' }));
+      expect(onSelectArtifact).toHaveBeenLastCalledWith(null);
+      rerender(panel(null));
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(fetch).toHaveBeenCalledTimes(3);
+    });
+    it('does not read a deep link absent from the listing and reports the missing artifact', async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(list());
+      render(<AgentArtifactsPanel runUUID="run-a" theme={theme} selectedArtifact="missing.txt" onSelectArtifact={vi.fn()} />);
+      expect(await screen.findByText('Artifact not found in this run.')).toHaveAttribute('role', 'status');
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(fetch).toHaveBeenCalledTimes(1);
     });
   });
 }
@@ -123,7 +204,7 @@ describe('identity resets and stale asynchronous work', () => {
     render(view());
     fireEvent.click(await screen.findByRole('button', { name: item.name }));
     const oldSignal = vi.mocked(fetch).mock.calls[1][1]?.signal;
-    fireEvent.click(screen.getByRole('button', { name: 'second.txt' }));
+    fireEvent.click(within(screen.getByRole('dialog', { name: 'Run artifacts workspace' })).getByRole('button', { name: 'second.txt' }));
     expect(oldSignal?.aborted).toBe(true);
     expect(await screen.findByText('next', { exact: true })).toBeInTheDocument();
     await act(async () => { late.resolve(page('late')); });
