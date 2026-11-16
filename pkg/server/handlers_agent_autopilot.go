@@ -30,6 +30,11 @@ func (h *Handlers) HandleAgentAutopilot(c fiber.Ctx) error {
 	if err := c.Bind().JSON(&req); err != nil {
 		return respondError(c, fiber.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
 	}
+	projectUUID, answered, projectErr := resolveAndValidateAgentProjectUUID(c, req.ProjectUUID, h.repo)
+	if answered {
+		return projectErr
+	}
+	req.ProjectUUID = projectUUID
 
 	// Natural language prompt: resolve when explicit fields are empty
 	if req.Prompt != "" && req.Target == "" && req.Input == "" && req.SourcePath == "" && req.Diff == "" && req.LastCommits == 0 {

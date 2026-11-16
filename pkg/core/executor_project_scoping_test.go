@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
@@ -185,6 +186,58 @@ func TestNewExecutorPropagatesProjectUUID(t *testing.T) {
 
 	if e.projectUUID != project {
 		t.Fatalf("executor projectUUID = %q, want %q", e.projectUUID, project)
+	}
+}
+
+// ExecutorConfig is passed by value, but its identity strings may still point
+// at mutable storage supplied by an HTTP adapter. Own both identities before
+// asynchronous workers and persistence paths retain them.
+func TestNewExecutorOwnsIdentityBytesForRecordAndFindingWrites(t *testing.T) {
+	const (
+		projectID = "3af56732-9c75-4fc2-8ace-a2e5655b725c"
+		foreignID = "1af56732-9c75-4fc2-8ace-a2e5655b725c"
+		scanID    = "11bbf7b3-84f4-4336-80c6-04cfd93947b4"
+		otherScan = "91bbf7b3-84f4-4336-80c6-04cfd93947b4"
+	)
+	base, db := newRepoExecutor(t)
+	projectBytes, scanBytes := []byte(projectID), []byte(scanID)
+	borrow := func(b []byte) string { return unsafe.String(unsafe.SliceData(b), len(b)) }
+	e := NewExecutor(ExecutorConfig{
+		Workers: 1, Repository: base.repo,
+		ProjectUUID: borrow(projectBytes), ScanUUID: borrow(scanBytes),
+	}, nil, nil, nil)
+
+	projectBytes[0], scanBytes[0] = '1', '9'
+	identityChanged := e.projectUUID != projectID || e.scanUUID != scanID || e.cfg.ProjectUUID != projectID || e.cfg.ScanUUID != scanID
+
+	ctx := context.Background()
+	req := newStubRecord("identity.example.test", "/owned").WithResponse(
+		httpmsg.NewHttpResponse([]byte("HTTP/1.1 200 OK\r\n\r\nowned")))
+	e.saveToDatabase(ctx, work.NewWithModules(req, nil), req, nil)
+	result := &output.ResultEvent{
+		ModuleID: "identity-check",
+		Info:     output.Info{Name: "Identity Check", Severity: severity.High, Confidence: severity.Firm},
+		Host:     "identity.example.test", URL: "https://identity.example.test/owned", Matched: "owned",
+	}
+	e.processResults(ctx, []*output.ResultEvent{result}, &trackingPassiveModule{id: "identity-check"}, nil, nil)
+
+	var records []*database.HTTPRecord
+	if err := db.NewSelect().Model(&records).Scan(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if identityChanged {
+		t.Errorf("executor retained caller-owned identity bytes: project=%q scan=%q cfg_project=%q cfg_scan=%q",
+			e.projectUUID, e.scanUUID, e.cfg.ProjectUUID, e.cfg.ScanUUID)
+	}
+	if len(records) != 1 || records[0].ProjectUUID != projectID || records[0].ScanUUID != scanID {
+		t.Errorf("record write lost executor-owned identity: %+v", records)
+	}
+	findings := loadFindings(t, db)
+	if len(findings) != 1 || findings[0].ProjectUUID != projectID || findings[0].ScanUUID != scanID {
+		t.Errorf("finding write lost executor-owned identity: %+v", findings)
+	}
+	if len(records) == 1 && (records[0].ProjectUUID == foreignID || records[0].ScanUUID == otherScan) {
+		t.Errorf("record adopted reused caller identity: %+v", records[0])
 	}
 }
 

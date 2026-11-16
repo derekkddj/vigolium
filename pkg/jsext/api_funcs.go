@@ -51,6 +51,7 @@ func allFuncDefs() []JSFuncDef {
 // registered regardless, so top-level code sees the runtime's API shape: pure
 // handlers are real and every effectful one is a loadTimeStub.
 func registerFuncs(vm *sobek.Runtime, opts APIOptions, defs []JSFuncDef) {
+	opts = ownAPIIdentity(opts)
 	nsCache := make(map[string]*sobek.Object)
 	nsCache[NsRoot] = vm.Get(NsRoot).ToObject(vm)
 
@@ -124,6 +125,7 @@ func stubReturnValue(vm *sobek.Runtime, returns string) sobek.Value {
 // dependency check. Used in tests to register handlers even when optional
 // dependencies (e.g. Repository) are nil.
 func registerFuncsUnchecked(vm *sobek.Runtime, opts APIOptions, defs []JSFuncDef) {
+	opts = ownAPIIdentity(opts)
 	nsCache := make(map[string]*sobek.Object)
 	nsCache[NsRoot] = vm.Get(NsRoot).ToObject(vm)
 

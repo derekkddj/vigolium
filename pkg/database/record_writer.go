@@ -230,6 +230,7 @@ var ErrRecordWriterClosed = errors.New("record writer is closed")
 // Call Close() to flush remaining records and stop the background goroutines.
 func NewRecordWriter(repo *Repository, cfg RecordWriterConfig) *RecordWriter {
 	cfg = cfg.withDefaults()
+	cfg.ScanUUID = strings.Clone(cfg.ScanUUID)
 
 	// Driver-aware shard default: SQLite has a single writer, so extra flush
 	// goroutines only fight over BEGIN IMMEDIATE / busy_timeout. PostgreSQL has
@@ -297,6 +298,12 @@ func (w *RecordWriter) admit(ctx context.Context, rr *httpmsg.HttpRequestRespons
 	if rr == nil || rr.Request() == nil {
 		return pendingWrite{err: fmt.Errorf("invalid HttpRequestResponse"), resolved: true}
 	}
+	projectUUID = strings.Clone(projectUUID)
+	// Lineage.ScanUUID can override the writer-level scan stamp below, so own
+	// that identity alongside the parent/root values before the record is queued.
+	lineage.ScanUUID = strings.Clone(lineage.ScanUUID)
+	lineage.ParentUUID = strings.Clone(lineage.ParentUUID)
+	lineage.RootUUID = strings.Clone(lineage.RootUUID)
 	// Identity first, enrichment only if this record survives the dedup cache.
 	// The expensive half of conversion — normalized body hash, HTML title parse,
 	// word count and owning the input bytes — is pure waste for a key the cache

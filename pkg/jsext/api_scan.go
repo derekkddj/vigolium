@@ -393,6 +393,22 @@ func scanFuncDefs() []JSFuncDef {
 						return scanRecordsResultToJS(vm, "", 0, []string{"no matching records found"})
 					}
 
+					// UUID lookup is intentionally global; do not let a record UUID
+					// authorize queueing its target into the active project's scan.
+					projectUUID := opts.ProjectUUID
+					if projectUUID == "" {
+						projectUUID = database.DefaultProjectUUID
+					}
+					for _, r := range records {
+						recordProjectUUID := r.ProjectUUID
+						if recordProjectUUID == "" {
+							recordProjectUUID = database.DefaultProjectUUID
+						}
+						if recordProjectUUID != projectUUID {
+							return scanRecordsResultToJS(vm, "", 0, []string{fmt.Sprintf("%s: record belongs to another project", r.UUID)})
+						}
+					}
+
 					// Collect targets for the scan record
 					var targets []string
 					var errors []string

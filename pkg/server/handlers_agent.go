@@ -141,6 +141,10 @@ func (h *Handlers) HandleAgentQuery(c fiber.Ctx) error {
 	if err := c.Bind().JSON(&req); err != nil {
 		return respondError(c, fiber.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
 	}
+	projectUUID, answered, projectErr := resolveAndValidateAgentProjectUUID(c, req.ProjectUUID, h.repo)
+	if answered {
+		return projectErr
+	}
 
 	if req.PromptTemplate == "" && req.PromptFile == "" && req.Prompt == "" {
 		return respondError(c, fiber.StatusBadRequest, ErrMissingPrompt)
@@ -153,11 +157,6 @@ func (h *Handlers) HandleAgentQuery(c fiber.Ctx) error {
 
 	opts := h.buildQueryOpts(req)
 	timeout := 10 * time.Minute
-
-	projectUUID := req.ProjectUUID
-	if projectUUID == "" {
-		projectUUID = getProjectUUID(c)
-	}
 
 	return h.startAgenticScan(c, "query", req.Stream, opts, timeout, projectUUID, req.UploadResults, eng, cleanup)
 }
@@ -827,7 +826,7 @@ func (h *Handlers) resolveSessionDirForRun(c fiber.Ctx) (sessionDir, agenticScan
 	if h.repo == nil {
 		return "", "", true, respondError(c, fiber.StatusServiceUnavailable, ErrDatabaseRequired)
 	}
-	agenticScanUUID = c.Params("id")
+	agenticScanUUID = strings.Clone(c.Params("id"))
 	if agenticScanUUID == "" {
 		return "", "", true, respondErrorMsg(c, fiber.StatusBadRequest, "missing session id")
 	}
