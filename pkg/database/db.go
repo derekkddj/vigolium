@@ -968,8 +968,9 @@ const ingestDecodeBackfillVersion = 6
 // rather than discovering it as a query error mid-run.
 func CurrentSchemaVersion() int { return currentSchemaVersion }
 
-// schemaVersion reads the recorded schema version, or 0 when unset (a fresh
-// database, or one created before versioning). Requires schema_meta to exist.
+// schemaVersion is a diagnostic convenience: it returns 0 when unset OR when
+// metadata cannot be read. Mutation gates must use validated SchemaInfo instead.
+// Requires schema_meta to exist.
 func (db *DB) schemaVersion(ctx context.Context) int {
 	var v int
 	if err := db.QueryRowContext(ctx, "SELECT version FROM schema_meta WHERE id = 1").Scan(&v); err != nil {
@@ -1025,11 +1026,26 @@ func (db *DB) CreateSchema(ctx context.Context) error {
 		// a symptom and no remedy.
 		return db.checkSchemaCurrent(ctx)
 	}
-	if err := db.guardWriteDB(ctx); err != nil {
+	info, err := db.schemaWriteInfo(ctx)
+	if err != nil {
 		return err
 	}
 	zap.L().Debug("Initializing database tables")
+	lineagePrerequisitesReady := false
 	for _, ddl := range schemaTables {
+		name, err := schemaDDLName(ddl)
+		if err != nil {
+			return err
+		}
+		if isSchemaLineageReceiptTable(name) && !lineagePrerequisitesReady {
+			// The original catalog passed the fence before any DDL. Complete
+			// the upstream markers before committing a receipts table, so an
+			// interrupted upstream/fresh migration cannot fence its own retry.
+			if err := db.prepareSchemaLineagePrerequisites(ctx); err != nil {
+				return err
+			}
+			lineagePrerequisitesReady = true
+		}
 		if _, err := db.ExecContext(ctx, db.renderDDL(ddl)); err != nil {
 			return fmt.Errorf("failed to create table: %w", err)
 		}
@@ -1045,7 +1061,9 @@ func (db *DB) CreateSchema(ctx context.Context) error {
 	// version-1 migrations, and a v1 store opened by a later binary has had them.
 	// Gating on the current version re-ran every one of them — a covering-index
 	// rebuild and whole-table backfills — on each schema bump.
-	storedVersion := db.schemaVersion(ctx)
+	// Retain the metadata that passed the original write guard. A second,
+	// zero-on-error version read must never authorize historical backfills.
+	storedVersion := info.Version
 	schemaCurrent := storedVersion >= legacyBackfillsVersion
 
 	// Drop old indexes before creating the correct ones (migration for existing

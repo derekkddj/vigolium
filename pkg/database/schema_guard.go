@@ -236,14 +236,25 @@ func guardWrite(info SchemaInfo) error {
 // guardWriteDB checks lineage before numeric compatibility. Only an absent
 // schema_meta is fresh; unreadable metadata must not authorize schema writes.
 func (db *DB) guardWriteDB(ctx context.Context) error {
+	_, err := db.schemaWriteInfo(ctx)
+	return err
+}
+
+// schemaWriteInfo retains the metadata that passed both write guards. Schema
+// mutation must use this validated version, never schemaVersion's diagnostic
+// zero-on-error fallback, to decide whether historical backfills are owed.
+func (db *DB) schemaWriteInfo(ctx context.Context) (SchemaInfo, error) {
 	if err := db.guardSchemaLineage(ctx); err != nil {
-		return err
+		return SchemaInfo{}, err
 	}
 	info, err := db.SchemaInfo(ctx)
 	if err != nil {
-		return fmt.Errorf("read schema_meta: %w", err)
+		return SchemaInfo{}, fmt.Errorf("read schema_meta: %w", err)
 	}
-	return guardWrite(info)
+	if err := guardWrite(info); err != nil {
+		return SchemaInfo{}, err
+	}
+	return info, nil
 }
 
 // CheckSchema answers, with catalog reads only, whether this store can be read

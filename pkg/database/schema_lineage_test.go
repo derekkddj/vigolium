@@ -258,14 +258,7 @@ func TestSchemaLineageOrdinaryUpstreamPreV6Compatible(t *testing.T) {
 	// Model an ordinary upstream pre-v6 store, NOT the local fixture: it has no
 	// receipts lineage. New upstream identity columns are legitimately migratable.
 	db := newTestDB(t)
-	for _, statement := range []string{
-		"DROP TABLE evidence_exchanges", "DROP TABLE finding_evidence", "DROP TABLE oast_planting_receipts",
-		"DROP TABLE finding_hash_aliases", "ALTER TABLE findings DROP COLUMN last_seen_at",
-		"ALTER TABLE scans DROP COLUMN module_stats", "ALTER TABLE scans DROP COLUMN coverage_modules",
-		"UPDATE schema_meta SET version = 5, min_reader_version = 1",
-	} {
-		mustExec(t, db, statement)
-	}
+	stripUpstreamPreV6LineageAdditions(t, db)
 	if err := db.CheckSchema(context.Background()); !errors.Is(err, ErrSchemaOutdated) {
 		t.Fatalf("ordinary upstream v5 CheckSchema = %v", err)
 	}
