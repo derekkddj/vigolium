@@ -80,8 +80,9 @@ func TestHandleHealth(t *testing.T) {
 	}
 }
 
-// TestHandleReady_NoDB confirms readiness returns 200 when there is no database
-// dependency to check (the liveness/readiness split doesn't hard-fail on a nil DB).
+// TestHandleReady_NoDB preserves intentionally DB-less library/test wiring:
+// neither a database handle nor an enabled database configuration was supplied.
+// The CLI does not use this as a fallback after database initialization failures.
 func TestHandleReady_NoDB(t *testing.T) {
 	h := newBasicHandlers(t, ServerConfig{}, &fakeQueue{}, nil, nil, nil)
 	app := fiber.New()
@@ -99,6 +100,97 @@ func TestHandleReady_NoDB(t *testing.T) {
 	}
 	if resp.Status != "ready" {
 		t.Errorf("status field = %q, want ready", resp.Status)
+	}
+}
+
+func TestHandleReady_MissingRequiredDatabase(t *testing.T) {
+	for _, cfg := range []ServerConfig{
+		{},
+		{ViewOnly: true},
+		{DemoOnly: true},
+		{BurpBridgeURL: "http://127.0.0.1:9876"},
+	} {
+		h := newBasicHandlers(t, cfg, &fakeQueue{}, nil, nil, config.DefaultSettings())
+		app := fiber.New()
+		app.Get("/ready", h.HandleReady)
+
+		status, body := doGet(t, app, "/ready", nil)
+		if status != http.StatusServiceUnavailable {
+			t.Fatalf("missing configured database: status=%d body=%s config=%+v", status, body, cfg)
+		}
+		var resp struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			t.Fatalf("unmarshal: %v\n%s", err, body)
+		}
+		if resp.Status != "not_ready" || !strings.Contains(resp.Reason, "database") {
+			t.Fatalf("want database not_ready reason, got %+v", resp)
+		}
+	}
+}
+
+func TestHandleReady_DisabledDatabaseCompatibility(t *testing.T) {
+	settings := config.DefaultSettings()
+	settings.Database.Enabled = false
+	h := newBasicHandlers(t, ServerConfig{ViewOnly: true}, &fakeQueue{}, nil, nil, settings)
+	app := fiber.New()
+	app.Get("/ready", h.HandleReady)
+
+	status, body := doGet(t, app, "/ready", nil)
+	if status != http.StatusOK {
+		t.Fatalf("explicitly DB-less library handler: status=%d body=%s", status, body)
+	}
+}
+
+func TestHandleReady_NormalizedDatabaseIsNotReady(t *testing.T) {
+	db, _ := newProjectModelTestDB(t)
+	h := newBasicHandlers(t, ServerConfig{}, &fakeQueue{}, db, nil, nil)
+	app := fiber.New()
+	app.Get("/ready", h.HandleReady)
+
+	status, body := doGet(t, app, "/ready", nil)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("half-initialized database must not be ready: status=%d body=%s", status, body)
+	}
+}
+
+func TestHandleReady_LiveAndClosedDatabase(t *testing.T) {
+	db, repo := newProjectModelTestDB(t)
+	h := newBasicHandlers(t, ServerConfig{ViewOnly: true}, &fakeQueue{}, db, repo, nil)
+	app := fiber.New()
+	app.Get("/ready", h.HandleReady)
+
+	status, body := doGet(t, app, "/ready", nil)
+	if status != http.StatusOK {
+		t.Fatalf("live database: status=%d body=%s", status, body)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+	status, body = doGet(t, app, "/ready", nil)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("closed database: status=%d body=%s", status, body)
+	}
+}
+
+func TestHandleReady_ClosedRecordWriter(t *testing.T) {
+	db, repo := newProjectModelTestDB(t)
+	writer := database.NewRecordWriter(repo, database.RecordWriterConfig{})
+	t.Cleanup(writer.Close)
+	h := newBasicHandlers(t, ServerConfig{}, &fakeQueue{}, db, repo, nil)
+	h.recordWriter = writer
+	app := fiber.New()
+	app.Get("/ready", h.HandleReady)
+	status, body := doGet(t, app, "/ready", nil)
+	if status != http.StatusOK {
+		t.Fatalf("open writer: status=%d body=%s", status, body)
+	}
+	writer.Close()
+	status, body = doGet(t, app, "/ready", nil)
+	if status != http.StatusServiceUnavailable || !strings.Contains(string(body), "record writer") {
+		t.Fatalf("closed writer: status=%d body=%s", status, body)
 	}
 }
 

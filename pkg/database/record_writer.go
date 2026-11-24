@@ -223,6 +223,13 @@ func (w *RecordWriter) beginAdmit() bool {
 // a process lifetime.
 var hashSeed = maphash.MakeSeed()
 
+// Accepting reports the writer's current admission state for readiness probes.
+// It is a snapshot, not a reservation: callers still rely on beginAdmit to
+// serialize actual admission with shutdown. No database write is performed.
+func (w *RecordWriter) Accepting() bool {
+	return w != nil && !w.closed.Load() && w.ctx != nil && w.ctx.Err() == nil
+}
+
 // ErrRecordWriterClosed is returned when writes are attempted after shutdown starts.
 var ErrRecordWriterClosed = errors.New("record writer is closed")
 
