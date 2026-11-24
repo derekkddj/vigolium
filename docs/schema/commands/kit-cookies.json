@@ -352,6 +352,7 @@
             "scan_abandoned",
             "scan_not_found",
             "scan_running",
+            "schema_lineage_requires_conversion",
             "schema_outdated",
             "schema_too_new",
             "service_unavailable",

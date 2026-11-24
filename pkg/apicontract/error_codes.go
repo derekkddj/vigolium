@@ -48,6 +48,9 @@ const (
 	CodeSchemaTooNew ErrorCode = "schema_too_new"
 	// CodeSchemaOutdated: the store needs `vigolium db migrate` before use.
 	CodeSchemaOutdated ErrorCode = "schema_outdated"
+	// CodeSchemaLineageRequiresConversion: a local/mixed receipts lineage must
+	// not be upgraded by ordinary schema migration or read auto-migration.
+	CodeSchemaLineageRequiresConversion ErrorCode = "schema_lineage_requires_conversion"
 )
 
 // Single-record extraction (traffic body / traffic headers).
@@ -220,7 +223,7 @@ const (
 var knownErrorCodes = []ErrorCode{
 	CodeFailed, CodeUsageError, CodeGateTripped, CodeConfigInvalid, CodeNotFound,
 	CodeSourceMissing, CodeSourceUnreadable, CodeSourceIncompatible,
-	CodeDatabaseLocked, CodeSchemaTooNew, CodeSchemaOutdated,
+	CodeDatabaseLocked, CodeSchemaTooNew, CodeSchemaOutdated, CodeSchemaLineageRequiresConversion,
 	CodeRecordNotFound, CodeAmbiguousID, CodeBodyUnavailable, CodeBodyDecodeFailed, CodeBodyIncomplete,
 	CodeExportFailed, CodePDFFailed, CodeIngestIncomplete, CodeOutputTooLarge,
 	CodeUnsupportedInputMode, CodeInputUnparsed,

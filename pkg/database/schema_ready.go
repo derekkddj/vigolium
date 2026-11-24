@@ -77,10 +77,9 @@ var expectedSchemaObjects = sync.OnceValue(func() (names struct{ core, deferrabl
 // schema this binary expects: tables, indexes, migrated columns, or the
 // migration version. An empty result means the schema is ready as-is.
 //
-// Every non-empty result means the same thing to the caller — run CreateSchema —
-// so "cannot tell" (an unreadable catalog, a fresh file with no tables at all)
-// is reported as a gap rather than as an error. A fresh database legitimately
-// has no catalog to read, and the answer for it is the same anyway.
+// This convenience form renders errors as gaps for diagnostics/tests. Mutation
+// paths must use schemaGapsDetail instead: an unreadable catalog is not evidence
+// that ordinary migration is safe.
 func (db *DB) schemaGaps(ctx context.Context) []string {
 	gaps, err := db.schemaGapsDetail(ctx)
 	switch {
@@ -160,8 +159,12 @@ func (db *DB) schemaGapsDetail(ctx context.Context) ([]string, error) {
 	// database holding every object but stuck at an older version still has
 	// migration work owed.
 	if len(gaps) == 0 {
-		if v := db.schemaVersion(ctx); v < currentSchemaVersion {
-			gaps = append(gaps, fmt.Sprintf("schema version %d < %d", v, currentSchemaVersion))
+		info, err := db.SchemaInfo(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("read schema_meta: %w", err)
+		}
+		if info.Version < currentSchemaVersion {
+			gaps = append(gaps, fmt.Sprintf("schema version %d < %d", info.Version, currentSchemaVersion))
 		}
 	}
 	return gaps, nil
@@ -233,7 +236,15 @@ func (db *DB) EnsureSchemaReady(ctx context.Context) error {
 	}
 
 	gaps, gapErr := db.schemaGapsDetail(ctx)
-	if gapErr == nil && len(gaps) == 0 {
+	if errors.Is(gapErr, errSchemaNotInitialized) {
+		// A fresh file: gapErr stays set so the implicit-migration refusal
+		// below does not apply to creating an empty store.
+		gaps = []string{"schema not initialized"}
+	} else if gapErr != nil {
+		// An unreadable catalog is not evidence that migration is safe.
+		return gapErr
+	}
+	if len(gaps) == 0 {
 		zap.L().Debug("schema ready; skipping schema DDL")
 		return nil
 	}

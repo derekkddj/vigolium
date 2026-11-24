@@ -1013,9 +1013,9 @@ func (db *DB) setSchemaVersion(ctx context.Context, v int) {
 // missing the tables surfaces as a query error rather than being silently
 // migrated into the current shape.
 //
-// It refuses (SchemaTooNewError) a store a newer binary has stamped: DDL and
-// backfills written for an older schema are not safe to run against one this
-// binary does not know.
+// It refuses a newer stamped store (SchemaTooNewError) and local/mixed receipts
+// lineage (SchemaLineageRequiresConversionError) before any DDL or backfill.
+// Ordinary additive migrations are not a safe conversion between lineages.
 func (db *DB) CreateSchema(ctx context.Context) error {
 	if !db.writable() {
 		// A read-only handle cannot be migrated — `mode=ro` refuses DDL, and a
@@ -1432,6 +1432,9 @@ func (db *DB) EnsureSchemaCurrent(ctx context.Context) error {
 		return err
 	}
 	missing, err := db.missingColumns(ctx)
+	if err != nil && !errors.Is(err, errSchemaNotInitialized) {
+		return fmt.Errorf("column catalog unreadable: %w", err)
+	}
 	if err == nil && len(missing) == 0 {
 		return nil
 	}
@@ -1464,15 +1467,24 @@ func (db *DB) HasVigoliumSchema(ctx context.Context) bool {
 // "outdated": it has no tables at all, and every read of it correctly returns
 // nothing.
 func (db *DB) checkSchemaCurrent(ctx context.Context) error {
-	// A store this binary cannot read at all is refused before anything else:
-	// its columns may well look complete, which is exactly the trap.
-	if info, err := db.SchemaInfo(ctx); err == nil {
-		if err := guardRead(info); err != nil {
-			return err
-		}
+	if err := db.guardSchemaLineage(ctx); err != nil {
+		return err
+	}
+	info, err := db.SchemaInfo(ctx)
+	if err != nil {
+		return fmt.Errorf("read schema_meta: %w", err)
+	}
+	if err := guardRead(info); err != nil {
+		return err
 	}
 	missing, err := db.missingColumns(ctx)
-	if err != nil || len(missing) == 0 {
+	if errors.Is(err, errSchemaNotInitialized) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("column catalog unreadable: %w", err)
+	}
+	if len(missing) == 0 {
 		return nil
 	}
 	if db.reader {
@@ -1486,16 +1498,17 @@ func (db *DB) checkSchemaCurrent(ctx context.Context) error {
 // missingColumns reports which entries of columnMigrations this database lacks,
 // as "table.column". Read-only: it never takes a write lock.
 //
-// A returned error means the catalog could not be read at all (an empty or
-// unopenable file); callers treat that as "cannot tell" rather than as "stale",
-// since a fresh database legitimately has no tables yet.
+// A catalog failure is distinct from an absent core table (fresh/uninitialized).
+// Neither permission nor I/O errors may authorize a schema repair.
 func (db *DB) missingColumns(ctx context.Context) ([]string, error) {
-	// An absent core table means a fresh (or empty) file: it needs the full
-	// CreateSchema, and being new it has no concurrent writer to contend with.
-	if !db.tableExists(ctx, coreTableName) {
+	present, err := db.listSchemaObjects(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("catalog unreadable: %w", err)
+	}
+	if !present[coreTableName] {
 		return nil, errSchemaNotInitialized
 	}
-	return db.missingColumnsFrom(ctx, nil)
+	return db.missingColumnsFrom(ctx, present)
 }
 
 // missingColumnsFrom is missingColumns for a caller that has already

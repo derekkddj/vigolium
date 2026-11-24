@@ -87,9 +87,37 @@ func (db *DB) SchemaInfo(ctx context.Context) (SchemaInfo, error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		return SchemaInfo{}, nil
 	}
-	// A v1 schema_meta has only the version column.
+	// Distinguish absent metadata from an unreadable catalog/table. Do not use
+	// tableExists here: it folds permission, I/O and context errors into false.
+	present, catalogErr := db.listSchemaObjects(ctx)
+	if catalogErr != nil {
+		return SchemaInfo{}, fmt.Errorf("schema metadata catalog unreadable: %w", catalogErr)
+	}
+	if !present["schema_meta"] {
+		return SchemaInfo{}, nil
+	}
+	columns, catalogErr := ListColumns(ctx, db, "schema_meta")
+	if catalogErr != nil {
+		return SchemaInfo{}, fmt.Errorf("schema metadata column catalog unreadable: %w", catalogErr)
+	}
+	// Fall back only for a genuine v1 table, not malformed/current metadata
+	// whose compatibility fields could not be read.
+	hasID, hasVersion := false, false
+	for _, column := range columns {
+		switch column.Name {
+		case "id":
+			hasID = true
+		case "version":
+			hasVersion = true
+		case "min_reader_version", "written_by", "updated_at":
+			return SchemaInfo{}, err
+		}
+	}
+	if !hasID || !hasVersion {
+		return SchemaInfo{}, err
+	}
 	if verr := db.QueryRowContext(ctx, "SELECT version FROM schema_meta WHERE id = 1").Scan(&info.Version); verr != nil {
-		if errors.Is(verr, sql.ErrNoRows) || !db.tableExists(ctx, "schema_meta") {
+		if errors.Is(verr, sql.ErrNoRows) {
 			return SchemaInfo{}, nil
 		}
 		return SchemaInfo{}, verr
@@ -205,13 +233,15 @@ func guardWrite(info SchemaInfo) error {
 	return nil
 }
 
-// guardWriteDB is guardWrite against this handle's schema_meta. An unreadable
-// schema_meta is not a refusal: a fresh store has none, and the migration that
-// follows creates it.
+// guardWriteDB checks lineage before numeric compatibility. Only an absent
+// schema_meta is fresh; unreadable metadata must not authorize schema writes.
 func (db *DB) guardWriteDB(ctx context.Context) error {
+	if err := db.guardSchemaLineage(ctx); err != nil {
+		return err
+	}
 	info, err := db.SchemaInfo(ctx)
 	if err != nil {
-		return nil
+		return fmt.Errorf("read schema_meta: %w", err)
 	}
 	return guardWrite(info)
 }
@@ -221,6 +251,7 @@ func (db *DB) guardWriteDB(ctx context.Context) error {
 //
 //   - nil: current (or newer but readable — additive migrations only add);
 //   - *SchemaTooNewError: min_reader_version is above this binary;
+//   - *SchemaLineageRequiresConversionError: local/mixed receipts catalog;
 //   - ErrSchemaNotInitialized: no vigolium tables at all;
 //   - *SchemaOutdatedError: tables, indexes, columns or the version are behind.
 //
@@ -228,6 +259,9 @@ func (db *DB) guardWriteDB(ctx context.Context) error {
 // through a separate writer (database.auto_migrate_on_read) or refuse with the
 // `vigolium db migrate` remedy.
 func (db *DB) CheckSchema(ctx context.Context) error {
+	if err := db.guardSchemaLineage(ctx); err != nil {
+		return err
+	}
 	info, err := db.SchemaInfo(ctx)
 	if err != nil {
 		return fmt.Errorf("read schema_meta: %w", err)
@@ -270,6 +304,9 @@ type MigrateResult struct {
 func (db *DB) Migrate(ctx context.Context) (*MigrateResult, error) {
 	if !db.writable() {
 		return nil, errors.New("migrate needs a writable database (drop --read-only)")
+	}
+	if err := db.guardSchemaLineage(ctx); err != nil {
+		return nil, err
 	}
 	before, err := db.SchemaInfo(ctx)
 	if err != nil {
