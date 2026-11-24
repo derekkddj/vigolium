@@ -55,6 +55,13 @@ func (r *Runner) checkResume(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	return r.checkResumeCompatibility(scan)
+}
+
+// checkResumeCompatibility also validates the exact capture used by the atomic
+// row reopen, so compatibility cannot be checked on an earlier row version.
+func (r *Runner) checkResumeCompatibility(scan *database.Scan) error {
+	uuid := scan.UUID
 	diffs := ResumeMismatch(scan, r.options, r.settings)
 	if len(diffs) == 0 || r.options.ResumeForce {
 		return nil
@@ -79,7 +86,7 @@ func (r *Runner) lookupResumeScan(ctx context.Context, uuid string) (*database.S
 			Message: fmt.Sprintf("--resume-scan %s: no such scan in this database", uuid)}
 	}
 	project := cmp.Or(r.options.ProjectUUID, database.DefaultProjectUUID)
-	if scan.ProjectUUID != "" && scan.ProjectUUID != project {
+	if scan.ProjectUUID != project {
 		return nil, &ResumeError{ScanUUID: uuid, Kind: apicontract.CodeScanNotFound,
 			Message: fmt.Sprintf("--resume-scan %s: the scan belongs to another project", uuid)}
 	}

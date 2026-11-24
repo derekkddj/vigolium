@@ -555,7 +555,9 @@ func (r *Runner) initializeNativeScan(ctx context.Context) (nativeScanScope, err
 	// ensures validate can distinguish an intentional Options reassignment from
 	// mutation of borrowed string storage.
 	project := strings.Clone(r.options.ProjectUUID)
-	scanUUID := strings.Clone(r.options.ScanUUID)
+	// Resolve --resume-scan before row admission, not after a fresh row has
+	// already been created. All startup writes must use the resumed identity.
+	scanUUID := strings.Clone(cmp.Or(r.options.ResumeScanUUID, r.options.ScanUUID))
 	if project == "" {
 		project = database.DefaultProjectUUID
 	}
@@ -584,12 +586,16 @@ func (r *Runner) initializeNativeScan(ctx context.Context) (nativeScanScope, err
 			return s, s.identityError(database.ErrScanProjectMismatch)
 		}
 		if r.options.ResumeScanUUID != "" {
-			// --resume-scan: the row exists; mark it running again rather than
-			// creating a new one.
+			// Refused compatibility checks must leave the terminal row and its
+			// durable STOP untouched. Only then claim the row for this run.
 			if err := r.resumeScanRow(rowCtx, s.scanUUID); err != nil {
 				return s, err
 			}
 		}
+	case errors.Is(err, sql.ErrNoRows) && r.options.ResumeScanUUID != "":
+		// A resume never creates a replacement for a missing scan.
+		_, err := r.lookupResumeScan(rowCtx, s.scanUUID)
+		return s, err
 	case errors.Is(err, sql.ErrNoRows) && !managed:
 		row := &database.Scan{
 			UUID: s.scanUUID, ProjectUUID: s.projectUUID, Name: "cli-scan", Status: "running",
