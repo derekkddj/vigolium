@@ -20,7 +20,9 @@ import (
 //   - written_by / updated_at: which vigolium build last stamped it, and when.
 //
 // A binary whose currentSchemaVersion is C may read a store whose
-// min_reader_version <= C, and may write or migrate it only when version <= C.
+// min_reader_version <= C, and may write or migrate it only when both the
+// version and the reader floor are <= C. A misleading low version must never
+// bypass a store's declared minimum reader.
 // Additive migrations (new columns, new tables) leave min_reader_version where
 // it is, so an older binary keeps reading a store a newer one upgraded; a
 // breaking migration raises it, and older binaries then refuse with
@@ -115,6 +117,10 @@ func (e *SchemaTooNewError) Error() string {
 	if e.WrittenBy != "" {
 		by = " (written by vigolium " + e.WrittenBy + ")"
 	}
+	if e.Write && e.MinReaderVersion > e.Binary && e.DBVersion <= e.Binary {
+		return fmt.Sprintf("database schema v%d%s needs a reader of at least v%d and this vigolium reads up to v%d; refusing to write it — upgrade vigolium",
+			e.DBVersion, by, e.MinReaderVersion, e.Binary)
+	}
 	if e.Write {
 		return fmt.Sprintf("database schema v%d%s is newer than this vigolium's v%d; refusing to write it — upgrade vigolium, or use a read command",
 			e.DBVersion, by, e.Binary)
@@ -178,7 +184,7 @@ var ErrSchemaNotInitialized = errSchemaNotInitialized
 
 // guardRead refuses a store whose min_reader_version is above this binary.
 func guardRead(info SchemaInfo) error {
-	if info.Version > currentSchemaVersion && info.MinReaderVersion > currentSchemaVersion {
+	if info.MinReaderVersion > currentSchemaVersion {
 		return &SchemaTooNewError{
 			DBVersion: info.Version, MinReaderVersion: info.MinReaderVersion,
 			Binary: currentSchemaVersion, WrittenBy: info.WrittenBy,
@@ -187,9 +193,10 @@ func guardRead(info SchemaInfo) error {
 	return nil
 }
 
-// guardWrite refuses to write or migrate a store a newer binary has stamped.
+// guardWrite refuses a newer schema or an independently incompatible reader
+// floor. Writing a store necessarily requires being able to interpret it first.
 func guardWrite(info SchemaInfo) error {
-	if info.Version > currentSchemaVersion {
+	if info.Version > currentSchemaVersion || info.MinReaderVersion > currentSchemaVersion {
 		return &SchemaTooNewError{
 			DBVersion: info.Version, MinReaderVersion: info.MinReaderVersion,
 			Binary: currentSchemaVersion, WrittenBy: info.WrittenBy, Write: true,
