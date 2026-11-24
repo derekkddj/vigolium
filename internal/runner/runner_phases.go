@@ -283,7 +283,8 @@ func (r *Runner) RunNativeScan() (err error) {
 		var sessionLogFile *os.File
 		var teeInner io.Writer = origStderr
 		if r.settings != nil && r.settings.ScanningStrategy.ScanLogs.IsPersistLogsEnabled() {
-			sessionDir, pathErr := sessionpath.RunDir(r.settings.ScanningStrategy.ScanLogs.EffectiveSessionsDir(), infra.scanUUID)
+			// Honor the same stateless/session-root policy as the heartbeat.
+			sessionDir, pathErr := sessionpath.RunDir(sessionsDirFor(r.settings), infra.scanUUID)
 			if pathErr != nil {
 				zap.L().Warn("Refusing unsafe native session ID", zap.String("scan_uuid", infra.scanUUID), zap.Error(pathErr))
 			} else if mkErr := os.MkdirAll(sessionDir, 0o755); mkErr == nil {
