@@ -50,8 +50,14 @@ func TestFindingSelectedEvidenceDBJSONLEnvelopesReceiptOnlyAndNoDuplicates(t *te
 	}
 	foreign := &database.Finding{ProjectUUID: "foreign", FindingHash: "foreign-jsonl", ModuleID: "test", Severity: "high", Evidence: []evidence.Entry{entry}}
 	require.NoError(t, repo.SaveFindingDirect(ctx, foreign))
+	withDBExportTable(t, "jsonl", "findings")
+	swapGlobal(t, &globalProjectUUID, database.DefaultProjectUUID)
+	swapGlobal(t, &globalProjectName, "")
+	swapGlobal(t, &exportLimit, 0)
+	swapGlobal(t, &exportOffset, 0)
 	var out bytes.Buffer
-	n, err := exportFindingJSONL(ctx, db, database.QueryFilters{ProjectUUID: database.DefaultProjectUUID}, &out)
+	// Exercise the command's production dispatcher, not an orphaned helper.
+	n, err := writeDBExportCounted(ctx, db, nil, nil, &out)
 	require.NoError(t, err)
 	require.Equal(t, 2, n)
 	seen := map[int64]bool{}

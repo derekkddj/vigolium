@@ -30,7 +30,7 @@ var dbExportCmd = &cobra.Command{
 	Short: "Export database records",
 	Long: `Export stored HTTP traffic, and the findings linked to it, with filters by host, method, status, path, scan, severity, time range and record UUID.
 
---format jsonl (the default) writes the same {"type": ..., "data": ...} lines as ` + "`vigolium export --format jsonl`" + `: one http_record line per selected record, then one finding line per confirmed finding linked to those records (--severity narrows the findings). ` + "`vigolium import`" + `, ` + "`finding load`" + ` and ` + "`-S --db`" + ` read it back. --limit and --offset count records, not lines. --table http_records keeps only the record lines, --table findings only the finding lines.
+--format jsonl (the default) writes the same {"type": ..., "data": ...} lines as ` + "`vigolium export --format jsonl`" + `: selected http_record lines followed by selected finding lines, including findings with no HTTP-record links and their exact selected evidence. ` + "`vigolium import`" + `, ` + "`finding load`" + ` and ` + "`-S --db`" + ` read it back. Shared filters apply independently to each type; --severity narrows findings. --limit and --offset paginate each selected type separately. --table http_records keeps only record lines, --table findings only finding lines. The -j receipt counts emitted rows in records and separately in http_record/finding.
 
 --format nuclei keeps the previous jsonl output: one nuclei-style ResultEvent (template-id, matched-at, info{}) per linked finding.`,
 	RunE: runDBExport,
@@ -110,7 +110,7 @@ func validateDBExportFlags() (dateFrom, dateTo *time.Time, err error) {
 // dbExportFilters builds the record selection shared by every export format.
 // runDBExport and runDBExportFS had byte-identical copies of this, which is how
 // --uuid came to be honored by one and ignored by the other.
-func dbExportFilters(db *database.DB, dateFrom, dateTo *time.Time) (database.QueryFilters, error) {
+func dbExportFilters(ctx context.Context, db *database.DB, dateFrom, dateTo *time.Time) (database.QueryFilters, error) {
 	projectUUID, err := resolveProjectUUID()
 	if err != nil {
 		return database.QueryFilters{}, err
@@ -137,7 +137,7 @@ func dbExportFilters(db *database.DB, dateFrom, dateTo *time.Time) (database.Que
 	// the UUID reported an existing record as "not found" whenever it fell
 	// outside --limit/--offset.
 	if exportRecordUUID != "" {
-		resolved, err := resolveRecordRefs(context.Background(), database.NewRepository(db), []string{exportRecordUUID}, projectUUID)
+		resolved, err := resolveRecordRefs(ctx, database.NewRepository(db), []string{exportRecordUUID}, projectUUID)
 		if err != nil {
 			return database.QueryFilters{}, err
 		}
@@ -192,7 +192,7 @@ func runDBExport(cmd *cobra.Command, args []string) error {
 		return emitDBExportReceipt(cmd, []exportedFile{{label: "bundle", path: exportOutput}}, stats.counts)
 	}
 
-	ctx := context.Background()
+	ctx := cmd.Context()
 
 	// A single-shot -o is staged and renamed, so a query that fails — or a
 	// cancelled run — leaves the previous export in place instead of a truncated
@@ -203,16 +203,15 @@ func runDBExport(cmd *cobra.Command, args []string) error {
 	// every tick for as long as it runs, so there is no single publication point
 	// to rename at. It keeps the open-once-and-append behavior it always had.
 	if exportOutput != "" && !dbExportWatching() {
-		var n int
+		var counts map[string]int
 		if err := atomicfile.WriteFile(exportOutput, 0o666, func(w *bufio.Writer) error {
 			var werr error
-			n, werr = writeDBExportCounted(ctx, db, dateFrom, dateTo, w)
+			_, counts, werr = writeDBExportWithCounts(ctx, db, dateFrom, dateTo, w)
 			return werr
 		}); err != nil || !globalJSON {
 			return err
 		}
-		return emitDBExportReceipt(cmd, []exportedFile{{label: exportFormat, path: exportOutput}},
-			map[string]int{"records": n})
+		return emitDBExportReceipt(cmd, []exportedFile{{label: exportFormat, path: exportOutput}}, counts)
 	}
 
 	var out io.Writer = os.Stdout
@@ -275,36 +274,39 @@ func writeDBExport(ctx context.Context, db *database.DB, dateFrom, dateTo *time.
 	return err
 }
 
-// writeDBExportCounted is writeDBExport reporting how many records the query
-// selected, for the -j receipt.
+// writeDBExportCounted reports emitted rows (envelopes for JSONL), not the
+// traffic page previously used to discover findings.
 func writeDBExportCounted(ctx context.Context, db *database.DB, dateFrom, dateTo *time.Time, out io.Writer) (int, error) {
-	filters, err := dbExportFilters(db, dateFrom, dateTo)
-	if err != nil {
-		return 0, err
-	}
+	n, _, err := writeDBExportWithCounts(ctx, db, dateFrom, dateTo, out)
+	return n, err
+}
 
-	// The envelope and nuclei dialects pair the selected records with their
-	// linked findings, so they read the selected page; every other format
-	// streams records without holding the corpus.
-	if exportFormat == "jsonl" || exportFormat == "nuclei" {
+func writeDBExportWithCounts(ctx context.Context, db *database.DB, dateFrom, dateTo *time.Time, out io.Writer) (int, map[string]int, error) {
+	filters, err := dbExportFilters(ctx, db, dateFrom, dateTo)
+	if err != nil {
+		return 0, nil, err
+	}
+	if exportFormat == "jsonl" {
+		return streamDBEnvelopes(ctx, db, filters, out)
+	}
+	// Preserve the explicitly selected legacy nuclei dialect. JSONL never
+	// materializes traffic to discover findings: receipt-only findings matter.
+	if exportFormat == "nuclei" {
+		if exportRecordUUID != "" {
+			filters.Limit, filters.Offset = 0, 0
+		}
 		records, err := database.NewQueryBuilder(db, filters).Execute(ctx)
 		if err != nil {
-			return 0, fmt.Errorf("failed to query database: %w", err)
+			return 0, nil, fmt.Errorf("failed to query database: %w", err)
 		}
 		if exportRecordUUID != "" && len(records) == 0 {
-			return 0, fmt.Errorf("record UUID %s not found", exportRecordUUID)
+			return 0, nil, fmt.Errorf("record UUID %s not found", exportRecordUUID)
 		}
-		if exportFormat == "jsonl" {
-			err = exportDBEnvelopes(ctx, db, filters, records, out)
-		} else {
-			err = exportJSONL(ctx, db, records, out)
-		}
-		if err != nil {
-			return 0, err
-		}
-		return len(records), nil
+		err = exportJSONL(ctx, db, records, out)
+		return len(records), map[string]int{"records": len(records)}, err
 	}
-	return streamRecordDBExport(ctx, db, filters, out)
+	n, err := streamRecordDBExport(ctx, db, filters, out)
+	return n, map[string]int{"records": n}, err
 }
 
 // runDBExportFS writes the filtered records + findings to a flat
@@ -316,7 +318,7 @@ func runDBExportFS(db *database.DB, dateFrom, dateTo *time.Time) (fsExportStats,
 	// Same builder as every other format. This branch used to keep its own copy,
 	// which is how it came to bind --search to FuzzyTerm while the others used
 	// SearchTerm, and to ignore --uuid entirely.
-	filters, err := dbExportFilters(db, dateFrom, dateTo)
+	filters, err := dbExportFilters(context.Background(), db, dateFrom, dateTo)
 	if err != nil {
 		return fsExportStats{}, err
 	}
@@ -356,60 +358,6 @@ func validateDBExportTable() error {
 	return nil
 }
 
-// exportDBEnvelopes writes db export's jsonl: the selected records as
-// http_record envelopes, then the confirmed findings linked to them as finding
-// envelopes (each once, --severity applied), in the dialect `vigolium export`
-// writes and `vigolium import` reads.
-func exportDBEnvelopes(ctx context.Context, db *database.DB, filters database.QueryFilters, records []*database.HTTPRecord, out io.Writer) error {
-	scope := dbExportScope()
-	enc := json.NewEncoder(out)
-	enc.SetEscapeHTML(false)
-	if scope.includes("http") {
-		for _, rec := range records {
-			if err := enc.Encode(exportEnvelope{Type: "http_record", Data: rec}); err != nil {
-				return fmt.Errorf("failed to write output: %w", err)
-			}
-		}
-	}
-	if !scope.includes("findings") || len(records) == 0 {
-		return nil
-	}
-	uuids := make([]string, 0, len(records))
-	for _, rec := range records {
-		uuids = append(uuids, rec.UUID)
-	}
-	seen := make(map[int64]struct{})
-	// Chunked so a large page stays under the driver's bound-parameter limit.
-	for start := 0; start < len(uuids); start += 500 {
-		chunk := uuids[start:min(start+500, len(uuids))]
-		var findings []*database.Finding
-		q := scopeProjectBun(db.NewSelect().Model(&findings), filters.ProjectUUID).
-			Where("f.id IN (SELECT finding_id FROM finding_records WHERE record_uuid IN (?))", bun.List(chunk)).
-			Where("(f.record_kind IS NULL OR f.record_kind = '' OR f.record_kind = ?)", database.RecordKindFinding).
-			OrderExpr("f.found_at DESC")
-		if len(filters.Severity) > 0 {
-			sevs := make([]string, 0, len(filters.Severity))
-			for _, s := range filters.Severity {
-				sevs = append(sevs, strings.ToLower(strings.TrimSpace(s)))
-			}
-			q = q.Where("LOWER(f.severity) IN (?)", bun.List(sevs))
-		}
-		if err := q.Scan(ctx); err != nil {
-			return fmt.Errorf("export linked findings: %w", err)
-		}
-		for _, f := range findings {
-			if _, dup := seen[f.ID]; dup {
-				continue
-			}
-			seen[f.ID] = struct{}{}
-			if err := enc.Encode(exportEnvelope{Type: "finding", Data: f}); err != nil {
-				return fmt.Errorf("failed to write output: %w", err)
-			}
-		}
-	}
-	return nil
-}
-
 // exportJSONL writes the nuclei-style dialect (--format nuclei): one
 // ResultEvent per finding linked to each record.
 func exportJSONL(ctx context.Context, db *database.DB, records []*database.HTTPRecord, out io.Writer) error {
@@ -439,7 +387,7 @@ func exportJSONL(ctx context.Context, db *database.DB, records []*database.HTTPR
 // per selected finding, including receipt-only findings and complete metadata.
 // Legacy flat ResultEvent conversion is not this format's storage contract.
 func exportFindingJSONL(ctx context.Context, db *database.DB, filters database.QueryFilters, out io.Writer) (int, error) {
-	enc := json.NewEncoder(out)
+	enc := json.NewEncoder(&dbExportErrorWriter{Writer: out})
 	enc.SetEscapeHTML(false)
 	n := 0
 	err := iterateFilteredEvidenceFindings(ctx, db, filters, func(f *database.Finding) error {

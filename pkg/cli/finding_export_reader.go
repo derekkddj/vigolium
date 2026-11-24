@@ -38,6 +38,9 @@ func iterateFilteredEvidenceFindings(ctx context.Context, db *database.DB, filte
 			return err
 		}
 		for i, f := range page {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			// Release the page's reference before hydration, so completed findings
 			// do not accumulate up to a page of raw receipt bodies in memory.
 			page[i] = nil

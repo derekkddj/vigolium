@@ -19,7 +19,7 @@ import (
 // a raw item collection or a second potentially different database query.
 func streamRecordDBExport(ctx context.Context, db *database.DB, filters database.QueryFilters, out io.Writer) (int, error) {
 	switch exportFormat {
-	case "json", "raw", "csv", "markdown", "markdown-table":
+	case "jsonl", "json", "raw", "csv", "markdown", "markdown-table":
 	default:
 		return 0, usageErrorf("unsupported export format: %s", exportFormat)
 	}
@@ -33,6 +33,11 @@ func streamRecordDBExport(ctx context.Context, db *database.DB, filters database
 		return 0, err
 	}
 	defer file.Close()
+	// --uuid selects exactly one resolved record, irrespective of a traffic
+	// page's offset. Finding pagination is independent and keeps its filters.
+	if exportRecordUUID != "" {
+		filters.Limit, filters.Offset = 0, 0
+	}
 	qb := database.NewQueryBuilder(db, filters)
 	if exportFormat == "csv" || exportFormat == "markdown-table" {
 		qb = qb.OmitBodies()
@@ -45,8 +50,12 @@ func streamRecordDBExport(ctx context.Context, db *database.DB, filters database
 	n, err := func() (int, error) {
 		defer rows.Close()
 		enc := json.NewEncoder(file)
+		enc.SetEscapeHTML(false)
 		n := 0
 		for rows.Next() {
+			if err := ctx.Err(); err != nil {
+				return n, err
+			}
 			r := new(database.HTTPRecord)
 			if err := db.ScanRow(ctx, rows, r); err != nil {
 				return n, err
@@ -70,7 +79,11 @@ func streamRecordDBExport(ctx context.Context, db *database.DB, filters database
 	// Capture errors from legacy single-record text helpers as well as framing.
 	w := &dbExportErrorWriter{Writer: out}
 	var csv *output.SafeCSVWriter
+	var envelopes *json.Encoder
 	switch exportFormat {
+	case "jsonl":
+		envelopes = json.NewEncoder(w)
+		envelopes.SetEscapeHTML(false)
 	case "json":
 		date, _ := json.Marshal(time.Now().Format(time.RFC3339))
 		fmt.Fprintf(w, "{\"export_date\":%s,\"total_records\":%d,\"records\":[", date, n)
@@ -86,6 +99,9 @@ func streamRecordDBExport(ctx context.Context, db *database.DB, filters database
 	}
 	dec := json.NewDecoder(file)
 	for i := 0; i < n; i++ {
+		if err := ctx.Err(); err != nil {
+			return n, err
+		}
 		var raw json.RawMessage
 		if err := dec.Decode(&raw); err != nil {
 			return n, err
@@ -95,6 +111,10 @@ func streamRecordDBExport(ctx context.Context, db *database.DB, filters database
 				io.WriteString(w, ",")
 			}
 			w.Write(raw)
+		} else if exportFormat == "jsonl" {
+			if err := envelopes.Encode(exportEnvelope{Type: "http_record", Data: raw}); err != nil {
+				return n, err
+			}
 		} else {
 			var r database.HTTPRecord
 			if err := json.Unmarshal(raw, &r); err != nil {

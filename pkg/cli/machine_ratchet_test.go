@@ -238,4 +238,16 @@ func TestExportJSONReceipts(t *testing.T) {
 	require.Equal(t, "csv", items[0].(map[string]any)["format"])
 	require.Greater(t, doc["counts"].(map[string]any)["records"], float64(0))
 	require.FileExists(t, out)
+
+	out = filepath.Join(e.home, "db-envelopes.jsonl")
+	code, stdout, stderr = e.run(t, nil, "db", "export", "--format", "jsonl", "-o", out, "-j")
+	require.Equal(t, 0, code, stderr)
+	doc = oneDoc(t, stdout, stderr)
+	counts = doc["counts"].(map[string]any)
+	data, err := os.ReadFile(out)
+	require.NoError(t, err)
+	types := countEnvelopeTypes(t, data)
+	require.Equal(t, float64(types["http_record"]), counts["http_record"])
+	require.Equal(t, float64(types["finding"]), counts["finding"])
+	require.Equal(t, float64(types["http_record"]+types["finding"]), counts["records"])
 }
