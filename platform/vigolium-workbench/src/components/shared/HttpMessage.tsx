@@ -63,7 +63,7 @@ export default function HttpMessage({ label, value, encoding = 'text', theme, re
       {value == null || value === '' ? <p style={{ color: colors.muted }}>Not stored / unavailable.</p> : decoded.text !== undefined && (
         <>
           {preview.truncated && <p style={{ color: colors.warning }}>Preview truncated to 64 Ki characters. Copy or download the full content above.</p>}
-          <pre className="border p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-64 overflow-y-auto" style={{ borderColor: colors.border, background: colors.background }}>{renderPreview ? renderPreview(preview.text) : preview.text}</pre>
+          <pre tabIndex={0} aria-label={`${label} text preview`} className="border p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-64 overflow-y-auto" style={{ borderColor: colors.border, background: colors.background }}>{renderPreview ? renderPreview(preview.text) : preview.text}</pre>
         </>
       )}
     </section>
