@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -418,9 +419,13 @@ func (h *Handlers) handleAutopilotSSE(c fiber.Ctx, agenticScanUUID string, req A
 		clientConnected := drainAgentPipeToSSE(sink, pr, cancel)
 
 		res := <-done
+		h.finalizeAutopilotFindingCount(agenticScanUUID, projectUUID, res.result)
 		now := time.Now()
 		h.agentMu.Lock()
 		status := h.agenticScanStatus[agenticScanUUID]
+		if status != nil && status.ProjectUUID != projectUUID {
+			status = nil
+		}
 
 		if res.err != nil {
 			runStatus := terminalStatusForRunErr(res.err)
@@ -431,7 +436,7 @@ func (h *Handlers) handleAutopilotSSE(c fiber.Ctx, agenticScanUUID string, req A
 			}
 			h.agentMu.Unlock()
 
-			h.enrichAgenticScanRecord(agenticScanUUID, func(run *database.AgenticScan) {
+			h.enrichAutopilotScanRecord(agenticScanUUID, projectUUID, res.result, func(run *database.AgenticScan) {
 				run.Status = runStatus
 				run.ErrorMessage = res.err.Error()
 				run.CompletedAt = now
@@ -447,14 +452,10 @@ func (h *Handlers) handleAutopilotSSE(c fiber.Ctx, agenticScanUUID string, req A
 			return
 		}
 
-		if status != nil && res.result != nil {
-			status.Status = database.CompletedAgenticScanStatus(res.result.Degraded)
+		if status != nil {
+			status.Status = database.CompletedAgenticScanStatus(res.result != nil && res.result.Degraded)
 			status.CompletedAt = &now
-			status.FindingCount = res.result.FindingsCount
-			if res.result.VerifiedFindingCount > 0 {
-				status.FindingCount = res.result.VerifiedFindingCount
-			}
-			if len(res.result.Warnings) > 0 {
+			if res.result != nil && len(res.result.Warnings) > 0 {
 				status.Error = strings.Join(res.result.Warnings, "\n")
 			}
 		}
@@ -464,15 +465,11 @@ func (h *Handlers) handleAutopilotSSE(c fiber.Ctx, agenticScanUUID string, req A
 		// so the SSE-mode row matches the async-mode row produced by
 		// runBackgroundAutopilot.
 		rawOutput := snapshotAgentRawOutput(streamFile, sessionDir)
-		h.enrichAgenticScanRecord(agenticScanUUID, func(run *database.AgenticScan) {
+		h.enrichAutopilotScanRecord(agenticScanUUID, projectUUID, res.result, func(run *database.AgenticScan) {
 			run.Status = database.CompletedAgenticScanStatus(res.result != nil && res.result.Degraded)
 			run.CompletedAt = now
 			run.DurationMs = now.Sub(run.StartedAt).Milliseconds()
 			if res.result != nil {
-				run.FindingCount = res.result.FindingsCount
-				if res.result.VerifiedFindingCount > 0 {
-					run.FindingCount = res.result.VerifiedFindingCount
-				}
 				if len(res.result.Warnings) > 0 {
 					run.ErrorMessage = strings.Join(res.result.Warnings, "\n")
 				}
@@ -556,6 +553,7 @@ func (h *Handlers) runBackgroundAutopilot(agenticScanUUID string, req AgentAutop
 
 	runner := agent.NewAutopilotPipelineRunner(engine, h.repo)
 	result, runErr := runner.RunAutonomous(ctx, cfg)
+	h.finalizeAutopilotFindingCount(agenticScanUUID, projectUUID, result)
 
 	now := time.Now()
 
@@ -565,7 +563,7 @@ func (h *Handlers) runBackgroundAutopilot(agenticScanUUID string, req AgentAutop
 	// Lock deadlocks (Go mutexes are non-reentrant).
 	h.agentMu.Lock()
 	status := h.agenticScanStatus[agenticScanUUID]
-	if status == nil {
+	if status == nil || status.ProjectUUID != projectUUID {
 		h.agentMu.Unlock()
 		return
 	}
@@ -577,10 +575,6 @@ func (h *Handlers) runBackgroundAutopilot(agenticScanUUID string, req AgentAutop
 		status.Status = database.CompletedAgenticScanStatus(result != nil && result.Degraded)
 		status.CompletedAt = &now
 		if result != nil {
-			status.FindingCount = result.FindingsCount
-			if result.VerifiedFindingCount > 0 {
-				status.FindingCount = result.VerifiedFindingCount
-			}
 			if len(result.Warnings) > 0 {
 				status.Error = strings.Join(result.Warnings, "\n")
 			}
@@ -592,7 +586,7 @@ func (h *Handlers) runBackgroundAutopilot(agenticScanUUID string, req AgentAutop
 	if runErr != nil {
 		// Persist the failure to the DB, preserving the source/target/session
 		// fields that the enrichment step wrote earlier.
-		h.enrichAgenticScanRecord(agenticScanUUID, func(run *database.AgenticScan) {
+		h.enrichAutopilotScanRecord(agenticScanUUID, projectUUID, result, func(run *database.AgenticScan) {
 			run.Status = "failed"
 			run.ErrorMessage = runErr.Error()
 			run.CompletedAt = now
@@ -614,15 +608,11 @@ func (h *Handlers) runBackgroundAutopilot(agenticScanUUID string, req AgentAutop
 
 	// Persist the completed state plus the artifacts the CLI would have shown
 	// live: a snapshot of runtime.log plus session dir summary fields.
-	h.enrichAgenticScanRecord(agenticScanUUID, func(run *database.AgenticScan) {
+	h.enrichAutopilotScanRecord(agenticScanUUID, projectUUID, result, func(run *database.AgenticScan) {
 		run.Status = database.CompletedAgenticScanStatus(result != nil && result.Degraded)
 		run.CompletedAt = now
 		run.DurationMs = now.Sub(run.StartedAt).Milliseconds()
 		if result != nil {
-			run.FindingCount = result.FindingsCount
-			if result.VerifiedFindingCount > 0 {
-				run.FindingCount = result.VerifiedFindingCount
-			}
 			if result.SessionDir != "" {
 				run.SessionDir = result.SessionDir
 			}
@@ -647,7 +637,40 @@ func (h *Handlers) runBackgroundAutopilot(agenticScanUUID string, req AgentAutop
 		zap.Int("finding_count", findingCount))
 }
 
-// enrichAgenticScanRecord loads the agentic_scans row for agenticScanUUID, applies mutate,
-// and writes it back. Used by background handlers to populate fields like
-// source_path / target_url / session_dir / agent_raw_output that the
-// lightweight persistAgenticScan helpers don't cover.
+// enrichAutopilotScanRecord persists terminal metadata and the reconciled count
+// in one update. Load the complete root row and validate ownership before giving
+// it to mutate; writing the loaded model without OmitZero preserves unrelated
+// metadata while allowing a known zero to replace an earlier nonzero count.
+func (h *Handlers) enrichAutopilotScanRecord(agenticScanUUID, projectUUID string, result *agent.AutopilotPipelineResult, mutate func(run *database.AgenticScan)) {
+	if h.repo == nil || mutate == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	run, err := h.repo.GetAgenticScan(ctx, agenticScanUUID)
+	if err != nil || run == nil {
+		zap.L().Debug("enrichAutopilotScanRecord: run not found", zap.String("agentic_scan_uuid", agenticScanUUID), zap.Error(err))
+		return
+	}
+	if run.ProjectUUID != projectUUID {
+		zap.L().Warn("enrichAutopilotScanRecord: project mismatch", zap.String("agentic_scan_uuid", agenticScanUUID), zap.String("project_uuid", projectUUID))
+		return
+	}
+	mutate(run)
+	run.FindingCount = autopilotFindingCount(result)
+	if result != nil && (run.Status == "completed" || run.Status == "completed_with_warnings") {
+		// Keep availability explicit in the stored success snapshot, and use the
+		// same canonical total as the row without mutating the caller's result.
+		snapshot := *result
+		snapshot.TotalFindings = run.FindingCount
+		if data, err := json.Marshal(snapshot); err == nil {
+			run.ResultJSON = string(data)
+		} else {
+			zap.L().Warn("Failed to encode autopilot result", zap.String("agentic_scan_uuid", agenticScanUUID), zap.Error(err))
+		}
+	}
+	if _, err := h.repo.DB().NewUpdate().Model(run).
+		Where("uuid = ?", agenticScanUUID).Where("project_uuid = ?", projectUUID).Exec(ctx); err != nil {
+		zap.L().Warn("Failed to persist autopilot terminal metadata", zap.String("agentic_scan_uuid", agenticScanUUID), zap.Error(err))
+	}
+}

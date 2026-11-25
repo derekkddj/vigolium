@@ -110,3 +110,30 @@ func TestRunWithBurpBridgeUsesReadOnlyBridgeSession(t *testing.T) {
 	require.Nil(t, fake.lastSpec.VigTools, "bridge-only queries must not gain replay tools")
 	require.Equal(t, "project-1", fake.lastSpec.BurpBridgeTools.ProjectUUID)
 }
+
+// TestRunHonorsOptionsMaxTurns proves the fresh-per-call path honors
+// Options.MaxTurns: a positive value builds a session carrying that turn cap
+// (SessionSpec.MaxTurns) and runs on it, instead of the plain RunPrompt path
+// that silently used the config default. This is the browser auth phase's fix —
+// before it, Options.MaxTurns was ignored on this path and the phase failed
+// with "exceeded max turns" at the 32-turn default.
+func TestRunHonorsOptionsMaxTurns(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeRuntime{output: "ok"}
+	e := &Engine{runtime: fake}
+	res, err := e.Run(context.Background(), Options{PromptInline: "login", MaxTurns: 80})
+	require.NoError(t, err)
+	require.Contains(t, res.RawOutput, "ok")
+	require.Equal(t, int32(1), fake.runOnSessionCalls.Load(), "a positive MaxTurns must run on an explicitly-built session")
+	require.Equal(t, int32(0), fake.runPromptCalls.Load(), "a positive MaxTurns must not use the default RunPrompt path")
+	require.Equal(t, 80, fake.lastSpec.MaxTurns, "the requested turn cap must reach the session spec")
+
+	// Control: without MaxTurns the engine keeps using the plain RunPrompt path.
+	plain := &fakeRuntime{output: "ok"}
+	ep := &Engine{runtime: plain}
+	_, err = ep.Run(context.Background(), Options{PromptInline: "login"})
+	require.NoError(t, err)
+	require.Equal(t, int32(1), plain.runPromptCalls.Load(), "no MaxTurns must keep the default RunPrompt path")
+	require.Equal(t, int32(0), plain.runOnSessionCalls.Load())
+}
