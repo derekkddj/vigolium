@@ -169,9 +169,26 @@ func TestDiffScans_DismissedAndProjectIsolation(t *testing.T) {
 	ctx := context.Background()
 	fx := newDiffFixture(t)
 
-	// Same hash observed by scan 2 under ANOTHER project never counts here.
+	// This deliberately models a historical corrupt row: a finding and
+	// observation attributed to project B but carrying project A's scan UUID.
+	// Current SaveFindingDirect rejects that ownership mismatch, so seed the
+	// legacy state explicitly rather than weakening the write guard.
 	const projB = "99999999-0000-0000-0000-000000000000"
-	otherID := observe(t, fx.repo, projB, "gone", SeverityLow, fx.s2.UUID)
+	other := &Finding{
+		ProjectUUID: projB, HTTPRecordUUIDs: []string{}, ScanUUID: fx.s2.UUID,
+		ModuleID: "m-gone", ModuleName: "M gone", Severity: SeverityLow,
+		Confidence: "firm", FindingHash: "gone",
+	}
+	if _, err := fx.db.NewInsert().Model(other).Exec(ctx); err != nil {
+		t.Fatalf("insert historical foreign-project finding: %v", err)
+	}
+	otherID := other.ID
+	observation := &FindingObservation{
+		ProjectUUID: projB, FindingID: otherID, FindingHash: "gone", ScanUUID: fx.s2.UUID,
+	}
+	if _, err := fx.db.NewInsert().Model(observation).Exec(ctx); err != nil {
+		t.Fatalf("insert historical foreign-project observation: %v", err)
+	}
 
 	if err := fx.repo.SetFindingStatus(ctx, DefaultProjectUUID, fx.fresh, StatusFalsePositive, "noise", "t"); err != nil {
 		t.Fatal(err)

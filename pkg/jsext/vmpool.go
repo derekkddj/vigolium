@@ -18,6 +18,7 @@ type VMPool struct {
 // NewVMPool pre-compiles the script source and creates a pool of ready VMs.
 // Returns an error if the script fails to compile.
 func NewVMPool(script *LoadedScript, opts APIOptions) (*VMPool, error) {
+	opts = ownAPIIdentity(opts)
 	prog, err := sobek.Compile(script.Path, script.Source, false)
 	if err != nil {
 		return nil, err

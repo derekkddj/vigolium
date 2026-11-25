@@ -45,38 +45,46 @@ test('stale stored UUID gets replaced when not in the API list', async ({ page }
 test('project-scoped requests carry the active X-Project-UUID', async ({ page }) => {
   // Capture every X-Project-UUID value seen on /api/findings calls.
   const seenUUIDs: string[] = [];
-  await page.route('**/api/findings*', (r) => {
+  await page.route('**/api/findings*', async (r) => {
     const header = r.request().headers()['x-project-uuid'];
     if (header) seenUUIDs.push(header);
-    r.fulfill({
+    await r.fulfill({
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify({ data: [], total: 0, limit: 50, offset: 0, has_more: false }),
     });
   });
 
+  const findingsResponse = page.waitForResponse(
+    response => new URL(response.url()).pathname === '/api/findings',
+    { timeout: 10_000 },
+  );
   // Project A
   await seedAuth(page, { projectUUID: FIXTURE_PROJECT.uuid });
   await page.goto('/findings/');
-  await page.waitForLoadState('networkidle');
+  await findingsResponse;
   expect(seenUUIDs, 'project A UUID should be on the wire').toContain(FIXTURE_PROJECT.uuid);
 });
 
 test('a different seeded project produces a different X-Project-UUID', async ({ page }) => {
   const seenUUIDs: string[] = [];
-  await page.route('**/api/findings*', (r) => {
+  await page.route('**/api/findings*', async (r) => {
     const header = r.request().headers()['x-project-uuid'];
     if (header) seenUUIDs.push(header);
-    r.fulfill({
+    await r.fulfill({
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify({ data: [], total: 0, limit: 50, offset: 0, has_more: false }),
     });
   });
 
+  const findingsResponse = page.waitForResponse(
+    response => new URL(response.url()).pathname === '/api/findings',
+    { timeout: 10_000 },
+  );
   await seedAuth(page, { projectUUID: FIXTURE_PROJECT_2.uuid });
   await page.goto('/findings/');
-  await page.waitForLoadState('networkidle');
+  await findingsResponse;
   expect(seenUUIDs).toContain(FIXTURE_PROJECT_2.uuid);
   expect(seenUUIDs, 'project A UUID must not leak when project B is active').not.toContain(
     FIXTURE_PROJECT.uuid,
@@ -89,27 +97,36 @@ test('project-bootstrap endpoints never receive X-Project-UUID', async ({ page }
   const projectsHeader: (string | undefined)[] = [];
   const serverInfoHeader: (string | undefined)[] = [];
 
-  await page.route('**/api/projects', (r) => {
+  await page.route('**/api/projects', async (r) => {
     projectsHeader.push(r.request().headers()['x-project-uuid']);
-    r.fulfill({
+    await r.fulfill({
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify([FIXTURE_PROJECT, FIXTURE_PROJECT_2]),
     });
   });
-  await page.route('**/server-info', (r) => {
+  await page.route('**/server-info', async (r) => {
     serverInfoHeader.push(r.request().headers()['x-project-uuid']);
-    r.fulfill({
+    await r.fulfill({
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify({ name: 'vigolium' }),
     });
   });
 
+  const projectsResponse = page.waitForResponse(
+    response => new URL(response.url()).pathname === '/api/projects',
+    { timeout: 10_000 },
+  );
+  const serverInfoResponse = page.waitForResponse(
+    response => new URL(response.url()).pathname === '/server-info',
+    { timeout: 10_000 },
+  );
   await page.goto('/');
-  await page.waitForLoadState('networkidle');
+  await Promise.all([projectsResponse, serverInfoResponse]);
 
   expect(projectsHeader.length, '/api/projects should be hit').toBeGreaterThan(0);
+  expect(serverInfoHeader.length, '/server-info should be hit').toBeGreaterThan(0);
   for (const h of projectsHeader) {
     expect(h, '/api/projects must not carry X-Project-UUID').toBeFalsy();
   }

@@ -156,7 +156,7 @@ func (r *replayRequestTool) Execute(ctx context.Context, args map[string]any, _ 
 		return tool.Result{Content: "replay_request: 'record_uuid' is required", IsError: true}, nil
 	}
 
-	rec, err := r.ctx.Repo.GetRecordByUUIDOrPrefix(ctx, uuid)
+	rec, err := resolveRecordInProject(ctx, r.ctx.Repo, uuid, r.ctx.ProjectUUID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		// An ambiguous prefix names its candidates; surface that verbatim.
 		return tool.Result{Content: "replay_request: " + err.Error(), IsError: true}, nil
@@ -170,7 +170,7 @@ func (r *replayRequestTool) Execute(ctx context.Context, args map[string]any, _ 
 	if err != nil {
 		return tool.Result{Content: fmt.Sprintf("replay_request: %v", err), IsError: true}, nil
 	}
-	if r.ctx.ProjectUUID != "" && rec.ProjectUUID != r.ctx.ProjectUUID {
+	if rec.ProjectUUID != effectiveRecordProjectUUID(r.ctx.ProjectUUID) {
 		return tool.Result{
 			Content: fmt.Sprintf("replay_request: record %q does not belong to the current project", uuid),
 			IsError: true,

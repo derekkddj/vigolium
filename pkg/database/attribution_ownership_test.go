@@ -36,7 +36,22 @@ func TestAttributeScanOwnershipAndRollback(t *testing.T) {
 			if scenario == "foreign-finding" {
 				findingProject = uuid.NewString()
 			}
-			id := saveFindingFull(t, repo, &Finding{ProjectUUID: findingProject, ScanUUID: child})
+			finding := &Finding{
+				ProjectUUID: findingProject, HTTPRecordUUIDs: []string{}, ScanUUID: child,
+				ModuleID: "mod", ModuleName: "mod", Severity: SeverityMedium,
+				Confidence: "firm", FindingHash: uuid.NewString(),
+			}
+			var id int64
+			if scenario == "foreign-finding" {
+				// This intentionally malformed parent is historical state used to
+				// exercise the attribution guard, not a supported current write.
+				if _, err := repo.DB().NewInsert().Model(finding).Exec(ctx); err != nil {
+					t.Fatalf("insert historical foreign finding fixture: %v", err)
+				}
+				id = finding.ID
+			} else {
+				id = saveFindingFull(t, repo, finding)
+			}
 			if scenario == "finding-update-failure" {
 				_, err := repo.DB().ExecContext(ctx, `CREATE TRIGGER attribution_failure BEFORE UPDATE OF agentic_scan_uuid ON findings BEGIN SELECT RAISE(FAIL, 'injected finding write failure'); END`)
 				if err != nil {

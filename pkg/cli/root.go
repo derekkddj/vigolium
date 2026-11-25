@@ -12,6 +12,7 @@ import (
 	"github.com/vigolium/vigolium/internal/paths"
 	"github.com/vigolium/vigolium/internal/scratch"
 	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
+	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/modules"
 	"github.com/vigolium/vigolium/pkg/olium"
 	"github.com/vigolium/vigolium/pkg/output"
@@ -157,6 +158,10 @@ Common workflows:
 Run 'vigolium <command> --help' for command-specific flags and examples, or 'vigolium --full-example' for a curated tour.`,
 	SilenceUsage: true,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		if err := validateScanUUIDFlag(globalScanUUID); err != nil {
+			return err
+		}
+
 		// Initialize logger for all commands
 		zapLogger := initLogger(globalVerbose, globalSilent, globalDebug, globalDumpTraffic, globalLogFile)
 		_ = zapLogger // logger is set globally via zap.ReplaceGlobals
@@ -398,6 +403,13 @@ Run 'vigolium <command> --help' for command-specific flags and examples, or 'vig
 		// Show help when no subcommand is given
 		return cmd.Help()
 	},
+}
+
+func validateScanUUIDFlag(scanUUID string) error {
+	if scanUUID != "" && !database.ValidRunID(scanUUID) {
+		return usageErrorf("--scan-uuid must be a canonical lowercase UUID")
+	}
+	return nil
 }
 
 func init() {

@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/internal/paths"
+	"github.com/vigolium/vigolium/internal/sessionpath"
 	"github.com/vigolium/vigolium/pkg/modules"
 	"go.uber.org/zap"
 )
@@ -90,6 +91,31 @@ func loadCheckpoint(sessionDir string) (*SwarmCheckpoint, error) {
 	return &cp, nil
 }
 
+// CreateExclusiveSessionDir creates a new session directory for a run ID.
+// It fails when the directory already exists so a colliding ID can never reuse
+// another run's working files. If baseDir is empty, it defaults to
+// ~/.vigolium/agent-sessions/.
+func CreateExclusiveSessionDir(baseDir, agenticScanUUID string) (string, error) {
+	if baseDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("failed to get home dir: %w", err)
+		}
+		baseDir = filepath.Join(home, ".vigolium", "agent-sessions")
+	}
+	dir, err := sessionpath.RunDir(baseDir, agenticScanUUID)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(baseDir, 0o700); err != nil {
+		return "", fmt.Errorf("failed to create sessions root: %w", err)
+	}
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		return "", fmt.Errorf("failed to create exclusive session dir: %w", err)
+	}
+	return dir, nil
+}
+
 // EnsureSessionDir creates the session directory for a given run ID under the specified base directory.
 // If baseDir is empty, defaults to ~/.vigolium/agent-sessions/.
 // Returns the absolute path to the created directory.
@@ -100,7 +126,10 @@ func EnsureSessionDir(baseDir, agenticScanUUID string) (string, error) {
 			return "", fmt.Errorf("failed to resolve the state directory: no home directory and no %s", paths.StateDirEnv)
 		}
 	}
-	dir := filepath.Join(baseDir, agenticScanUUID)
+	dir, err := sessionpath.RunDir(baseDir, agenticScanUUID)
+	if err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("failed to create session dir: %w", err)
 	}

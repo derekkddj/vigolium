@@ -311,9 +311,13 @@ func ParseScanIntentWithSetup(ctx context.Context, engine *Engine, prompt string
 		return nil, fmt.Errorf("no settings available for intent setup")
 	}
 
-	agenticScanUUID := "setup-" + uuid.New().String()[:8]
-	cloneDir := filepath.Join(sessionsDir, agenticScanUUID, "repos")
-	if err := os.MkdirAll(cloneDir, 0o755); err != nil {
+	agenticScanUUID := uuid.NewString()
+	sessionDir, err := CreateExclusiveSessionDir(sessionsDir, agenticScanUUID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create setup session directory: %w", err)
+	}
+	cloneDir := filepath.Join(sessionDir, "repos")
+	if err := os.Mkdir(cloneDir, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create clone directory %s: %w", cloneDir, err)
 	}
 

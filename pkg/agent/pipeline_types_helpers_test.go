@@ -1,11 +1,28 @@
 package agent
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
 	"testing"
 )
+
+func TestCreateExclusiveSessionDirRejectsCollision(t *testing.T) {
+	base := t.TempDir()
+	const runID = "api-1234abcd"
+
+	first, err := CreateExclusiveSessionDir(base, runID)
+	if err != nil {
+		t.Fatalf("CreateExclusiveSessionDir first call: %v", err)
+	}
+	if want := filepath.Join(base, runID); first != want {
+		t.Fatalf("first dir = %q, want %q", first, want)
+	}
+	if _, err := CreateExclusiveSessionDir(base, runID); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("second CreateExclusiveSessionDir error = %v, want os.ErrExist", err)
+	}
+}
 
 func TestEnsureSessionDir(t *testing.T) {
 	t.Run("creates dir under explicit base", func(t *testing.T) {
@@ -20,6 +37,19 @@ func TestEnsureSessionDir(t *testing.T) {
 		info, err := os.Stat(dir)
 		if err != nil || !info.IsDir() {
 			t.Fatalf("expected created directory, stat err=%v", err)
+		}
+	})
+
+	t.Run("rejects unsafe ID without creating outside the sessions root", func(t *testing.T) {
+		root := t.TempDir()
+		base := filepath.Join(root, "sessions")
+		for _, id := range []string{"../escaped", "..", "nested/run", filepath.Join(string(filepath.Separator), "absolute")} {
+			if _, err := EnsureSessionDir(base, id); err == nil {
+				t.Errorf("EnsureSessionDir accepted unsafe ID %q", id)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(root, "escaped")); !os.IsNotExist(err) {
+			t.Errorf("unsafe ID created a directory outside the session root: stat err=%v", err)
 		}
 	})
 

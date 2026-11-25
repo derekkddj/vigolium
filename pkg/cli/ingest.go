@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	fileutil "github.com/projectdiscovery/utils/file"
 	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/internal/config"
@@ -1081,6 +1082,10 @@ func ingestParseVariables(variables []string) map[string]string {
 	return result
 }
 
+func newIngestScanUUID() string {
+	return uuid.NewString()
+}
+
 // runLocalIngestScan runs a vulnerability scan on ingested records using a one-shot DB source.
 // If scanUUID is empty, a new Scan record is created automatically.
 func runLocalIngestScan(settings *config.Settings, db *database.DB, repo *database.Repository, scanUUID string) error {
@@ -1111,7 +1116,7 @@ func runLocalIngestScan(settings *config.Settings, db *database.DB, repo *databa
 	opts.ScopeTargets, opts.ScopeCensus = ingestScanScope(settings)
 	if scanUUID == "" {
 		scan := &database.Scan{
-			UUID:        fmt.Sprintf("scan-%d", time.Now().UnixNano()),
+			UUID:        newIngestScanUUID(),
 			ProjectUUID: ingestScanProjectUUID,
 			Name:        "ingest-scan",
 			Status:      "running",

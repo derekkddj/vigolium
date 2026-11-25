@@ -372,7 +372,7 @@ export interface Scan {
   total_findings: number;
   processed_count: number;
   started_at: string;
-  finished_at?: string;
+  finished_at?: string | null;
   created_at: string;
 }
 

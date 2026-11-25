@@ -127,17 +127,18 @@ var projectCreateCmd = &cobra.Command{
 		// an exported VIGOLIUM_PROJECT_UUID (meant to scope ops to an existing
 		// project) doesn't silently dictate the new project's UUID.
 		if cmd.Flags().Changed("project-uuid") && globalProjectUUID != "" {
-			if _, parseErr := uuid.Parse(globalProjectUUID); parseErr != nil {
+			canonicalUUID, parseErr := database.CanonicalUUID(globalProjectUUID)
+			if parseErr != nil {
 				return usageErrorf("--project-uuid value %q is not a valid UUID: %w", globalProjectUUID, parseErr)
 			}
-			existing, lookupErr := repo.GetProjectByUUID(ctx, globalProjectUUID)
+			existing, lookupErr := repo.GetProjectByUUID(ctx, canonicalUUID)
 			if lookupErr == nil && existing != nil {
-				return fmt.Errorf("project with UUID %s already exists (name: %q)", globalProjectUUID, existing.Name)
+				return fmt.Errorf("project with UUID %s already exists (name: %q)", canonicalUUID, existing.Name)
 			}
 			if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
 				return fmt.Errorf("failed to check for existing project: %w", lookupErr)
 			}
-			projectUUID = globalProjectUUID
+			projectUUID = canonicalUUID
 		}
 		name := args[0]
 		desc, _ := cmd.Flags().GetString("description")
@@ -304,9 +305,10 @@ func runProjectUse(cmd *cobra.Command, args []string) error {
 	projectUUID := strings.TrimSpace(args[0])
 	create, _ := cmd.Flags().GetBool("create")
 	printEnv, _ := cmd.Flags().GetBool("print-env")
+	canonicalUUID, uuidErr := database.CanonicalUUID(projectUUID)
 	if create {
-		if _, parseErr := uuid.Parse(projectUUID); parseErr != nil {
-			return usageErrorf("--create needs a valid UUID, got %q: %w", projectUUID, parseErr)
+		if uuidErr != nil {
+			return usageErrorf("--create needs a valid UUID, got %q: %w", projectUUID, uuidErr)
 		}
 		if printEnv {
 			return usageErrorf("--print-env pins a shell to an existing project; create it first with `vigolium project create <name>`")
@@ -323,6 +325,12 @@ func runProjectUse(cmd *cobra.Command, args []string) error {
 	// A UUID, an exact name or a unique UUID prefix, like every other project
 	// reference.
 	project, err := clicommon.LookupProjectRef(ctx, repo, projectUUID, "")
+	if err != nil && uuidErr == nil && canonicalUUID != projectUUID {
+		// Preserve access to a legacy row stored with the exact supplied
+		// spelling, but otherwise resolve equivalent UUID forms canonically.
+		projectUUID = canonicalUUID
+		project, err = clicommon.LookupProjectRef(ctx, repo, projectUUID, "")
+	}
 	if err != nil {
 		// Never auto-created without --create: a typo'd UUID used to mint a
 		// fresh, empty project and point every later command at it, which an
@@ -330,6 +338,7 @@ func runProjectUse(cmd *cobra.Command, args []string) error {
 		if !create || !clicommon.IsProjectNotFound(err) {
 			return err
 		}
+		projectUUID = canonicalUUID
 		project, err = autoCreateProject(ctx, repo, cmd, projectUUID)
 		if err != nil {
 			return err
@@ -337,6 +346,8 @@ func runProjectUse(cmd *cobra.Command, args []string) error {
 		created = true
 		fmt.Fprintf(os.Stderr, "%s Created project %s (%s)\n",
 			terminal.SuccessSymbol(), terminal.BoldGreen(project.Name), project.UUID)
+	} else if err == nil {
+		projectUUID = project.UUID
 	}
 
 	if printEnv {
@@ -396,9 +407,11 @@ func autoCreateProject(ctx context.Context, repo *database.Repository, cmd *cobr
 	if err := checkProjectReadonly(); err != nil {
 		return nil, err
 	}
-	if _, parseErr := uuid.Parse(projectUUID); parseErr != nil {
+	canonicalUUID, parseErr := database.CanonicalUUID(projectUUID)
+	if parseErr != nil {
 		return nil, usageErrorf("%q is not a valid UUID: %w", projectUUID, parseErr)
 	}
+	projectUUID = canonicalUUID
 
 	name, _ := cmd.Flags().GetString("name")
 	desc, _ := cmd.Flags().GetString("description")
