@@ -1157,10 +1157,13 @@ update-secret-rules:
 # Only public/static-reports/template.html is generated here; its sibling
 # report-template.html is hand-maintained and read straight out of the embed
 # by pkg/output/format_report.go.
+# WORKBENCH_ONLY=1 avoids reading/building the separate static-reports project.
 update-ui:
+ifneq ($(WORKBENCH_ONLY),1)
 	@echo "$(PREFIX) Building static report template..."
 	@cd platform/static-reports && bun install && bun run build
 	@cp platform/static-reports/dist/template.html public/static-reports/template.html
+endif
 	@echo "$(PREFIX) Building workbench UI..."
 	@cd platform/vigolium-workbench && bun install && bun run build
 	@echo "$(PREFIX) Updating dashboard UI..."
