@@ -189,9 +189,13 @@ func TestReassignAndPurgeProjectData(t *testing.T) {
 		t.Errorf("reassign records: src=%d dst=%d, want 0/1", srcCount, dstCount)
 	}
 
-	// Purge wipes dst entirely.
-	if err := repo.PurgeProjectData(ctx, dst); err != nil {
-		t.Fatalf("PurgeProjectData: %v", err)
+	// Purge wipes dst entirely and reports the rows removed per table.
+	counts, err := repo.PurgeProjectDataWithCounts(ctx, dst)
+	if err != nil {
+		t.Fatalf("PurgeProjectDataWithCounts: %v", err)
+	}
+	if counts["http_records"] != 1 || counts["findings"] != 1 {
+		t.Errorf("purge counts = %+v, want one record and finding", counts)
 	}
 	dstRecords, _ := db.NewSelect().Model((*HTTPRecord)(nil)).Where("project_uuid = ?", dst).Count(ctx)
 	dstFindings, _ := db.NewSelect().Model((*Finding)(nil)).Where("project_uuid = ?", dst).Count(ctx)
