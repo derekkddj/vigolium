@@ -52,7 +52,7 @@ func (r *Runner) reportExtensionFailures(engine *jsext.Engine) error {
 	}
 	for _, f := range failures {
 		explicit := f.Explicit
-		scanevents.Emit(scanevents.Event{
+		r.emitEvent(scanevents.Event{
 			Type:     scanevents.TypeExtensionFailed,
 			ModuleID: f.ID,
 			Path:     f.Path,

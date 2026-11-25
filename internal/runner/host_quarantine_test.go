@@ -18,7 +18,7 @@ import (
 func TestNewHostErrorCache_OffWhenMaxHostErrorZero(t *testing.T) {
 	opts := types.DefaultOptions()
 	opts.MaxHostError = 0
-	if c := newHostErrorCache(opts, nil, nil); c != nil {
+	if c := newHostErrorCache(opts, nil, nil, scanevents.Emit); c != nil {
 		t.Fatal("--max-host-error 0 must disable the breaker")
 	}
 }
@@ -32,7 +32,7 @@ func TestNewHostErrorCache_EmitsQuarantined(t *testing.T) {
 	settings := &config.Settings{}
 	settings.ScanningStrategy.HTTP.HostErrors = config.HostErrorsConfig{Cooldown: "45s"}
 
-	c := newHostErrorCache(opts, settings, func() string { return "dynamic-assessment" })
+	c := newHostErrorCache(opts, settings, func() string { return "dynamic-assessment" }, scanevents.Emit)
 	defer c.Close()
 	refused := errors.New("dial tcp 10.0.0.1:443: connect: connection refused")
 	c.MarkFailed("dead.example:443", refused, false)
@@ -56,9 +56,9 @@ func TestNewHostErrorCache_EmitsQuarantined(t *testing.T) {
 
 func TestEmitHostTransition_RecoveredAndDead(t *testing.T) {
 	buf := withEventStream(t)
-	emitHostTransition(hosterrors.Transition{Key: "h:80", From: hosterrors.StateHalfOpen, To: hosterrors.StateClosed, Trips: 1}, nil)
-	emitHostTransition(hosterrors.Transition{Key: "h:80", From: hosterrors.StateHalfOpen, To: hosterrors.StateOpen, Trips: 1, Cooldown: time.Minute, Err: errors.New("i/o timeout")}, nil)
-	emitHostTransition(hosterrors.Transition{Key: "h:81", From: hosterrors.StateHalfOpen, To: hosterrors.StateDead, Trips: 5, Err: errors.New("connection refused")}, nil)
+	emitHostTransition(hosterrors.Transition{Key: "h:80", From: hosterrors.StateHalfOpen, To: hosterrors.StateClosed, Trips: 1}, nil, scanevents.Emit)
+	emitHostTransition(hosterrors.Transition{Key: "h:80", From: hosterrors.StateHalfOpen, To: hosterrors.StateOpen, Trips: 1, Cooldown: time.Minute, Err: errors.New("i/o timeout")}, nil, scanevents.Emit)
+	emitHostTransition(hosterrors.Transition{Key: "h:81", From: hosterrors.StateHalfOpen, To: hosterrors.StateDead, Trips: 5, Err: errors.New("connection refused")}, nil, scanevents.Emit)
 
 	if got := eventsOfType(t, buf, scanevents.TypeHostRecovered); len(got) != 1 || got[0]["host"] != "h:80" {
 		t.Errorf("host.recovered = %v", got)

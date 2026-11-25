@@ -105,7 +105,7 @@ func (r *Runner) buildInfrastructure(ctx context.Context, plan NativeScanPlan) (
 		RateLimiter:  buildScanRateLimiter(effectiveRateLimit(r.options)),
 	}
 
-	if cache := newHostErrorCache(r.options, r.settings, r.currentPhaseName); cache != nil {
+	if cache := newHostErrorCache(r.options, r.settings, r.currentPhaseName, r.emitEvent); cache != nil {
 		svc.HostErrors = cache
 	}
 
@@ -341,7 +341,7 @@ func (r *Runner) reportOASTUnavailable(err error, caveatOnly bool) {
 	} else {
 		r.currentPhase.Load().markPartial(database.ReasonOASTUnavailable)
 	}
-	scanevents.Emit(scanevents.Event{
+	r.emitEvent(scanevents.Event{
 		Type:    scanevents.TypeOASTUnavailable,
 		Phase:   string(PhaseDynamicAssessment),
 		Message: err.Error(),

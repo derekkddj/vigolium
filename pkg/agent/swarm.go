@@ -109,7 +109,8 @@ type SwarmConfig struct {
 	// When set, the swarm runner loads the checkpoint and skips completed phases.
 	ResumeDir string
 
-	// Streaming
+	// Streaming: raw AI output and best-effort runtime metadata for this session.
+	// Run synchronizes writes but never closes the caller-owned writer.
 	StreamWriter     io.Writer
 	Verbose          bool // when true, agent calls render a per-tool result preview alongside the standard one-liner
 	ProgressCallback func(ProgressEvent)
@@ -239,6 +240,10 @@ func (s *SwarmRunner) selectTriageSkills(cfg SwarmConfig, result *SwarmResult) *
 	for _, w := range warnings {
 		zap.L().Warn(w)
 	}
+	if len(warnings) > 0 {
+		_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", SwarmPhaseTriage, fmt.Sprintf(
+			"warning: skill selection warnings recorded: count=%d; see run details", len(warnings)))
+	}
 	if sel == nil || sel.Len() == 0 {
 		return sel
 	}
@@ -268,6 +273,7 @@ func (cfg *SwarmConfig) probeConfig() ProbeConfig {
 // Run executes the full agent swarm pipeline.
 func (s *SwarmRunner) Run(ctx context.Context, cfg SwarmConfig) (*SwarmResult, error) {
 	start := time.Now()
+	cfg.StreamWriter = NewSynchronizedWriter(cfg.StreamWriter)
 
 	// Set up context cache for DB enrichment across phases. ttl=0 means
 	// entries live for the full run; we explicitly InvalidateContextCache
@@ -354,10 +360,7 @@ func (s *SwarmRunner) Run(ctx context.Context, cfg SwarmConfig) (*SwarmResult, e
 
 	result := &SwarmResult{AgenticScanUUID: agenticScanUUID}
 
-	// The parent ctx may expire (--max-duration) or be cancelled by the
-	// budget below; the run row is still finalized after that, so its writes
-	// go through a context that outlives the run's.
-	finalizeCtx := context.WithoutCancel(ctx)
+	_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", "run", "run started: "+agenticScanUUID)
 
 	// Run budget: the engine charges every agent call; the first cap crossed
 	// cancels the run with a *BudgetExhaustedError cause.
@@ -387,7 +390,13 @@ func (s *SwarmRunner) Run(ctx context.Context, cfg SwarmConfig) (*SwarmResult, e
 		err = s.runSwarmPipeline(ctx, cfg, agenticScan, result)
 	}
 
-	// Finalize
+	return s.finishRun(ctx, cfg, agenticScan, result, start, err)
+}
+
+func (s *SwarmRunner) finishRun(ctx context.Context, cfg SwarmConfig, agenticScan *database.AgenticScan, result *SwarmResult, start time.Time, err error) (*SwarmResult, error) {
+	// Finalization must survive the run's cancellation/deadline. Logging below
+	// only observes the context; it never changes err or the existing status rules.
+	finalizeCtx := context.WithoutCancel(ctx)
 	result.Duration = time.Since(start)
 	now := time.Now()
 	agenticScan.CompletedAt = now
@@ -452,6 +461,33 @@ func (s *SwarmRunner) Run(ctx context.Context, cfg SwarmConfig) (*SwarmResult, e
 		}
 	}
 
+	// Free-form warnings/errors can contain credentials or complete target URLs.
+	// Keep originals in result/DB, but log only safe categories and counts here.
+	if len(result.Warnings) > 0 {
+		_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", "run", fmt.Sprintf(
+			"warning: warnings recorded: count=%d; see run details", len(result.Warnings)))
+	}
+	phase := agenticScan.CurrentPhase
+	if phase == "" {
+		phase = "run" // preflight failure or cancellation before the first phase
+	}
+	if budgetErr != nil {
+		_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", phase, "error: budget exhausted; see run details")
+	} else if err != nil {
+		_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", phase, "error: error recorded; see run details")
+	}
+	// Observe cancellation even if a non-fatal callback swallowed it, without
+	// changing the returned error, persisted status or which phases execute.
+	switch ctx.Err() {
+	case context.Canceled:
+		_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", "run", "context cancellation observed at run finish")
+	case context.DeadlineExceeded:
+		_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", "run", "context deadline observed at run finish")
+	}
+	_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", "run", fmt.Sprintf(
+		"run finished: status=%s duration=%s records=%d findings=%d confirmed=%d false_positives=%d iterations=%d warnings=%d",
+		agenticScan.Status, result.Duration.Round(time.Millisecond), result.TotalRecords, result.TotalFindings,
+		result.Confirmed, result.FalsePositives, result.Iterations, len(result.Warnings)))
 	if err != nil {
 		return result, err
 	}
@@ -459,6 +495,13 @@ func (s *SwarmRunner) Run(ctx context.Context, cfg SwarmConfig) (*SwarmResult, e
 }
 
 func (s *SwarmRunner) emitPhase(cfg SwarmConfig, phase string) {
+	_ = WriteRuntimeProgress(cfg.StreamWriter, "swarm", phase, "phase started: "+phase)
+	s.emitPhaseConsole(cfg, phase)
+}
+
+// emitPhaseConsole preserves the CLI callback/console behavior when a phase
+// already logged its start before preparing work (e.g. extension validation).
+func (s *SwarmRunner) emitPhaseConsole(cfg SwarmConfig, phase string) {
 	if cfg.PhaseCallback != nil {
 		cfg.PhaseCallback(phase)
 	}

@@ -50,7 +50,9 @@ const teeDrainTimeout = 2 * time.Second
 //	KnownIssueScan    — nuclei + secret scan (opt-in via --known-issue-scan)
 //	DynamicAssessment — modules + extensions scan DB records
 func (r *Runner) RunNativeScan() (err error) {
+	r.freezeEventCallback()
 	defer close(r.done)
+	callbackStartedAt := time.Now()
 	ctx := r.ctx
 
 	// A Runner is reused across agent rescans, so the phase ledger starts empty
@@ -107,6 +109,14 @@ func (r *Runner) RunNativeScan() (err error) {
 	admission := r.targetAdmission()
 	if admission != nil && admission.NoneAdmitted() {
 		plan = NativeScanPlan{}
+	}
+
+	if r.beginCallbackScan(plan) {
+		// Registered before infrastructure teardown, so terminal delivery follows
+		// teardown. The emitter barrier joins in-flight callbacks and drops late
+		// events from abandoned workers. Also covers setup errors, before the
+		// database finalizer can be registered.
+		defer func() { r.finishCallbackScan(ctx, callbackStartedAt, err) }()
 	}
 
 	infra, err := r.buildInfrastructure(ctx, plan)
@@ -259,7 +269,9 @@ func (r *Runner) RunNativeScan() (err error) {
 	// restore or close each other's descriptors and corrupt process-wide stderr.
 	// A single-owner claim keeps the common single-scan (CLI) case fully captured
 	// while a concurrent secondary scan simply skips raw capture rather than racing.
-	if r.repository != nil && stderrCaptureActive.CompareAndSwap(false, true) {
+	// Embedded callback scans use instance-owned events, never process stderr
+	// capture (which can contain traffic from unrelated concurrent runners).
+	if r.repository != nil && r.getEventCallback() == nil && stderrCaptureActive.CompareAndSwap(false, true) {
 		defer stderrCaptureActive.Store(false)
 		origStderr := os.Stderr
 		// Optionally mirror raw console output to ~/.vigolium/native-sessions/{uuid}/run.log.
