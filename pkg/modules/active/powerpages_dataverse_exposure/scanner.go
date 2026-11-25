@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	proof "github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	ppinfra "github.com/vigolium/vigolium/pkg/modules/infra/powerpages"
@@ -73,7 +74,8 @@ func (m *Module) ScanPerHost(
 	// bogus entity set with a Dataverse 404. This is the fail-closed presence check
 	// (a non-portal returns HTML, not a Dataverse error) and rules out a site that
 	// 200s everything under /_api/.
-	if !ppinfra.DataverseAPIMounted(ctx, httpClient) {
+	gateEvidence := modkit.NewEvidenceCollector()
+	if !ppinfra.DataverseAPIMountedWithEvidence(ctx, httpClient, gateEvidence) {
 		return nil, nil
 	}
 	ppinfra.MarkPowerPages(scanCtx, host)
@@ -82,6 +84,7 @@ func (m *Module) ScanPerHost(
 	var results []*output.ResultEvent
 	for _, tbl := range seedTables {
 		if res := m.probeAndConfirm(ctx, httpClient, tbl, baseURL, host); res != nil {
+			modkit.AppendEvidence(res, gateEvidence)
 			results = append(results, res)
 		}
 	}
@@ -95,7 +98,9 @@ func (m *Module) probeAndConfirm(
 	httpClient *http.Requester,
 	tbl dvTable,
 	baseURL, host string,
-) *output.ResultEvent {
+) (result *output.ResultEvent) {
+	context := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(result, context) }()
 	res := probeTable(ctx, httpClient, tbl.set, "$top=1&$count=true")
 	verdict := ppinfra.ClassifyTableRead(res)
 
@@ -105,6 +110,7 @@ func (m *Module) probeAndConfirm(
 		// reporting, so a one-off / flapping response can't produce a finding.
 		for i := 0; i < confirmRounds; i++ {
 			rd := ppinfra.ClassifyTableRead(probeTable(ctx, httpClient, tbl.set, "$top=1"))
+			context.AddExchange(rd.Exchange, proof.RoleConfirmation, fmt.Sprintf("Independent table read %d", i+1))
 			if rd.Kind != ppinfra.VerdictExposed {
 				return nil
 			}
@@ -113,13 +119,15 @@ func (m *Module) probeAndConfirm(
 		sample := ppinfra.ClassifyTableRead(probeTable(ctx, httpClient, tbl.set, "$top=20&$count=true"))
 		if sample.Kind != ppinfra.VerdictExposed {
 			sample = verdict
+		} else {
+			context.AddExchange(verdict.Exchange, proof.RoleObservation, "Initial exposed table read")
 		}
 		return m.buildExposed(tbl, sample, baseURL, host)
 	case ppinfra.VerdictColumnRestricted:
 		// Table is Web-API-enabled and anonymously reachable, but the probed
 		// columns are not allow-listed. Report the reachable table at a lower
 		// severity — it evidences a misconfigured permission surface.
-		return m.buildColumnRestricted(tbl, baseURL, host)
+		return m.buildColumnRestricted(tbl, baseURL, host, verdict.Exchange)
 	default:
 		return nil
 	}
@@ -133,7 +141,10 @@ func probeTable(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, se
 	return saasprobe.Get(ctx, httpClient, path, odataHeaders)
 }
 
-func (m *Module) buildExposed(tbl dvTable, v ppinfra.TableVerdict, baseURL, host string) *output.ResultEvent {
+func (m *Module) buildExposed(tbl dvTable, v ppinfra.TableVerdict, baseURL, host string) (result *output.ResultEvent) {
+	defer func() {
+		modkit.SetPrimaryEvidence(result, v.Exchange, proof.RoleObservation, "Anonymous exposed table read")
+	}()
 	matchedURL := baseURL + "/_api/" + tbl.set
 
 	total := "unknown"
@@ -176,7 +187,12 @@ func (m *Module) buildExposed(tbl dvTable, v ppinfra.TableVerdict, baseURL, host
 	}
 }
 
-func (m *Module) buildColumnRestricted(tbl dvTable, baseURL, host string) *output.ResultEvent {
+func (m *Module) buildColumnRestricted(tbl dvTable, baseURL, host string, receipt ...*proof.Exchange) (result *output.ResultEvent) {
+	defer func() {
+		if len(receipt) > 0 {
+			modkit.SetPrimaryEvidence(result, receipt[0], proof.RoleObservation, "Column-restricted table response")
+		}
+	}()
 	matchedURL := baseURL + "/_api/" + tbl.set
 	// Cap severity: the table is reachable but no record data was returned, so this
 	// is a weaker signal than a full data leak.

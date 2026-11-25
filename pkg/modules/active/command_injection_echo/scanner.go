@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -94,11 +95,12 @@ ipScan:
 
 		// Fetch the clean, unpayloaded response once per insertion point. Its body
 		// is the negative control: the unique needle must NEVER appear here.
-		body, raw, full, baselineErr := m.probe(ctx, httpClient, ip, baseValue)
+		var baselineExchange *evidence.Exchange
+		body, raw, full, baselineErr := m.probe(ctx, httpClient, ip, baseValue, &baselineExchange)
 		if errors.Is(baselineErr, hosterrors.ErrUnresponsiveHost) {
 			return results, nil
 		}
-		base := baselineProbe{value: baseValue, body: body, raw: raw, full: full, ok: baselineErr == nil}
+		base := baselineProbe{exchange: baselineExchange, value: baseValue, body: body, raw: raw, full: full, ok: baselineErr == nil}
 
 		for _, c := range candidates {
 			result, err := m.confirmCandidate(ctx, httpClient, ip, c, base)
@@ -125,11 +127,12 @@ ipScan:
 // from it. ok is false when the baseline fetch failed — the absence check is
 // then skipped, but the two-round confirmation still applies.
 type baselineProbe struct {
-	value string
-	body  string
-	raw   string
-	full  string
-	ok    bool
+	exchange *evidence.Exchange
+	value    string
+	body     string
+	raw      string
+	full     string
+	ok       bool
 }
 
 // confirmCandidate runs the multi-layer confirmation for a single breakout
@@ -144,7 +147,8 @@ func (m *Module) confirmCandidate(
 	c infra.CmdiCandidate,
 	base baselineProbe,
 ) (*output.ResultEvent, error) {
-	_, raw1, _, ok1, err := m.confirmRound(ctx, httpClient, ip, c, base)
+	var firstExchange, secondExchange *evidence.Exchange
+	_, _, _, ok1, err := m.confirmRound(ctx, httpClient, ip, c, base, &firstExchange)
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +156,7 @@ func (m *Module) confirmCandidate(
 		return nil, nil
 	}
 
-	marker2, raw2, full2, ok2, err := m.confirmRound(ctx, httpClient, ip, c, base)
+	marker2, raw2, full2, ok2, err := m.confirmRound(ctx, httpClient, ip, c, base, &secondExchange)
 	if err != nil {
 		return nil, err
 	}
@@ -163,10 +167,10 @@ func (m *Module) confirmCandidate(
 	// Confirmed. Attach the baseline + round-1 context as supporting evidence.
 	ev := modkit.NewEvidenceCollector()
 	if base.ok {
-		ev.Add("baseline (no payload)", base.raw, base.full)
+		ev.AddExchange(base.exchange, evidence.RoleControl, "baseline (no payload)")
 	}
-	ev.Add("round 1 ("+c.Label+")", raw1, "")
-	ev.Add("round 2 ("+c.Label+")", raw2, full2)
+	ev.AddExchange(firstExchange, evidence.RoleConfirmation, "round 1 ("+c.Label+")")
+	ev.AddExchange(secondExchange, evidence.RoleConfirmation, "round 2 ("+c.Label+")")
 
 	desc := fmt.Sprintf(
 		"OS command injection confirmed in parameter %q via the %s breakout context. "+
@@ -176,12 +180,13 @@ func (m *Module) confirmCandidate(
 			"literal reflection of the payload could not produce the computed sum.",
 		ip.Name(), c.Label, marker2.Expected)
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		Request:            raw2,
 		Response:           full2,
 		FuzzingParameter:   ip.Name(),
 		ExtractedResults:   []string{marker2.Needle(), base.value + c.Render(marker2)},
 		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
 		MatcherStatus:      true,
 		Info: output.Info{
 			Name:        ModuleName,
@@ -189,7 +194,9 @@ func (m *Module) confirmCandidate(
 			Severity:    severity.Critical,
 			Confidence:  severity.Certain,
 		},
-	}, nil
+	}
+	modkit.SetPrimaryEvidence(result, secondExchange, evidence.RoleAttack, "selected probe")
+	return result, nil
 }
 
 // confirmRound runs one confirmation round: inject the candidate with a fresh
@@ -203,10 +210,11 @@ func (m *Module) confirmRound(
 	ip httpmsg.InsertionPoint,
 	c infra.CmdiCandidate,
 	base baselineProbe,
+	receipts ...**evidence.Exchange,
 ) (marker infra.CmdiArithMarker, raw, full string, ok bool, err error) {
 	marker = infra.NewCmdiArithMarker()
 	var body string
-	body, raw, full, err = m.probe(ctx, httpClient, ip, base.value+c.Render(marker))
+	body, raw, full, err = m.probe(ctx, httpClient, ip, base.value+c.Render(marker), receipts...)
 	if err != nil {
 		return marker, raw, full, false, err
 	}
@@ -228,6 +236,7 @@ func (m *Module) probe(
 	httpClient *http.Requester,
 	ip httpmsg.InsertionPoint,
 	value string,
+	receipts ...**evidence.Exchange,
 ) (body, rawReq, fullResp string, err error) {
 	raw := ip.BuildRequest([]byte(value))
 	rawReq = string(raw)
@@ -246,6 +255,9 @@ func (m *Module) probe(
 	}
 	body = resp.Body().String()
 	fullResp = resp.FullResponseString()
+	if len(receipts) > 0 {
+		*receipts[0] = http.CaptureEvidence(resp)
+	}
 	resp.Close()
 	return body, rawReq, fullResp, nil
 }

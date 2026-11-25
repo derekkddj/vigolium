@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -207,6 +208,7 @@ func (m *Module) ScanPerInsertionPoint(
 					Description: fmt.Sprintf("LDAP error triggered by injecting %q into parameter %q", payload, ip.Name()),
 				},
 			})
+			modkit.SetPrimaryEvidence(results[len(results)-1], http.CaptureEvidence(resp), evidence.RoleAttack, "LDAP error probe")
 			resp.Close()
 			return results, nil
 		}
@@ -223,6 +225,7 @@ func (m *Module) ScanPerInsertionPoint(
 	}
 
 	baselineSig := newResponseSignature(baselineStatus, baselineBody)
+	baselineSig.exchange = ctx.Evidence()
 
 	// Negation boolean oracle: an LDAP-specific TRUE/FALSE pair that differs by a
 	// single operator character. It is a stronger (more LDAP-specific) signal than
@@ -290,6 +293,10 @@ func (m *Module) ScanPerInsertionPoint(
 		return results, nil
 	}
 
+	ev := modkit.NewEvidenceCollector()
+	ev.AddExchange(baselineSig.exchange, evidence.RoleBaseline, "input comparison")
+	ev.AddExchange(controlSig.exchange, evidence.RoleControl, "no-match control")
+
 	// Determinism precondition. The wildcard-vs-baseline/control deltas only mean
 	// "LDAP filter expansion" if the endpoint answers the SAME input the SAME way.
 	// The params this module targets (user/search/query/name/email) are exactly the
@@ -299,23 +306,25 @@ func (m *Module) ScanPerInsertionPoint(
 	// deltas. Re-fetch the original value twice and require a stable body; a flapping
 	// or dynamic page fails closed. NoClustering (in probeSignature) makes each a
 	// genuine round-trip so the 500ms request cache can't hide the variance.
-	if !m.baseValueDeterministic(ctx, ip, httpClient) {
+	if !m.baseValueDeterministic(ctx, ip, httpClient, ev) {
 		return results, nil // original value is non-deterministic — differential is noise
 	}
 
 	// Reproduction: re-send the wildcard and require its response to be stable. A
 	// one-off anomaly (a transient large page or error render) that happened to clear
 	// the deltas on the first probe will not reproduce here.
-	if !m.signatureReproduces(ctx, httpClient, wildcardRaw, wildcardSig) {
+	if !m.signatureReproduces(ctx, httpClient, wildcardRaw, wildcardSig, ev) {
 		return results, nil // wildcard response is not reproducible
 	}
 
 	results = append(results, &output.ResultEvent{
-		URL:              urlx.String(),
-		Matched:          urlx.String(),
-		Request:          string(wildcardRaw),
-		Response:         wildcardFull,
-		FuzzingParameter: ip.Name(),
+		URL:                urlx.String(),
+		Matched:            urlx.String(),
+		Request:            string(wildcardRaw),
+		Response:           wildcardFull,
+		FuzzingParameter:   ip.Name(),
+		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
 		ExtractedResults: []string{fmt.Sprintf(
 			"baseline_status=%d baseline_len=%d wildcard_status=%d wildcard_len=%d control_status=%d control_len=%d",
 			baselineSig.statusCode, baselineSig.bodyLength,
@@ -332,6 +341,7 @@ func (m *Module) ScanPerInsertionPoint(
 			Confidence: severity.Tentative,
 		},
 	})
+	modkit.SetPrimaryEvidence(results[len(results)-1], wildcardSig.exchange, evidence.RoleAttack, "wildcard probe")
 
 	return results, nil
 }
@@ -349,7 +359,7 @@ func (m *Module) detectNegationOracle(
 	httpClient *http.Requester,
 	urlStr string,
 	baselineSig responseSignature,
-) *output.ResultEvent {
+) (finding *output.ResultEvent) {
 	trueRaw := ip.BuildRequest([]byte(negationTruePayload))
 	trueSig, trueFull, ok := m.probeSignature(ctx, httpClient, trueRaw)
 	if !ok {
@@ -388,25 +398,34 @@ func (m *Module) detectNegationOracle(
 		return nil
 	}
 
+	ev := modkit.NewEvidenceCollector()
+	ev.AddExchange(baselineSig.exchange, evidence.RoleBaseline, "input comparison")
+	ev.AddExchange(falseSig.exchange, evidence.RoleControl, "negated filter control")
+
 	// Determinism precondition: the base value fetched twice must be stable, otherwise
 	// the endpoint is dynamic and the TRUE/FALSE delta is noise.
-	if !m.baseValueDeterministic(ctx, ip, httpClient) {
+	if !m.baseValueDeterministic(ctx, ip, httpClient, ev) {
 		return nil
 	}
 
 	// Reproduction: re-send both probes and require each to reproduce, so a one-off
 	// render that happened to create the delta is rejected.
-	if !m.signatureReproduces(ctx, httpClient, trueRaw, trueSig) ||
-		!m.signatureReproduces(ctx, httpClient, falseRaw, falseSig) {
+	if !m.signatureReproduces(ctx, httpClient, trueRaw, trueSig, ev) ||
+		!m.signatureReproduces(ctx, httpClient, falseRaw, falseSig, ev) {
 		return nil
 	}
 
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, trueSig.exchange, evidence.RoleAttack, "disjunction filter probe")
+	}()
 	return &output.ResultEvent{
-		URL:              urlStr,
-		Matched:          urlStr,
-		Request:          string(trueRaw),
-		Response:         trueFull,
-		FuzzingParameter: ip.Name(),
+		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
+		URL:                urlStr,
+		Matched:            urlStr,
+		Request:            string(trueRaw),
+		Response:           trueFull,
+		FuzzingParameter:   ip.Name(),
 		ExtractedResults: []string{fmt.Sprintf(
 			"true_status=%d true_len=%d false_status=%d false_len=%d baseline_status=%d baseline_len=%d",
 			trueSig.statusCode, trueSig.bodyLength,
@@ -433,10 +452,14 @@ func (m *Module) detectNegationOracle(
 // reports whether the endpoint answers it the same way both times. A flapping /
 // dynamic page (per-request result counts, tokens, timestamps) fails closed so its
 // variance is not mistaken for filter expansion. Shared by both boolean legs.
-func (m *Module) baseValueDeterministic(ctx *httpmsg.HttpRequestResponse, ip httpmsg.InsertionPoint, httpClient *http.Requester) bool {
+func (m *Module) baseValueDeterministic(ctx *httpmsg.HttpRequestResponse, ip httpmsg.InsertionPoint, httpClient *http.Requester, collectors ...*modkit.EvidenceCollector) bool {
 	origRaw := ip.BuildRequest([]byte(ip.BaseValue()))
 	det1, _, ok1 := m.probeSignature(ctx, httpClient, origRaw)
 	det2, _, ok2 := m.probeSignature(ctx, httpClient, origRaw)
+	for _, ev := range collectors {
+		ev.AddExchange(det1.exchange, evidence.RoleControl, "base-value determinism 1")
+		ev.AddExchange(det2.exchange, evidence.RoleControl, "base-value determinism 2")
+	}
 	if !ok1 || !ok2 {
 		return false
 	}
@@ -446,8 +469,11 @@ func (m *Module) baseValueDeterministic(ctx *httpmsg.HttpRequestResponse, ip htt
 // signatureReproduces re-sends raw and reports whether the response still matches orig
 // (same status, no substantial body difference), so a one-off anomaly that happened to
 // clear the deltas on the first probe is rejected. Shared by both boolean legs.
-func (m *Module) signatureReproduces(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte, orig responseSignature) bool {
+func (m *Module) signatureReproduces(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte, orig responseSignature, collectors ...*modkit.EvidenceCollector) bool {
 	sig2, _, ok := m.probeSignature(ctx, httpClient, raw)
+	for _, ev := range collectors {
+		ev.AddExchange(sig2.exchange, evidence.RoleConfirmation, "filter reproduction")
+	}
 	if !ok {
 		return false
 	}
@@ -459,6 +485,7 @@ type responseSignature struct {
 	statusCode int
 	bodyLength int
 	bodyHash   [32]byte
+	exchange   *evidence.Exchange
 }
 
 func newResponseSignature(statusCode int, body string) responseSignature {
@@ -534,6 +561,7 @@ func (m *Module) probeSignature(
 
 	body := resp.Body().String()
 	sig := newResponseSignature(resp.Response().StatusCode, body)
+	sig.exchange = http.CaptureEvidence(resp)
 	full := resp.FullResponseString()
 	return sig, full, true
 }

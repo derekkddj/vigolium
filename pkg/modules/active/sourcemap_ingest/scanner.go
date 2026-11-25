@@ -27,6 +27,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/dedup"
 	"github.com/vigolium/vigolium/pkg/deparos/jstangle/linkfinder"
 	"github.com/vigolium/vigolium/pkg/deparos/jstangle/sourcemap"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -187,12 +188,13 @@ func (m *Module) ingestMap(
 	candidate sourcemap.Candidate,
 ) *output.ResultEvent {
 	body := candidate.Inline
+	var exchange *evidence.Exchange
 	if len(body) == 0 {
-		fetched, ok := fetchMap(ctx, httpClient, candidate.URL)
+		fetched, receipt, ok := fetchMap(ctx, httpClient, candidate.URL)
 		if !ok {
 			return nil
 		}
-		body = fetched
+		body, exchange = fetched, receipt
 	}
 	if !sourcemap.LooksLikeMap(body) {
 		return nil
@@ -219,7 +221,12 @@ func (m *Module) ingestMap(
 			mapLocation(assetURL, candidate), fed))
 	}
 	m.storeRecoveredSources(context.Background(), scanCtx, requestID, assetURL, document)
-	return m.buildEvent(ctx, assetURL, candidate, document, fed)
+	event := m.buildEvent(ctx, assetURL, candidate, document, fed)
+	if len(candidate.Inline) == 0 {
+		event.EvidenceStatus = "missing"
+		modkit.SetPrimaryEvidence(event, exchange, evidence.RoleObservation, "Anonymous fetched source map")
+	}
+	return event
 }
 
 // storeRecoveredSources persists each recovered original file beside the bundle's
@@ -399,9 +406,12 @@ func (m *Module) buildEvent(
 	}
 
 	event := &output.ResultEvent{
-		ModuleID:      ModuleID,
-		RecordKind:    output.RecordKindFinding,
-		EvidenceGrade: grade,
+		// Only an inline map is evidence contained in the input asset itself.
+		// Fetched maps need their own receipt, never the triggering bundle.
+		BaselineEvidence: len(candidate.Inline) > 0,
+		ModuleID:         ModuleID,
+		RecordKind:       output.RecordKindFinding,
+		EvidenceGrade:    grade,
 		Info: output.Info{
 			Name:        name,
 			Description: description,
@@ -430,9 +440,9 @@ func (m *Module) buildEvent(
 			"contentless_sources": len(document.FetchableSources),
 		},
 	}
-	if ctx.Request() != nil {
-		event.Request = string(ctx.Request().Raw())
-	}
+	// Inline input analysis leaves both fields unset so the executor can retain
+	// the original input receipt, not this credential-stripped working request.
+	// ingestMap selects fetched maps from their own asset-operation receipt.
 	return event
 }
 
@@ -448,10 +458,10 @@ func mapLocation(assetURL string, candidate sourcemap.Candidate) string {
 // fetchMap retrieves a candidate map. The catch-all/blocked/pooled-buffer guards
 // live in modkit.FetchAssetBytes; LooksLikeMap downstream rejects anything that
 // slips past them and still is not a map document.
-func fetchMap(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, mapURL string) ([]byte, bool) {
+func fetchMap(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, mapURL string) ([]byte, *evidence.Exchange, bool) {
 	parsed, err := url.Parse(mapURL)
 	if err != nil {
-		return nil, false
+		return nil, nil, false
 	}
-	return modkit.FetchAssetBytes(ctx, httpClient, parsed.RequestURI(), maxMapBytes)
+	return modkit.FetchAssetBytesCapture(ctx, httpClient, parsed.RequestURI(), maxMapBytes)
 }

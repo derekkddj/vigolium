@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -188,8 +189,9 @@ func (m *Module) ScanPerHost(
 				// match when it is indistinguishable from the host's wildcard response
 				// to a random path (cached per host, fails open on probe error so a
 				// real endpoint is never suppressed by a flaky probe).
-				if modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, statusCode, []byte(respBody), location) {
-					results = append(results, &output.ResultEvent{
+				guardProof := modkit.NewEvidenceCollector()
+				if modkit.ConfirmNotSoft404WithEvidence(scanCtx, httpClient, ctx, statusCode, []byte(respBody), location, guardProof) {
+					result := &output.ResultEvent{
 						URL:      target,
 						Matched:  target,
 						Request:  string(modifiedRaw),
@@ -203,7 +205,10 @@ func (m *Module) ScanPerHost(
 							Name:        fmt.Sprintf("%s - %s", p.framework, p.description),
 							Description: fmt.Sprintf("The %s framework endpoint at %s is accessible in production. %s.", p.framework, p.path, p.description),
 						},
-					})
+					}
+					modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+					modkit.AppendEvidence(result, guardProof)
+					results = append(results, result)
 				}
 			}
 		}

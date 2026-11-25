@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -63,8 +64,9 @@ func (m *Module) ScanPerInsertionPoint(
 		}
 	}
 
+	ev := modkit.NewEvidenceCollector()
 	// Phase 1: Initial reflection check
-	reflects, err := m.checkReflection(ctx, ip, httpClient)
+	reflects, err := m.checkReflection(ctx, ip, httpClient, ev)
 	if err != nil {
 		if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
 			return nil, nil
@@ -80,7 +82,7 @@ func (m *Module) ScanPerInsertionPoint(
 	}
 
 	// Phase 2: Backslash consumption check
-	backslashConsumed, err := m.checkBackslashConsumption(ctx, ip, httpClient)
+	backslashConsumed, err := m.checkBackslashConsumption(ctx, ip, httpClient, ev)
 	if err != nil {
 		if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
 			return nil, nil
@@ -153,11 +155,13 @@ func (m *Module) ScanPerInsertionPoint(
 
 		// If interesting, also record the follow-up payload
 		if hasInteresting {
-			followUpTransforms, err := m.recordTransformations(ctx, ip, httpClient, followUpPayload)
+			var followUpReceipt *evidence.Exchange
+			followUpTransforms, err := m.recordTransformations(ctx, ip, httpClient, followUpPayload, &followUpReceipt)
 			if err == nil {
 				for _, t := range followUpTransforms {
 					interesting = append(interesting, &TransformResult{
 						Probe:          followUpPayload,
+						exchange:       followUpReceipt,
 						Received:       t,
 						Classification: ClassificationInteresting,
 						Pretty:         followUpPayload + " => " + t,
@@ -172,7 +176,7 @@ func (m *Module) ScanPerInsertionPoint(
 		return nil, nil
 	}
 
-	return m.buildResults(ctx, ip, httpClient, interesting, boring, backslashConsumed)
+	return m.buildResults(ctx, ip, httpClient, interesting, boring, backslashConsumed, ev)
 }
 
 // checkReflection verifies that the parameter value reflects in the response.
@@ -181,6 +185,7 @@ func (m *Module) checkReflection(
 	ctx *httpmsg.HttpRequestResponse,
 	ip httpmsg.InsertionPoint,
 	httpClient *http.Requester,
+	collectors ...*modkit.EvidenceCollector,
 ) (bool, error) {
 	// Fast path: check if base value reflects in existing response
 	if ctx.HasResponse() && ip.BaseValue() != "" {
@@ -207,6 +212,9 @@ func (m *Module) checkReflection(
 
 	body := resp.Body().Bytes()
 	matches := httpmsg.GetMatches(body, []byte(searchAnchor), 1)
+	if len(matches) > 0 && len(collectors) > 0 {
+		collectors[0].AddExchange(http.CaptureEvidence(resp), evidence.RoleObservation, "canary reflection precondition")
+	}
 
 	return len(matches) > 0, nil
 }
@@ -216,12 +224,17 @@ func (m *Module) checkBackslashConsumption(
 	ctx *httpmsg.HttpRequestResponse,
 	ip httpmsg.InsertionPoint,
 	httpClient *http.Requester,
+	collectors ...*modkit.EvidenceCollector,
 ) (bool, error) {
-	transformations, err := m.recordTransformations(ctx, ip, httpClient, "\\zz")
+	var exchange *evidence.Exchange
+	transformations, err := m.recordTransformations(ctx, ip, httpClient, "\\zz", &exchange)
 	if err != nil {
 		return false, err
 	}
 
+	if len(collectors) > 0 {
+		collectors[0].AddExchange(exchange, evidence.RoleControl, "backslash consumption control")
+	}
 	return IsBackslashConsumed(transformations), nil
 }
 
@@ -231,6 +244,7 @@ func (m *Module) recordTransformations(
 	ip httpmsg.InsertionPoint,
 	httpClient *http.Requester,
 	probe string,
+	receipts ...**evidence.Exchange,
 ) ([]string, error) {
 	ap := NewAnchoredPayload(probe)
 
@@ -246,6 +260,9 @@ func (m *Module) recordTransformations(
 	defer resp.Close()
 
 	body := resp.Body().Bytes()
+	if len(receipts) > 0 {
+		*receipts[0] = http.CaptureEvidence(resp)
+	}
 	return ExtractBetweenAnchors(body, ap.SearchAnchor(), ap.RightAnchor), nil
 }
 
@@ -276,8 +293,15 @@ func (m *Module) recordAndClassify(
 	transformations := ExtractBetweenAnchors(body, ap.SearchAnchor(), ap.RightAnchor)
 
 	var results []*TransformResult
+	var selected *evidence.Exchange
 	for _, t := range transformations {
 		result := ClassifyTransformation(probe, t, expectBackslashConsumption)
+		if result.Classification == ClassificationInteresting || result.Classification == ClassificationBackslashConsumed {
+			if selected == nil {
+				selected = http.CaptureEvidence(resp)
+			}
+			result.exchange = selected
+		}
 		results = append(results, result)
 	}
 
@@ -292,6 +316,7 @@ func (m *Module) buildResults(
 	interesting []*TransformResult,
 	_ []*TransformResult, // boring results not included in output
 	backslashConsumed bool,
+	collectors ...*modkit.EvidenceCollector,
 ) ([]*output.ResultEvent, error) {
 	urlx, _ := ctx.URL()
 
@@ -330,28 +355,31 @@ func (m *Module) buildResults(
 		description = "Backslash consumption detected - escape bypass possible"
 	}
 
-	// Get a sample request/response for the report
-	var reqRaw []byte
-	var respFull string
-	if len(interesting) > 0 {
-		// Re-send first interesting probe for the report
-		ap := NewAnchoredPayload(interesting[0].Probe)
-		// BuildRequest produces well-formed raw, so wrap directly instead of
-		// re-parsing on this hot path.
-		fuzzedRaw := ip.BuildRequest([]byte(ap.FullPayload))
-		fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
-		resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
-		if err == nil {
-			reqRaw = fuzzedRaw
-			respFull = resp.FullResponseString()
-			resp.Close()
+	// Select the receipt of the matched transformation; reporting sends no probe.
+	var selected *evidence.Exchange
+	ev := modkit.NewEvidenceCollector()
+	if len(collectors) > 0 && collectors[0] != nil {
+		ev = collectors[0]
+	}
+	seen := make(map[string]bool)
+	for _, item := range interesting {
+		if item.exchange == nil || seen[item.exchange.ID] {
+			continue
+		}
+		seen[item.exchange.ID] = true
+		if selected == nil {
+			selected = item.exchange
+		} else if item.exchange.ID != selected.ID {
+			ev.AddExchange(item.exchange, evidence.RoleObservation, "additional matched transformation")
 		}
 	}
 
 	result := &output.ResultEvent{
-		URL:              urlx.String(),
-		Request:          string(reqRaw),
-		Response:         respFull,
+		URL:                urlx.String(),
+		EvidenceStatus:     "missing", // No reporting re-send or baseline fallback when a matched receipt is absent.
+		Evidence:           ev.Evidence(),
+		AdditionalEvidence: ev.Entries(),
+
 		FuzzingParameter: ip.Name(),
 		ExtractedResults: extracted,
 		Matched:          urlx.String(),
@@ -365,6 +393,7 @@ func (m *Module) buildResults(
 		},
 	}
 
+	modkit.SetPrimaryEvidence(result, selected, evidence.RoleObservation, "matched transformation")
 	return []*output.ResultEvent{result}, nil
 }
 

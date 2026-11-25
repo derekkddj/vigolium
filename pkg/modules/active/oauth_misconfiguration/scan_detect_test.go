@@ -48,6 +48,7 @@ func TestScanPerRequest_DetectsRedirectURIManipulation(t *testing.T) {
 			sawRedirectFinding = true
 			assert.Equal(t, output.RecordKindFinding, r.RecordKind)
 			assert.Equal(t, output.EvidenceGradeBypass, r.EvidenceGrade)
+			assert.False(t, r.BaselineEvidence, "redirect probes cannot use the input as proof")
 			assert.NotContains(t, r.Info.Description, "enabling authorization code/token theft")
 			break
 		}
@@ -66,6 +67,8 @@ func TestMissingStateIsObservation(t *testing.T) {
 	assert.Equal(t, output.RecordKindObservation, result.RecordKind)
 	assert.Equal(t, output.EvidenceGradeObservation, result.EvidenceGrade)
 	assert.False(t, result.Metadata["csrf_impact_proven"].(bool))
+	require.True(t, result.BaselineEvidence, "only the missing-state input-analysis branch opts in")
+	require.Equal(t, string(rr.Request().Raw()), result.Request)
 }
 
 func TestResponseTypeAcceptanceWithoutTokenIsCandidate(t *testing.T) {
@@ -96,6 +99,7 @@ func TestResponseTypeAcceptanceWithoutTokenIsCandidate(t *testing.T) {
 	assert.Equal(t, output.RecordKindCandidate, candidate.RecordKind)
 	assert.Equal(t, output.EvidenceGradeDifferential, candidate.EvidenceGrade)
 	assert.Equal(t, false, candidate.Metadata["access_token_issued"])
+	assert.False(t, candidate.BaselineEvidence, "response-type probes cannot use the input as proof")
 }
 
 func TestResponseTypeTokenIssuanceIsFinding(t *testing.T) {

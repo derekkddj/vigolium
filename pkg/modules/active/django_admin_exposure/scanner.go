@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -191,7 +192,9 @@ func (m *Module) probeEndpoint(
 	p probe,
 	probePath string,
 	fp *notFoundFingerprint,
-) *output.ResultEvent {
+) (guardResult *output.ResultEvent) {
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(guardResult, guardProof) }()
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
@@ -259,7 +262,7 @@ func (m *Module) probeEndpoint(
 		return nil
 	}
 
-	matchedMarkers, ok := modkit.MatchAndConfirmSibling(ctx, httpClient, probePath, body, p.markers)
+	matchedMarkers, ok := modkit.MatchAndConfirmSiblingWithEvidence(ctx, httpClient, probePath, body, p.markers, guardProof)
 	if !ok {
 		return nil
 	}
@@ -267,7 +270,7 @@ func (m *Module) probeEndpoint(
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		ModuleID:         ModuleID,
 		RecordKind:       output.RecordKindObservation,
 		EvidenceGrade:    output.EvidenceGradeObservation,
@@ -290,4 +293,6 @@ func (m *Module) probeEndpoint(
 			"admin_access_confirmed":  false,
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+	return result
 }

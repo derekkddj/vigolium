@@ -12,15 +12,15 @@ import (
 	"github.com/vigolium/vigolium/pkg/output"
 )
 
-// stubReportFormat is a non-streaming report format that records the items it
-// was handed, so selection can be asserted without invoking a real renderer.
+// stubReportFormat collects a small test producer so selection can be asserted
+// without invoking a real renderer. Production reports never use this collector.
 func stubReportFormat(captured *[]any) reportFormatEntry {
 	return reportFormatEntry{
 		format: "report",
 		label:  "stub",
-		generate: func(items []any, _ string, _ output.HTMLReportMeta) error {
-			*captured = items
-			return nil
+		streamGenerate: func(produce output.ReportItemProducer, _ string, _ output.HTMLReportMeta) error {
+			*captured = nil
+			return produce(func(item any) error { *captured = append(*captured, item); return nil })
 		},
 	}
 }
@@ -56,11 +56,9 @@ func findingModuleIDs(items []any) []string {
 	return out
 }
 
-// TestGenerateReportFromDBScopesMaterializedFormatsToScan is the regression guard
-// for the non-streaming report formats. `report`, `pdf` and `sarif` have no
-// streaming generator, so they took the materialized branch — which dropped the
-// scan uuid and rendered the project's entire finding history as this run's
-// result. The streaming branch (html) was already correct.
+// TestGenerateReportFromDBScopesMaterializedFormatsToScan guards the historical
+// document-format scope bug. All formats now use producers, and must still pass
+// the captured scan UUID rather than exporting the project's entire history.
 func TestGenerateReportFromDBScopesMaterializedFormatsToScan(t *testing.T) {
 	ctx := context.Background()
 	db := newExportTestDB(t)

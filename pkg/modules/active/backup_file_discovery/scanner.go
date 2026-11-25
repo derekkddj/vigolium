@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -227,7 +228,9 @@ func (m *Module) probePath(
 	scanCtx *modkit.ScanContext,
 	path string,
 	fp *notFoundFingerprint,
-) *output.ResultEvent {
+) (guardResult *output.ResultEvent) {
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(guardResult, guardProof) }()
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
@@ -326,7 +329,7 @@ func (m *Module) probePath(
 	// Soft-404 / SPA-shell gate: reject a 200 that is just the host's wildcard
 	// response to a random path.
 	location := resp.Response().Header.Get("Location")
-	if !modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, status, []byte(body), location) {
+	if !modkit.ConfirmNotSoft404WithEvidence(scanCtx, httpClient, ctx, status, []byte(body), location, guardProof) {
 		return nil
 	}
 
@@ -335,7 +338,7 @@ func (m *Module) probePath(
 	// response cannot forge a finding. The candidate body is compared against both
 	// the reproduce and decoy bodies, so its signature is built once and reused.
 	bodySig := modkit.BodySignature(body)
-	if repStatus, repBody, repOK := modkit.FetchPath(ctx, httpClient, path); !repOK || repStatus != 200 || !modkit.BodiesSimilarSig(bodySig, repBody) {
+	if repStatus, repBody, repOK := modkit.FetchPathWithEvidence(ctx, httpClient, path, guardProof); !repOK || repStatus != 200 || !modkit.BodiesSimilarSig(bodySig, repBody) {
 		return nil
 	}
 
@@ -344,7 +347,7 @@ func (m *Module) probePath(
 	// a no-extension random path and so cannot see an extension-scoped catch-all (a
 	// wildcard that hands back the same archive/dump for every *.zip / *.sql); the
 	// same-extension decoy can.
-	if decoyStatus, decoyBody, served := modkit.DecoyFileBaseline(scanCtx, ctx, httpClient, path); served && decoyStatus == status && modkit.BodiesSimilarSig(bodySig, decoyBody) {
+	if decoyStatus, decoyBody, served := modkit.DecoyFileBaselineWithEvidence(scanCtx, ctx, httpClient, path, guardProof); served && decoyStatus == status && modkit.BodiesSimilarSig(bodySig, decoyBody) {
 		return nil
 	}
 
@@ -357,7 +360,7 @@ func (m *Module) probePath(
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + path
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:      targetURL,
 		Matched:  targetURL,
 		Request:  string(modifiedRaw),
@@ -371,4 +374,6 @@ func (m *Module) probePath(
 			Reference:   []string{"https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information"},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+	return result
 }

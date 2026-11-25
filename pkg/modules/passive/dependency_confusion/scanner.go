@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/output"
@@ -50,8 +51,8 @@ type Module struct {
 	modkit.BasePassiveModule
 
 	// observed collapses candidates to one entry per package name as responses
-	// stream in, so memory is bounded by unique names × maxObservedURLs rather
-	// than by total observations. Guarded by mu.
+	// stream in: at most maxObservedURLs locations and one owned input receipt
+	// per candidate, sharing receipts from the same bundle. Guarded by mu.
 	mu       sync.Mutex
 	observed map[string]*aggregatedCandidate
 
@@ -127,10 +128,26 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, _ *modkit.Scan
 	if m.observed == nil {
 		m.observed = make(map[string]*aggregatedCandidate)
 	}
+	// Retain one immutable, owned representative for new candidates in this
+	// response. Candidates from the same bundle may share it; do not retain every
+	// observation or references to mutable analysis messages across the flush.
+	var observation *evidence.Exchange
 	for _, n := range names {
 		a := m.observed[n]
 		if a == nil {
-			a = &aggregatedCandidate{name: n, host: host}
+			if observation == nil {
+				observation = ctx.Evidence()
+				if observation == nil {
+					service := ""
+					if svc := ctx.Service(); svc != nil {
+						service = svc.Protocol() + "://" + urlx.Host
+					}
+					// Direct/module-only callers may provide traffic without a
+					// capture. Own their bytes without upgrading its provenance.
+					observation = evidence.NewExchange(service, urlStr, ctx.Request().Raw(), resp.Raw(), evidence.ProvenanceSupplied)
+				}
+			}
+			a = &aggregatedCandidate{name: n, host: host, observation: observation}
 			m.observed[n] = a
 		}
 		if len(a.urls) < maxObservedURLs && !slices.Contains(a.urls, urlStr) {
@@ -185,19 +202,27 @@ func (m *Module) FlushFindings(scanCtx *modkit.ScanContext) ([]*output.ResultEve
 	unclaimed := m.resolveUnclaimed(ctx, reg, names)
 
 	results := make([]*output.ResultEvent, 0, len(unclaimed))
-	for _, name := range unclaimed {
-		results = append(results, newFinding(observed[name]))
+	for _, candidate := range unclaimed {
+		results = append(results, newFinding(observed[candidate.name], candidate.exchange))
 	}
 	return results, nil
 }
 
+type unclaimedCandidate struct {
+	name     string
+	exchange *evidence.Exchange
+}
+
 // resolveUnclaimed queries names concurrently (bounded by registryConcurrency)
-// and returns those that 404, preserving input order. Each goroutine owns a
-// unique index, so it writes its own slot in unclaimedByIdx without a lock;
-// wg.Wait establishes the happens-before for the read that follows.
-func (m *Module) resolveUnclaimed(ctx context.Context, reg *registryClient, names []string) []string {
+// and returns those that 404 with their own registry receipt, preserving input
+// order. Workers own distinct slots; wg.Wait establishes the read happens-before.
+func (m *Module) resolveUnclaimed(ctx context.Context, reg *registryClient, names []string) []unclaimedCandidate {
 	sem := make(chan struct{}, registryConcurrency)
-	unclaimedByIdx := make([]bool, len(names))
+	type lookupSlot struct {
+		unclaimed bool
+		exchange  *evidence.Exchange
+	}
+	unclaimedByIdx := make([]lookupSlot, len(names))
 	var wg sync.WaitGroup
 
 	for i, name := range names {
@@ -207,18 +232,21 @@ func (m *Module) resolveUnclaimed(ctx context.Context, reg *registryClient, name
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
-				return // leaves false — same as an indeterminate result
+				return // leaves unclaimed false — same as an indeterminate result
 			}
 			defer func() { <-sem }()
-			unclaimedByIdx[idx] = reg.lookup(ctx, n) == resolutionUnclaimed
+			resolution, exchange := reg.lookup(ctx, n)
+			if resolution == resolutionUnclaimed {
+				unclaimedByIdx[idx] = lookupSlot{unclaimed: true, exchange: exchange}
+			}
 		}(i, name)
 	}
 	wg.Wait()
 
-	var unclaimed []string
+	var unclaimed []unclaimedCandidate
 	for i, name := range names {
-		if unclaimedByIdx[i] {
-			unclaimed = append(unclaimed, name)
+		if slot := unclaimedByIdx[i]; slot.unclaimed {
+			unclaimed = append(unclaimed, unclaimedCandidate{name: name, exchange: slot.exchange})
 		}
 	}
 	return unclaimed
@@ -228,19 +256,20 @@ func (m *Module) resolveUnclaimed(ctx context.Context, reg *registryClient, name
 // to maxObservedURLs distinct locations; urls[0] (always present) is the finding's
 // location.
 type aggregatedCandidate struct {
-	name string
-	host string
-	urls []string
+	name        string
+	host        string
+	urls        []string
+	observation *evidence.Exchange // one owned input representative, never a registry probe
 }
 
 // newFinding builds the ResultEvent for one unclaimed package name.
-func newFinding(a *aggregatedCandidate) *output.ResultEvent {
+func newFinding(a *aggregatedCandidate, registryReceipt *evidence.Exchange) *output.ResultEvent {
 	desc := fmt.Sprintf(
 		"The scoped package %q is imported by this target's JavaScript but is not registered on the public npm registry (%s returned 404). "+
 			"If the build resolves this dependency from the public registry, an attacker can publish a malicious package under this name to hijack the build (dependency confusion).",
 		a.name, defaultRegistryBase)
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		ModuleID: ModuleID,
 		Info: output.Info{
 			Name:        ModuleName + ": " + a.name,
@@ -261,6 +290,15 @@ func newFinding(a *aggregatedCandidate) *output.ResultEvent {
 			"observed_urls":   a.urls,
 		},
 	}
+	context := modkit.NewEvidenceCollector()
+	context.AddExchange(registryReceipt, evidence.RoleConfirmation, "Public registry HEAD: package unclaimed")
+	result.Evidence = context.Evidence()
+	result.AdditionalEvidence = context.Entries()
+	// This is a conditional dependency-confusion candidate, not proof that the
+	// target's build resolves from npm. Keep the target import as the primary
+	// observation and the registry's own exchange as supporting confirmation.
+	modkit.SetPrimaryEvidence(result, a.observation, evidence.RoleObservation, "Target JavaScript import")
+	return result
 }
 
 // hasJSPathSuffix reports whether path ends in a JavaScript file extension.

@@ -1,0 +1,12 @@
+{
+  "id": "11111111-2222-3333-4444-555555555555",
+  "url": "https://app.test/proof",
+  "service": "https://app.test:443",
+  "request": "UE9TVCAvcHJvb2YgSFRUUC8xLjENCkhvc3Q6IGFwcC50ZXN0DQpDb250ZW50LUxlbmd0aDogMg0KDQoA/w==",
+  "response": "SFRUUC8xLjEgMjAwIE9LDQpDb250ZW50LVR5cGU6IGFwcGxpY2F0aW9uL29jdGV0LXN0cmVhbQ0KDQr/AHByb29m",
+  "request_state": "complete",
+  "response_state": "complete",
+  "provenance": "captured",
+  "content_hash": "54380499cf3ada8859620875396349398660d695933a2eda255e2de07763376c",
+  "captured_at": "2026-11-03T00:00:00Z"
+}

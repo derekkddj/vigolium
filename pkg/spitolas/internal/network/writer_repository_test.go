@@ -21,6 +21,7 @@ type fakeRecordSaver struct {
 	singleCalls  int
 	batchCalls   int
 	savedRecords int
+	records      []*httpmsg.HttpRequestResponse
 	// block, when non-nil, parks every batch save until it is closed or the
 	// save's own context expires.
 	block chan struct{}
@@ -64,6 +65,7 @@ func (f *fakeRecordSaver) SaveRecordBatch(ctx context.Context, records []*httpms
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.savedRecords += len(records)
+	f.records = append(f.records, records...)
 	ids := make([]string, len(records))
 	for i := range ids {
 		ids[i] = "id"

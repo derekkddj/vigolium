@@ -11,6 +11,7 @@ import (
 	urlutil "github.com/projectdiscovery/utils/url"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -107,6 +108,7 @@ func (m *Module) IncludesBaseCanProcess() bool { return false }
 
 // injResult holds the outcome of a single injected request.
 type injResult struct {
+	exchange *evidence.Exchange
 	status   int
 	body     string // response body only (for comparison/echo checks)
 	full     string // full response incl. headers (evidence)
@@ -156,6 +158,7 @@ func (m *Module) ScanPerRequest(
 	}
 	baselineBody := ctx.Response().BodyToString()
 
+	benignProof := modkit.NewEvidenceCollector()
 	// Control probe: inject a benign unknown key. If the endpoint reflects it back
 	// (and the baseline did not already contain it), it mirrors arbitrary input and
 	// no privilege-key echo can be trusted — bail out to avoid false positives.
@@ -165,6 +168,9 @@ func (m *Module) ScanPerRequest(
 		control[canaryKey] = canaryValue
 
 		ctl, err := m.sendInjected(ctx, httpClient, control)
+		if ctl != nil {
+			benignProof.AddExchange(ctl.exchange, evidence.RoleControl, "benign unknown-field control")
+		}
 		if err != nil {
 			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
 				return nil, nil
@@ -232,11 +238,12 @@ func (m *Module) ScanPerRequest(
 		// of an SSR page's embedded state (feature flags, personalization) can look
 		// "newly reflected" by coincidence. Require it to reflect again on re-injection
 		// AND be absent from a fresh no-key control before trusting it.
-		if !m.reflectionTracksInjection(ctx, httpClient, injected, probe.key, probe.value) {
+		support := modkit.NewEvidenceCollector()
+		if !m.reflectionTracksInjection(ctx, httpClient, injected, probe.key, probe.value, support) {
 			continue
 		}
 
-		readback, persisted := m.verifyPersistence(ctx, httpClient, res, probe.key, probe.value)
+		readback, persisted := m.verifyPersistence(ctx, httpClient, res, probe.key, probe.value, support)
 		kind := output.RecordKindCandidate
 		grade := output.EvidenceGradeDifferential
 		name := "Mass Assignment Acceptance Candidate"
@@ -273,6 +280,14 @@ func (m *Module) ScanPerRequest(
 				"persisted":      persisted,
 			},
 		})
+		finding := results[len(results)-1]
+		finding.Evidence = []evidence.Entry{evidence.Select(preControl.exchange, evidence.RoleControl, false, "pre-mutation no-key control")}
+		if persisted && readback != nil {
+			finding.Evidence = append(finding.Evidence, evidence.Select(readback.exchange, evidence.RoleConfirmation, false, "persistent state readback"))
+		}
+		modkit.SetPrimaryEvidence(finding, res.exchange, evidence.RoleAttack, "privilege-key mutation")
+		modkit.AppendEvidence(finding, benignProof)
+		modkit.AppendEvidence(finding, support)
 		return results, nil
 	}
 
@@ -302,11 +317,15 @@ func (m *Module) sendInjected(
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true, NoClustering: true})
 	if err != nil {
-		return nil, err
+		x := http.CaptureFailureEvidence(err)
+		if x == nil {
+			return nil, err
+		}
+		return &injResult{exchange: x}, err
 	}
 	defer resp.Close()
 
-	res := &injResult{raw: modifiedRaw}
+	res := &injResult{raw: modifiedRaw, exchange: http.CaptureEvidence(resp)}
 	if resp.Response() != nil {
 		res.status = resp.Response().StatusCode
 		res.body = resp.BodyString()
@@ -345,11 +364,17 @@ func (m *Module) reflectionTracksInjection(
 	injected map[string]any,
 	key string,
 	value any,
+	collectors ...*modkit.EvidenceCollector,
 ) bool {
 	// (a) Re-inject: a genuinely accepted/echoed field reflects on every send. A 2xx
 	// re-injection that no longer carries the key means the first reflection was
 	// per-request noise, not our field.
 	re, err := m.sendInjected(ctx, httpClient, injected)
+	if re != nil {
+		for _, proof := range collectors {
+			proof.AddExchange(re.exchange, evidence.RoleConfirmation, "privilege-key reinjection")
+		}
+	}
 	if err != nil || re.status < 200 || re.status >= 300 || !jsonContainsKeyValue(re.body, key, value) {
 		return false
 	}
@@ -425,16 +450,27 @@ func (m *Module) verifyPersistence(
 	injected *injResult,
 	key string,
 	value any,
+	collectors ...*modkit.EvidenceCollector,
 ) (*injResult, bool) {
 	readRaw, ok := readbackRequest(ctx, injected.location)
 	if !ok {
 		return nil, false
 	}
 	first, err := m.sendRaw(ctx, client, readRaw)
+	if first != nil {
+		for _, proof := range collectors {
+			proof.AddExchange(first.exchange, evidence.RoleConfirmation, "persistent state readback")
+		}
+	}
 	if err != nil || first.status < 200 || first.status >= 300 || !jsonContainsKeyValue(first.body, key, value) {
 		return nil, false
 	}
 	second, err := m.sendRaw(ctx, client, readRaw)
+	if second != nil {
+		for _, proof := range collectors {
+			proof.AddExchange(second.exchange, evidence.RoleConfirmation, "persistent state readback replay")
+		}
+	}
 	if err != nil || second.status != first.status || !jsonContainsKeyValue(second.body, key, value) || !modkit.BodiesSimilar(first.body, second.body) {
 		return nil, false
 	}
@@ -488,10 +524,14 @@ func (m *Module) sendRaw(ctx *httpmsg.HttpRequestResponse, client *http.Requeste
 	request := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
 	resp, _, err := client.Execute(request, http.Options{NoRedirects: true, NoClustering: true})
 	if err != nil {
-		return nil, err
+		x := http.CaptureFailureEvidence(err)
+		if x == nil {
+			return nil, err
+		}
+		return &injResult{exchange: x}, err
 	}
 	defer resp.Close()
-	result := &injResult{raw: raw}
+	result := &injResult{raw: raw, exchange: http.CaptureEvidence(resp)}
 	if resp.Response() != nil {
 		result.status = resp.Response().StatusCode
 		result.body = resp.BodyString()

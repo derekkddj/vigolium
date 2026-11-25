@@ -7,6 +7,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/core"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/dnsresolve"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/fuzz"
 	"github.com/vigolium/vigolium/pkg/oast"
 	"github.com/vigolium/vigolium/pkg/output"
@@ -39,6 +40,9 @@ type findingViewSchema struct {
 	FindingSource      string                          `json:"finding_source"`
 	RecordKind         string                          `json:"record_kind"`
 	EvidenceGrade      string                          `json:"evidence_grade"`
+	EvidenceStatus     string                          `json:"evidence_status"`
+	Evidence           []evidence.Entry                `json:"evidence"`
+	ProjectUUID        string                          `json:"project_uuid"`
 	Short              string                          `json:"short,omitempty"`
 	Description        string                          `json:"description,omitempty"`
 	URL                string                          `json:"url,omitempty"`

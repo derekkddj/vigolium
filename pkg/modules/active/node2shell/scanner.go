@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	node2shellinfra "github.com/vigolium/vigolium/pkg/modules/infra/node2shell"
@@ -142,10 +143,21 @@ func (m *Module) scan(ctx *httpmsg.HttpRequestResponse, httpClient *http.Request
 	// endpoint whose pool answers one unmodified request with different pages
 	// makes every pairwise comparison above a coin flip. Memoized per record and
 	// shared with the other differential modules, and it fails open.
-	if modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+	guardProof := modkit.NewEvidenceCollector()
+	if modkit.EndpointVolatileWithEvidence(scanCtx, ctx, httpClient, guardProof) {
 		return nil, nil
 	}
-	return []*output.ResultEvent{buildResult(v, g, scanCtx, ctx, origin+path, lane)}, nil
+	// Reserve two slots for the deciding stability guard before the builder's
+	// optional initial gate classes fill the bounded context. All samples still run.
+	for i, entry := range guardProof.Evidence() {
+		if i >= 2 {
+			break
+		}
+		v.contextEvidence.AddExchange(entry.Exchange, entry.Role, entry.Label)
+	}
+	finding := buildResult(v, g, scanCtx, ctx, origin+path, lane)
+	modkit.AppendEvidence(finding, guardProof)
+	return []*output.ResultEvent{finding}, nil
 }
 
 // probeRounds is how many times the probe must reach the route's {} class,
@@ -163,7 +175,8 @@ const probeRounds = 2
 // verdict is a completed version oracle: the twin and the last probe exchange
 // that produced it, plus what the stability control said afterwards.
 type verdict struct {
-	twin, probe node2shellinfra.Exchange
+	twin, probe     node2shellinfra.Exchange
+	contextEvidence *modkit.EvidenceCollector
 	// stopped records that the route no longer answered after the last probe.
 	stopped bool
 }
@@ -207,7 +220,7 @@ func confirm(p *node2shellinfra.Prober, g node2shellinfra.Gate) (verdict, bool) 
 	}
 	var ok bool
 
-	var v verdict
+	v := verdict{contextEvidence: modkit.NewEvidenceCollector()}
 	// Round one. A patched decoder refuses here and the stage ends.
 	if v.probe, ok = sendStream(p, g, node2shellinfra.ProbeStream(), g.Empty); !ok {
 		return verdict{}, false
@@ -218,7 +231,13 @@ func confirm(p *node2shellinfra.Prober, g node2shellinfra.Gate) (verdict, bool) 
 		return verdict{}, false
 	}
 	for range probeRounds - 1 {
-		if !node2shellinfra.Reverify(p.Send, g) {
+		v.contextEvidence.AddExchange(v.probe.Receipt, evidence.RoleAttack, "preceding version-oracle probe")
+		reverify := func(name, value string, body []byte) (node2shellinfra.Exchange, bool) {
+			got, ok := p.Send(name, value, body)
+			v.contextEvidence.AddExchange(got.Receipt, evidence.RoleControl, "decode-class re-verification")
+			return got, ok
+		}
+		if !node2shellinfra.Reverify(reverify, g) {
 			return verdict{}, false
 		}
 		if v.probe, ok = sendStream(p, g, node2shellinfra.ProbeStream(), g.Empty); !ok {
@@ -227,6 +246,7 @@ func confirm(p *node2shellinfra.Prober, g node2shellinfra.Gate) (verdict, bool) 
 	}
 
 	final, ok := p.Send(node2shellinfra.ContentEncoding, g.Encoding(), g.Bodies.Empty)
+	v.contextEvidence.AddExchange(final.Receipt, evidence.RoleControl, "post-probe stability control")
 	switch {
 	case !ok:
 		v.stopped = true
@@ -250,7 +270,23 @@ func sendStream(p *node2shellinfra.Prober, g node2shellinfra.Gate, body []byte, 
 	return got, true
 }
 
-func buildResult(v verdict, g node2shellinfra.Gate, scanCtx *modkit.ScanContext, ctx *httpmsg.HttpRequestResponse, target, lane string) *output.ResultEvent {
+func buildResult(v verdict, g node2shellinfra.Gate, scanCtx *modkit.ScanContext, ctx *httpmsg.HttpRequestResponse, target, lane string) (finding *output.ResultEvent) {
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, v.probe.Receipt, evidence.RoleAttack, "version-oracle probe matching the decoded class")
+	}()
+	collector := modkit.NewEvidenceCollector()
+	collector.AddExchange(v.twin.Receipt, evidence.RoleControl, "size-matched malformed twin")
+	for _, entry := range v.contextEvidence.Evidence() {
+		collector.AddExchange(entry.Exchange, entry.Role, entry.Label)
+	}
+	collector.AddExchange(g.Empty.Receipt, evidence.RoleControl, "plain empty JSON class")
+	collector.AddExchange(g.Malformed.Receipt, evidence.RoleControl, "plain malformed JSON class")
+	collector.AddExchange(g.Failed.Receipt, evidence.RoleControl, "refused-stream class")
+	collector.AddExchange(g.Decoded.Receipt, evidence.RoleConfirmation, "encoded empty JSON gate")
+	collector.AddExchange(g.DecodedMalformed.Receipt, evidence.RoleConfirmation, "encoded malformed JSON gate")
+	collector.AddExchange(g.Unknown.Receipt, evidence.RoleControl, "unknown encoding control")
+	collector.AddExchange(g.Noise.Receipt, evidence.RoleControl, "benign decoy-header control")
+	collector.AddExchange(g.Misplaced.Receipt, evidence.RoleControl, "misplaced encoding header control")
 	decoder := node2shellinfra.LikelyDecoder(scanCtx, modkit.RegistryHostKey(ctx), v.probe.Header)
 	extracted := []string{
 		"Lane: " + lane,
@@ -282,10 +318,9 @@ func buildResult(v verdict, g node2shellinfra.Gate, scanCtx *modkit.ScanContext,
 		Request:       v.probe.Request,
 		Response:      v.probe.Response,
 
-		ExtractedResults: extracted,
-		AdditionalEvidence: []string{
-			"Size-matched malformed twin request:\n" + v.twin.Request + "\n\nTwin response:\n" + v.twin.Response,
-		},
+		ExtractedResults:   extracted,
+		AdditionalEvidence: collector.Entries(),
+		Evidence:           collector.Evidence(),
 		Info: output.Info{
 			Name: "Potential unpatched Brotli request decoder (node2shell, " + node2shellinfra.CVE + ")",
 			Description: fmt.Sprintf(

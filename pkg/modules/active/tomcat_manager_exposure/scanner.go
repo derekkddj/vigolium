@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -273,7 +274,7 @@ func (m *Module) probeEndpoint(
 		if strings.Contains(wwwAuth, "Tomcat") || strings.Contains(wwwAuth, "tomcat") {
 			urlx, _ := ctx.URL()
 			targetURL := urlx.Scheme + "://" + urlx.Host + probePath
-			return &output.ResultEvent{
+			result := &output.ResultEvent{
 				ModuleID:         ModuleID,
 				RecordKind:       output.RecordKindObservation,
 				EvidenceGrade:    output.EvidenceGradeObservation,
@@ -296,7 +297,9 @@ func (m *Module) probeEndpoint(
 					"administrative_access":   false,
 					"state_change_attempted":  false,
 				},
-			}, status
+			}
+			modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "Tomcat authentication challenge")
+			return result, status
 		}
 	}
 
@@ -352,7 +355,8 @@ func (m *Module) probeEndpoint(
 	// nonexistent sibling under the same parent satisfies the same groups (a
 	// sub-directory catch-all that 200s every child path). Root-level probes are
 	// already covered by the random-path 404 fingerprint above.
-	matchedMarkers, ok := modkit.MatchAndConfirmSibling(ctx, httpClient, probePath, matchBody, p.markers)
+	guardProof := modkit.NewEvidenceCollector()
+	matchedMarkers, ok := modkit.MatchAndConfirmSiblingWithEvidence(ctx, httpClient, probePath, matchBody, p.markers, guardProof)
 	if !ok {
 		return nil, status
 	}
@@ -365,7 +369,7 @@ func (m *Module) probeEndpoint(
 		resultName = fmt.Sprintf("Tomcat Administrative Surface Candidate: %s", p.name)
 	}
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		ModuleID:         ModuleID,
 		RecordKind:       p.kind,
 		EvidenceGrade:    p.grade,
@@ -388,5 +392,8 @@ func (m *Module) probeEndpoint(
 			"state_change_attempted":          false,
 			"administrative_action_confirmed": false,
 		},
-	}, status
+	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected administrative endpoint response")
+	modkit.AppendEvidence(result, guardProof)
+	return result, status
 }

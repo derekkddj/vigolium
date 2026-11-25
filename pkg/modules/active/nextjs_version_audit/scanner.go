@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	evidencecontract "github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -25,8 +26,9 @@ var (
 )
 
 type versionEvidence struct {
-	version string
-	source  string
+	version  string
+	source   string
+	exchange *evidencecontract.Exchange // selected version-bearing probe only
 }
 
 // Module implements the Next.js version audit active scanner.
@@ -78,6 +80,9 @@ func (m *Module) ScanPerHost(
 	}
 
 	evidence := extractVersionEvidence(ctx.Response().BodyToString(), "observed response")
+	// Positive intent applies only to versions parsed from this input. A version
+	// found by a chunk probe selects that probe's receipt instead.
+	observedVersion := evidence.version != ""
 	if evidence.version == "" {
 		evidence = m.probeForVersion(ctx, httpClient)
 	}
@@ -106,13 +111,14 @@ func (m *Module) ScanPerHost(
 			description += " Exploitability additionally requires: " + strings.Join(adv.prerequisites, "; ") + "."
 		}
 
-		results = append(results, &output.ResultEvent{
-			ModuleID:      ModuleID,
-			Host:          host,
-			URL:           target,
-			Matched:       target,
-			RecordKind:    kind,
-			EvidenceGrade: grade,
+		result := &output.ResultEvent{
+			BaselineEvidence: observedVersion,
+			ModuleID:         ModuleID,
+			Host:             host,
+			URL:              target,
+			Matched:          target,
+			RecordKind:       kind,
+			EvidenceGrade:    grade,
 			ExtractedResults: []string{
 				fmt.Sprintf("Detected version: Next.js %s", evidence.version),
 				fmt.Sprintf("Version evidence: %s", evidence.source),
@@ -135,7 +141,11 @@ func (m *Module) ScanPerHost(
 				"fixed_version":    matchedRange.fixed,
 				"prerequisites":    adv.prerequisites,
 			},
-		})
+		}
+		if evidence.exchange != nil {
+			modkit.SetPrimaryEvidence(result, evidence.exchange, evidencecontract.RoleObservation, "version-bearing chunk probe")
+		}
+		results = append(results, result)
 	}
 	return results, nil
 }
@@ -173,8 +183,9 @@ func (m *Module) probeForVersion(ctx *httpmsg.HttpRequestResponse, httpClient *h
 			contentType := resp.Response().Header.Get("Content-Type")
 			if looksLikeJavaScriptResponse(contentType, body) {
 				if v := extractVersion(body); v != "" {
+					selected := versionEvidence{version: v, source: path, exchange: http.CaptureEvidence(resp)}
 					resp.Close()
-					return versionEvidence{version: v, source: path}
+					return selected
 				}
 			}
 		}

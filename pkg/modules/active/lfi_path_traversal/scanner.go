@@ -6,6 +6,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -140,7 +141,7 @@ func (m *Module) testPayload(
 	baselineBody string,
 	baselineLen int,
 	baselineStatus int,
-) (*output.ResultEvent, bool, error) {
+) (finding *output.ResultEvent, changed bool, err error) {
 	fuzzedRaw := httpmsg.BuildPayload(ip, []byte(p.payload), p.preEncoded)
 
 	// BuildRequest produces well-formed raw, so wrap directly instead
@@ -205,6 +206,10 @@ func (m *Module) testPayload(
 		}
 	}
 
+	selectedExchange := http.CaptureEvidence(resp)
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, selectedExchange, evidence.RoleAttack, "matched traversal probe")
+	}()
 	return &output.ResultEvent{
 		URL:              target,
 		Matched:          target,

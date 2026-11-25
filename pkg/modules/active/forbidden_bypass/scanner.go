@@ -9,6 +9,7 @@ import (
 	urlutil "github.com/projectdiscovery/utils/url"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -170,6 +171,7 @@ func bypassPath(urlx *urlutil.URL, ctx *httpmsg.HttpRequestResponse, httpClient 
 		// modifiedRaw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
 		fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
+		proofs := modkit.NewEvidenceCollector()
 		resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true})
 		if err != nil {
 			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
@@ -184,12 +186,12 @@ func bypassPath(urlx *urlutil.URL, ctx *httpmsg.HttpRequestResponse, httpClient 
 			// response to a random path (fails open on probe error).
 			body := resp.Body().String()
 			location := resp.Response().Header.Get("Location")
-			if !modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, 200, []byte(body), location) {
+			if !modkit.ConfirmNotSoft404WithEvidence(scanCtx, httpClient, ctx, 200, []byte(body), location, proofs) {
 				resp.Close()
 				continue
 			}
 			// Reproducibility gate: a transient 200 is not a bypass.
-			if !confirmStableBypass(httpClient, ctx.Service(), modifiedRaw, 200, body) {
+			if !confirmStableBypass(httpClient, ctx.Service(), modifiedRaw, 200, body, proofs) {
 				resp.Close()
 				continue
 			}
@@ -198,7 +200,7 @@ func bypassPath(urlx *urlutil.URL, ctx *httpmsg.HttpRequestResponse, httpClient 
 			// 200), the host catch-alls every URL and no path payload here is a real
 			// bypass. ConfirmNotSoft404's WildcardProbe misses this because it only
 			// fires on a NON-EMPTY wildcard body.
-			if !confirmDistinctFromCatchAll(httpClient, ctx.Service(), ctx.Request().Raw(), 200, body) {
+			if !confirmDistinctFromCatchAll(httpClient, ctx.Service(), ctx.Request().Raw(), 200, body, proofs) {
 				resp.Close()
 				return results, nil
 			}
@@ -207,7 +209,7 @@ func bypassPath(urlx *urlutil.URL, ctx *httpmsg.HttpRequestResponse, httpClient 
 			// MANGLED path shape while 404-ing clean unknown paths. Re-apply this
 			// payload to a random base (see confirmDistinctFromShapeCatchAll); a
 			// matching 200 is generic to the shape, so try the next payload.
-			if !confirmDistinctFromShapeCatchAll(httpClient, ctx.Service(), ctx.Request().Raw(), payload, path, 200, body) {
+			if !confirmDistinctFromShapeCatchAll(httpClient, ctx.Service(), ctx.Request().Raw(), payload, path, 200, body, proofs) {
 				resp.Close()
 				continue
 			}
@@ -217,21 +219,25 @@ func bypassPath(urlx *urlutil.URL, ctx *httpmsg.HttpRequestResponse, httpClient 
 			// now publicly 2xx, a 200 on a path-mutated payload is not a bypass —
 			// the resource simply became reachable. No path payload can be a bypass
 			// of a now-public resource, so drop the whole phase.
-			if !stillForbiddenWithoutHeaders(httpClient, ctx.Service(), ctx.Request().Raw()) {
+			if !stillForbiddenWithoutHeaders(httpClient, ctx.Service(), ctx.Request().Raw(), proofs) {
 				resp.Close()
 				return results, nil
 			}
 			respDump := resp.FullResponseString()
-			results = append(results, &output.ResultEvent{
-				URL:              urlx.Scheme + "://" + urlx.Host + payload,
-				Request:          string(modifiedRaw),
-				Response:         respDump,
-				FuzzingParameter: "path",
-				ExtractedResults: []string{payload},
+			result := &output.ResultEvent{
+				Evidence:           proofs.Evidence(),
+				AdditionalEvidence: proofs.Entries(),
+				URL:                urlx.Scheme + "://" + urlx.Host + payload,
+				Request:            string(modifiedRaw),
+				Response:           respDump,
+				FuzzingParameter:   "path",
+				ExtractedResults:   []string{payload},
 				Info: output.Info{
 					Description: "Found 403 Forbidden Bypass using path",
 				},
-			})
+			}
+			modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleAttack, "selected probe")
+			results = append(results, result)
 			resp.Close()
 			return results, nil
 		}
@@ -290,6 +296,7 @@ func bypassHeaders(
 		// modifiedRaw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
 		fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
+		proofs := modkit.NewEvidenceCollector()
 		resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true})
 		if err != nil {
 			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
@@ -302,12 +309,12 @@ func bypassHeaders(
 			// matches the host's random-path shell is not a genuine bypass.
 			body := resp.Body().String()
 			location := resp.Response().Header.Get("Location")
-			if !modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, 200, []byte(body), location) {
+			if !modkit.ConfirmNotSoft404WithEvidence(scanCtx, httpClient, ctx, 200, []byte(body), location, proofs) {
 				resp.Close()
 				continue
 			}
 			// Reproducibility gate: a transient 200 is not a bypass.
-			if !confirmStableBypass(httpClient, ctx.Service(), modifiedRaw, 200, body) {
+			if !confirmStableBypass(httpClient, ctx.Service(), modifiedRaw, 200, body, proofs) {
 				resp.Close()
 				continue
 			}
@@ -317,7 +324,7 @@ func bypassHeaders(
 			// answers everything alike. Using the clean original (not modifiedRaw)
 			// avoids a false negative on path-rewriting headers (x-original-url etc.),
 			// whose server-honored path would otherwise echo the protected resource.
-			if !confirmDistinctFromCatchAll(httpClient, ctx.Service(), ctx.Request().Raw(), 200, body) {
+			if !confirmDistinctFromCatchAll(httpClient, ctx.Service(), ctx.Request().Raw(), 200, body, proofs) {
 				resp.Close()
 				return results, nil
 			}
@@ -328,21 +335,25 @@ func bypassHeaders(
 			// had no effect. Re-issue the same request at newPath WITHOUT the header;
 			// if it returns the same response, the header is irrelevant, so drop this
 			// probe and try the next one.
-			if !confirmHeaderCausedChange(httpClient, ctx.Service(), ctx.Request().Raw(), newPath, 200, body) {
+			if !confirmHeaderCausedChange(httpClient, ctx.Service(), ctx.Request().Raw(), newPath, 200, body, proofs) {
 				resp.Close()
 				continue
 			}
 			respDump := resp.FullResponseString()
-			results = append(results, &output.ResultEvent{
-				URL:              urlx.Scheme + "://" + urlx.Host + newPath,
-				Request:          string(modifiedRaw),
-				Response:         respDump,
-				FuzzingParameter: headerKey,
-				ExtractedResults: []string{headerValue},
+			result := &output.ResultEvent{
+				Evidence:           proofs.Evidence(),
+				AdditionalEvidence: proofs.Entries(),
+				URL:                urlx.Scheme + "://" + urlx.Host + newPath,
+				Request:            string(modifiedRaw),
+				Response:           respDump,
+				FuzzingParameter:   headerKey,
+				ExtractedResults:   []string{headerValue},
 				Info: output.Info{
 					Description: "Found 403 Forbidden Bypass using header",
 				},
-			})
+			}
+			modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleAttack, "selected probe")
+			results = append(results, result)
 			resp.Close()
 			return results, nil
 		}
@@ -461,11 +472,12 @@ func evalTrustedHeaderProbe(
 	scanCtx *modkit.ScanContext,
 	baseRaw, modifiedRaw []byte,
 	baselineBody string,
-	fuzzParam, evidence, description string,
+	fuzzParam, summary, description string,
 ) (ev *output.ResultEvent, abort bool) {
 	// modifiedRaw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
 	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
+	proofs := modkit.NewEvidenceCollector()
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true})
 	if err != nil {
 		if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
@@ -480,18 +492,21 @@ func evalTrustedHeaderProbe(
 	bypassBody := resp.Body().String()
 	location := resp.Response().Header.Get("Location")
 	respDump := resp.FullResponseString()
+	exchange := http.CaptureEvidence(resp)
 	resp.Close()
 
-	if !confirmTrustedHeaderBypass(ctx, httpClient, scanCtx, baseRaw, modifiedRaw, baselineBody, bypassBody, location) {
+	if !confirmTrustedHeaderBypass(ctx, httpClient, scanCtx, baseRaw, modifiedRaw, baselineBody, bypassBody, location, proofs) {
 		return nil, false
 	}
 
-	return &output.ResultEvent{
-		URL:              urlx.String(),
-		Request:          string(modifiedRaw),
-		Response:         respDump,
-		FuzzingParameter: fuzzParam,
-		ExtractedResults: []string{evidence},
+	result := &output.ResultEvent{
+		Evidence:           proofs.Evidence(),
+		AdditionalEvidence: proofs.Entries(),
+		URL:                urlx.String(),
+		Request:            string(modifiedRaw),
+		Response:           respDump,
+		FuzzingParameter:   fuzzParam,
+		ExtractedResults:   []string{summary},
 		Info: output.Info{
 			Name:        "Trusted Identity Header Authentication Bypass",
 			Description: description,
@@ -503,7 +518,9 @@ func evalTrustedHeaderProbe(
 				"https://oauth2-proxy.github.io/oauth2-proxy/configuration/overview/",
 			},
 		},
-	}, false
+	}
+	modkit.SetPrimaryEvidence(result, exchange, evidence.RoleAttack, "selected probe")
+	return result, false
 }
 
 // confirmTrustedHeaderBypass is the multi-layer confirmation for a candidate
@@ -531,9 +548,13 @@ func confirmTrustedHeaderBypass(
 	scanCtx *modkit.ScanContext,
 	baseRaw, modifiedRaw []byte,
 	baselineBody, bypassBody, location string,
-) bool {
+	collectors ...*modkit.EvidenceCollector) bool {
+	var proof *modkit.EvidenceCollector
+	if len(collectors) > 0 {
+		proof = collectors[0]
+	}
 	// 1. soft-404 / SPA shell / login-redirect guard.
-	if !modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, 200, []byte(bypassBody), location) {
+	if !modkit.ConfirmNotSoft404WithEvidence(scanCtx, httpClient, ctx, 200, []byte(bypassBody), location, proof) {
 		return false
 	}
 	// 2. the authorized body must diverge from the forbidden baseline body.
@@ -541,15 +562,15 @@ func confirmTrustedHeaderBypass(
 		return false
 	}
 	// 3. reproducible 200 + stable body.
-	if !confirmStableBypass(httpClient, ctx.Service(), modifiedRaw, 200, bypassBody) {
+	if !confirmStableBypass(httpClient, ctx.Service(), modifiedRaw, 200, bypassBody, collectors...) {
 		return false
 	}
 	// 4. distinct from the host's catch-all / wildcard handler.
-	if !confirmDistinctFromCatchAll(httpClient, ctx.Service(), baseRaw, 200, bypassBody) {
+	if !confirmDistinctFromCatchAll(httpClient, ctx.Service(), baseRaw, 200, bypassBody, collectors...) {
 		return false
 	}
 	// 5. causal: the bare request (no identity header) is still forbidden.
-	if !stillForbiddenWithoutHeaders(httpClient, ctx.Service(), baseRaw) {
+	if !stillForbiddenWithoutHeaders(httpClient, ctx.Service(), baseRaw, collectors...) {
 		return false
 	}
 	return true
@@ -561,8 +582,8 @@ func confirmTrustedHeaderBypass(
 // resource having become public. It returns false (drop) ONLY when the bare
 // request is itself authorized now (a 2xx). It fails OPEN (true) on a transient
 // error or any non-2xx status, so a real bypass is never suppressed.
-func stillForbiddenWithoutHeaders(httpClient *http.Requester, service *httpmsg.Service, baseRaw []byte) bool {
-	status, _, ok := modkit.ExecuteRaw(httpClient, service, baseRaw, http.Options{NoRedirects: true, NoClustering: true})
+func stillForbiddenWithoutHeaders(httpClient *http.Requester, service *httpmsg.Service, baseRaw []byte, collectors ...*modkit.EvidenceCollector) bool {
+	status, _, ok := executeBypassProbe(httpClient, service, baseRaw, http.Options{NoRedirects: true, NoClustering: true}, collectors, evidence.RoleControl)
 	if !ok {
 		return true // inconclusive transient error — don't suppress
 	}
@@ -600,6 +621,7 @@ func bypassMethod(
 		// modifiedRaw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
 		fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
+		proofs := modkit.NewEvidenceCollector()
 		resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true})
 		if err != nil {
 			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
@@ -614,12 +636,12 @@ func bypassMethod(
 			// wildcard shell.
 			body := resp.Body().String()
 			location := resp.Response().Header.Get("Location")
-			if !modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, resp.Response().StatusCode, []byte(body), location) {
+			if !modkit.ConfirmNotSoft404WithEvidence(scanCtx, httpClient, ctx, resp.Response().StatusCode, []byte(body), location, proofs) {
 				resp.Close()
 				continue
 			}
 			// Reproducibility gate: a transient 2xx for the method is not a bypass.
-			if !confirmStableBypass(httpClient, ctx.Service(), modifiedRaw, resp.Response().StatusCode, body) {
+			if !confirmStableBypass(httpClient, ctx.Service(), modifiedRaw, resp.Response().StatusCode, body, proofs) {
 				resp.Close()
 				continue
 			}
@@ -628,7 +650,7 @@ func bypassMethod(
 			// with the original, space-free path) so a per-method catch-all is caught:
 			// if METHOD /random returns the same shell as METHOD /resource, the method
 			// isn't bypassing anything.
-			if !confirmDistinctFromCatchAll(httpClient, ctx.Service(), modifiedRaw, resp.Response().StatusCode, body) {
+			if !confirmDistinctFromCatchAll(httpClient, ctx.Service(), modifiedRaw, resp.Response().StatusCode, body, proofs) {
 				resp.Close()
 				return results, nil
 			}
@@ -636,21 +658,25 @@ func bypassMethod(
 			// access-controlled. If the crawl-time 401/403 was transient and the
 			// bare request is now 2xx (resource became public), a 2xx for an
 			// alternate method is not a bypass — drop the phase.
-			if !stillForbiddenWithoutHeaders(httpClient, ctx.Service(), ctx.Request().Raw()) {
+			if !stillForbiddenWithoutHeaders(httpClient, ctx.Service(), ctx.Request().Raw(), proofs) {
 				resp.Close()
 				return results, nil
 			}
 			respDump := resp.FullResponseString()
-			results = append(results, &output.ResultEvent{
-				URL:              urlx.String(),
-				Request:          string(modifiedRaw),
-				Response:         respDump,
-				FuzzingParameter: "method",
-				ExtractedResults: []string{method},
+			result := &output.ResultEvent{
+				Evidence:           proofs.Evidence(),
+				AdditionalEvidence: proofs.Entries(),
+				URL:                urlx.String(),
+				Request:            string(modifiedRaw),
+				Response:           respDump,
+				FuzzingParameter:   "method",
+				ExtractedResults:   []string{method},
 				Info: output.Info{
 					Description: "Found 403/401 Bypass using HTTP method " + method,
 				},
-			})
+			}
+			modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleAttack, "selected probe")
+			results = append(results, result)
 			resp.Close()
 			return results, nil
 		}
@@ -671,6 +697,7 @@ func bypassMethod(
 		// modifiedRaw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
 		fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
+		proofs := modkit.NewEvidenceCollector()
 		resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true})
 		if err != nil {
 			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
@@ -684,26 +711,30 @@ func bypassMethod(
 			respBody := resp.Body().String()
 			location := resp.Response().Header.Get("Location")
 			if !strings.Contains(strings.ToLower(body), "method not allowed") &&
-				modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, 200, []byte(respBody), location) &&
-				confirmStableBypass(httpClient, ctx.Service(), modifiedRaw, 200, respBody) &&
+				modkit.ConfirmNotSoft404WithEvidence(scanCtx, httpClient, ctx, 200, []byte(respBody), location, proofs) &&
+				confirmStableBypass(httpClient, ctx.Service(), modifiedRaw, 200, respBody, proofs) &&
 				// Empty/blank-body catch-all guard (see bypassPath): the override
 				// must yield content distinct from the host's response to an
 				// unrelated random path, or it's just the catch-all shell.
-				confirmDistinctFromCatchAll(httpClient, ctx.Service(), modifiedRaw, 200, respBody) &&
+				confirmDistinctFromCatchAll(httpClient, ctx.Service(), modifiedRaw, 200, respBody, proofs) &&
 				// Clean-canonical control: the original method+path must still be
 				// access-controlled — a now-public resource is not a method-override
 				// bypass.
-				stillForbiddenWithoutHeaders(httpClient, ctx.Service(), ctx.Request().Raw()) {
-				results = append(results, &output.ResultEvent{
-					URL:              urlx.String(),
-					Request:          string(modifiedRaw),
-					Response:         body,
-					FuzzingParameter: overrideHeader,
-					ExtractedResults: []string{"POST with " + overrideHeader + ": GET"},
+				stillForbiddenWithoutHeaders(httpClient, ctx.Service(), ctx.Request().Raw(), proofs) {
+				result := &output.ResultEvent{
+					Evidence:           proofs.Evidence(),
+					AdditionalEvidence: proofs.Entries(),
+					URL:                urlx.String(),
+					Request:            string(modifiedRaw),
+					Response:           body,
+					FuzzingParameter:   overrideHeader,
+					ExtractedResults:   []string{"POST with " + overrideHeader + ": GET"},
 					Info: output.Info{
 						Description: "Found 403/401 Bypass using method override header " + overrideHeader,
 					},
-				})
+				}
+				modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleAttack, "selected probe")
+				results = append(results, result)
 				resp.Close()
 				return results, nil
 			}
@@ -766,8 +797,8 @@ func confirmStableBypass(
 	modifiedRaw []byte,
 	wantStatus int,
 	firstBody string,
-) bool {
-	status, body, ok := modkit.ExecuteRaw(httpClient, service, modifiedRaw, http.Options{NoRedirects: true, NoClustering: true})
+	collectors ...*modkit.EvidenceCollector) bool {
+	status, body, ok := executeBypassProbe(httpClient, service, modifiedRaw, http.Options{NoRedirects: true, NoClustering: true}, collectors, evidence.RoleConfirmation)
 	if !ok {
 		return true // inconclusive transient error — don't suppress
 	}
@@ -802,12 +833,12 @@ func confirmDistinctFromCatchAll(
 	baseRaw []byte,
 	bypassStatus int,
 	bypassBody string,
-) bool {
+	collectors ...*modkit.EvidenceCollector) bool {
 	controlRaw, err := httpmsg.SetPath(baseRaw, "/"+modkit.FreshCanary()+"-vigolium404")
 	if err != nil {
 		return true // inconclusive — don't suppress
 	}
-	status, body, ok := modkit.ExecuteRaw(httpClient, service, controlRaw, http.Options{NoRedirects: true, NoClustering: true})
+	status, body, ok := executeBypassProbe(httpClient, service, controlRaw, http.Options{NoRedirects: true, NoClustering: true}, collectors, evidence.RoleControl)
 	if !ok {
 		return true // inconclusive transient error — don't suppress
 	}
@@ -842,7 +873,7 @@ func confirmDistinctFromShapeCatchAll(
 	payload, origPath string,
 	bypassStatus int,
 	bypassBody string,
-) bool {
+	collectors ...*modkit.EvidenceCollector) bool {
 	if strings.Trim(origPath, "/") == "" || !strings.Contains(payload, origPath) {
 		return true // no embedded path to randomize (root path / upper-cased) — don't suppress
 	}
@@ -851,7 +882,7 @@ func confirmDistinctFromShapeCatchAll(
 	if err != nil {
 		return true // inconclusive — don't suppress
 	}
-	status, body, ok := modkit.ExecuteRaw(httpClient, service, controlRaw, http.Options{NoRedirects: true, NoClustering: true})
+	status, body, ok := executeBypassProbe(httpClient, service, controlRaw, http.Options{NoRedirects: true, NoClustering: true}, collectors, evidence.RoleControl)
 	if !ok {
 		return true // inconclusive transient error — don't suppress
 	}
@@ -882,12 +913,12 @@ func confirmHeaderCausedChange(
 	newPath string,
 	bypassStatus int,
 	bypassBody string,
-) bool {
+	collectors ...*modkit.EvidenceCollector) bool {
 	cleanRaw, err := httpmsg.SetPath(origRaw, newPath)
 	if err != nil {
 		return true // inconclusive — don't suppress
 	}
-	status, body, ok := modkit.ExecuteRaw(httpClient, service, cleanRaw, http.Options{NoRedirects: true, NoClustering: true})
+	status, body, ok := executeBypassProbe(httpClient, service, cleanRaw, http.Options{NoRedirects: true, NoClustering: true}, collectors, evidence.RoleControl)
 	if !ok {
 		return true // inconclusive transient error — don't suppress
 	}
@@ -909,4 +940,28 @@ func (m *Module) markAndShouldContinue(urlx *urlutil.URL, scanCtx *modkit.ScanCo
 	host := urlx.Hostname()
 	_, shouldContinue := diskSet.IncrementAndCheck(host, m.limitCheckPerHost)
 	return shouldContinue
+}
+
+// executeBypassProbe keeps the same single-send/body-only comparison contract as
+// ExecuteRaw, while retaining the actual local control or replay before close.
+func executeBypassProbe(client *http.Requester, service *httpmsg.Service, raw []byte, opts http.Options, collectors []*modkit.EvidenceCollector, role evidence.Role) (int, string, bool) {
+	req, err := httpmsg.ParseRawRequest(string(raw))
+	if err != nil {
+		return 0, "", false
+	}
+	if service != nil {
+		req = req.WithService(service)
+	}
+	resp, _, err := client.Execute(req, opts)
+	if err != nil {
+		return 0, "", false
+	}
+	defer resp.Close()
+	if resp.Response() == nil {
+		return 0, "", false
+	}
+	if len(collectors) > 0 {
+		collectors[0].AddExchange(http.CaptureEvidence(resp), role, "bypass differential probe")
+	}
+	return resp.Response().StatusCode, resp.Body().String(), true
 }

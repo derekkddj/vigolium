@@ -14,6 +14,7 @@ import (
 	"github.com/samber/lo"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -425,6 +426,7 @@ scan:
 						Severity:    severity.Medium,
 					},
 				})
+				modkit.SetPrimaryEvidence(results[len(results)-1], http.CaptureEvidence(resp), evidence.RoleAttack, "matched redirect probe")
 				match = true
 				return false
 			}
@@ -470,6 +472,7 @@ scan:
 						Severity:    severity.Medium,
 					},
 				})
+				modkit.SetPrimaryEvidence(results[len(results)-1], http.CaptureEvidence(resp), evidence.RoleAttack, "matched redirect probe")
 				match = true
 				return false
 			}
@@ -554,6 +557,7 @@ func checkRedirectBasedOnParamValue(rawRequest []byte, ip httpmsg.InsertionPoint
 						Severity:    newSeverity,
 					},
 				})
+				modkit.SetPrimaryEvidence(results[len(results)-1], http.CaptureEvidence(resp), evidence.RoleAttack, "matched redirect probe")
 				match = true
 				return false
 			}

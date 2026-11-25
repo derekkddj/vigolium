@@ -172,6 +172,15 @@ func runScanRequestCmd(cmd *cobra.Command, _ []string) error {
 	// installing the signal trap per request is what leaked a goroutine there.
 	ctx, stop := lightweightScanContext()
 	defer stop()
+	sess := newDirectScanSession(database.ScanNameScanRequest, inputs)
+	sess.admission = admission
+	sess.cfg = cfg
+	defer sess.close()
+	if !needsRunnerScan() {
+		if err := sess.validateBeforeSchemeProbe(ctx); err != nil {
+			return err
+		}
+	}
 
 	// No -t override and no scheme on the request line: settle the scheme from
 	// the request's own signals, else probe the target (after admission, so a
@@ -200,11 +209,9 @@ func runScanRequestCmd(cmd *cobra.Command, _ []string) error {
 		return runLightweightDryRun(cmd, inputs)
 	}
 
-	sess := newDirectScanSession(database.ScanNameScanRequest, inputs)
+	sess.targets = []string{target}
 	sess.admission = admission
-	sess.cfg = cfg
 	sess.schemeSource = schemeSource
-	defer sess.close()
 
 	// Route through the Runner when output/persistence/phase flags are in play;
 	// otherwise take the fast in-memory direct path. An input that got no answer

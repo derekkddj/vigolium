@@ -59,7 +59,8 @@ func TestProcessResults_PersistsReplayContext(t *testing.T) {
 	ctx := context.Background()
 
 	_, rr := makeTestItem("example.com", "/x?a=1&b=2", "<html>body</html>")
-	const originUUID = "origin-record-uuid"
+	originUUID, err := e.repo.SaveRecord(ctx, rr, "spidering", e.projectUUID)
+	require.NoError(t, err)
 	e.caches.requestUUIDs.Store(rr.Request().ID(), originUUID)
 
 	pts, err := httpmsg.CreateAllInsertionPoints(rr.Request().Raw(), true)

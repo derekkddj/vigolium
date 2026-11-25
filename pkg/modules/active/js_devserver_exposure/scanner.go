@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -66,9 +67,15 @@ func (m *Module) ScanPerRequest(
 
 	// Fingerprint the 404 response (body hash + status) so probes can tell a
 	// distinctive dev-server response from the host's generic answer to any path.
-	notFoundHash, notFoundStatus := fingerprint404(ctx, httpClient)
+	controlProof := modkit.NewEvidenceCollector()
+	notFoundHash, notFoundStatus := fingerprint404(ctx, httpClient, controlProof)
 
 	var results []*output.ResultEvent
+	defer func() {
+		for _, finding := range results {
+			modkit.AppendEvidence(finding, controlProof)
+		}
+	}()
 	target := ctx.Target()
 
 	for _, probe := range devProbes {
@@ -104,7 +111,7 @@ func (m *Module) ScanPerRequest(
 		// that way (a blanket 204/200 catch-all) and the match proves nothing.
 		if probe.expectedStatus > 0 {
 			if statusCode == probe.expectedStatus && statusCode != notFoundStatus {
-				results = append(results, buildResult(target, host, probe, string(probeRaw), resp.FullResponseString()))
+				results = append(results, buildResult(target, host, probe, string(probeRaw), resp.FullResponseString(), http.CaptureEvidence(resp)))
 			}
 			resp.Close()
 			continue
@@ -150,7 +157,7 @@ func (m *Module) ScanPerRequest(
 
 		// Check expected Content-Type
 		if probe.expectedCT != "" && strings.Contains(strings.ToLower(ct), probe.expectedCT) {
-			results = append(results, buildResult(target, host, probe, string(probeRaw), resp.FullResponseString()))
+			results = append(results, buildResult(target, host, probe, string(probeRaw), resp.FullResponseString(), http.CaptureEvidence(resp)))
 			resp.Close()
 			continue
 		}
@@ -165,7 +172,7 @@ func (m *Module) ScanPerRequest(
 		if len(probe.markers) > 0 {
 			for _, marker := range probe.markers {
 				if strings.Contains(body, marker) {
-					results = append(results, buildResult(target, host, probe, string(probeRaw), resp.FullResponseString()))
+					results = append(results, buildResult(target, host, probe, string(probeRaw), resp.FullResponseString(), http.CaptureEvidence(resp)))
 					break
 				}
 			}
@@ -181,7 +188,7 @@ func (m *Module) ScanPerRequest(
 // unknown path: the body hash (to drop probes that echo the 404 page) and the
 // status code (to drop status-only probes whose expected status the host returns
 // for every path). Returns ("", 0) on any error.
-func fingerprint404(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) (hash string, status int) {
+func fingerprint404(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, collectors ...*modkit.EvidenceCollector) (hash string, status int) {
 	notFoundPath := "/vigolium-nonexistent-path-404-check"
 	raw, err := httpmsg.SetPath(ctx.Request().Raw(), notFoundPath)
 	if err != nil {
@@ -195,9 +202,17 @@ func fingerprint404(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester
 
 	resp, _, err := httpClient.Execute(req, http.Options{})
 	if err != nil {
+		x := http.CaptureFailureEvidence(err)
+		for _, proof := range collectors {
+			proof.AddExchange(x, evidence.RoleControl, "known-missing path fingerprint")
+		}
 		return "", 0
 	}
 	defer resp.Close()
+	x := http.CaptureEvidence(resp)
+	for _, proof := range collectors {
+		proof.AddExchange(x, evidence.RoleControl, "known-missing path fingerprint")
+	}
 
 	if resp.Response() != nil {
 		status = resp.Response().StatusCode
@@ -205,7 +220,12 @@ func fingerprint404(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester
 	return utils.Sha1(resp.Body().String()), status
 }
 
-func buildResult(target, host string, probe devProbe, request, response string) *output.ResultEvent {
+func buildResult(target, host string, probe devProbe, request, response string, exchanges ...*evidence.Exchange) (finding *output.ResultEvent) {
+	defer func() {
+		if len(exchanges) > 0 {
+			modkit.SetPrimaryEvidence(finding, exchanges[0], evidence.RoleObservation, "matched dev-server endpoint")
+		}
+	}()
 	return &output.ResultEvent{
 		ModuleID: ModuleID,
 		Host:     host,

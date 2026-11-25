@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"slices"
 	"strings"
@@ -344,11 +345,17 @@ func (qb *QueryBuilder) OmitBodies() *QueryBuilder {
 	return qb
 }
 
-// BuildRecordsQuery builds a query for http_records table
+// BuildRecordsQuery builds a query for http_records table. Callers that narrow
+// the projection must first ExcludeColumn("*"): Bun's Column adds to the SELECT.
 func (qb *QueryBuilder) BuildRecordsQuery() *bun.SelectQuery {
 	query := qb.db.NewSelect().Model((*HTTPRecord)(nil))
 	if qb.omitBodies {
 		query = query.ExcludeColumn(recordBodyColumns...)
+	} else if qb.db.readOnly {
+		// Full reads must also work on readonly pre-v10 archives without schema
+		// writes. Missing capture-state columns remain zero; qualify the wildcard
+		// because severity filters join findings and their record links.
+		query = query.ColumnExpr("r.*")
 	}
 
 	qb.applyFilters(query)
@@ -692,7 +699,8 @@ func NewDeleteBuilder(db *DB, filters QueryFilters) *DeleteBuilder {
 //  2. drop those records' junction rows, so the junction describes surviving
 //     evidence only;
 //  3. delete the records;
-//  4. delete the collected findings that now link to nothing.
+//  4. delete the collected findings that now link to nothing, unless they retain
+//     selected receipt associations (even when those receipt bytes are missing).
 //
 // Step 4 is scoped to the collected candidates rather than sweeping every
 // evidence-less finding, because a finding with no HTTP record is normal — audit
@@ -714,7 +722,7 @@ func (db *DeleteBuilder) DeleteRecords(ctx context.Context, dryRun bool) (int64,
 // the same transaction and rolls it back, so its counts are exact.
 func (db *DeleteBuilder) DeleteRecordsByTable(ctx context.Context, dryRun bool) (DeleteCounts, error) {
 	qb := NewQueryBuilder(db.db, db.filters)
-	query := qb.BuildRecordsQuery().Column("uuid")
+	query := qb.BuildRecordsQuery().ExcludeColumn("*").Column("uuid")
 
 	// The uuids are materialized rather than counted in SQL because the filters
 	// carry the caller's LIMIT: a COUNT(*) would report (and a subquery delete
@@ -762,13 +770,15 @@ func (db *DeleteBuilder) DeleteRecordsByTable(ctx context.Context, dryRun bool) 
 		// They go through deleteFindingsByIDsTx so their history rows go too.
 		var doomed []int64
 		for chunk := range slices.Chunk(candidateFindings, SQLChunkSize) {
-			var ids []int64
-			if err := tx.NewSelect().
-				Model((*Finding)(nil)).
-				Column("id").
+			q := tx.NewSelect().Model((*Finding)(nil)).Column("id").
 				Where("id IN (?)", bun.List(chunk)).
 				Where("NOT EXISTS (SELECT 1 FROM finding_records fr WHERE fr.finding_id = f.id)").
-				Scan(ctx, &ids); err != nil {
+				Where("NOT EXISTS (SELECT 1 FROM finding_evidence fe WHERE fe.finding_id = f.id)")
+			if db.filters.ProjectUUID != "" {
+				q = q.Where("f.project_uuid = ?", db.filters.ProjectUUID)
+			}
+			var ids []int64
+			if err := q.Scan(ctx, &ids); err != nil {
 				return fmt.Errorf("failed to find findings left without evidence: %w", err)
 			}
 			doomed = append(doomed, ids...)
@@ -784,8 +794,11 @@ func (db *DeleteBuilder) DeleteRecordsByTable(ctx context.Context, dryRun bool) 
 	return counts, nil
 }
 
-// DeleteOrphans deletes orphaned findings (findings where none of the
-// http_record_uuids exist in http_records).
+// DeleteOrphans deletes findings with neither live legacy records nor selected
+// evidence associations. An association remains evidence even when its raw
+// receipt is unavailable; retention loss must not erase the finding manifest.
+// Raw receipts remain retained until explicit evidence-table or full-store
+// cleanup.
 func (db *DeleteBuilder) DeleteOrphans(ctx context.Context, dryRun bool) (int64, error) {
 	counts, err := db.DeleteOrphansByTable(ctx, dryRun)
 	return counts["findings"], err
@@ -799,7 +812,7 @@ func (db *DeleteBuilder) DeleteOrphans(ctx context.Context, dryRun bool) (int64,
 // cross-project leak the scoped delete paths exist to prevent. With no project
 // filter set the behavior is unchanged and the whole store is swept.
 func (db *DeleteBuilder) DeleteOrphansByTable(ctx context.Context, dryRun bool) (DeleteCounts, error) {
-	orphanCondition := "NOT EXISTS (SELECT 1 FROM finding_records fr INNER JOIN http_records r ON r.uuid = fr.record_uuid WHERE fr.finding_id = f.id)"
+	orphanCondition := "NOT EXISTS (SELECT 1 FROM finding_records fr INNER JOIN http_records r ON r.uuid = fr.record_uuid AND r.project_uuid = f.project_uuid WHERE fr.finding_id = f.id) AND NOT EXISTS (SELECT 1 FROM finding_evidence fe WHERE fe.finding_id = f.id)"
 
 	counts := DeleteCounts{}
 	err := db.countedTx(ctx, counts, dryRun, func(ctx context.Context, tx bun.Tx) error {
@@ -881,11 +894,16 @@ var AllowedCleanTables = map[string]cleanableTable{
 	"record_tags":              {SQLName: "record_tags"},
 	"findings":                 {SQLName: "findings", CascadeFirst: findingChildTables},
 	"finding_records":          {SQLName: "finding_records"},
+	"finding_evidence":         {SQLName: "finding_evidence"},
+	"evidence_exchanges":       {SQLName: "evidence_exchanges"},
+	"analysis_artifacts":       {SQLName: "analysis_artifacts"},
+	"host_observations":        {SQLName: "host_observations"},
 	"finding_observations":     {SQLName: "finding_observations"},
 	"finding_status_events":    {SQLName: "finding_status_events"},
 	"finding_hash_aliases":     {SQLName: "finding_hash_aliases"},
 	"oast_payloads":            {SQLName: "oast_payloads"},
 	"oast_sessions":            {SQLName: "oast_sessions"},
+	"oast_planting_receipts":   {SQLName: "oast_planting_receipts"},
 	"scans":                    {SQLName: "scans"},
 	"agentic_scans":            {SQLName: "agentic_scans", CascadeFirst: []string{"agent_sections", "agent_finding_candidates"}},
 	"agent_sections":           {SQLName: "agent_sections"},
@@ -896,7 +914,31 @@ var AllowedCleanTables = map[string]cleanableTable{
 	"scopes":                   {SQLName: "scopes"},
 }
 
-// DeleteTable deletes all rows from a specific table.
+// cleanTableScope is shared by counting and deletion. Association tables have
+// no project column and must be scoped through their still-existing finding.
+// Unknown ownership fails closed instead of silently sweeping another project.
+func cleanTableScope(table, projectUUID string) (string, []interface{}, error) {
+	if projectUUID == "" {
+		return "", nil, nil
+	}
+	switch table {
+	case "finding_records", "finding_evidence":
+		return " WHERE finding_id IN (SELECT id FROM findings WHERE project_uuid = ?)", []interface{}{projectUUID}, nil
+	case "record_tags":
+		// Caller labels have no project column; they belong to their record.
+		return " WHERE record_uuid IN (SELECT uuid FROM http_records WHERE project_uuid = ?)", []interface{}{projectUUID}, nil
+	default:
+		if !slices.Contains(projectOwnedTables, table) {
+			return "", nil, fmt.Errorf("table %q has no known project cleanup scope", table)
+		}
+		return " WHERE project_uuid = ?", []interface{}{projectUUID}, nil
+	}
+}
+
+// DeleteTable deletes rows in the selected project (or the entire table when
+// unscoped). Findings lose their associations, but raw receipts are retained
+// until explicit evidence_exchanges cleanup. Raw cleanup leaves associations
+// intact so readers can report unavailable receipts rather than invented bytes.
 func (db *DeleteBuilder) DeleteTable(ctx context.Context, tableName string, dryRun bool) (int64, error) {
 	entry, ok := AllowedCleanTables[tableName]
 	if !ok {
@@ -913,16 +955,60 @@ func (db *DeleteBuilder) DeleteTableByTable(ctx context.Context, tableName strin
 	if !ok {
 		return nil, fmt.Errorf("table %q is not allowed for cleaning", tableName)
 	}
+	where, args, err := cleanTableScope(entry.SQLName, db.filters.ProjectUUID)
+	if err != nil {
+		return nil, err
+	}
 	counts := DeleteCounts{}
-	err := db.countedTx(ctx, counts, dryRun, func(ctx context.Context, tx bun.Tx) error {
+	err = db.countedTx(ctx, counts, dryRun, func(ctx context.Context, tx bun.Tx) error {
+		if entry.SQLName == "oast_planting_receipts" {
+			// Remove unselected canonical receipts owned by the cleaned bindings.
+			// Selected evidence remains available to its findings; full/raw cleanup
+			// explicitly counts and deletes the canonical table as well.
+			q := `DELETE FROM evidence_exchanges WHERE EXISTS (
+				SELECT 1 FROM oast_planting_receipts b WHERE b.project_uuid = evidence_exchanges.project_uuid
+				AND b.exchange_id = evidence_exchanges.id`
+			if db.filters.ProjectUUID != "" {
+				q += " AND b.project_uuid = ?"
+			}
+			q += `) AND NOT EXISTS (SELECT 1 FROM finding_evidence fe JOIN findings f ON f.id = fe.finding_id
+				WHERE f.project_uuid = evidence_exchanges.project_uuid AND fe.exchange_id = evidence_exchanges.id)`
+			res, err := tx.NewRaw(q, args...).Exec(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to clean canonical OAST receipts: %w", err)
+			}
+			noteDeleted(ctx, "evidence_exchanges", res)
+		}
 		for _, dep := range entry.CascadeFirst {
-			res, err := tx.ExecContext(ctx, "DELETE FROM "+dep)
+			depWhere, depArgs, err := cleanTableScope(dep, db.filters.ProjectUUID)
+			if err != nil {
+				return err
+			}
+			// Cascades target only rows associated with the selected parents,
+			// including when no project filter was provided.
+			switch entry.SQLName {
+			case "findings":
+				depWhere = " WHERE finding_id IN (SELECT id FROM findings" + where + ")"
+				depArgs = args
+			case "http_records":
+				if depWhere == "" {
+					depWhere = " WHERE "
+				} else {
+					depWhere += " AND "
+				}
+				depWhere += "record_uuid IN (SELECT uuid FROM http_records" + where + ")"
+				depArgs = append(depArgs, args...)
+			case "agentic_scans":
+				depWhere = " WHERE agentic_scan_uuid IN (SELECT uuid FROM agentic_scans" + where + ")"
+				depArgs = args
+			}
+			res, err := tx.NewRaw("DELETE FROM "+dep+depWhere, depArgs...).Exec(ctx)
 			if err != nil {
 				return fmt.Errorf("failed to clean cascade table %s: %w", dep, err)
 			}
 			noteDeleted(ctx, dep, res)
 		}
-		res, err := tx.ExecContext(ctx, "DELETE FROM "+entry.SQLName)
+		res, err := tx.NewRaw("DELETE FROM "+entry.SQLName+where, args...).Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to delete from %s: %w", entry.SQLName, err)
 		}
@@ -941,13 +1027,18 @@ func (db *DeleteBuilder) DeleteTableByTable(ctx context.Context, tableName strin
 // allTablesDeleteOrder is the deletion order respecting dependencies.
 var allTablesDeleteOrder = []string{
 	"finding_records",
+	"finding_evidence",
 	"finding_observations",
 	"finding_status_events",
 	"finding_hash_aliases",
 	"findings",
 	"record_tags",
+	"oast_planting_receipts",
+	"evidence_exchanges",
+	"analysis_artifacts",
 	"http_records",
 	"websocket_frames",
+	"host_observations",
 	"oast_interactions",
 	"oast_payloads",
 	"oast_sessions",
@@ -962,29 +1053,44 @@ var allTablesDeleteOrder = []string{
 	"scans",
 }
 
-// DeleteAllTables deletes all data from every data table.
+// DeleteAllTables deletes all data tables, including raw receipts, within the
+// selected project. Empty ProjectUUID explicitly requests a full-store wipe.
+// Counts and deletion use identical predicates in one transaction; associations
+// are removed before findings so scoped ownership is still available.
 func (db *DeleteBuilder) DeleteAllTables(ctx context.Context, dryRun bool) (map[string]int64, error) {
 	counts := make(map[string]int64, len(allTablesDeleteOrder))
-	for _, tbl := range allTablesDeleteOrder {
-		var count int64
-		if err := db.db.NewRaw("SELECT COUNT(*) FROM "+tbl).Scan(ctx, &count); err != nil {
-			return nil, fmt.Errorf("failed to count %s: %w", tbl, err)
+	err := db.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+		for _, tbl := range allTablesDeleteOrder {
+			where, args, err := cleanTableScope(tbl, db.filters.ProjectUUID)
+			if err != nil {
+				return err
+			}
+			var count int64
+			if err := tx.NewRaw("SELECT COUNT(*) FROM "+tbl+where, args...).Scan(ctx, &count); err != nil {
+				return fmt.Errorf("failed to count %s: %w", tbl, err)
+			}
+			counts[tbl] = count
 		}
-		counts[tbl] = count
-	}
-
-	if dryRun {
-		return counts, nil
-	}
-
-	for _, tbl := range allTablesDeleteOrder {
-		if counts[tbl] > 0 {
-			if _, err := db.db.ExecContext(ctx, "DELETE FROM "+tbl); err != nil {
-				return nil, fmt.Errorf("failed to delete from %s: %w", tbl, err)
+		if dryRun {
+			return nil
+		}
+		for _, tbl := range allTablesDeleteOrder {
+			if counts[tbl] == 0 {
+				continue
+			}
+			where, args, err := cleanTableScope(tbl, db.filters.ProjectUUID)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.NewRaw("DELETE FROM "+tbl+where, args...).Exec(ctx); err != nil {
+				return fmt.Errorf("failed to delete from %s: %w", tbl, err)
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-
 	return counts, nil
 }
 
@@ -1033,6 +1139,9 @@ func (fqb *FindingsQueryBuilder) Execute(ctx context.Context) ([]*Finding, error
 	if err := query.Scan(ctx, &findings); err != nil {
 		return nil, err
 	}
+	if err := NewRepository(fqb.db).HydrateFindingEvidenceManifest(ctx, findings); err != nil {
+		return nil, err
+	}
 	return findings, nil
 }
 
@@ -1056,6 +1165,9 @@ func (fqb *FindingsQueryBuilder) ExecuteWithCount(ctx context.Context) ([]*Findi
 
 	count, err := query.ScanAndCount(ctx)
 	if err != nil {
+		return nil, 0, err
+	}
+	if err := NewRepository(fqb.db).HydrateFindingEvidenceManifest(ctx, findings); err != nil {
 		return nil, 0, err
 	}
 	return findings, int64(count), nil

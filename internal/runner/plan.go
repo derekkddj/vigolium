@@ -748,7 +748,7 @@ func (r *Runner) resolveRunPlan(ctx context.Context, infra *phaseInfra, admissio
 // event of the stream: the CLI's scan.started is the first, and nothing in the
 // runner emits before this) and stores it on the scan row. A plan that cannot
 // be resolved is logged and skipped: it describes the scan, it is not the scan.
-func (r *Runner) announcePlan(ctx context.Context, infra *phaseInfra, admission *TargetAdmission) {
+func (r *Runner) announcePlan(ctx context.Context, infra *phaseInfra, admission *TargetAdmission, scope nativeScanScope) {
 	plan, err := r.resolveRunPlan(ctx, infra, admission)
 	if err != nil {
 		zap.L().Warn("Failed to resolve the scan plan", zap.Error(err))
@@ -764,7 +764,7 @@ func (r *Runner) announcePlan(ctx context.Context, infra *phaseInfra, admission 
 		zap.L().Warn("Failed to encode the scan plan", zap.Error(err))
 		return
 	}
-	if err := r.repository.UpdateScanPartial(ctx, &database.Scan{UUID: infra.scanUUID, Plan: raw}); err != nil {
+	if err := scope.updateMetadata(ctx, &database.Scan{UUID: infra.scanUUID, Plan: raw}); err != nil {
 		zap.L().Warn("Failed to store the scan plan on the scan row", zap.Error(err))
 	}
 }

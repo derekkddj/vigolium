@@ -92,7 +92,7 @@ func (m *Module) probePanel(
 			continue
 		}
 		if isPanel(ctx, p, path, res) {
-			if fin := m.confirm(ctx, httpClient, scanCtx, p, path, baseURL, ""); fin != nil {
+			if fin := m.confirm(ctx, httpClient, scanCtx, p, path, baseURL, "", aem.NewProof(res)); fin != nil {
 				return fin
 			}
 			continue
@@ -101,7 +101,9 @@ func (m *Module) probePanel(
 			for _, bp := range aem.TraversalBypasses(path) {
 				bres := aem.Get(ctx, httpClient, bp, nil)
 				if bres.OK && isPanel(ctx, p, bp, bres) {
-					if fin := m.confirm(ctx, httpClient, scanCtx, p, bp, baseURL, path); fin != nil {
+					proof := aem.NewProof(bres)
+					proof.Control(res)
+					if fin := m.confirm(ctx, httpClient, scanCtx, p, bp, baseURL, path, proof); fin != nil {
 						return fin
 					}
 				}
@@ -136,6 +138,7 @@ func (m *Module) confirm(
 	scanCtx *modkit.ScanContext,
 	p panel,
 	requestedPath, baseURL, directPath string,
+	proof *aem.Proof,
 ) *output.ResultEvent {
 	match := func(r aem.ProbeResult) bool {
 		if r.Status != 200 {
@@ -147,18 +150,21 @@ func (m *Module) confirm(
 
 	// A guaranteed-nonexistent sibling under the same directory that serves the
 	// same markers means a sub-directory catch-all, not a real panel.
-	if modkit.SiblingServesAnyMarker(scanCtx, ctx, httpClient, requestedPath, p.markers[0]) {
+	guardEvidence := modkit.NewEvidenceCollector()
+	if modkit.SiblingServesAnyMarkerWithEvidence(scanCtx, ctx, httpClient, requestedPath, p.markers[0], guardEvidence) {
 		return nil
 	}
 	// The panel must serve its identifying markers on every re-fetch.
-	if !aem.ReproduceMarker(ctx, httpClient, requestedPath, reproduceRounds, match) {
+	if !aem.ReproduceMarker(ctx, httpClient, requestedPath, reproduceRounds, match, proof) {
 		return nil
 	}
 
-	return m.buildFinding(p, requestedPath, baseURL, directPath)
+	result := m.buildFinding(p, requestedPath, baseURL, directPath, proof)
+	modkit.AppendEvidence(result, guardEvidence)
+	return result
 }
 
-func (m *Module) buildFinding(p panel, requestedPath, baseURL, directPath string) *output.ResultEvent {
+func (m *Module) buildFinding(p panel, requestedPath, baseURL, directPath string, proof *aem.Proof) *output.ResultEvent {
 	matchedURL := baseURL + requestedPath
 
 	tags := append([]string{"aem", "adobe"}, p.tags...)
@@ -191,5 +197,5 @@ func (m *Module) buildFinding(p panel, requestedPath, baseURL, directPath string
 	if directPath != "" && directPath != requestedPath {
 		modkit.AnnotatePathBypassFinding(res, requestedPath)
 	}
-	return res
+	return proof.Observation(res)
 }

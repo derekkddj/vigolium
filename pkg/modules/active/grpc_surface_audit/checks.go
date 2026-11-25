@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	urlutil "github.com/projectdiscovery/utils/url"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra/grpcweb"
@@ -54,7 +55,7 @@ func (m *Module) checkReflectionHealth(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	u *urlutil.URL,
-) *output.ResultEvent {
+) (finding *output.ResultEvent) {
 	for _, svc := range reflectionHealthPaths {
 		// Build the framed probe once, then execute it twice for the stability check
 		// (both probes are byte-identical — there is no per-request nonce).
@@ -81,6 +82,7 @@ func (m *Module) checkReflectionHealth(
 			catalog = m.reflectionCatalog(ctx, httpClient, svc.path)
 		}
 		ev := &output.ResultEvent{
+			Evidence:         []evidence.Entry{evidence.Select(p2.exchange, evidence.RoleConfirmation, false, "service-presence replay")},
 			ModuleID:         ModuleID,
 			Host:             u.Host,
 			URL:              endpoint,
@@ -119,6 +121,7 @@ func (m *Module) checkReflectionHealth(
 			ev.Metadata["method_count"] = methods
 			ev.Info.Description += fmt.Sprintf(" Reflection listed %d service(s) and %d method(s); metadata.services holds the catalog.", len(catalog), methods)
 		}
+		modkit.SetPrimaryEvidence(ev, p1.exchange, evidence.RoleObservation, "gRPC-Web service-presence probe")
 		return ev
 	}
 	return nil
@@ -194,8 +197,9 @@ func (m *Module) reflectionCall(ctx *httpmsg.HttpRequestResponse, httpClient *ht
 
 // probeResult is a single reflection/health existence verdict.
 type probeResult struct {
-	present bool
-	status  string // grpc-status observed ("" when derived from HTTP 404)
+	exchange *evidence.Exchange
+	present  bool
+	status   string // grpc-status observed ("" when derived from HTTP 404)
 }
 
 // probeOnce executes one pre-built framed probe and classifies service presence.
@@ -223,7 +227,7 @@ func (m *Module) probeOnce(
 	}
 	// Anything else (OK, INVALID_ARGUMENT, INTERNAL, ...) means the service IS
 	// registered and answered → PRESENT.
-	return probeResult{present: true, status: res.grpcStatus}, true
+	return probeResult{present: true, status: res.grpcStatus, exchange: res.exchange}, true
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +249,7 @@ func (m *Module) checkMissingAuthz(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	u *urlutil.URL,
-) *output.ResultEvent {
+) (finding *output.ResultEvent) {
 	// Only touch RPC-shaped paths.
 	if !grpcweb.IsRPCPath(u.Path) {
 		return nil
@@ -320,9 +324,9 @@ func (m *Module) checkMissingAuthz(
 		na1.dataHash == na2.dataHash
 
 	ev := modkit.NewEvidenceCollector()
-	ev.Add("authed-baseline", base1.rawReq, base1.rawResp)
-	ev.Add("no-auth round 1", na1.rawReq, na1.rawResp)
-	ev.Add("no-auth round 2", na2.rawReq, na2.rawResp)
+	ev.AddExchange(base1.exchange, evidence.RoleBaseline, "authed-baseline")
+	ev.AddExchange(base2.exchange, evidence.RoleBaseline, "authed-baseline replay")
+	ev.AddExchange(na2.exchange, evidence.RoleConfirmation, "no-auth round 2")
 
 	// Optional, self-disabling corroboration: replay through any configured
 	// lower-privilege identity and attach the result as extra evidence. No-op when
@@ -338,7 +342,7 @@ func (m *Module) checkMissingAuthz(
 				label = "compare: " + labels[i]
 			}
 			if res, cok := m.executeRaw(ctx, c, noAuthRaw); cok {
-				ev.Add(label, res.rawReq, res.rawResp)
+				ev.AddExchange(res.exchange, evidence.RoleConfirmation, label)
 			}
 		}
 	}
@@ -352,6 +356,9 @@ func (m *Module) checkMissingAuthz(
 		desc = "An idempotent gRPC-Web read method returns the SAME substantive data as the authenticated baseline (byte-identical message frames) after the Authorization and Cookie headers are removed, reproduced across multiple rounds. The method enforces no authorization."
 	}
 
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, na1.exchange, evidence.RoleAttack, "credential-stripped gRPC-Web replay")
+	}()
 	return &output.ResultEvent{
 		ModuleID:           ModuleID,
 		Host:               u.Host,
@@ -360,6 +367,7 @@ func (m *Module) checkMissingAuthz(
 		Request:            na1.rawReq,
 		Response:           na1.rawResp,
 		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
 		FuzzingParameter:   u.Path,
 		ExtractedResults: []string{
 			fmt.Sprintf("RPC %s returns grpc-status 0 with %d bytes after removing Authorization and Cookie", u.Path, na1.dataLen),

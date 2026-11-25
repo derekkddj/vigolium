@@ -4,11 +4,15 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
+	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/modules/shared/diffscan"
 )
 
 // finding represents a detected Nginx path escape vulnerability.
 type finding struct {
+	Primary      *evidence.Exchange
+	Context      *modkit.EvidenceCollector
 	ProbeInfo    *ProbeInfo
 	BreakAttack  *diffscan.Attack
 	EscapeAttack *diffscan.Attack

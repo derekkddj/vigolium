@@ -30,5 +30,12 @@ func AuraMode(body string) (mode string, ok bool) {
 // disables clustering), so a caller can invoke it across independent rounds for
 // confirmation. ok is false when no page yields an Aura mode marker.
 func HarvestAuraMode(ctx *httpmsg.HttpRequestResponse, client *http.Requester) (mode string, ok bool) {
+	res := HarvestAuraModeCapture(ctx, client)
+	return res.Value, res.OK
+}
+
+// HarvestAuraModeCapture returns the observed mode and its owned page receipt.
+// The tuple API above remains compatible for callers that need only the value.
+func HarvestAuraModeCapture(ctx *httpmsg.HttpRequestResponse, client *http.Requester) HarvestResult {
 	return harvestLandingPages(ctx, client, AuraMode)
 }

@@ -10,6 +10,7 @@ import (
 	httputil "github.com/projectdiscovery/utils/http"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	receipt "github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -181,7 +182,7 @@ func (m *Module) probeEndpoint(
 	fp *notFoundFingerprint,
 	scanCtx *modkit.ScanContext,
 	host string,
-) *output.ResultEvent {
+) (finding *output.ResultEvent) {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), p.method)
 	if err != nil {
 		return nil
@@ -322,6 +323,10 @@ func (m *Module) probeEndpoint(
 		return nil
 	}
 
+	selectedExchange := http.CaptureEvidence(resp)
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, selectedExchange, receipt.RoleObservation, "selected endpoint observation")
+	}()
 	return &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,

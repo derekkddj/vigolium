@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -20,13 +21,14 @@ var (
 )
 
 type fetched struct {
-	status  int
-	body    string
-	ctype   string
-	nosniff bool
-	full    string
-	raw     []byte
-	ok      bool
+	exchange *evidence.Exchange
+	status   int
+	body     string
+	ctype    string
+	nosniff  bool
+	full     string
+	raw      []byte
+	ok       bool
 }
 
 // Module implements the path-relative stylesheet import (PRSSI) scanner.
@@ -120,7 +122,11 @@ func (m *Module) ScanPerRequest(
 	}
 
 	target := urlx.Scheme + "://" + urlx.Host + confusedPath
-	return []*output.ResultEvent{{
+	finding := &output.ResultEvent{
+		Evidence: []evidence.Entry{
+			evidence.Select(base.exchange, evidence.RoleBaseline, false, "fresh baseline page"),
+			evidence.Select(control.exchange, evidence.RoleControl, false, "nonexistent sibling control"),
+		},
 		URL:      target,
 		Matched:  target,
 		Request:  string(confused.raw),
@@ -140,7 +146,9 @@ func (m *Module) ScanPerRequest(
 			Confidence:  ModuleConfidence,
 			Tags:        ModuleTags,
 		},
-	}}, nil
+	}
+	modkit.SetPrimaryEvidence(finding, confused.exchange, evidence.RoleAttack, "path-info confusion probe")
+	return []*output.ResultEvent{finding}, nil
 }
 
 // get fetches path with a GET and returns a compact response view. When wantFull is
@@ -168,11 +176,12 @@ func (m *Module) get(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requeste
 		return fetched{}, false
 	}
 	f := fetched{
-		status:  r.StatusCode,
-		body:    resp.Body().String(),
-		ctype:   r.Header.Get("Content-Type"),
-		nosniff: strings.Contains(strings.ToLower(r.Header.Get("X-Content-Type-Options")), "nosniff"),
-		ok:      true,
+		exchange: http.CaptureEvidence(resp),
+		status:   r.StatusCode,
+		body:     resp.Body().String(),
+		ctype:    r.Header.Get("Content-Type"),
+		nosniff:  strings.Contains(strings.ToLower(r.Header.Get("X-Content-Type-Options")), "nosniff"),
+		ok:       true,
 	}
 	if wantFull {
 		f.full = resp.FullResponseString()

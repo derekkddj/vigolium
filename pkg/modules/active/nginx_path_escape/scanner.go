@@ -8,12 +8,12 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/modules/shared/diffscan"
 	"github.com/vigolium/vigolium/pkg/output"
-	"github.com/vigolium/vigolium/pkg/types/severity"
 	"github.com/vigolium/vigolium/pkg/utils"
 	"go.uber.org/zap"
 )
@@ -89,6 +89,9 @@ func (m *Module) ScanPerRequest(
 
 	diskSet := m.ds.Get(scanCtx.DedupMgr())
 
+	// Options are module-shared; enable receipts on this call's copy only.
+	diffOptions := *m.options.DiffScanOptions
+	diffOptions.CaptureEvidence = true
 	var allFindings []*finding
 
 	// Per-level probes: create a level insertion point per path level
@@ -106,7 +109,7 @@ func (m *Module) ScanPerRequest(
 			continue
 		}
 
-		inj := diffscan.NewPayloadInjector(modReq, ip, httpService, httpClient, m.options.DiffScanOptions)
+		inj := diffscan.NewPayloadInjector(modReq, ip, httpService, httpClient, &diffOptions)
 
 		segment := ip.BaseValue()
 
@@ -132,7 +135,7 @@ func (m *Module) ScanPerRequest(
 	fullPathIP, err := createFullPathInsertionPoint(rawRequest)
 	if err == nil {
 		if diskSet == nil || !diskSet.IsSeen(urlx.Host+fullPath) {
-			fullInj := diffscan.NewPayloadInjector(rawRequest, fullPathIP, httpService, httpClient, m.options.DiffScanOptions)
+			fullInj := diffscan.NewPayloadInjector(rawRequest, fullPathIP, httpService, httpClient, &diffOptions)
 
 			fullSoftBase, err := m.buildStabilizedBaseline(fullInj, fullPath)
 			if err == nil {
@@ -159,27 +162,7 @@ func (m *Module) ScanPerRequest(
 		zap.String("url", urlx.String()),
 		zap.Int("count", len(allFindings)))
 
-	vulnPath := allFindings[0].ProbeInfo.Probe.Base
-	modifiedRaw, err := httpmsg.SetPath(rawRequest, vulnPath)
-	if err != nil {
-		modifiedRaw = rawRequest
-	}
-
-	// All findings from this module are emitted at Info severity. Diff-based
-	// path-escape detection compares response fingerprints between a baseline
-	// and escape payloads, a noisy false-positive-prone heuristic, so it is
-	// surfaced as an informational lead for a human to confirm. The per-probe
-	// severity remains in the report body for triage context.
-	return []*output.ResultEvent{{
-		URL:              urlx.String(),
-		Host:             urlx.Host,
-		Request:          string(modifiedRaw),
-		FuzzingParameter: "PATH",
-		Info: output.Info{
-			Severity:    severity.Info,
-			Description: report,
-		},
-	}}, nil
+	return []*output.ResultEvent{buildEvidenceResult(urlx.String(), urlx.Host, report, allFindings)}, nil
 }
 
 // testPathLevel tests all per-level probes (N1-N6, N8-N15, N17-N18) at a single path level.
@@ -712,7 +695,24 @@ func (m *Module) validateAttacks(
 		zap.Int("escape_status", escapeAttack.FirstSnapshot.StatusCode),
 	)
 
+	primaryAttack, otherAttack := escapeAttack, breakAttack
+	if traversalLevels == 0 {
+		primaryAttack, otherAttack = breakAttack, escapeAttack
+	}
+	context := modkit.NewEvidenceCollector()
+	context.AddExchange(otherAttack.FirstSnapshot.Exchange, evidence.RoleAttack, "Opposite side of validated break/escape differential")
+	addSnapshotContext(context, softBase, evidence.RoleControl, "Canonical path control")
+	addSnapshotContext(context, errorBase, evidence.RoleControl, "Nonexistent path control")
+	addSnapshotContext(context, parentBaselines[traversalLevels], evidence.RoleControl, "Reached parent-path comparison")
+	for _, receipt := range primaryAttack.ConfirmationReceipts {
+		context.AddExchange(receipt, evidence.RoleConfirmation, "Reached-resource reproduction")
+	}
+	for _, receipt := range otherAttack.ConfirmationReceipts {
+		context.AddExchange(receipt, evidence.RoleConfirmation, "Differential counterpart reproduction")
+	}
 	return &finding{
+		Primary: primaryAttack.FirstSnapshot.Exchange,
+		Context: context,
 		ProbeInfo: &ProbeInfo{
 			ID:              id,
 			Name:            name,

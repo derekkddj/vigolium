@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -212,13 +213,15 @@ func (m *Module) ScanPerInsertionPoint(
 
 	// Baseline: prefer the captured response; otherwise fetch the endpoint with the
 	// original value. A blocked/empty baseline is unusable — fail closed.
-	baselineBody, blocked, ok := m.send(ctx, ip, httpClient, base)
+	var baselineReceipt *evidence.Exchange
+	baselineBody, blocked, ok := m.send(ctx, ip, httpClient, base, &baselineReceipt)
 	if !ok || blocked {
 		return nil, nil
 	}
 	if bb := strings.TrimSpace(baselineBody); bb == "" {
 		if ctx.Response() != nil {
 			baselineBody = ctx.Response().BodyToString()
+			baselineReceipt = nil // comparison bytes came from the supplied input
 		}
 	}
 
@@ -231,7 +234,7 @@ func (m *Module) ScanPerInsertionPoint(
 
 	// Leg 1: error-based (strongest signal). Not gated on XML/XPath context — an
 	// engine-specific XPath error string is self-corroborating wherever it surfaces.
-	if res := m.scanErrorBased(ctx, ip, httpClient, urlx.String(), base, baselineBody); res != nil {
+	if res := m.scanErrorBased(ctx, ip, httpClient, urlx.String(), base, baselineBody, baselineReceipt); res != nil {
 		return []*output.ResultEvent{res}, nil
 	}
 
@@ -264,12 +267,14 @@ func (m *Module) scanErrorBased(
 	ip httpmsg.InsertionPoint,
 	httpClient *http.Requester,
 	target, base, baselineBody string,
+	baselines ...*evidence.Exchange,
 ) *output.ResultEvent {
 	baseHasErr := xpathErrorRe.MatchString(baselineBody)
 
 	for _, brk := range errorBreakers {
 		value := base + brk
-		body, blocked, ok := m.send(ctx, ip, httpClient, value)
+		var probeReceipt, controlReceipt *evidence.Exchange
+		body, blocked, ok := m.send(ctx, ip, httpClient, value, &probeReceipt)
 		if !ok || blocked {
 			continue
 		}
@@ -280,7 +285,7 @@ func (m *Module) scanErrorBased(
 		}
 		// Negative control: a benign value must NOT leave the error present, else
 		// it's a static error page, not injection.
-		ctrlBody, ctrlBlocked, ctrlOK := m.send(ctx, ip, httpClient, base+"vig")
+		ctrlBody, ctrlBlocked, ctrlOK := m.send(ctx, ip, httpClient, base+"vig", &controlReceipt)
 		if !ctrlOK || ctrlBlocked {
 			continue
 		}
@@ -288,9 +293,19 @@ func (m *Module) scanErrorBased(
 			continue
 		}
 
-		return m.result(ctx, target, ip,
+		result := m.result(ctx, target, ip,
 			fmt.Sprintf("A syntax-breaking payload (%q) in parameter %q leaked an XPath engine error (%q) that is absent from the baseline and from a benign control request, indicating the value is concatenated into an XPath/XQuery expression.", value, ip.Name(), hit),
 			[]string{"payload=" + value, "xpath_error=" + hit})
+		ev := modkit.NewEvidenceCollector()
+		if len(baselines) > 0 && baselines[0] != nil {
+			ev.AddExchange(baselines[0], evidence.RoleBaseline, "unmodified XPath value")
+		} else {
+			ev.AddBaseline("input baseline", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
+		}
+		ev.AddExchange(controlReceipt, evidence.RoleControl, "benign XPath value")
+		result.Evidence, result.AdditionalEvidence = ev.Evidence(), ev.Entries()
+		modkit.SetPrimaryEvidence(result, probeReceipt, evidence.RoleAttack, "XPath syntax-breaking payload")
+		return result
 	}
 	return nil
 }
@@ -350,19 +365,31 @@ func (m *Module) scanBoolean(
 	// Boolean matrix: three independent always-true and three always-false payloads.
 	// Every probe must be a usable 2xx; then require agreement within each branch and
 	// a real true/false differential.
+	ev := modkit.NewEvidenceCollector()
+	var primary *evidence.Exchange
 	trueBodies := make([]string, 0, len(pairs))
 	falseBodies := make([]string, 0, len(pairs))
 	for _, p := range pairs {
-		tb, tok := m.sendUsable(ctx, ip, httpClient, base+p.truthy)
+		var receipt *evidence.Exchange
+		tb, tok := m.sendUsable(ctx, ip, httpClient, base+p.truthy, &receipt)
 		if !tok {
 			return nil
+		}
+		if primary == nil {
+			primary = receipt
+		} else if len(trueBodies) == 1 {
+			ev.AddExchange(receipt, evidence.RoleConfirmation, "independent TRUE operands")
 		}
 		trueBodies = append(trueBodies, tb)
 	}
 	for _, p := range pairs {
-		fb, fok := m.sendUsable(ctx, ip, httpClient, base+p.falsy)
+		var receipt *evidence.Exchange
+		fb, fok := m.sendUsable(ctx, ip, httpClient, base+p.falsy, &receipt)
 		if !fok {
 			return nil
+		}
+		if len(falseBodies) == 0 {
+			ev.AddExchange(receipt, evidence.RoleControl, "independent FALSE operands")
 		}
 		falseBodies = append(falseBodies, fb)
 	}
@@ -385,8 +412,11 @@ func (m *Module) scanBoolean(
 	// Many login/workflow endpoints instead flap between a 200 page and a 302 redirect
 	// (rotating session tokens) independent of our input; on those the differential
 	// above is that flapping, not injected logic — fail closed.
-	b1, bok1 := m.sendUsable(ctx, ip, httpClient, base)
-	b2, bok2 := m.sendUsable(ctx, ip, httpClient, base)
+	var baselineReceipt, baselineReplay *evidence.Exchange
+	b1, bok1 := m.sendUsable(ctx, ip, httpClient, base, &baselineReceipt)
+	b2, bok2 := m.sendUsable(ctx, ip, httpClient, base, &baselineReplay)
+	ev.AddExchange(baselineReceipt, evidence.RoleBaseline, "unmodified XPath value")
+	ev.AddExchange(baselineReplay, evidence.RoleConfirmation, "baseline determinism replay")
 	if !bok1 || !bok2 || !modkit.BodiesSimilar(b1, b2) {
 		return nil
 	}
@@ -397,9 +427,11 @@ func (m *Module) scanBoolean(
 	// blocked/failed/non-2xx inert probe (ok=false) proves nothing and is ignored
 	// (fails open, so a transient block on a control cannot manufacture a rejection).
 	for _, inert := range inertControls {
-		if ib, iok := m.sendUsable(ctx, ip, httpClient, base+inert); iok && modkit.BodiesSimilarSig(truePageSig, ib) {
+		var receipt *evidence.Exchange
+		if ib, iok := m.sendUsable(ctx, ip, httpClient, base+inert, &receipt); iok && modkit.BodiesSimilarSig(truePageSig, ib) {
 			return nil
 		}
+		ev.AddExchange(receipt, evidence.RoleControl, "inert XPath condition")
 	}
 
 	// Engine discriminator (XPath vs SQL), multi-pattern and multi-round. Everything
@@ -411,17 +443,20 @@ func (m *Module) scanBoolean(
 	// functions reproduce it) and a non-true page (always-false functions do not). A SQL
 	// engine raises a syntax error on these functions and satisfies neither round, so it
 	// is rejected; a genuine XPath sink satisfies every round.
-	if !m.confirmXPathFunctionOracle(ctx, ip, httpClient, base, truePageSig, funcRounds) {
+	if !m.confirmXPathFunctionOracle(ctx, ip, httpClient, base, truePageSig, funcRounds, ev) {
 		return nil
 	}
 
-	return m.result(ctx, target, ip,
+	result := m.result(ctx, target, ip,
 		fmt.Sprintf("Parameter %q behaves as an XPath boolean oracle: three independent always-true payloads produced matching responses, three independent always-false payloads produced a different matching response, the true/false responses differ, two symmetric inert controls (OR-false, AND-true) did not reproduce the true page, and two rounds of XPath core-function controls (string-length, local-name, count, normalize-space, boolean) — which a SQL boolean oracle cannot satisfy — drove both the true and the non-true page, ruling out SQL/other-engine injection. The injected boolean logic controls the query result.", ip.Name()),
 		[]string{
 			"true_payload=" + base + pairs[0].truthy,
 			"false_payload=" + base + pairs[0].falsy,
 			"xpath_function_confirmed=" + base + funcRounds[0].truthy[0],
 		})
+	result.Evidence, result.AdditionalEvidence = ev.Evidence(), ev.Entries()
+	modkit.SetPrimaryEvidence(result, primary, evidence.RoleAttack, "TRUE XPath predicate")
+	return result
 }
 
 // confirmXPathFunctionOracle runs the multi-pattern, multi-round engine discriminator.
@@ -440,16 +475,27 @@ func (m *Module) confirmXPathFunctionOracle(
 	base string,
 	truePageSig modkit.ResponseSignature,
 	rounds []xpathFuncRound,
+	collectors ...*modkit.EvidenceCollector,
 ) bool {
+	var ev *modkit.EvidenceCollector
+	if len(collectors) > 0 {
+		ev = collectors[0]
+	}
 	for _, round := range rounds {
-		for _, t := range round.truthy {
-			body, ok := m.sendUsable(ctx, ip, httpClient, base+t)
+		for i, t := range round.truthy {
+			var receipt *evidence.Exchange
+			body, ok := m.sendUsable(ctx, ip, httpClient, base+t, &receipt)
+			if i == 0 {
+				ev.AddExchange(receipt, evidence.RoleConfirmation, "TRUE XPath core function")
+			}
 			if !ok || !modkit.BodiesSimilarSig(truePageSig, body) {
 				return false
 			}
 		}
 		for _, f := range round.falsy {
-			body, ok := m.sendUsable(ctx, ip, httpClient, base+f)
+			var receipt *evidence.Exchange
+			body, ok := m.sendUsable(ctx, ip, httpClient, base+f, &receipt)
+			ev.AddExchange(receipt, evidence.RoleControl, "FALSE XPath core function")
 			if !ok || modkit.BodiesSimilarSig(truePageSig, body) {
 				return false
 			}
@@ -490,6 +536,7 @@ func (m *Module) sendStatus(
 	ip httpmsg.InsertionPoint,
 	httpClient *http.Requester,
 	value string,
+	receiptOut ...**evidence.Exchange,
 ) (body string, status int, blocked bool, ok bool) {
 	raw := ip.BuildRequest([]byte(value))
 	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
@@ -498,6 +545,9 @@ func (m *Module) sendStatus(
 		return "", 0, false, false
 	}
 	defer resp.Close()
+	if len(receiptOut) > 0 && receiptOut[0] != nil {
+		*receiptOut[0] = http.CaptureEvidence(resp)
+	}
 	if infra.IsBlockedResponse(resp) {
 		return "", 0, true, true
 	}
@@ -515,8 +565,9 @@ func (m *Module) send(
 	ip httpmsg.InsertionPoint,
 	httpClient *http.Requester,
 	value string,
+	receiptOut ...**evidence.Exchange,
 ) (body string, blocked bool, ok bool) {
-	body, _, blocked, ok = m.sendStatus(ctx, ip, httpClient, value)
+	body, _, blocked, ok = m.sendStatus(ctx, ip, httpClient, value, receiptOut...)
 	return body, blocked, ok
 }
 
@@ -529,8 +580,9 @@ func (m *Module) sendUsable(
 	ip httpmsg.InsertionPoint,
 	httpClient *http.Requester,
 	value string,
+	receiptOut ...**evidence.Exchange,
 ) (string, bool) {
-	body, status, blocked, ok := m.sendStatus(ctx, ip, httpClient, value)
+	body, status, blocked, ok := m.sendStatus(ctx, ip, httpClient, value, receiptOut...)
 	return body, ok && !blocked && infra.Is2xx(status)
 }
 

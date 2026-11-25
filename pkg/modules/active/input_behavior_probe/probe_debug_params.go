@@ -44,7 +44,7 @@ func probeDebugParams(
 			if confirmChange(ctx, httpClient, baseline, raw, change) {
 				results = append(results, buildProbeResult(
 					urlStr, raw, resp.FullResponseString(),
-					name, "debug_param", name+"="+value, change,
+					name, "debug_param", name+"="+value, change, http.CaptureEvidence(resp),
 				))
 			}
 			resp.Close()

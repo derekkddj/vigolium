@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -95,10 +96,12 @@ func (m *Module) ScanPerRequest(
 
 	if cookielessSessRe.MatchString(urlx.String()) || cookielessSessRe.MatchString(body) {
 		results = append(results, &output.ResultEvent{
-			ModuleID: ModuleID,
-			Host:     host,
-			URL:      urlx.String(),
-			Matched:  urlx.String(),
+			// This result analyzes the input URL/body, not the ViewState probes below.
+			BaselineEvidence: true,
+			ModuleID:         ModuleID,
+			Host:             host,
+			URL:              urlx.String(),
+			Matched:          urlx.String(),
 			ExtractedResults: []string{
 				"Cookieless session token detected in URL",
 			},
@@ -186,7 +189,7 @@ func (m *Module) testMACDisabled(
 	if containsViewStateRejection(tamperedProbe.body) {
 		if containsStackTrace(tamperedProbe.body) {
 			urlx, _ := ctx.URL()
-			return &output.ResultEvent{
+			result := &output.ResultEvent{
 				ModuleID:      ModuleID,
 				Host:          urlx.Host,
 				URL:           urlx.Scheme + "://" + urlx.Host + formAction,
@@ -207,6 +210,8 @@ func (m *Module) testMACDisabled(
 					Reference:   []string{"https://learn.microsoft.com/en-us/previous-versions/aspnet/bb386448(v=vs.100)"},
 				},
 			}
+			modkit.SetPrimaryEvidence(result, tamperedProbe.exchange, evidence.RoleAttack, "selected probe")
+			return result
 		}
 		return nil
 	}
@@ -223,7 +228,7 @@ func (m *Module) testMACDisabled(
 	}
 
 	urlx, _ := ctx.URL()
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		ModuleID:           ModuleID,
 		Host:               urlx.Host,
 		URL:                urlx.Scheme + "://" + urlx.Host + formAction,
@@ -231,6 +236,7 @@ func (m *Module) testMACDisabled(
 		Request:            tamperedProbe.request,
 		Response:           tamperedProbe.response,
 		AdditionalEvidence: []string{valid.request, valid.response, malformed.request, malformed.response},
+		Evidence:           []evidence.Entry{evidence.Select(valid.exchange, evidence.RoleControl, false, "valid ViewState"), evidence.Select(malformed.exchange, evidence.RoleControl, false, "malformed ViewState")},
 		RecordKind:         output.RecordKindCandidate,
 		EvidenceGrade:      output.EvidenceGradeDifferential,
 		ExtractedResults: []string{
@@ -246,9 +252,12 @@ func (m *Module) testMACDisabled(
 			Reference:   []string{"https://learn.microsoft.com/en-us/previous-versions/aspnet/bb386448(v=vs.100)"},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, tamperedProbe.exchange, evidence.RoleAttack, "selected probe")
+	return result
 }
 
 type formProbe struct {
+	exchange *evidence.Exchange
 	status   int
 	body     string
 	request  string
@@ -286,6 +295,7 @@ func (m *Module) postForm(ctx *httpmsg.HttpRequestResponse, client *http.Request
 		body:     resp.Body().String(),
 		request:  string(modifiedRaw),
 		response: resp.FullResponseString(),
+		exchange: http.CaptureEvidence(resp),
 	}
 }
 
@@ -353,12 +363,14 @@ func eventValidationCandidate(ctx *httpmsg.HttpRequestResponse, body string) *ou
 		return nil
 	}
 	return &output.ResultEvent{
-		ModuleID:      ModuleID,
-		Host:          urlx.Host,
-		URL:           urlx.String(),
-		Matched:       urlx.String(),
-		RecordKind:    output.RecordKindCandidate,
-		EvidenceGrade: output.EvidenceGradeCandidate,
+		// Absence of the field is input configuration evidence, not probe proof.
+		BaselineEvidence: true,
+		ModuleID:         ModuleID,
+		Host:             urlx.Host,
+		URL:              urlx.String(),
+		Matched:          urlx.String(),
+		RecordKind:       output.RecordKindCandidate,
+		EvidenceGrade:    output.EvidenceGradeCandidate,
 		ExtractedResults: []string{
 			fmt.Sprintf("real_postback_target=%s", match[1]),
 			"__EVENTVALIDATION field absent",

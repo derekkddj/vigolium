@@ -101,20 +101,24 @@ func (m *Module) probeServlet(
 				continue
 			}
 			// Same-directory catch-all disproof (JSON servlets only).
-			if s.siblingGuard && modkit.SiblingPathCatchAll(scanCtx, ctx, httpClient, path, func(b string) bool {
+			guardEvidence := modkit.NewEvidenceCollector()
+			if s.siblingGuard && modkit.SiblingPathCatchAllWithEvidence(scanCtx, ctx, httpClient, path, func(b string) bool {
 				_, sok := s.eval(aem.ProbeResult{Status: 200, Body: b, ContentType: "application/json", OK: true})
 				return sok
-			}) {
+			}, guardEvidence) {
 				continue
 			}
+			proof := aem.NewProof(res)
 			// The disclosure must reproduce across independent rounds.
 			if !aem.ReproduceMarker(ctx, httpClient, path, reproduceRounds, func(r aem.ProbeResult) bool {
 				_, rok := s.eval(r)
 				return rok
-			}) {
+			}, proof) {
 				continue
 			}
-			return m.build(s, v, path, base, baseURL)
+			result := m.build(s, v, path, base, baseURL, proof)
+			modkit.AppendEvidence(result, guardEvidence)
+			return result
 		}
 	}
 	return nil
@@ -132,7 +136,7 @@ func candidatePaths(base string) []string {
 	return out
 }
 
-func (m *Module) build(s servlet, v verdict, requestedPath, base, baseURL string) *output.ResultEvent {
+func (m *Module) build(s servlet, v verdict, requestedPath, base, baseURL string, proof *aem.Proof) *output.ResultEvent {
 	matchedURL := baseURL + requestedPath
 
 	confidence := severity.Firm
@@ -168,5 +172,5 @@ func (m *Module) build(s servlet, v verdict, requestedPath, base, baseURL string
 	if requestedPath != base {
 		modkit.AnnotatePathBypassFinding(res, requestedPath)
 	}
-	return res
+	return proof.Observation(res)
 }

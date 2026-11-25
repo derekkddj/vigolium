@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -154,7 +155,7 @@ func (m *Module) probeEndpoint(
 	p probe,
 	probePath string,
 	fp *notFoundFingerprint,
-) *output.ResultEvent {
+) (finding *output.ResultEvent) {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
@@ -215,6 +216,8 @@ func (m *Module) probeEndpoint(
 		return nil
 	}
 
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(finding, guardProof) }()
 	var matchedMarkers []string
 
 	if len(p.markers) > 0 {
@@ -244,7 +247,7 @@ func (m *Module) probeEndpoint(
 		if !looksLikeRailsHealthCheck(ct, body) {
 			return nil
 		}
-		if !modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, status, []byte(body), "") {
+		if !modkit.ConfirmNotSoft404WithEvidence(scanCtx, httpClient, ctx, status, []byte(body), "", guardProof) {
 			return nil
 		}
 	}
@@ -253,13 +256,17 @@ func (m *Module) probeEndpoint(
 	// under context-path prefixes, drop the finding if a nonexistent sibling under
 	// the same parent returns the same markers (a handler that 200s every child).
 	// The markerless /up probe is already guarded by ConfirmNotSoft404 above.
-	if len(p.markers) > 0 && modkit.SiblingServesAnyMarker(scanCtx, ctx, httpClient, probePath, p.markers) {
+	if len(p.markers) > 0 && modkit.SiblingServesAnyMarkerWithEvidence(scanCtx, ctx, httpClient, probePath, p.markers, guardProof) {
 		return nil
 	}
 
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 
+	selectedExchange := http.CaptureEvidence(resp)
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, selectedExchange, evidence.RoleObservation, "selected endpoint observation")
+	}()
 	return &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,

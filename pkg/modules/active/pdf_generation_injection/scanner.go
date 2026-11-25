@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -181,6 +182,7 @@ func (m *Module) ScanPerInsertionPoint(
 					Confidence:  rp.conf,
 				},
 			}
+			modkit.SetPrimaryEvidence(event, http.CaptureEvidence(resp), evidence.RoleAttack, "PDF rendering probe")
 			resp.Close()
 			if rp.kind == output.RecordKindFinding {
 				return []*output.ResultEvent{event}, nil

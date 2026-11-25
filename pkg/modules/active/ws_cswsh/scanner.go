@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	vighttp "github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -75,6 +76,7 @@ type upgradeAttempt struct {
 	status   int
 	request  string
 	response string
+	receipt  *evidence.Exchange
 }
 
 type upgradeEvidence struct {
@@ -136,7 +138,8 @@ func (m *Module) ScanPerRequest(
 	}
 
 	legitimateOrigin := fmt.Sprintf("%s://%s", urlx.Scheme, urlx.Host)
-	if _, ok := m.confirmUpgrade(ctx, httpClient, legitimateOrigin, false, false, true); !ok {
+	baseline, ok := m.confirmUpgrade(ctx, httpClient, legitimateOrigin, false, false, true)
+	if !ok {
 		return nil, nil
 	}
 
@@ -173,7 +176,7 @@ func (m *Module) ScanPerRequest(
 	if len(accepted) == 0 {
 		return nil, nil
 	}
-	return []*output.ResultEvent{m.result(urlx.String(), posture, accepted)}, nil
+	return []*output.ResultEvent{m.result(urlx.String(), posture, accepted, baseline)}, nil
 }
 
 func inspectCredentialPosture(ctx *httpmsg.HttpRequestResponse, scanCtx *modkit.ScanContext) credentialPosture {
@@ -299,7 +302,7 @@ func (m *Module) tryUpgrade(
 	}
 	defer resp.Close()
 
-	attempt := upgradeAttempt{request: string(modified), response: resp.FullResponseString()}
+	attempt := upgradeAttempt{request: string(modified), response: resp.FullResponseString(), receipt: vighttp.CaptureEvidence(resp)}
 	if resp.Response() != nil {
 		attempt.status = resp.Response().StatusCode
 		attempt.accepted = infra.IsWebSocketHandshakeForKey(resp, key)
@@ -315,7 +318,7 @@ func newWebSocketKey() (string, error) {
 	return base64.StdEncoding.EncodeToString(nonce), nil
 }
 
-func (m *Module) result(target string, posture credentialPosture, accepted []acceptedScenario) *output.ResultEvent {
+func (m *Module) result(target string, posture credentialPosture, accepted []acceptedScenario, baselines ...upgradeEvidence) *output.ResultEvent {
 	kind := output.RecordKindObservation
 	grade := output.EvidenceGradeObservation
 	sev := severity.Info
@@ -342,8 +345,6 @@ func (m *Module) result(target string, posture credentialPosture, accepted []acc
 			grade = output.EvidenceGradeDifferential
 			sev = severity.Medium
 			name = "Credential-Dependent WebSocket Origin Bypass Candidate"
-			control := scenario.credentialControl
-			credentialControl = &control
 		}
 		if scenario.browserConfirmed {
 			rank = 3
@@ -356,6 +357,11 @@ func (m *Module) result(target string, posture credentialPosture, accepted []acc
 		if rank > primaryRank {
 			primary = scenario.evidence
 			primaryRank = rank
+			credentialControl = nil
+			if scenario.credentialDependent {
+				control := scenario.credentialControl
+				credentialControl = &control
+			}
 		}
 	}
 
@@ -380,7 +386,21 @@ func (m *Module) result(target string, posture credentialPosture, accepted []acc
 		)
 	}
 
-	return &output.ResultEvent{
+	ev := modkit.NewEvidenceCollector()
+	if len(baselines) > 0 {
+		ev.AddExchange(baselines[0].first.receipt, evidence.RoleBaseline, "legitimate Origin handshake")
+		ev.AddExchange(baselines[0].confirmation.receipt, evidence.RoleConfirmation, "legitimate Origin replay")
+	}
+	ev.AddExchange(primary.confirmation.receipt, evidence.RoleConfirmation, "fresh-key confirmation")
+	if credentialControl != nil {
+		ev.AddExchange(credentialControl.first.receipt, evidence.RoleControl, "credential-free negative control")
+		ev.AddExchange(credentialControl.confirmation.receipt, evidence.RoleControl, "credential-free control confirmation")
+	}
+	if ev.Len() > 0 {
+		additional = ev.Entries()
+	}
+	result := &output.ResultEvent{
+		Evidence:           ev.Evidence(),
 		ModuleID:           ModuleID,
 		RecordKind:         kind,
 		EvidenceGrade:      grade,
@@ -414,4 +434,10 @@ func (m *Module) result(target string, posture credentialPosture, accepted []acc
 			"fresh_handshake_keys":              true,
 		},
 	}
+	role := evidence.RoleAttack
+	if primaryRank == 0 {
+		role = evidence.RoleObservation
+	}
+	modkit.SetPrimaryEvidence(result, primary.first.receipt, role, "selected Origin handshake")
+	return result
 }

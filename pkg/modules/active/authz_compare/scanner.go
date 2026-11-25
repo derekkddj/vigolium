@@ -10,6 +10,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -202,6 +203,8 @@ func (m *Module) ScanPerRequest(
 
 // responseSummary holds response data for comparison.
 type responseSummary struct {
+	Receipt    *evidence.Exchange
+	Fetched    bool // fetched baselines must never borrow the triggering request as proof
 	StatusCode int
 	BodyLength int
 	Summary    *authzutil.ResponseSummary
@@ -227,6 +230,7 @@ func (m *Module) getPrimaryResponse(
 			body,
 		)
 		return &responseSummary{
+			Receipt:      ctx.Evidence(),
 			StatusCode:   resp.StatusCode(),
 			BodyLength:   len(body),
 			Summary:      summary,
@@ -250,6 +254,8 @@ func (m *Module) getPrimaryResponse(
 		body,
 	)
 	return &responseSummary{
+		Receipt:      entry.Receipt.Clone(),
+		Fetched:      true,
 		StatusCode:   entry.StatusCode,
 		BodyLength:   entry.BodyLen,
 		Summary:      summary,
@@ -286,6 +292,7 @@ func (m *Module) probeWithSession(
 	// afterwards is a use-after-free that races with concurrent module execution.
 	compareBody := append([]byte(nil), resp.Body().Bytes()...)
 	fullResp := resp.FullResponseString()
+	exchange := http.CaptureEvidence(resp)
 	resp.Close()
 
 	// Authorization enforced: 401, 403
@@ -332,7 +339,13 @@ func (m *Module) probeWithSession(
 	}
 
 	ev := modkit.NewEvidenceCollector()
-	ev.Add("baseline (primary session)", string(ctx.Request().Raw()), primary.FullResponse)
+	if primary.Receipt != nil {
+		ev.AddExchange(primary.Receipt, evidence.RoleBaseline, "baseline (primary session)")
+	} else if primary.Fetched {
+		ev.AddBaseline("baseline (primary session)", "", primary.FullResponse)
+	} else {
+		ev.AddBaseline("baseline (primary session)", string(ctx.Request().Raw()), primary.FullResponse)
+	}
 
 	desc := fmt.Sprintf(
 		"A request targeting %s at %s returned a successful, structurally similar response "+
@@ -342,7 +355,7 @@ func (m *Module) probeWithSession(
 		target.kind, urlStr, sessionName, strings.Join(sharedIdentity, ", "),
 	)
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		ModuleID:           ModuleID,
 		Host:               host,
 		URL:                urlStr,
@@ -350,6 +363,7 @@ func (m *Module) probeWithSession(
 		Request:            string(ctx.Request().Raw()),
 		Response:           fullResp,
 		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
 		Info: output.Info{
 			Name:        "Cross-Session Object Access / Broken Object Level Authorization",
 			Description: desc,
@@ -376,7 +390,9 @@ func (m *Module) probeWithSession(
 			"authorization_target":   target.kind,
 			"object_references":      target.references,
 		},
-	}, nil
+	}
+	modkit.SetPrimaryEvidence(result, exchange, evidence.RoleAttack, "selected probe")
+	return result, nil
 }
 
 // classifyAuthorizationTarget rejects generic endpoints before cross-session

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -115,7 +116,9 @@ func (m *Module) probeFile(
 	httpClient *http.Requester,
 	probe firebaseProbe,
 	fp *notFoundFingerprint,
-) *output.ResultEvent {
+) (guardResult *output.ResultEvent) {
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(guardResult, guardProof) }()
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
@@ -212,14 +215,14 @@ func (m *Module) probeFile(
 		_, sibOK := modkit.MatchAllGroups(b, probe.markers)
 		return sibOK
 	}
-	if modkit.MultiRoundExtDecoyCatchAll(ctx, httpClient, probe.path, body, status, decoyRounds, markerMatch) {
+	if modkit.MultiRoundExtDecoyCatchAllWithEvidence(ctx, httpClient, probe.path, body, status, decoyRounds, markerMatch, guardProof) {
 		return nil
 	}
 
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + probe.path
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,
 		Request:          string(modifiedRaw),
@@ -233,4 +236,6 @@ func (m *Module) probeFile(
 			Tags:        []string{"firebase", "misconfiguration"},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+	return result
 }

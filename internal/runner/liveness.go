@@ -183,6 +183,9 @@ type Heartbeat struct {
 // the moment the scan starts already finds it, then keeps beating until Stop
 // or Finish.
 func StartHeartbeat(cfg HeartbeatConfig) *Heartbeat {
+	if cfg.ProjectUUID == "" {
+		cfg.ProjectUUID = database.DefaultProjectUUID
+	}
 	h := &Heartbeat{
 		cfg:      cfg,
 		interval: cfg.Interval,
@@ -351,10 +354,11 @@ func (h *Heartbeat) beat(ctx context.Context, fileOnly bool) (rowDone bool, stop
 		return false, nil
 	}
 	hb := database.ScanHeartbeat{
-		At:    st.HeartbeatAt,
-		Phase: st.Phase,
-		PID:   st.PID,
-		Host:  st.Host,
+		ProjectUUID: h.cfg.ProjectUUID,
+		At:          st.HeartbeatAt,
+		Phase:       st.Phase,
+		PID:         st.PID,
+		Host:        st.Host,
 	}
 	if h.cfg.Requests != nil {
 		n := st.RequestsSent
@@ -379,7 +383,7 @@ func (h *Heartbeat) adoptRowStatus() {
 	ctx, cancel := context.WithTimeout(context.Background(), heartbeatWriteBudget)
 	defer cancel()
 	row, err := h.cfg.Repo.GetScanByUUID(ctx, h.cfg.ScanUUID)
-	if err != nil || row == nil {
+	if err != nil || row == nil || row.ProjectUUID != h.cfg.ProjectUUID {
 		return
 	}
 	status := row.Status
@@ -463,7 +467,7 @@ func sqliteDBPathFor(settings *config.Settings) string {
 // Requests is the shared requester's count plus the running phase's extra
 // counters (deparos, a phase-local requester, the browser's own traffic);
 // finished phases' extras are folded in by PhaseEnded.
-func (r *Runner) startLiveness(infra *phaseInfra, plan NativeScanPlan) *Heartbeat {
+func (r *Runner) startLiveness(infra *phaseInfra, plan NativeScanPlan, scope nativeScanScope) *Heartbeat {
 	planned := []string{}
 	for _, step := range plan.Steps {
 		if step.Enabled {
@@ -472,10 +476,10 @@ func (r *Runner) startLiveness(infra *phaseInfra, plan NativeScanPlan) *Heartbea
 	}
 	requester := infra.httpRequester
 	h := StartHeartbeat(HeartbeatConfig{
-		Repo:            r.repository,
-		ScanUUID:        infra.scanUUID,
+		Repo:            scope.repo,
+		ScanUUID:        scope.scanUUID,
 		SessionsDir:     sessionsDirFor(r.settings),
-		ProjectUUID:     r.options.ProjectUUID,
+		ProjectUUID:     scope.projectUUID,
 		DBPath:          sqliteDBPathFor(r.settings),
 		PhasesPlanned:   planned,
 		ScanMaxDuration: r.options.ScanMaxDuration,

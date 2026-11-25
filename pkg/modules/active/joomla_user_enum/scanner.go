@@ -7,6 +7,7 @@ import (
 
 	httpUtils "github.com/projectdiscovery/utils/http"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -108,7 +109,7 @@ func (m *Module) sendGET(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requ
 	return resp, modifiedRaw, nil
 }
 
-func (m *Module) probeRegistration(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) *output.ResultEvent {
+func (m *Module) probeRegistration(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) (finding *output.ResultEvent) {
 	resp, raw, err := m.sendGET(ctx, httpClient, "/index.php?option=com_users&view=registration")
 	if err != nil {
 		return nil
@@ -131,6 +132,10 @@ func (m *Module) probeRegistration(ctx *httpmsg.HttpRequestResponse, httpClient 
 	}
 
 	urlx, _ := ctx.URL()
+	selectedExchange := http.CaptureEvidence(resp)
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, selectedExchange, evidence.RoleObservation, "selected anonymous observation")
+	}()
 	return &output.ResultEvent{
 		ModuleID:         ModuleID,
 		RecordKind:       output.RecordKindObservation,
@@ -157,7 +162,7 @@ func (m *Module) probeRegistration(ctx *httpmsg.HttpRequestResponse, httpClient 
 	}
 }
 
-func (m *Module) probeAPIUsers(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) *output.ResultEvent {
+func (m *Module) probeAPIUsers(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) (finding *output.ResultEvent) {
 	resp, raw, err := m.sendGET(ctx, httpClient, "/api/index.php/v1/users")
 	if err != nil {
 		return nil
@@ -180,6 +185,10 @@ func (m *Module) probeAPIUsers(ctx *httpmsg.HttpRequestResponse, httpClient *htt
 	}
 
 	urlx, _ := ctx.URL()
+	selectedExchange := http.CaptureEvidence(resp)
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, selectedExchange, evidence.RoleObservation, "selected anonymous observation")
+	}()
 	return &output.ResultEvent{
 		ModuleID:         ModuleID,
 		RecordKind:       output.RecordKindObservation,
@@ -238,7 +247,7 @@ func parseJoomlaAPIUsers(body string) (int, []string, bool) {
 	return count, labels, count > 0
 }
 
-func (m *Module) probeAdminLogin(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) *output.ResultEvent {
+func (m *Module) probeAdminLogin(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) (finding *output.ResultEvent) {
 	resp, raw, err := m.sendGET(ctx, httpClient, "/administrator/")
 	if err != nil {
 		return nil
@@ -265,6 +274,10 @@ func (m *Module) probeAdminLogin(ctx *httpmsg.HttpRequestResponse, httpClient *h
 	}
 
 	urlx, _ := ctx.URL()
+	selectedExchange := http.CaptureEvidence(resp)
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, selectedExchange, evidence.RoleObservation, "selected anonymous observation")
+	}()
 	return &output.ResultEvent{
 		ModuleID:         ModuleID,
 		RecordKind:       output.RecordKindObservation,

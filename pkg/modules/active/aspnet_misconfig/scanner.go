@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -142,7 +143,9 @@ func (m *Module) probeEndpoint(
 	httpClient *http.Requester,
 	p probe,
 	fp *notFoundFingerprint,
-) *output.ResultEvent {
+) (guardResult *output.ResultEvent) {
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(guardResult, guardProof) }()
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
@@ -241,17 +244,17 @@ func (m *Module) probeEndpoint(
 	// this costs no true positives, and it is robust to the body-truncation quirk
 	// because the decoy is run through the same predicate, not a body-similarity
 	// compare.
-	if modkit.MultiRoundExtDecoyCatchAll(ctx, httpClient, p.path, body, status, decoyRounds, func(b string) bool {
+	if modkit.MultiRoundExtDecoyCatchAllWithEvidence(ctx, httpClient, p.path, body, status, decoyRounds, func(b string) bool {
 		_, sibOK := p.accepts(b)
 		return sibOK
-	}) {
+	}, guardProof) {
 		return nil
 	}
 
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + p.path
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,
 		Request:          string(modifiedRaw),
@@ -266,6 +269,8 @@ func (m *Module) probeEndpoint(
 			Reference:   []string{"https://learn.microsoft.com/en-us/aspnet/core/fundamentals/error-handling"},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+	return result
 }
 
 func (m *Module) probeYSoD(
@@ -320,7 +325,7 @@ func (m *Module) probeYSoD(
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + errorPath
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,
 		Request:          string(modifiedRaw),
@@ -335,4 +340,6 @@ func (m *Module) probeYSoD(
 			Reference:   []string{"https://learn.microsoft.com/en-us/aspnet/core/fundamentals/error-handling"},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+	return result
 }

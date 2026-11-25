@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/graphqlx"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
@@ -193,7 +194,7 @@ func (m *Module) sendCSRF(
 		return nil, "", false
 	}
 	defer resp.Close()
-	out := &gqlResp{body: resp.BodyString(), blocked: infra.IsBlockedResponse(resp)}
+	out := &gqlResp{Exchange: http.CaptureEvidence(resp), body: resp.BodyString(), blocked: infra.IsBlockedResponse(resp)}
 	if r := resp.Response(); r != nil {
 		out.status = r.StatusCode
 		out.ctype = r.Header.Get("Content-Type")
@@ -318,6 +319,9 @@ func (m *Module) phaseCSRF(
 			continue // same data without the cookie: not cookie-authenticated
 		}
 
+		proof := &gqlProof{}
+		proof.context.AddExchange(ref.Exchange, evidence.RoleBaseline, "Cookie-authenticated JSON reference")
+		proof.control(ctrl)
 		var accepted []csrfVector
 		var evidenceReq, evidenceResp string
 		for _, vec := range csrfVectors {
@@ -326,6 +330,7 @@ func (m *Module) phaseCSRF(
 			}
 			path, body := vec.build(endpointPath, op)
 			var lastReq, lastBody string
+			vectorProof := &gqlProof{}
 			if !confirmRounds(defaultConfirmRounds, func() (bool, error) {
 				r, raw, ok := m.sendCSRF(ctx, anon, vec.method, path, vec.contentType, body, cookie, true)
 				if !ok {
@@ -333,13 +338,23 @@ func (m *Module) phaseCSRF(
 				}
 				data, ok := gqlData(r)
 				lastReq, lastBody = raw, r.body
+				vectorProof.attack(r, body)
 				return ok && data == refData, nil
 			}) {
 				continue
 			}
 			accepted = append(accepted, vec)
 			if evidenceReq == "" || vec.postTransport {
+				if proof.primary != nil {
+					proof.context.AddExchange(proof.primary, evidence.RoleAttack, "Other accepted forgeable transport")
+				}
 				evidenceReq, evidenceResp = lastReq, lastBody
+				proof.primary, proof.payload = vectorProof.primary, vectorProof.payload
+			} else {
+				proof.context.AddExchange(vectorProof.primary, evidence.RoleAttack, "Other accepted forgeable transport")
+			}
+			for _, entry := range vectorProof.context.Evidence() {
+				proof.context.AddExchange(entry.Exchange, entry.Role, entry.Label)
 			}
 		}
 		if len(accepted) == 0 {
@@ -348,7 +363,7 @@ func (m *Module) phaseCSRF(
 			// operation is representative of the transport, so stop here.
 			return nil
 		}
-		return csrfResult(target, endpointPath, op, accepted, sessionCookies, postureObserved, evidenceReq, evidenceResp)
+		return csrfResult(target, endpointPath, op, accepted, sessionCookies, postureObserved, evidenceReq, evidenceResp, proof)
 	}
 	return nil
 }
@@ -365,6 +380,7 @@ func csrfResult(
 	sessionCookies []string,
 	postureObserved bool,
 	evidenceReq, evidenceResp string,
+	proofs ...*gqlProof,
 ) *output.ResultEvent {
 	names := make([]string, 0, len(accepted))
 	postAccepted := false
@@ -383,7 +399,11 @@ func csrfResult(
 		posture = "session cookie observed without SameSite=Strict/Lax"
 	}
 
-	return &output.ResultEvent{
+	proof := &gqlProof{}
+	if len(proofs) > 0 {
+		proof = proofs[0]
+	}
+	return proof.finding(&output.ResultEvent{
 		ModuleID:      ModuleID,
 		RecordKind:    kind,
 		EvidenceGrade: grade,
@@ -423,5 +443,5 @@ func csrfResult(
 			"operation_source":       op.source,
 			"confirmation_rounds":    defaultConfirmRounds,
 		},
-	}
+	})
 }

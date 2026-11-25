@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -45,6 +46,8 @@ var ppProbes = []ppProbe{
 
 // ppFinding holds evidence from the static analysis.
 type ppFinding struct {
+	inputOnly  bool
+	exchange   *evidence.Exchange
 	Source     ppSourcePattern
 	SourceFile string
 	SourceLine string
@@ -132,14 +135,31 @@ func (m *Module) ScanPerRequest(
 
 	// Collect all JavaScript content to analyze
 	type jsBlock struct {
-		content string
-		source  string // "inline" or script URL
+		content   string
+		exchange  *evidence.Exchange
+		inputOnly bool
+		source    string // "inline" or script URL
 	}
 	var blocks []jsBlock
 
+	inputOnly := entry.Response == ctx.Response()
+	var inlineReceipt *evidence.Exchange
+	if inputOnly {
+		inlineReceipt = ctx.Evidence()
+	}
+	if !inputOnly {
+		inlineReceipt = entry.Receipt.Clone()
+		// Compatibility for a caller-supplied baseline with no captured receipt:
+		// preserve its response without inventing the baseline's actual request.
+		if inlineReceipt == nil {
+			inlineReceipt = evidence.NewExchange("", pageURL(ctx), nil, entry.Response.Raw(), evidence.ProvenanceSupplied)
+			inlineReceipt.ResponseState = evidence.StateUnknown
+			inlineReceipt.ContentHash = inlineReceipt.Hash()
+		}
+	}
 	// Extract inline scripts
 	for _, script := range extractInlineScripts(htmlBody) {
-		blocks = append(blocks, jsBlock{content: script, source: "inline <script>"})
+		blocks = append(blocks, jsBlock{content: script, source: "inline <script>", exchange: inlineReceipt, inputOnly: inputOnly})
 	}
 
 	// Extract and fetch external scripts
@@ -154,9 +174,10 @@ func (m *Module) ScanPerRequest(
 		if isCDNURL(resolved) || !sameOriginScript(pageURLStr, resolved) {
 			continue
 		}
-		jsContent := fetchScript(resolved, httpClient, ctx)
+		var scriptReceipt *evidence.Exchange
+		jsContent := fetchScript(resolved, httpClient, ctx, &scriptReceipt)
 		if jsContent != "" {
-			blocks = append(blocks, jsBlock{content: jsContent, source: resolved})
+			blocks = append(blocks, jsBlock{content: jsContent, source: resolved, exchange: scriptReceipt})
 			fetched++
 		}
 	}
@@ -185,6 +206,8 @@ func (m *Module) ScanPerRequest(
 			matchLine := extractMatchLine(block.content, hit.Pos)
 			findings = append(findings, ppFinding{
 				Source:     hit.Pattern,
+				exchange:   block.exchange,
+				inputOnly:  block.inputOnly,
 				SourceFile: block.source,
 				SourceLine: matchLine,
 				Gadgets:    allGadgets,
@@ -199,9 +222,10 @@ func (m *Module) ScanPerRequest(
 	// Send probe requests to verify URL parameter acceptance
 	var probeRaw string
 	var probeResp string
+	var reachability *evidence.Exchange
 	for _, probe := range ppProbes {
 		pURL := buildProbeURL(pageURLStr, probe.Suffix)
-		raw, resp, ok := sendProbe(pURL, httpClient, ctx)
+		raw, resp, ok := sendProbe(pURL, httpClient, ctx, &reachability)
 		if ok {
 			probeRaw = raw
 			probeResp = resp
@@ -264,6 +288,18 @@ func (m *Module) ScanPerRequest(
 		},
 	}
 
+	result.Request, result.Response = "", ""
+	if reachability != nil {
+		result.Evidence = []evidence.Entry{evidence.Select(reachability, evidence.RoleObservation, false, "reachability only; not source proof")}
+	}
+	if f.inputOnly {
+		// Supporting reachability must not block selection of the source-bearing
+		// input receipt. Only receipt-less input analysis requests inheritance;
+		// the reaching request is never promoted to primary source proof.
+		result.BaselineEvidence = !modkit.SetPrimaryEvidence(result, f.exchange, evidence.RoleObservation, "source-bearing input JavaScript")
+	} else {
+		modkit.SetPrimaryEvidence(result, f.exchange, evidence.RoleObservation, "source-bearing JavaScript")
+	}
 	return []*output.ResultEvent{result}, nil
 }
 
@@ -280,7 +316,7 @@ func sameOriginScript(pageURL, scriptURL string) bool {
 }
 
 // fetchScript fetches a JavaScript file and returns its content.
-func fetchScript(scriptURL string, httpClient *http.Requester, ctx *httpmsg.HttpRequestResponse) string {
+func fetchScript(scriptURL string, httpClient *http.Requester, ctx *httpmsg.HttpRequestResponse, receipts ...**evidence.Exchange) string {
 	rawReq := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: placeholder\r\n\r\n", scriptURL)
 	req, err := httpmsg.ParseRawRequest(rawReq)
 	if err != nil {
@@ -301,6 +337,9 @@ func fetchScript(scriptURL string, httpClient *http.Requester, ctx *httpmsg.Http
 		modkit.ClassifyContentType(resp.Response().Header.Get("Content-Type")) == modkit.ContentClassHTML {
 		return ""
 	}
+	if len(receipts) > 0 {
+		*receipts[0] = http.CaptureEvidence(resp)
+	}
 	return resp.Body().String()
 }
 
@@ -313,7 +352,7 @@ func buildProbeURL(pageURL, suffix string) string {
 }
 
 // sendProbe sends a probe request and returns whether the server accepted it (2xx).
-func sendProbe(probeURL string, httpClient *http.Requester, ctx *httpmsg.HttpRequestResponse) (rawReq string, fullResp string, ok bool) {
+func sendProbe(probeURL string, httpClient *http.Requester, ctx *httpmsg.HttpRequestResponse, receipts ...**evidence.Exchange) (rawReq string, fullResp string, ok bool) {
 	raw := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: placeholder\r\n\r\n", probeURL)
 	req, err := httpmsg.ParseRawRequest(raw)
 	if err != nil {
@@ -332,6 +371,9 @@ func sendProbe(probeURL string, httpClient *http.Requester, ctx *httpmsg.HttpReq
 	}
 	sc := resp.Response().StatusCode
 	if sc >= 200 && sc < 400 {
+		if len(receipts) > 0 {
+			*receipts[0] = http.CaptureEvidence(resp)
+		}
 		return raw, resp.FullResponseString(), true
 	}
 	return "", "", false
@@ -357,3 +399,5 @@ func extractMatchLine(content string, pos int) string {
 	}
 	return line
 }
+
+func pageURL(ctx *httpmsg.HttpRequestResponse) string { return ctx.Target() }

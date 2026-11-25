@@ -6,6 +6,7 @@ import (
 
 	urlutil "github.com/projectdiscovery/utils/url"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/iisgate"
@@ -78,7 +79,8 @@ func (m *Module) ScanPerRequest(
 	}
 	// Gate: passive detection AND active behavioral confirmation (a spoofed
 	// Server header alone never passes). Cached per host across IIS modules.
-	if !iisgate.IsIIS(ctx, scanCtx, host, httpClient) {
+	gateEvidence := modkit.NewEvidenceCollector()
+	if !iisgate.IsIISWithEvidence(ctx, scanCtx, host, httpClient, gateEvidence) {
 		return nil, nil
 	}
 
@@ -91,6 +93,7 @@ func (m *Module) ScanPerRequest(
 			return nil, nil
 		}
 		if r := m.sourceDisclosure(ctx, httpClient, urlx, path); r != nil {
+			modkit.AppendEvidence(r, gateEvidence)
 			return []*output.ResultEvent{r}, nil
 		}
 	case status == 401 || status == 403:
@@ -98,6 +101,7 @@ func (m *Module) ScanPerRequest(
 			return nil, nil
 		}
 		if r := m.accessBypass(ctx, httpClient, urlx, path); r != nil {
+			modkit.AppendEvidence(r, gateEvidence)
 			return []*output.ResultEvent{r}, nil
 		}
 	}
@@ -112,7 +116,10 @@ func (m *Module) sourceDisclosure(
 	httpClient *http.Requester,
 	urlx *urlutil.URL,
 	path string,
-) *output.ResultEvent {
+) (result *output.ResultEvent) {
+	context := modkit.NewEvidenceCollector()
+	context.AddBaseline("Observed input", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
+	defer func() { modkit.AppendEvidence(result, context) }()
 	rendered := ""
 	if b := ctx.Response().Body(); b != nil {
 		rendered = string(b)
@@ -127,7 +134,8 @@ func (m *Module) sourceDisclosure(
 		vec := path + suffix
 
 		// Round 1: the ADS request must return raw source distinct from the page.
-		st, body, ok := m.probe(ctx, httpClient, vec)
+		var attack, decoyReceipt, confirmation *evidence.Exchange
+		st, body, ok := m.probe(ctx, httpClient, vec, &attack)
 		if !ok || st != 200 || !hasSourceMarkers(body) || modkit.BodiesSimilar(body, rendered) {
 			continue
 		}
@@ -135,20 +143,22 @@ func (m *Module) sourceDisclosure(
 		// Round 2: decoy negative — the same trick on a random script path must
 		// NOT return source (rules out a server that streams source for anything).
 		decoy := "/" + modkit.FreshCanary() + ".aspx" + suffix
-		if dst, dbody, dok := m.probe(ctx, httpClient, decoy); dok && dst == 200 && hasSourceMarkers(dbody) {
+		if dst, dbody, dok := m.probe(ctx, httpClient, decoy, &decoyReceipt); dok && dst == 200 && hasSourceMarkers(dbody) {
 			return nil
 		}
 
 		// Round 3: re-confirm determinism.
-		st2, body2, ok2 := m.probe(ctx, httpClient, vec)
+		st2, body2, ok2 := m.probe(ctx, httpClient, vec, &confirmation)
 		if !ok2 || st2 != 200 || !hasSourceMarkers(body2) {
 			continue
 		}
 
+		context.AddExchange(decoyReceipt, evidence.RoleControl, "Same-shape source decoy")
+		context.AddExchange(confirmation, evidence.RoleConfirmation, "Source disclosure reproduction")
 		return m.buildFinding(urlx, vec,
 			"IIS Script Source Disclosure via NTFS ::$DATA",
 			fmt.Sprintf("The raw server-side source of `%s` was disclosed by appending the NTFS default data stream (`%s`), returning the unprocessed file instead of executing it.", path, suffix),
-			body, []string{"source-disclosure", "ntfs-ads"})
+			body, []string{"source-disclosure", "ntfs-ads"}, attack)
 	}
 	return nil
 }
@@ -160,7 +170,10 @@ func (m *Module) accessBypass(
 	httpClient *http.Requester,
 	urlx *urlutil.URL,
 	path string,
-) *output.ResultEvent {
+) (result *output.ResultEvent) {
+	context := modkit.NewEvidenceCollector()
+	context.AddBaseline("Observed input", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
+	defer func() { modkit.AppendEvidence(result, context) }()
 	for shape := 0; shape < numAccessShapes; shape++ {
 		cand, label, ok := applyAccessShape(path, shape)
 		if !ok {
@@ -168,7 +181,8 @@ func (m *Module) accessBypass(
 		}
 
 		// Round 1: the rewrite must now be allowed (200).
-		st, body, ok := m.probe(ctx, httpClient, cand)
+		var attack, decoyReceipt, confirmation *evidence.Exchange
+		st, body, ok := m.probe(ctx, httpClient, cand, &attack)
 		if !ok || st != 200 {
 			continue
 		}
@@ -185,21 +199,23 @@ func (m *Module) accessBypass(
 			decoyBase += pathExt(path)
 		}
 		if decoy, _, dok := applyAccessShape(decoyBase, shape); dok {
-			if dst, dbody, dok2 := m.probe(ctx, httpClient, decoy); dok2 && dst == 200 && modkit.BodiesSimilar(body, dbody) {
+			if dst, dbody, dok2 := m.probe(ctx, httpClient, decoy, &decoyReceipt); dok2 && dst == 200 && modkit.BodiesSimilar(body, dbody) {
 				return nil
 			}
 		}
 
 		// Round 3: re-confirm determinism.
-		st2, body2, ok2 := m.probe(ctx, httpClient, cand)
+		st2, body2, ok2 := m.probe(ctx, httpClient, cand, &confirmation)
 		if !ok2 || st2 != 200 || !modkit.BodiesSimilar(body, body2) {
 			continue
 		}
 
+		context.AddExchange(decoyReceipt, evidence.RoleControl, "Same-shape access decoy")
+		context.AddExchange(confirmation, evidence.RoleConfirmation, "Access bypass reproduction")
 		return m.buildFinding(urlx, cand,
 			"IIS Access-Control Bypass via Path Parsing Quirk",
 			fmt.Sprintf("A resource that returned %d when requested directly became reachable (200) using the IIS-specific `%s` rewrite, bypassing the path-based access control.", ctx.Response().StatusCode(), label),
-			body, []string{"access-control", label})
+			body, []string{"access-control", label}, attack)
 	}
 	return nil
 }
@@ -209,6 +225,7 @@ func (m *Module) probe(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	path string,
+	receiptOut ...**evidence.Exchange,
 ) (int, string, bool) {
 	raw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
@@ -218,11 +235,20 @@ func (m *Module) probe(
 	if err != nil {
 		return 0, "", false
 	}
-	return modkit.ExecuteRaw(httpClient, ctx.Service(), raw, http.Options{NoRedirects: true, NoClustering: true})
+	status, body, _, receipt, ok := infra.ExecuteRawCapture(httpClient, ctx.Service(), raw, http.Options{NoRedirects: true, NoClustering: true})
+	if len(receiptOut) > 0 && receiptOut[0] != nil {
+		*receiptOut[0] = receipt
+	}
+	return status, body, ok
 }
 
 // buildFinding assembles a High-severity finding with an evidence snippet.
-func (m *Module) buildFinding(urlx *urlutil.URL, candPath, name, desc, body string, tags []string) *output.ResultEvent {
+func (m *Module) buildFinding(urlx *urlutil.URL, candPath, name, desc, body string, tags []string, receipt ...*evidence.Exchange) (result *output.ResultEvent) {
+	defer func() {
+		if len(receipt) > 0 {
+			modkit.SetPrimaryEvidence(result, receipt[0], evidence.RoleAttack, "IIS path-confusion probe")
+		}
+	}()
 	fullURL := urlx.Scheme + "://" + urlx.Host + candPath
 
 	snippet := body

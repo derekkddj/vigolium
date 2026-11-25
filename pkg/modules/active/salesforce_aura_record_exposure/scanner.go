@@ -5,6 +5,7 @@ import (
 	"sort"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	sf "github.com/vigolium/vigolium/pkg/modules/infra/salesforce"
@@ -66,7 +67,8 @@ func (m *Module) ScanPerHost(
 
 	// Tech gate: locating a live Aura gateway + context IS the fail-closed presence
 	// check (a non-Salesforce host has no gateway).
-	endpoint, auraContext, ok := sf.Prepare(ctx, httpClient, scanCtx)
+	collector := modkit.NewEvidenceCollector()
+	endpoint, auraContext, ok := sf.Prepare(ctx, httpClient, scanCtx, collector)
 	if !ok {
 		return nil, nil
 	}
@@ -74,16 +76,20 @@ func (m *Module) ScanPerHost(
 	// Catch-all negative control: getItems for an object that cannot exist must
 	// NOT return records. If it does, the endpoint returns data for anything, so
 	// any positive would be a false positive — skip the host entirely.
-	if page, _, ok := m.readRecords(ctx, httpClient, endpoint, auraContext, bogusObject); ok && page > 0 {
+	var control *evidence.Exchange
+	if page, _, ok := m.readRecords(ctx, httpClient, endpoint, auraContext, bogusObject, &control); ok && page > 0 {
 		return nil, nil
 	}
+	collector.AddExchange(control, evidence.RoleControl, "Bogus object record control")
 
-	targets := m.enumerationTargets(ctx, httpClient, endpoint, auraContext)
+	var enumeration *evidence.Exchange
+	targets := m.enumerationTargets(ctx, httpClient, endpoint, auraContext, &enumeration)
+	collector.AddExchange(enumeration, evidence.RoleObservation, "Object enumeration for record targets")
 
 	baseURL := urlx.Scheme + "://" + urlx.Host + endpoint
 	var results []*output.ResultEvent
 	for _, obj := range targets {
-		if res := m.probeObject(ctx, httpClient, endpoint, auraContext, obj, baseURL, host); res != nil {
+		if res := m.probeObject(ctx, httpClient, endpoint, auraContext, obj, baseURL, host, collector); res != nil {
 			results = append(results, res)
 		}
 	}
@@ -93,7 +99,7 @@ func (m *Module) ScanPerHost(
 // enumerationTargets returns the standard sensitive object set unioned with any
 // custom (__c) objects the guest can enumerate via getConfigData, capped at
 // maxObjects.
-func (m *Module) enumerationTargets(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, endpoint, auraContext string) []string {
+func (m *Module) enumerationTargets(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, endpoint, auraContext string, receipts ...**evidence.Exchange) []string {
 	seen := make(map[string]struct{}, len(standardObjects))
 	targets := make([]string, 0, len(standardObjects))
 	add := func(name string) {
@@ -113,6 +119,11 @@ func (m *Module) enumerationTargets(ctx *httpmsg.HttpRequestResponse, httpClient
 	// Harvest custom objects from getConfigData (best-effort; standard set is still
 	// probed if this fails).
 	resp := sf.InvokeAction(ctx, httpClient, endpoint, sf.BuildGetConfigData(), auraContext)
+	for _, receipt := range receipts {
+		if receipt != nil {
+			*receipt = resp.Exchange
+		}
+	}
 	if parsed, ok := sf.ParseAuraResponse(resp.Body); ok {
 		if rv, ok := parsed.SuccessReturnValue(); ok {
 			var custom []string
@@ -139,26 +150,47 @@ func (m *Module) probeObject(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	endpoint, auraContext, obj, baseURL, host string,
+	support ...*modkit.EvidenceCollector,
 ) *output.ResultEvent {
-	page, total, ok := m.readRecords(ctx, httpClient, endpoint, auraContext, obj)
+	// Copy shared gate/control context into an object-local collector so evidence
+	// from another object's successful or failed attempt cannot leak into this one.
+	collector := modkit.NewEvidenceCollector()
+	for _, parent := range support {
+		for _, entry := range parent.Evidence() {
+			collector.AddExchange(entry.Exchange, entry.Role, entry.Label)
+		}
+	}
+	var primary *evidence.Exchange
+	page, total, ok := m.readRecords(ctx, httpClient, endpoint, auraContext, obj, &primary)
 	if !ok || page == 0 {
 		return nil
 	}
 	// Reproduce across independent rounds before reporting.
 	for i := 0; i < confirmRounds; i++ {
-		p, _, ok := m.readRecords(ctx, httpClient, endpoint, auraContext, obj)
+		var exchange *evidence.Exchange
+		p, _, ok := m.readRecords(ctx, httpClient, endpoint, auraContext, obj, &exchange)
 		if !ok || p == 0 {
 			return nil
 		}
+		collector.AddExchange(exchange, evidence.RoleConfirmation, fmt.Sprintf("Record read confirmation %d", i+1))
 	}
-	return m.build(host, baseURL, obj, page, total)
+	result := m.build(host, baseURL, obj, page, total)
+	result.AdditionalEvidence, result.Evidence = collector.Entries(), collector.Evidence()
+	result.EvidenceStatus = "missing"
+	modkit.SetPrimaryEvidence(result, primary, evidence.RoleAttack, "Guest getItems record exposure")
+	return result
 }
 
 // readRecords invokes getItems for one object and returns the page record count
 // and total. ok is false when the action did not succeed (ERROR / invalidSession
 // / non-record envelope), which is distinct from a SUCCESS with zero records.
-func (m *Module) readRecords(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, endpoint, auraContext, obj string) (page int, total *int, ok bool) {
+func (m *Module) readRecords(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, endpoint, auraContext, obj string, receipts ...**evidence.Exchange) (page int, total *int, ok bool) {
 	resp := sf.InvokeAction(ctx, httpClient, endpoint, sf.BuildGetItems(obj, probePageSize, 0), auraContext)
+	for _, receipt := range receipts {
+		if receipt != nil {
+			*receipt = resp.Exchange
+		}
+	}
 	parsed, pok := sf.ParseAuraResponse(resp.Body)
 	if !pok {
 		return 0, nil, false

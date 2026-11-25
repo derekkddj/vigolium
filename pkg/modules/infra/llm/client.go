@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	httpUtils "github.com/projectdiscovery/utils/http"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra/mcp"
@@ -79,18 +80,25 @@ type chatResponse struct {
 // the chain internally and returns copied strings. This keeps evidence capture
 // leak-free and the call sites trivial.
 func (c *Client) Chat(ctx context.Context, userPrompt string) (assistant, rawRequest, respBody string, err error) {
+	assistant, rawRequest, respBody, _, err = c.ChatCapture(ctx, userPrompt)
+	return
+}
+
+// ChatCapture returns this chat operation's transport receipt separately from
+// parsed assistant text and the body-only comparison projection.
+func (c *Client) ChatCapture(ctx context.Context, userPrompt string) (assistant, rawRequest, respBody string, receipt *evidence.Exchange, err error) {
 	body, mErr := json.Marshal(chatRequest{
 		Model:    c.model,
 		Messages: []chatMessage{{Role: "user", Content: userPrompt}},
 	})
 	if mErr != nil {
-		return "", "", "", mErr
+		return "", "", "", nil, mErr
 	}
 
 	resp, rawReq, sErr := c.send(ctx, body)
 	rawRequest = rawReq
 	if sErr != nil {
-		return "", rawRequest, "", sErr
+		return "", rawRequest, "", nil, sErr
 	}
 	defer resp.Close()
 
@@ -101,7 +109,8 @@ func (c *Client) Chat(ctx context.Context, userPrompt string) (assistant, rawReq
 	} else {
 		assistant = assistantFromJSON(respBody)
 	}
-	return assistant, rawRequest, respBody, nil
+	receipt = http.CaptureEvidence(resp)
+	return assistant, rawRequest, respBody, receipt, nil
 }
 
 // modelFromSeed echoes the model named in the seed request body when present,

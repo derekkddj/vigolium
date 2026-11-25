@@ -279,7 +279,7 @@ func httpSessionPoolFuncDefs() []JSFuncDef {
 							if br.resp.err {
 								_ = resultObj.Set(br.name, sobek.Undefined())
 							} else {
-								_ = resultObj.Set(br.name, buildResponseObject(vm, br.resp.raw, br.resp.elapsed))
+								_ = resultObj.Set(br.name, buildResponseObject(vm, br.resp.raw, br.resp.elapsed, br.resp.exchange))
 							}
 						}
 						return resultObj

@@ -81,9 +81,14 @@ func (m *Module) ScanPerRequest(
 	target := ctx.Target()
 
 	// Phase 2: Test introspection
-	introBody, err := m.sendGraphQLQuery(ctx, httpClient, endpointPath, introspectionQuery)
+	intro, err := m.send(ctx, httpClient, "POST", endpointPath, "application/json", introspectionQuery)
+	introBody := ""
+	if intro != nil {
+		introBody = intro.body
+	}
 	if err == nil && hasIntrospection(introBody) {
-		results = append(results, &output.ResultEvent{
+		proof := &gqlProof{primary: intro.Exchange, payload: introspectionQuery}
+		results = append(results, proof.observation(&output.ResultEvent{
 			ModuleID:      ModuleID,
 			RecordKind:    output.RecordKindObservation,
 			EvidenceGrade: output.EvidenceGradeObservation,
@@ -105,7 +110,7 @@ func (m *Module) ScanPerRequest(
 				"security_primitive": "schema-introspection",
 				"impact_proven":      false,
 			},
-		})
+		}))
 	}
 
 	// Phase 3: Test error-based SQL injection through GraphQL arguments
@@ -122,7 +127,7 @@ func (m *Module) ScanPerRequest(
 	// Phase 4: Expand the introspection schema into concrete operations and feed
 	// them into the pipeline so every detector evaluates real GraphQL responses.
 	if scanCtx != nil {
-		if op := m.phaseOperations(ctx, scanCtx, endpointPath, schema, target); op != nil {
+		if op := m.phaseOperations(ctx, scanCtx, endpointPath, schema, target, intro); op != nil {
 			results = append(results, op)
 		}
 	}
@@ -274,25 +279,28 @@ func (m *Module) testInjection(
 
 	sqliPayload := `' OR '1'='1`
 	for _, field := range fieldsToTest {
+		proof := &gqlProof{}
 		confirmed := confirmRounds(defaultConfirmRounds, func() (bool, error) {
 			benignQuery := fmt.Sprintf(`{"query":"{ %s(%s: \"%s\") { __typename } }"}`,
 				field.fieldName, field.argName, escapeJSON("vigolium"))
-			controlBody, controlBlocked, cerr := m.sendGraphQLQueryEx(ctx, httpClient, endpointPath, benignQuery)
-			if cerr != nil || controlBlocked || containsSQLError(controlBody) {
+			control, cerr := m.send(ctx, httpClient, "POST", endpointPath, "application/json", benignQuery)
+			if cerr != nil || control.blocked || containsSQLError(control.body) {
 				return false, cerr
 			}
+			proof.control(control)
 
 			attackQuery := fmt.Sprintf(`{"query":"{ %s(%s: \"%s\") { __typename } }"}`,
 				field.fieldName, field.argName, escapeJSON(sqliPayload))
-			attackBody, attackBlocked, attackErr := m.sendGraphQLQueryEx(ctx, httpClient, endpointPath, attackQuery)
-			if attackErr != nil || attackBlocked {
+			attack, attackErr := m.send(ctx, httpClient, "POST", endpointPath, "application/json", attackQuery)
+			if attackErr != nil || attack.blocked {
 				return false, attackErr
 			}
-			return containsSQLError(attackBody), nil
+			proof.attack(attack, attackQuery)
+			return containsSQLError(attack.body), nil
 		})
 		if confirmed {
 
-			results = append(results, &output.ResultEvent{
+			results = append(results, proof.finding(&output.ResultEvent{
 				ModuleID:      ModuleID,
 				RecordKind:    output.RecordKindCandidate,
 				EvidenceGrade: output.EvidenceGradeDifferential,
@@ -315,7 +323,7 @@ func (m *Module) testInjection(
 					"confirmation_rounds": defaultConfirmRounds,
 					"impact_proven":       false,
 				},
-			})
+			}))
 			return results // One finding is enough
 		}
 	}

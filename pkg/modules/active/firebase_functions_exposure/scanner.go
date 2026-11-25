@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -41,6 +42,7 @@ type Module struct {
 }
 
 type functionResponse struct {
+	exchange     *evidence.Exchange
 	status       int
 	body         string
 	contentType  string
@@ -173,7 +175,8 @@ func (m *Module) probeFunction(
 	// Strict drop-on-fail: confirm the 200 is a stable, function-SPECIFIC
 	// response, not a transient blip or a catch-all the host returns for any path
 	// (including a nonexistent sibling function).
-	confirmationEvidence, confirmed := m.confirmFunctionExposure(httpClient, funcURL, first.body)
+	ev := modkit.NewEvidenceCollector()
+	confirmationEvidence, confirmed := m.confirmFunctionExposure(httpClient, funcURL, first.body, ev)
 	if !confirmed {
 		return nil
 	}
@@ -183,7 +186,7 @@ func (m *Module) probeFunction(
 		responseStr = responseStr[:4096] + "\n... (truncated)"
 	}
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		ModuleID:           ModuleID,
 		RecordKind:         output.RecordKindCandidate,
 		EvidenceGrade:      output.EvidenceGradeDifferential,
@@ -192,6 +195,7 @@ func (m *Module) probeFunction(
 		Request:            first.rawRequest,
 		Response:           responseStr,
 		AdditionalEvidence: confirmationEvidence,
+		Evidence:           ev.Evidence(),
 		Info: output.Info{
 			Name:        fmt.Sprintf("Public Firebase Cloud Function Candidate (%s)", funcName),
 			Description: fmt.Sprintf("Cloud Function %q at %s returns a stable, function-specific nontrivial response without credentials. Public HTTP functions are supported; sensitive data or unauthorized state access was not established.", funcName, funcURL),
@@ -206,6 +210,8 @@ func (m *Module) probeFunction(
 			"sensitive_data_confirmed": false,
 		},
 	}
+	modkit.SetPrimaryEvidence(result, first.exchange, evidence.RoleAttack, "selected probe")
+	return result
 }
 
 func (m *Module) probeErrorLeakage(
@@ -258,7 +264,7 @@ func (m *Module) probeErrorLeakage(
 		responseStr = responseStr[:4096] + "\n... (truncated)"
 	}
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		ModuleID:         ModuleID,
 		RecordKind:       output.RecordKindFinding,
 		EvidenceGrade:    output.EvidenceGradeImpact,
@@ -267,6 +273,7 @@ func (m *Module) probeErrorLeakage(
 		Request:          first.rawRequest,
 		Response:         responseStr,
 		ExtractedResults: matchedMarkers,
+		Evidence:         []evidence.Entry{evidence.Select(clean.exchange, evidence.RoleControl, false, "clean function"), evidence.Select(replay.exchange, evidence.RoleConfirmation, false, "malformed JSON replay")},
 		AdditionalEvidence: []string{
 			output.BuildEvidence("clean function control", clean.rawRequest, clean.fullResponse),
 			output.BuildEvidence("malformed request replay", replay.rawRequest, replay.fullResponse),
@@ -285,6 +292,8 @@ func (m *Module) probeErrorLeakage(
 			"replayed":           true,
 		},
 	}
+	modkit.SetPrimaryEvidence(result, first.exchange, evidence.RoleAttack, "selected probe")
+	return result
 }
 
 // getFuncResponse issues a credential-free absolute Cloud Functions request and
@@ -317,6 +326,7 @@ func getFuncResponse(httpClient *http.Requester, method, funcURL, body string) (
 		contentType:  strings.ToLower(resp.Response().Header.Get("Content-Type")),
 		rawRequest:   rawReq,
 		fullResponse: resp.FullResponseString(),
+		exchange:     http.CaptureEvidence(resp),
 	}, true
 }
 
@@ -325,7 +335,7 @@ func getFuncResponse(httpClient *http.Requester, method, funcURL, body string) (
 // equivalent to the first hit), and a nonexistent sibling function must NOT
 // return the same 200 (which would mean the host serves a catch-all). Incomplete
 // controls fail closed and the replay/decoy exchanges are retained as evidence.
-func (m *Module) confirmFunctionExposure(httpClient *http.Requester, funcURL, firstBody string) ([]string, bool) {
+func (m *Module) confirmFunctionExposure(httpClient *http.Requester, funcURL, firstBody string, collectors ...*modkit.EvidenceCollector) ([]string, bool) {
 	replay, ok := getFuncResponse(httpClient, "GET", funcURL, "")
 	if !ok {
 		return nil, false
@@ -341,6 +351,10 @@ func (m *Module) confirmFunctionExposure(httpClient *http.Requester, funcURL, fi
 	}
 	if decoy.status == 200 && modkit.BodiesSimilar(firstBody, decoy.body) {
 		return nil, false
+	}
+	if len(collectors) > 0 {
+		collectors[0].AddExchange(replay.exchange, evidence.RoleConfirmation, "function replay")
+		collectors[0].AddExchange(decoy.exchange, evidence.RoleControl, "nonexistent function")
 	}
 	return []string{
 		output.BuildEvidence("function replay", replay.rawRequest, replay.fullResponse),

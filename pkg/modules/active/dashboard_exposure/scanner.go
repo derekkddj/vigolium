@@ -21,6 +21,7 @@ import (
 	"github.com/pkg/errors"
 	httpUtils "github.com/projectdiscovery/utils/http"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra/dashboardsig"
@@ -159,11 +160,13 @@ func (m *Module) ScanPerRequest(
 }
 
 type hit struct {
-	c       *dashboardsig.Confirmer
-	version string
-	url     string
-	prefix  string // the confirmed base+mount, so a default-login probe targets the right context path
-	sev     severity.Severity
+	context  *modkit.EvidenceCollector
+	exchange *evidence.Exchange
+	c        *dashboardsig.Confirmer
+	version  string
+	url      string
+	prefix   string // the confirmed base+mount, so a default-login probe targets the right context path
+	sev      severity.Severity
 }
 
 // probeProduct probes a single product's confirmers under the given base (and, in
@@ -195,7 +198,8 @@ probe:
 				break probe
 			}
 			probePath := prefix + c.Path
-			version, ok := m.confirmHit(client, rawHTTP, svc, probePath, c, baseline, budget)
+			capture := &hit{}
+			version, ok := m.confirmHit(client, rawHTTP, svc, probePath, c, baseline, budget, capture)
 			if !ok {
 				continue
 			}
@@ -204,7 +208,7 @@ probe:
 				sev = p.PresenceSeverity()
 			}
 			if best == nil || sev > best.sev {
-				best = &hit{c: c, version: version, url: baseURL + probePath, prefix: prefix, sev: sev}
+				best = &hit{exchange: capture.exchange, context: capture.context, c: c, version: version, url: baseURL + probePath, prefix: prefix, sev: sev}
 			}
 			// A leak is the strongest possible signal for this product — stop here.
 			if c.UnauthLeak {
@@ -242,6 +246,7 @@ probe:
 func (m *Module) confirmHit(
 	client *http.Requester, rawHTTP []byte, svc *httpmsg.Service,
 	probePath string, c *dashboardsig.Confirmer, baseline *probeResp, budget *int,
+	captures ...*hit,
 ) (string, bool) {
 	if baseline != nil {
 		if _, _, ok := c.Confirm(baseline.status, baseline.get, baseline.body, baseline.bodyLower); ok {
@@ -275,6 +280,10 @@ func (m *Module) confirmHit(
 	if !ok || baselineLikeResponse(baseline, pr) {
 		return "", false
 	}
+	ev := modkit.NewEvidenceCollector()
+	if baseline != nil {
+		ev.AddExchange(baseline.exchange, evidence.RoleControl, "random path baseline")
+	}
 	if signals < 2 {
 		// Single pattern: require a fresh (uncached) reproduction that still
 		// confirms and still differs from the baseline.
@@ -286,9 +295,13 @@ func (m *Module) confirmHit(
 		if pr2 == nil {
 			return "", false
 		}
+		ev.AddExchange(pr2.exchange, evidence.RoleConfirmation, "dashboard replay")
 		if _, _, ok2 := c.Confirm(pr2.status, pr2.get, pr2.body, pr2.bodyLower); !ok2 || baselineLikeResponse(baseline, pr2) {
 			return "", false
 		}
+	}
+	if len(captures) > 0 {
+		captures[0].exchange, captures[0].context = pr.exchange, ev
 	}
 	return version, true
 }
@@ -343,12 +356,14 @@ func (m *Module) buildResult(p *dashboardsig.Product, h *hit, host string) *outp
 	}
 	extracted = append(extracted, "endpoint: "+h.url)
 
-	return &output.ResultEvent{
-		ModuleID:         ModuleID,
-		Host:             host,
-		URL:              h.url,
-		Matched:          h.url,
-		ExtractedResults: extracted,
+	result := &output.ResultEvent{
+		ModuleID:           ModuleID,
+		Host:               host,
+		URL:                h.url,
+		Matched:            h.url,
+		ExtractedResults:   extracted,
+		Evidence:           h.context.Evidence(),
+		AdditionalEvidence: h.context.Entries(),
 		Info: output.Info{
 			Name:        name,
 			Description: desc,
@@ -363,12 +378,15 @@ func (m *Module) buildResult(p *dashboardsig.Product, h *hit, host string) *outp
 			"leak":     h.c.UnauthLeak,
 		},
 	}
+	modkit.SetPrimaryEvidence(result, h.exchange, evidence.RoleObservation, "selected observation")
+	return result
 }
 
 // probeResp is a copied, decoupled view of a probe response. bodyLower is the
 // lowercased body, computed once so confirmers matched against it don't each
 // re-lowercase the (potentially large) body.
 type probeResp struct {
+	exchange  *evidence.Exchange
 	status    int
 	body      string
 	bodyLower string
@@ -418,6 +436,7 @@ func newProbeResp(resp *httpUtils.ResponseChain, joinHeaders bool) *probeResp {
 	}
 	bodyStr := string(append([]byte(nil), body...))
 	pr := &probeResp{
+		exchange:  http.CaptureEvidence(resp),
 		status:    resp.Response().StatusCode,
 		body:      bodyStr,
 		bodyLower: strings.ToLower(bodyStr),

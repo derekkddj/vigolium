@@ -9,6 +9,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -162,7 +163,10 @@ type round struct {
 }
 
 func (p *prober) run() (*output.ResultEvent, error) {
-	floor, err := p.floor()
+	floorProof := modkit.NewEvidenceCollector()
+	escalationProof := modkit.NewEvidenceCollector()
+	confirmationProof := modkit.NewEvidenceCollector()
+	floor, err := p.floor(floorProof)
 	if err != nil || floor > maxFloor {
 		return nil, err
 	}
@@ -181,6 +185,10 @@ func (p *prober) run() (*output.ResultEvent, error) {
 			return nil, err
 		}
 		if a.elapsed-c.elapsed >= floor {
+			// Retain the decisive escalation pair, not every preliminary length,
+			// so floor/confirmation operations have room under the shared cap.
+			escalationProof.AddExchange(c.exchange, evidence.RoleControl, "decisive escalation control")
+			escalationProof.AddExchange(a.exchange, evidence.RoleAttack, "decisive escalation attack")
 			highLen = n
 			lowLen = fallbackLow
 			if i > 0 {
@@ -211,18 +219,33 @@ func (p *prober) run() (*output.ResultEvent, error) {
 		if !superLinear(c.elapsed, low.elapsed, high.elapsed, highLen/lowLen, floor) {
 			return nil, nil
 		}
+		confirmationProof.AddExchange(c.exchange, evidence.RoleControl, fmt.Sprintf("timing round %d control", r+1))
+		confirmationProof.AddExchange(low.exchange, evidence.RoleAttack, fmt.Sprintf("timing round %d low attack", r+1))
+		if r < confirmRounds-1 {
+			confirmationProof.AddExchange(high.exchange, evidence.RoleConfirmation, fmt.Sprintf("timing round %d high replay", r+1))
+		}
 		rounds = append(rounds, round{c.elapsed, low.elapsed, high.elapsed})
 		proof = high
 	}
-	return p.result(rounds, proof, lowLen, highLen, floor), nil
+	finding := p.result(rounds, proof, lowLen, highLen, floor)
+	// The final high remains the primary. Prioritize both confirmation triples
+	// (that primary accounts for the last high), then decisive escalation and
+	// representative floor samples; only the cap trims optional timing context.
+	modkit.AppendEvidence(finding, confirmationProof)
+	modkit.AppendEvidence(finding, escalationProof)
+	modkit.AppendEvidence(finding, floorProof)
+	return finding, nil
 }
 
 // floor derives the delay a backtracking input must add over its control:
 // max(minFloor, timeStdevCoeff × baseline stdev).
-func (p *prober) floor() (time.Duration, error) {
+func (p *prober) floor(collectors ...*modkit.EvidenceCollector) (time.Duration, error) {
 	samples := make([]time.Duration, 0, baselineSamples)
 	for i := 0; i < baselineSamples; i++ {
 		t, err := p.timed(control(lengths[len(lengths)-1]), false)
+		for _, proof := range collectors {
+			proof.AddExchange(t.exchange, evidence.RoleControl, fmt.Sprintf("timing floor sample %d", i+1))
+		}
 		if err != nil {
 			return 0, err
 		}
@@ -260,6 +283,7 @@ func superLinear(controlD, lowD, highD time.Duration, ratio int, floor time.Dura
 
 // timed is one measured probe, with the raw exchange when captured.
 type timed struct {
+	exchange *evidence.Exchange
 	elapsed  time.Duration
 	request  string
 	response string
@@ -279,9 +303,15 @@ func (p *prober) timed(value string, isAttack bool) (timed, error) {
 		if !isAttack || errors.Is(err, hosterrors.ErrUnresponsiveHost) {
 			return timed{}, err
 		}
-		return timed{elapsed: elapsed, request: string(raw)}, nil
+		// A native failure may own actual final-attempt bytes. If it does not,
+		// intended bytes remain no proof of emission and both halves stay missing.
+		x := http.CaptureFailureEvidence(err)
+		if x == nil {
+			x = evidence.NewExchange("", "", nil, nil, evidence.ProvenanceSupplied)
+		}
+		return timed{elapsed: elapsed, request: string(raw), exchange: x}, nil
 	}
-	t := timed{elapsed: elapsed}
+	t := timed{elapsed: elapsed, exchange: http.CaptureEvidence(resp)}
 	if isAttack {
 		t.request = string(raw)
 		t.response = resp.FullResponseString()
@@ -290,7 +320,10 @@ func (p *prober) timed(value string, isAttack bool) (timed, error) {
 	return t, nil
 }
 
-func (p *prober) result(rounds []round, proof timed, lowLen, highLen int, floor time.Duration) *output.ResultEvent {
+func (p *prober) result(rounds []round, proof timed, lowLen, highLen int, floor time.Duration) (finding *output.ResultEvent) {
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, proof.exchange, evidence.RoleAttack, "selected backtracking probe")
+	}()
 	extracted := []string{attack(highLen), attack(lowLen), control(highLen)}
 	for i, r := range rounds {
 		extracted = append(extracted, fmt.Sprintf(
@@ -299,7 +332,7 @@ func (p *prober) result(rounds []round, proof timed, lowLen, highLen int, floor 
 	}
 	last := rounds[len(rounds)-1]
 	ev := modkit.NewEvidenceCollector()
-	ev.Add("baseline (unmodified request)", modkit.CtxRequestRaw(p.ctx), modkit.CtxResponseRaw(p.ctx))
+	ev.AddBaseline("baseline (unmodified request)", modkit.CtxRequestRaw(p.ctx), modkit.CtxResponseRaw(p.ctx))
 
 	return &output.ResultEvent{
 		Request:            proof.request,
@@ -307,6 +340,7 @@ func (p *prober) result(rounds []round, proof timed, lowLen, highLen int, floor 
 		FuzzingParameter:   p.ip.Name(),
 		ExtractedResults:   extracted,
 		AdditionalEvidence: ev.Entries(),
+		Evidence:           ev.Evidence(),
 		MatcherStatus:      true,
 		Info: output.Info{
 			Name: ModuleName,

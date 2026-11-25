@@ -2,8 +2,9 @@ package agent
 
 import (
 	"context"
-	"crypto/md5"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -117,15 +118,23 @@ type AuditAgenticScanner struct {
 
 	agenticScanUUID string // UUID of the child AgenticScan record tracking this audit
 
-	mu        sync.Mutex
-	cmd       *exec.Cmd
-	done      chan struct{}
-	err       error
-	cancelled bool
-	startedAt time.Time // wall time the agent subprocess was launched
+	mu             sync.Mutex
+	cmd            *exec.Cmd
+	done           chan struct{}
+	err            error
+	processErr     error
+	evidenceErr    error
+	terminalStatus string
+	cancelled      bool
+	startedAt      time.Time // wall time the agent subprocess was launched
 
-	lastStateHash string           // cached hash for change detection in syncLoop
-	syncedFiles   map[string]int64 // filename → size, for incremental sync
+	// syncMu serializes periodic writes with the final archive. Once finalizing
+	// begins, no tick may overwrite the verified archive or regress DB status.
+	syncMu        sync.Mutex
+	syncFinalized bool
+	archiveDir    string            // populated only after a complete, verified archive
+	lastStateHash string            // advances only after successful disk and DB writes
+	syncedFiles   map[string]string // filename → content hash, including same-size edits
 
 	// Populated by importFindings after monitor() completes.
 	findingStats FindingStats
@@ -224,7 +233,7 @@ func NewAuditAgenticScanner(cfg AuditAgentConfig, repo *database.Repository) *Au
 		repo:            repo,
 		agenticScanUUID: deriveAuditScanUUID(cfg),
 		done:            make(chan struct{}),
-		syncedFiles:     make(map[string]int64),
+		syncedFiles:     make(map[string]string),
 	}
 }
 
@@ -522,6 +531,9 @@ func (r *AuditAgenticScanner) monitor(ctx context.Context, cmd *exec.Cmd, output
 	}
 
 	err := cmd.Wait()
+	// Capture execution cancellation before detaching finalization. A clean exit
+	// still wins if cancellation arrived after the process had already finished.
+	executionCancelled := err != nil && ctx.Err() != nil
 
 	// Drain the streaming goroutine (if any) before reading captured
 	// state — auditResult and the raw outputBuf both depend on the
@@ -535,11 +547,14 @@ func (r *AuditAgenticScanner) monitor(ctx context.Context, cmd *exec.Cmd, output
 
 	r.mu.Lock()
 	r.err = err
+	r.processErr = err
+	r.cancelled = r.cancelled || executionCancelled
+	cancelled := r.cancelled
 	r.mu.Unlock()
 
 	harnessName := r.harness().Name
 	if err != nil {
-		if r.cancelled {
+		if cancelled {
 			zap.L().Info("Audit cancelled", zap.String("harness", harnessName))
 		} else {
 			zap.L().Warn("Audit process exited with error",
@@ -554,25 +569,21 @@ func (r *AuditAgenticScanner) monitor(ctx context.Context, cmd *exec.Cmd, output
 	// is already done, which would fail the finding import and the terminal status
 	// update — dropping findings and leaving the run stuck at "running" exactly
 	// when it was cancelled. WithoutCancel keeps values but not the cancellation,
-	// so finalization always lands (the "cancelled" vs "failed" distinction is
-	// preserved via r.cancelled in finalizeAgenticScan).
+	// so finalization is attempted independently (the "cancelled" vs "failed"
+	// distinction is preserved via r.cancelled in finalizeAgenticScan).
 	finalizeCtx, cancelFinalize := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
 	defer cancelFinalize()
 
-	// Final sync and import
-	r.syncFolderFull()
-	r.importFindings(finalizeCtx)
-
-	// Cleanup: remove the harness output dir from source since we have a
-	// copy in session. KeepSourceOutputDir opts out (see its field doc).
+	// Only a complete, verified archive permits source removal. Failed archive
+	// (including absent SessionDir) imports the authoritative source, not a
+	// possibly partial incremental copy, and leaves that source intact.
+	evidenceErr := r.archiveAndImport(finalizeCtx)
 	harness := r.harness()
-	srcOutputDir := filepath.Join(r.cfg.SourcePath, harness.SourceFolder)
-	if _, statErr := os.Stat(srcOutputDir); statErr == nil && !r.cfg.KeepSourceOutputDir {
-		if rmErr := os.RemoveAll(srcOutputDir); rmErr != nil {
-			zap.L().Debug("Failed to cleanup harness output dir from source", zap.Error(rmErr))
-		} else {
-			zap.L().Info("Cleaned up harness output dir from source", zap.String("path", srcOutputDir))
-		}
+	if evidenceErr != nil {
+		zap.L().Warn("Audit evidence finalization incomplete", zap.Error(evidenceErr))
+		r.mu.Lock()
+		r.err = errors.Join(err, evidenceErr)
+		r.mu.Unlock()
 	}
 
 	// Save raw output
@@ -581,27 +592,56 @@ func (r *AuditAgenticScanner) monitor(ctx context.Context, cmd *exec.Cmd, output
 		rawOutput := output.Bytes()
 
 		// If stdout buffer is empty (process killed before --print flushed),
-		// fall back to reading key audit output files from the synced session dir.
+		// fall back to guarded reads from the verified archive/source authority.
 		if len(rawOutput) == 0 {
-			rawOutput = r.collectFallbackOutput()
+			var fallbackErr error
+			rawOutput, fallbackErr = r.collectFallbackOutputContext(finalizeCtx)
+			evidenceErr = errors.Join(evidenceErr, fallbackErr)
 		}
 
 		if len(rawOutput) > 0 {
-			if writeErr := os.WriteFile(outputPath, rawOutput, 0o644); writeErr != nil {
-				zap.L().Debug("Failed to save audit output", zap.Error(writeErr))
+			if writeErr := writeAuditArtifact(outputPath, rawOutput); writeErr != nil {
+				zap.L().Warn("Failed to save audit output", zap.Error(writeErr))
+				evidenceErr = errors.Join(evidenceErr, writeErr)
+				r.mu.Lock()
+				r.err = errors.Join(err, evidenceErr)
+				r.mu.Unlock()
 			}
 		}
 	}
 
-	// Update AgenticScan as completed/failed/cancelled (detached ctx, see above).
-	r.finalizeAgenticScan(finalizeCtx, err)
+	// The archive budget may be exhausted. Do not reuse it for the terminal DB
+	// write: cancellation or slow evidence work must not strand a running row.
+	r.computeCostSummary()
+	terminalErr := r.persistAuditTerminalStatus(ctx, err, evidenceErr)
+	evidenceErr = errors.Join(evidenceErr, terminalErr)
+	run := &database.AgenticScan{}
+	applyAuditTerminalStatus(run, err, cancelled)
+	if err == nil && evidenceErr != nil {
+		run.Status = database.CompletedAgenticScanStatus(true)
+	}
+	r.mu.Lock()
+	r.evidenceErr = evidenceErr
+	r.terminalStatus = run.Status
+	r.err = errors.Join(err, evidenceErr)
+	r.mu.Unlock()
 }
 
-// collectFallbackOutput reads key audit output files from the synced session
-// directory and concatenates them. Used when the process was killed before
+// collectFallbackOutput reads key files from the verified archive or source
+// fallback and concatenates them. Used when the process was killed before
 // stdout was flushed (e.g. --print mode with early cancellation).
 func (r *AuditAgenticScanner) collectFallbackOutput() []byte {
-	auditDirLocal := filepath.Join(r.cfg.SessionDir, r.harness().SessionSubdir)
+	ctx, cancel := context.WithTimeout(context.Background(), auditIOTimeout)
+	defer cancel()
+	data, _ := r.collectFallbackOutputContext(ctx)
+	return data
+}
+
+func (r *AuditAgenticScanner) collectFallbackOutputContext(ctx context.Context) ([]byte, error) {
+	auditDirLocal := r.evidenceDir()
+	if auditDirLocal == "" {
+		return nil, nil
+	}
 
 	// Top-level reports across lite/scan/deep modes. Includes the Phase 5A/5B/5C
 	// matrices added in upstream commit 87b2281.
@@ -619,8 +659,14 @@ func (r *AuditAgenticScanner) collectFallbackOutput() []byte {
 
 	var parts [][]byte
 	for _, name := range candidates {
-		data, err := os.ReadFile(filepath.Join(auditDirLocal, name))
-		if err != nil || len(data) == 0 {
+		data, err := readAuditControl(ctx, auditDirLocal, name, maxAuditControlBytes)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if len(data) == 0 {
 			continue
 		}
 		header := fmt.Sprintf("# %s\n\n", strings.TrimSuffix(name, ".md"))
@@ -632,8 +678,16 @@ func (r *AuditAgenticScanner) collectFallbackOutput() []byte {
 	// Enumerate confirmed findings (each in audit/findings/<ID>-<slug>/report.md).
 	// findings-draft/ is wiped at the end of every successful run so we no longer
 	// scan it; consolidated findings live under findings/ regardless of mode.
-	findingsDir := filepath.Join(auditDirLocal, "findings")
-	if entries, err := os.ReadDir(findingsDir); err == nil {
+	root, rootErr := openAuditRoot(auditDirLocal)
+	if rootErr != nil {
+		return nil, rootErr
+	}
+	defer root.root.Close()
+	entries, readErr := root.readDirContext(ctx, "findings")
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return nil, readErr
+	}
+	if readErr == nil {
 		var findingDirs []string
 		for _, e := range entries {
 			if e.IsDir() {
@@ -642,23 +696,29 @@ func (r *AuditAgenticScanner) collectFallbackOutput() []byte {
 		}
 		if len(findingDirs) > 0 {
 			sort.Strings(findingDirs)
-			summary := fmt.Sprintf("# Findings\n\n%d findings produced:\n", len(findingDirs))
+			var summary strings.Builder
+			fmt.Fprintf(&summary, "# Findings\n\n%d findings produced:\n", len(findingDirs))
 			for _, name := range findingDirs {
-				summary += fmt.Sprintf("- %s\n", name)
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				if int64(summary.Len()+len(name)+3) > maxAuditParseBytes {
+					return nil, fmt.Errorf("audit fallback summary limit exceeded")
+				}
+				fmt.Fprintf(&summary, "- %s\n", name)
 			}
-			parts = append(parts, []byte(summary))
+			parts = append(parts, []byte(summary.String()))
 		}
-	}
-
-	if len(parts) == 0 {
-		return nil
 	}
 
 	var buf []byte
 	for _, p := range parts {
+		if int64(len(buf)+len(p)) > maxAuditParseBytes {
+			return nil, fmt.Errorf("audit fallback summary limit exceeded")
+		}
 		buf = append(buf, p...)
 	}
-	return buf
+	return buf, ctx.Err()
 }
 
 func (r *AuditAgenticScanner) syncLoop(ctx context.Context) {
@@ -673,7 +733,7 @@ func (r *AuditAgenticScanner) syncLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			r.syncStateOnce(ctx)
-			r.syncFindingsIncremental()
+			r.syncFindingsIncrementalContext(ctx)
 		}
 	}
 }
@@ -684,103 +744,259 @@ func (r *AuditAgenticScanner) syncLoop(ctx context.Context) {
 // unchanged from the previous tick — long-running audits don't churn
 // hundreds of KB of identical bytes through fsync once a minute.
 func (r *AuditAgenticScanner) syncStateOnce(ctx context.Context) {
-	if r.cfg.SessionDir == "" || r.cfg.SourcePath == "" {
+	r.syncMu.Lock()
+	defer r.syncMu.Unlock()
+	if r.syncFinalized || r.cfg.SessionDir == "" || r.cfg.SourcePath == "" {
 		return
 	}
 	harness := r.harness()
 
-	src := filepath.Join(r.cfg.SourcePath, harness.SourceFolder, "audit-state.json")
-	data, err := os.ReadFile(src)
+	readCtx, cancel := context.WithTimeout(ctx, auditIOTimeout)
+	defer cancel()
+	data, err := readAuditControl(readCtx, filepath.Join(r.cfg.SourcePath, harness.SourceFolder), "audit-state.json", maxAuditControlBytes)
 	if err != nil {
 		return // file may not exist yet
 	}
 
-	hash := fmt.Sprintf("%x", md5.Sum(data))
+	hash := fmt.Sprintf("%x", sha256.Sum256(data))
 	if hash == r.lastStateHash {
 		return
 	}
-	r.lastStateHash = hash
 
 	destDir := filepath.Join(r.cfg.SessionDir, harness.SessionSubdir)
-	_ = os.MkdirAll(destDir, 0o755)
-	dest := filepath.Join(destDir, "audit-state.json")
-	if writeErr := os.WriteFile(dest, data, 0o644); writeErr != nil {
-		zap.L().Debug("Failed to sync audit state", zap.Error(writeErr))
+	if err := ensureAuditDir(destDir); err != nil {
+		zap.L().Warn("Failed to create audit state directory", zap.Error(err))
+		return
 	}
-	r.updateAgenticScanProgress(ctx, data)
+	dest := filepath.Join(destDir, "audit-state.json")
+	if writeErr := writeAuditArtifact(dest, data); writeErr != nil {
+		zap.L().Warn("Failed to sync audit state", zap.Error(writeErr))
+		return
+	}
+	if err := r.updateAgenticScanProgress(readCtx, data); err != nil {
+		zap.L().Warn("Failed to sync audit progress", zap.Error(err))
+		return
+	}
+	r.lastStateHash = hash
 }
 
-// syncFindingsIncremental copies new/changed files from findings-draft/ to session dir.
-// Tracks synced files by size to avoid re-copying unchanged files.
+// syncFindingsIncremental streams changed draft files to the session directory.
+// Content fingerprints detect same-size edits and advance only after publication.
 func (r *AuditAgenticScanner) syncFindingsIncremental() {
-	if r.cfg.SessionDir == "" || r.cfg.SourcePath == "" {
+	r.syncFindingsIncrementalContext(context.Background())
+}
+
+func (r *AuditAgenticScanner) syncFindingsIncrementalContext(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, auditIOTimeout)
+	defer cancel()
+	r.syncMu.Lock()
+	defer r.syncMu.Unlock()
+	if r.syncFinalized || r.cfg.SessionDir == "" || r.cfg.SourcePath == "" {
 		return
 	}
 	harness := r.harness()
-
 	srcDir := filepath.Join(r.cfg.SourcePath, harness.SourceFolder, "findings-draft")
-	entries, err := os.ReadDir(srcDir)
+	root, err := openAuditRoot(srcDir)
 	if err != nil {
 		return
 	}
-
+	defer root.root.Close()
+	entries, err := root.readDirContext(ctx, ".")
+	if err != nil {
+		return
+	}
 	destDir := filepath.Join(r.cfg.SessionDir, harness.SessionSubdir, "findings-draft")
-	_ = os.MkdirAll(destDir, 0o755)
-
+	if err := ensureAuditDir(destDir); err != nil {
+		zap.L().Warn("Failed to create draft findings directory", zap.Error(err))
+		return
+	}
+	if r.syncedFiles == nil {
+		r.syncedFiles = make(map[string]string)
+	}
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if !entry.Type().IsRegular() {
 			continue
 		}
-		info, err := entry.Info()
+		if ctx.Err() != nil {
+			return
+		}
+		hash, err := auditHashInRoot(ctx, root, entry.Name())
 		if err != nil {
 			continue
 		}
-		// Skip if already synced with same size
-		if prevSize, ok := r.syncedFiles[entry.Name()]; ok && prevSize == info.Size() {
+		if r.syncedFiles[entry.Name()] == hash {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(srcDir, entry.Name()))
+		copiedHash, err := copyAuditInRoot(ctx, root, entry.Name(), filepath.Join(destDir, entry.Name()), -1)
 		if err != nil {
+			zap.L().Warn("Failed to sync draft finding", zap.String("file", entry.Name()), zap.Error(err))
 			continue
 		}
-		if writeErr := os.WriteFile(filepath.Join(destDir, entry.Name()), data, 0o644); writeErr == nil {
-			r.syncedFiles[entry.Name()] = info.Size()
-		}
+		r.syncedFiles[entry.Name()] = copiedHash
 	}
 }
 
-// syncFolderFull copies the entire harness output folder to session dir.
-func (r *AuditAgenticScanner) syncFolderFull() {
+// syncFolderFull publishes only a complete, verified archive. Periodic sync is
+// stopped before copying; a partial or stale session tree is never authoritative.
+func (r *AuditAgenticScanner) syncFolderFull() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return r.syncFolderFullContext(ctx)
+}
+
+func (r *AuditAgenticScanner) syncFolderFullContext(ctx context.Context) error {
+	r.syncMu.Lock()
+	defer r.syncMu.Unlock()
+	r.syncFinalized = true
+	r.archiveDir = ""
 	if r.cfg.SessionDir == "" || r.cfg.SourcePath == "" {
-		return
+		return fmt.Errorf("cannot archive audit evidence: source and session directories are required")
 	}
 	harness := r.harness()
-
+	if !filepath.IsLocal(harness.SourceFolder) || !filepath.IsLocal(harness.SessionSubdir) {
+		return fmt.Errorf("cannot archive audit evidence: harness paths must be local")
+	}
 	srcDir := filepath.Join(r.cfg.SourcePath, harness.SourceFolder)
-	if _, err := os.Stat(srcDir); os.IsNotExist(err) {
-		return
+	destDir := filepath.Join(r.cfg.SessionDir, harness.SessionSubdir)
+	if err := ensureAuditDir(filepath.Dir(destDir)); err != nil {
+		return err
+	}
+	resolvedSrc, err := filepath.EvalSymlinks(srcDir)
+	if err != nil {
+		return err
+	}
+	resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(destDir))
+	if err != nil {
+		return err
+	}
+	if auditPathsOverlap(resolvedSrc, filepath.Join(resolvedParent, filepath.Base(destDir))) {
+		return fmt.Errorf("cannot archive audit evidence: source and destination overlap")
+	}
+	before, err := auditFolderManifestContext(ctx, srcDir)
+	if err != nil {
+		return err
+	}
+	stage, err := os.MkdirTemp(filepath.Dir(destDir), ".audit-archive-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stage)
+	if err := copyDirContext(ctx, srcDir, stage); err != nil {
+		return fmt.Errorf("copy audit archive: %w", err)
+	}
+	after, err := auditFolderManifestContext(ctx, srcDir)
+	if err != nil {
+		return err
+	}
+	copied, err := auditFolderManifestContext(ctx, stage)
+	if err != nil {
+		return err
+	}
+	if !equalAuditManifests(before, after) || !equalAuditManifests(after, copied) {
+		return fmt.Errorf("audit archive verification failed: source changed or copy is incomplete")
+	}
+	if err := syncAuditDirsContext(ctx, stage); err != nil {
+		return fmt.Errorf("sync audit archive directories: %w", err)
 	}
 
-	destDir := filepath.Join(r.cfg.SessionDir, harness.SessionSubdir)
-	_ = os.MkdirAll(destDir, 0o755)
+	// Preserve the old incremental tree until the verified replacement is in
+	// place. Rename failure restores it; no partial copy is published.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	backup := stage + ".previous"
+	if info, err := os.Lstat(destDir); err == nil {
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("audit archive destination is not a real directory")
+		}
+		if err := os.Rename(destDir, backup); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Rename(stage, destDir); err != nil {
+		if _, statErr := os.Lstat(backup); statErr == nil {
+			if restoreErr := os.Rename(backup, destDir); restoreErr != nil {
+				return errors.Join(err, fmt.Errorf("restore previous archive at %s: %w", backup, restoreErr))
+			}
+		}
+		return err
+	}
+	if err := syncAuditDir(filepath.Dir(destDir)); err != nil {
+		return fmt.Errorf("sync published audit archive: %w", err)
+	}
+	r.archiveDir = destDir
+	if err := os.RemoveAll(backup); err != nil {
+		zap.L().Warn("Verified archive published but old incremental copy remains", zap.String("path", backup), zap.Error(err))
+	}
+	return nil
+}
 
-	copyDir(srcDir, destDir)
+// archiveAndImport is called only after the harness process has exited. Failed
+// copies explicitly fall back to source and never authorize source removal.
+func (r *AuditAgenticScanner) archiveAndImport(ctx context.Context) error {
+	archiveErr := r.syncFolderFullContext(ctx)
+	if archiveErr != nil {
+		zap.L().Warn("Audit archive failed; retaining source and importing source evidence",
+			zap.String("source", r.cfg.SourcePath), zap.Error(archiveErr))
+	}
+	importErr := r.importFindingsFrom(ctx, r.evidenceDir())
+	if archiveErr != nil || importErr != nil || r.cfg.KeepSourceOutputDir {
+		return errors.Join(archiveErr, importErr)
+	}
+	srcDir := filepath.Join(r.cfg.SourcePath, r.harness().SourceFolder)
+	// Recheck immediately before cleanup, including descendant content, so a
+	// changed/resumed source is retained. This is not a cross-process lease.
+	source, err := auditFolderManifestContext(ctx, srcDir)
+	if err != nil {
+		return err
+	}
+	archived, err := auditFolderManifestContext(ctx, r.evidenceDir())
+	if err != nil {
+		return err
+	}
+	if !equalAuditManifests(source, archived) {
+		return fmt.Errorf("source evidence changed after archiving; retaining %s", srcDir)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(srcDir); err != nil {
+		return fmt.Errorf("remove verified audit source: %w", err)
+	}
+	zap.L().Info("Cleaned up verified harness output dir from source", zap.String("path", srcDir))
+	return nil
+}
+
+func (r *AuditAgenticScanner) evidenceDir() string {
+	r.syncMu.Lock()
+	defer r.syncMu.Unlock()
+	if r.archiveDir != "" {
+		return r.archiveDir
+	}
+	if r.cfg.SourcePath != "" {
+		return filepath.Join(r.cfg.SourcePath, r.harness().SourceFolder)
+	}
+	// Standalone imports of an already-existing archive have no source path.
+	if r.cfg.SessionDir != "" {
+		return filepath.Join(r.cfg.SessionDir, r.harness().SessionSubdir)
+	}
+	return ""
 }
 
 // importFindings parses the harness output from session dir and imports findings.
 // Populates r.findingStats so the CLI summary can report what was persisted.
 func (r *AuditAgenticScanner) importFindings(ctx context.Context) {
+	_ = r.importFindingsFrom(ctx, r.evidenceDir())
+}
+
+func (r *AuditAgenticScanner) importFindingsFrom(ctx context.Context, auditDirLocal string) error {
 	harness := r.harness()
-
-	// Parse from session dir (synced copy) or fall back to source dir
-	var auditDirLocal string
-	if r.cfg.SessionDir != "" {
-		auditDirLocal = filepath.Join(r.cfg.SessionDir, harness.SessionSubdir)
-	} else {
-		auditDirLocal = filepath.Join(r.cfg.SourcePath, harness.SourceFolder)
+	if auditDirLocal == "" {
+		return fmt.Errorf("cannot import audit findings: no evidence directory")
 	}
-
-	result, err := audit.ParseFolder(auditDirLocal)
+	result, err := parseAuditEvidence(ctx, auditDirLocal)
 	if err != nil {
 		// ParseFolder returns a nil error for a missing/empty dir, so a non-nil
 		// error means the audit output is corrupt and every finding is being
@@ -788,7 +1004,7 @@ func (r *AuditAgenticScanner) importFindings(ctx context.Context) {
 		zap.L().Warn("Failed to parse harness output for import (findings dropped)",
 			zap.String("dir", auditDirLocal),
 			zap.Error(err))
-		return
+		return err
 	}
 
 	auditID := ""
@@ -808,10 +1024,17 @@ func (r *AuditAgenticScanner) importFindings(ctx context.Context) {
 
 	// Persist when a repository is available — otherwise we still want Parsed
 	// and BySeverity on the runner so the CLI summary can render counts.
+	var persistenceErr error
 	if r.repo != nil {
 		for _, f := range findings {
+			if err := ctx.Err(); err != nil {
+				persistenceErr = errors.Join(persistenceErr, err)
+				break
+			}
 			f.ScanUUID = r.cfg.ScanUUID
 			if err := r.repo.SaveFindingDirect(ctx, f); err != nil {
+				persistenceErr = errors.Join(persistenceErr, err)
+				zap.L().Warn("Failed to persist audit finding; retaining source evidence", zap.String("module", f.ModuleID), zap.Error(err))
 				continue
 			}
 			if f.ID > 0 {
@@ -847,6 +1070,7 @@ func (r *AuditAgenticScanner) importFindings(ctx context.Context) {
 			zap.Int("parsed", stats.Parsed),
 			zap.Int("saved", stats.Saved))
 	}
+	return persistenceErr
 }
 
 // FindingStats returns the summary of findings parsed and imported by this
@@ -872,14 +1096,17 @@ func (r *AuditAgenticScanner) FindingStats() FindingStats {
 	return stats
 }
 
-func (r *AuditAgenticScanner) updateAgenticScanProgress(ctx context.Context, stateData []byte) {
+func (r *AuditAgenticScanner) updateAgenticScanProgress(ctx context.Context, stateData []byte) error {
 	if r.repo == nil || r.cfg.SuppressAgenticScanRow {
-		return
+		return nil
 	}
 
 	var state audit.State
-	if err := json.Unmarshal(stateData, &state); err != nil || len(state.Audits) == 0 {
-		return
+	if err := json.Unmarshal(stateData, &state); err != nil {
+		return err
+	}
+	if len(state.Audits) == 0 {
+		return nil
 	}
 
 	latest := state.Audits[len(state.Audits)-1]
@@ -897,7 +1124,7 @@ func (r *AuditAgenticScanner) updateAgenticScanProgress(ctx context.Context, sta
 
 	run, err := r.repo.GetAgenticScan(ctx, r.agenticScanUUID)
 	if err != nil {
-		return
+		return err
 	}
 
 	run.PhasesRun = phases
@@ -910,47 +1137,59 @@ func (r *AuditAgenticScanner) updateAgenticScanProgress(ctx context.Context, sta
 		}
 	}
 
-	if err := r.repo.UpdateAgenticScan(ctx, run); err != nil {
-		zap.L().Warn("failed to persist agentic scan progress", zap.String("run", run.UUID), zap.Error(err))
-	}
+	return r.repo.UpdateAgenticScan(ctx, run)
 }
 
-func (r *AuditAgenticScanner) finalizeAgenticScan(ctx context.Context, processErr error) {
-	// Compute the cost summary regardless of whether a DB repo is attached
-	// — the CLI summary reads it from memory, so we want it populated even
-	// in the no-persistence path.
-	r.computeCostSummary()
+func (r *AuditAgenticScanner) persistAuditTerminalStatus(executionCtx context.Context, processErr, evidenceErr error) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(executionCtx), auditTerminalTimeout)
+	defer cancel()
+	return r.finalizeAgenticScan(ctx, processErr, evidenceErr)
+}
 
-	// SuppressAgenticScanRow: the piolium chain scanner owns the single
-	// aggregated row and finalizes it itself after all modes run. The
-	// cost summary above is still computed so the chain can sum it.
+func (r *AuditAgenticScanner) finalizeAgenticScan(ctx context.Context, processErr, evidenceErr error) error {
 	if r.repo == nil || r.cfg.SuppressAgenticScanRow {
-		return
+		return nil
 	}
 
 	run, err := r.repo.GetAgenticScan(ctx, r.agenticScanUUID)
 	if err != nil {
-		return
+		return fmt.Errorf("read audit terminal catalog: %w", err)
 	}
+
+	var stateErr error
+	if evidenceDir := r.evidenceDir(); evidenceDir != "" {
+		data, err := readAuditControl(ctx, evidenceDir, "audit-state.json", maxAuditControlBytes)
+		if err == nil {
+			run.ResultJSON = string(data)
+		} else if !os.IsNotExist(err) {
+			stateErr = err
+		}
+	}
+	evidenceErr = errors.Join(evidenceErr, stateErr)
 
 	run.CompletedAt = time.Now()
 	run.DurationMs = run.CompletedAt.Sub(run.StartedAt).Milliseconds()
 
 	// A clean process exit is "completed" even if Cancel() raced in after
 	// the process already finished — processErr==nil takes precedence.
-	applyAuditTerminalStatus(run, processErr, r.cancelled || ctx.Err() != nil)
-
-	// Load final state for result_json
-	stateFile := filepath.Join(r.cfg.SessionDir, r.harness().SessionSubdir, "audit-state.json")
-	if data, readErr := os.ReadFile(stateFile); readErr == nil {
-		run.ResultJSON = string(data)
+	r.mu.Lock()
+	cancelled := r.cancelled
+	r.mu.Unlock()
+	applyAuditTerminalStatus(run, processErr, cancelled)
+	if evidenceErr != nil {
+		if processErr == nil {
+			run.Status = database.CompletedAgenticScanStatus(true)
+		}
+		run.ErrorMessage = errors.Join(processErr, evidenceErr).Error()
 	}
 
 	applyScanCost(run, r.costSummary)
 
 	if err := r.repo.UpdateAgenticScan(ctx, run); err != nil {
 		zap.L().Warn("failed to persist finalized agentic scan", zap.String("run", run.UUID), zap.Error(err))
+		return errors.Join(stateErr, fmt.Errorf("persist audit terminal catalog: %w", err))
 	}
+	return stateErr
 }
 
 // computeCostSummary derives a priced ScanCost for the run and stores
@@ -1113,7 +1352,9 @@ func (r *AuditAgenticScanner) readCurrentState() *audit.State {
 	}
 
 	for _, path := range candidates {
-		data, err := os.ReadFile(path)
+		ctx, cancel := context.WithTimeout(context.Background(), auditIOTimeout)
+		data, err := readAuditControl(ctx, filepath.Dir(path), filepath.Base(path), maxAuditControlBytes)
+		cancel()
 		if err != nil {
 			continue
 		}
@@ -1149,30 +1390,208 @@ func (b *syncBuffer) Bytes() []byte {
 	return cp
 }
 
-// copyDir recursively copies a directory's contents. Silently skips errors.
-func copyDir(src, dest string) {
-	_ = filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		rel, relErr := filepath.Rel(src, path)
-		if relErr != nil {
-			return nil
-		}
-		destPath := filepath.Join(dest, rel)
+// copyDir streams regular files and rejects symlinks/special files instead of
+// following them out of the evidence tree or silently producing a partial copy.
+func copyDir(src, dest string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), auditIOTimeout)
+	defer cancel()
+	return copyDirContext(ctx, src, dest)
+}
 
+func copyDirContext(ctx context.Context, src, dest string) error {
+	return walkAuditTree(ctx, src, func(root *auditRootFS, name string, d fs.DirEntry) error {
+		destPath := filepath.Join(dest, filepath.FromSlash(name))
 		if d.IsDir() {
-			_ = os.MkdirAll(destPath, 0o755)
+			return ensureAuditDir(destPath)
+		}
+		_, err := copyAuditInRoot(ctx, root, name, destPath, -1)
+		return err
+	})
+}
+
+// ensureAuditDir rejects symlink components. New evidence directories are
+// private; existing shared parent directories keep their permissions.
+func ensureAuditDir(path string) error {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		if err := ensureAuditDir(filepath.Dir(path)); err != nil {
+			return err
+		}
+		if err := os.Mkdir(path, 0o700); err != nil && !os.IsExist(err) {
+			return err
+		}
+		info, err = os.Lstat(path)
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("audit evidence directory is not a real directory: %s", path)
+	}
+	if parent := filepath.Dir(path); parent != path {
+		return ensureAuditDir(parent)
+	}
+	return nil
+}
+
+// publishAuditArtifact writes a private temporary file, fsyncs it, and renames
+// it atomically. Errors leave the previous artifact and fingerprint untouched.
+func publishAuditArtifact(dest string, write func(io.Writer) error) error {
+	if err := ensureAuditDir(filepath.Dir(dest)); err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(filepath.Dir(dest), ".audit-copy-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	writeErr := write(file)
+	if writeErr == nil {
+		writeErr = file.Sync()
+	}
+	closeErr := file.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), dest)
+}
+
+func writeAuditArtifact(dest string, data []byte) error {
+	return publishAuditArtifact(dest, func(out io.Writer) error {
+		_, err := out.Write(data)
+		return err
+	})
+}
+
+func openAuditFile(filePath string) (*os.File, error) {
+	root, err := openAuditRoot(filepath.Dir(filePath))
+	if err != nil {
+		return nil, err
+	}
+	defer root.root.Close()
+	file, err := root.Open(filepath.Base(filePath))
+	if err != nil {
+		return nil, err
+	}
+	f := file.(*os.File)
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("unsupported audit evidence file")
+	}
+	return f, nil
+}
+
+func auditFileHash(filePath string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), auditIOTimeout)
+	defer cancel()
+	root, err := openAuditRoot(filepath.Dir(filePath))
+	if err != nil {
+		return "", err
+	}
+	defer root.root.Close()
+	return auditHashInRoot(ctx, root, filepath.Base(filePath))
+}
+
+func copyAuditFile(src, dest string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), auditIOTimeout)
+	defer cancel()
+	root, err := openAuditRoot(filepath.Dir(src))
+	if err != nil {
+		return "", err
+	}
+	defer root.root.Close()
+	return copyAuditInRoot(ctx, root, filepath.Base(src), dest, -1)
+}
+
+// A manifest holds only paths and fingerprints, never whole evidence contents.
+// Directory entries are included so missing/extra files or empty dirs are caught.
+func auditFolderManifest(root string) (map[string]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), auditIOTimeout)
+	defer cancel()
+	return auditFolderManifestContext(ctx, root)
+}
+
+func auditFolderManifestContext(ctx context.Context, dir string) (map[string]string, error) {
+	manifest := make(map[string]string)
+	err := walkAuditTree(ctx, dir, func(root *auditRootFS, name string, d fs.DirEntry) error {
+		if d.IsDir() {
+			manifest[name] = "dir"
 			return nil
 		}
-		data, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return nil
+		hash, err := auditHashInRoot(ctx, root, name)
+		if err != nil {
+			return err
 		}
-		_ = os.MkdirAll(filepath.Dir(destPath), 0o755)
-		writeSessionArtifact(destPath, data)
+		manifest[name] = hash
 		return nil
 	})
+	return manifest, err
+}
+
+// Sync directory entries as well as file contents before source removal.
+func syncAuditDirs(root string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), auditIOTimeout)
+	defer cancel()
+	return syncAuditDirsContext(ctx, root)
+}
+
+func syncAuditDirsContext(ctx context.Context, dir string) error {
+	var dirs []string
+	if err := walkAuditTree(ctx, dir, func(_ *auditRootFS, name string, d fs.DirEntry) error {
+		if d.IsDir() {
+			dirs = append(dirs, filepath.Join(dir, filepath.FromSlash(name)))
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for i := len(dirs) - 1; i >= 0; i-- {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := syncAuditDir(dirs[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func syncAuditDir(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return errors.Join(dir.Sync(), dir.Close())
+}
+
+func equalAuditManifests(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for path, hash := range a {
+		if b[path] != hash {
+			return false
+		}
+	}
+	return true
+}
+
+func auditPathsOverlap(a, b string) bool {
+	a, err := filepath.Abs(a)
+	if err != nil {
+		return true
+	}
+	b, err = filepath.Abs(b)
+	if err != nil {
+		return true
+	}
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	return a == b || strings.HasPrefix(a, b+string(os.PathSeparator)) || strings.HasPrefix(b, a+string(os.PathSeparator))
 }
 
 // --- Audit harness environment ---
@@ -1498,8 +1917,8 @@ func StartAuditAgent(ctx context.Context, agentCfg config.AuditAgentConfig, harn
 // startAuditAgentBackground is a shared helper that starts an audit (audit
 // or piolium) and returns the runner and a wait func. Logs startup
 // success/failure via the provided logFn. Returns nil runner and nil wait
-// when the audit is disabled or fails to start. The harness drives the
-// stale-output-dir cleanup (`<source>/<harness.SourceFolder>/`) and the
+// when the audit is disabled or fails to start. Under the local source lease,
+// any existing output requires recovery before reuse. The harness also drives
 // platform/stream-decoder selection inside StartAuditAgent.
 func startAuditAgentBackground(ctx context.Context, auditCfg *config.AuditAgentConfig, harness HarnessSpec, sourcePath, sessionDir, projectUUID, scanUUID, parentAgenticScanUUID string, repo *database.Repository, streamWriter io.Writer, logFn func(msg string)) (*AuditAgenticScanner, func(), error) {
 	if auditCfg == nil || !auditCfg.IsEnabled() || sourcePath == "" {
@@ -1510,13 +1929,21 @@ func startAuditAgentBackground(ctx context.Context, auditCfg *config.AuditAgentC
 	}
 
 	// Serialize audits that share this source-tree output dir. The embedded audit
-	// binary writes to a fixed `<source>/<SourceFolder>` path, and both the startup
-	// cleanup below and the post-run cleanup RemoveAll it — so two concurrent audits
-	// on the same checkout (e.g. two projects) would delete each other's in-progress
-	// output. The lease makes a second same-source audit wait for the first to
-	// finish instead of clobbering it. Released when the run's monitor exits.
+	// binary writes to a fixed `<source>/<SourceFolder>` path. The lease makes a
+	// second same-source audit wait for the first to finish, then refuses reuse
+	// if previous evidence remains. Released when the run's monitor exits.
 	staleDir := filepath.Join(sourcePath, harness.SourceFolder)
-	releaseLease := acquireAuditSourceLease(staleDir)
+	releaseLease, leaseErr := acquireAuditSourceLeaseContext(ctx, staleDir)
+	if leaseErr != nil {
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
+		zap.L().Warn("Audit source output cannot be checked; recover before reusing source", zap.String("path", staleDir))
+		if logFn != nil {
+			logFn("audit source output cannot be checked; recovery path " + staleDir)
+		}
+		return nil, nil, errors.Join(ErrAuditSourceNeedsRecovery, leaseErr)
+	}
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(releaseLease) }
 	leaseHeld := true
@@ -1527,15 +1954,12 @@ func startAuditAgentBackground(ctx context.Context, auditCfg *config.AuditAgentC
 			release()
 		}
 	}()
-	if info, statErr := os.Stat(staleDir); statErr == nil && info.IsDir() {
-		zap.L().Info("Removing stale audit output dir from previous run",
-			zap.String("path", staleDir),
-			zap.String("harness", harness.Name))
-		if rmErr := os.RemoveAll(staleDir); rmErr != nil {
-			zap.L().Warn("Failed to remove stale audit dir", zap.Error(rmErr))
-		} else if logFn != nil {
-			logFn(fmt.Sprintf("cleaned up stale %s/ dir from previous run", harness.SourceFolder))
+	if err := checkAuditSourceReusable(staleDir); err != nil {
+		zap.L().Warn("Audit source output retained; recover before reusing source", zap.String("path", staleDir))
+		if logFn != nil {
+			logFn("audit source output retained for recovery at " + staleDir)
 		}
+		return nil, nil, err
 	}
 
 	runner, err := StartAuditAgent(ctx, *auditCfg, harness, sourcePath, sessionDir, projectUUID, scanUUID, parentAgenticScanUUID, repo, streamWriter)
@@ -1572,7 +1996,14 @@ func startAuditAgentBackground(ctx context.Context, auditCfg *config.AuditAgentC
 	}()
 
 	wait := func() {
-		<-runner.Done()
+		if err := runner.Wait(); err != nil {
+			// Keep the historical func() API; the caller can obtain the structured
+			// outcome from runner after waiting, without reimporting an old tree.
+			zap.L().Warn("Background audit finalization incomplete", zap.String("run", runner.agenticScanUUID))
+			if logFn != nil {
+				logFn("audit evidence degraded; inspect retained run evidence before source reuse")
+			}
+		}
 	}
 	return runner, wait, nil
 }
@@ -1583,21 +2014,46 @@ func startAuditAgentBackground(ctx context.Context, auditCfg *config.AuditAgentC
 // must not overlap or they clobber each other's output.
 var (
 	auditSourceLeasesMu sync.Mutex
-	auditSourceLeases   = map[string]*sync.Mutex{}
+	auditSourceLeases   = map[string]chan struct{}{}
 )
 
 // acquireAuditSourceLease blocks until the lease for key is free, then returns a
 // release func. Callers must call the returned func exactly once.
 func acquireAuditSourceLease(key string) func() {
+	release, _ := acquireAuditSourceLeaseContext(context.Background(), key)
+	return release
+}
+
+func acquireAuditSourceLeaseContext(ctx context.Context, key string) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	abs, err := filepath.Abs(key)
+	if err != nil {
+		return nil, err
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(abs))
+	if err != nil {
+		return nil, err
+	}
+	key = filepath.Join(parent, filepath.Base(abs))
 	auditSourceLeasesMu.Lock()
-	m, ok := auditSourceLeases[key]
+	gate, ok := auditSourceLeases[key]
 	if !ok {
-		m = &sync.Mutex{}
-		auditSourceLeases[key] = m
+		gate = make(chan struct{}, 1)
+		auditSourceLeases[key] = gate
 	}
 	auditSourceLeasesMu.Unlock()
-	m.Lock()
-	return m.Unlock
+	select {
+	case gate <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-gate
+			return nil, err
+		}
+		return func() { <-gate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // ResolveAuditAgentConfig determines whether vigolium-audit should run.

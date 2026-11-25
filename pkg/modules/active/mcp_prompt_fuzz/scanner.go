@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	mcpinfra "github.com/vigolium/vigolium/pkg/modules/infra/mcp"
@@ -100,7 +101,7 @@ func (m *Module) ScanPerHost(
 	for i := 0; i < limit; i++ {
 		p := prompts.Prompts[i]
 		baseArgs := promptBaseArgs(p)
-		baseDuration, baseBody, ok := timedGet(client, 1500+i*100, p.Name, baseArgs)
+		baseDuration, baseBody, baseExchange, ok := timedGet(client, 1500+i*100, p.Name, baseArgs)
 		if !ok {
 			continue
 		}
@@ -116,26 +117,31 @@ func (m *Module) ScanPerHost(
 				mut[argName] = pl.value
 
 				idForCall := 2500 + i*100 + j
+				proof := &mcpinfra.Proof{}
+				proof.Control(baseExchange)
+				proof.Payload = pl.value
 
 				if pl.timed {
-					duration, _, ok := timedGet(client, idForCall, p.Name, mut)
+					duration, _, exchange, ok := timedGet(client, idForCall, p.Name, mut)
+					proof.Primary = exchange
 					if !ok {
 						continue
 					}
 					if duration >= cmdSleepSeconds && duration > baseDuration+cmdSleepSeconds-2 {
 						findings = append(findings, m.makeFinding(urlx.String(), p.Name, argName, pl,
-							fmt.Sprintf("response delay %ds (baseline %ds)", duration, baseDuration)))
+							fmt.Sprintf("response delay %ds (baseline %ds)", duration, baseDuration), proof))
 					}
 					continue
 				}
 
-				_, body, ok := plainGet(client, idForCall, p.Name, mut)
+				_, body, exchange, ok := plainGet(client, idForCall, p.Name, mut)
+				proof.Primary = exchange
 				if !ok {
 					continue
 				}
 				if matched := matchMarkers(body, baseBody, pl.expectMarkers); matched > 0 {
 					findings = append(findings, m.makeFinding(urlx.String(), p.Name, argName, pl,
-						fmt.Sprintf("%d marker(s) matched", matched)))
+						fmt.Sprintf("%d marker(s) matched", matched), proof))
 				}
 			}
 		}
@@ -144,14 +150,14 @@ func (m *Module) ScanPerHost(
 	return findings, nil
 }
 
-func (m *Module) makeFinding(targetURL, promptName, argName string, p payload, evidence string) *output.ResultEvent {
+func (m *Module) makeFinding(targetURL, promptName, argName string, p payload, evidence string, proof *mcpinfra.Proof) *output.ResultEvent {
 	sev, conf := p.severity, severity.Firm
 	if p.timed {
 		// Time-based (sleep) detection is prone to backend-delay false
 		// positives — flag as suspect/tentative rather than the payload default.
 		sev, conf = severity.Suspect, severity.Tentative
 	}
-	return &output.ResultEvent{
+	return proof.Attack(&output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,
 		FuzzingParameter: argName,
@@ -164,7 +170,7 @@ func (m *Module) makeFinding(targetURL, promptName, argName string, p payload, e
 			Tags:        []string{"mcp", p.vulnTag, "injection"},
 			Reference:   []string{"https://modelcontextprotocol.io/specification/2025-11-25/server/prompts"},
 		},
-	}
+	})
 }
 
 // helpers -------------------------------------------------------------------
@@ -198,22 +204,22 @@ func cloneStr(in map[string]string) map[string]string {
 	return out
 }
 
-func timedGet(client *mcpinfra.Client, id int, name string, args map[string]string) (int, string, bool) {
+func timedGet(client *mcpinfra.Client, id int, name string, args map[string]string) (int, string, *evidence.Exchange, bool) {
 	start := time.Now()
-	_, raw, err := client.GetPrompt(id, name, args)
+	_, raw, exchange, err := client.GetPromptEvidence(id, name, args)
 	elapsed := int(time.Since(start).Seconds())
 	if err != nil && raw == "" {
-		return elapsed, "", false
+		return elapsed, "", exchange, false
 	}
-	return elapsed, raw, true
+	return elapsed, raw, exchange, true
 }
 
-func plainGet(client *mcpinfra.Client, id int, name string, args map[string]string) (*mcpinfra.PromptsGetResult, string, bool) {
-	res, raw, err := client.GetPrompt(id, name, args)
+func plainGet(client *mcpinfra.Client, id int, name string, args map[string]string) (*mcpinfra.PromptsGetResult, string, *evidence.Exchange, bool) {
+	res, raw, exchange, err := client.GetPromptEvidence(id, name, args)
 	if err != nil {
-		return nil, "", false
+		return nil, "", exchange, false
 	}
-	return res, raw, true
+	return res, raw, exchange, true
 }
 
 func matchMarkers(body, baseline string, markers []string) int {

@@ -1,6 +1,7 @@
 package modkit
 
 import (
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 )
@@ -29,6 +30,15 @@ func ReconfirmFinding(client *http.Requester, item *httpmsg.HttpRequestResponse,
 		cachedBody = string(item.Response().Raw())
 		cachedStatus = item.Response().StatusCode()
 	}
-	return ConfirmBodyDifferential(client, item.Service(), []byte(findingRequest), baselineRaw,
+	result := ConfirmBodyDifferential(client, item.Service(), []byte(findingRequest), baselineRaw,
 		cachedBody, cachedStatus, ReconfirmConfig{NoRedirects: true})
+	// Keep the existing input receipt as context, preserving its identity and
+	// fidelity. It is not a fresh send, and cannot become primary confirmation.
+	// With no completed replays there is no selected confirmation to contextualize.
+	if len(result.Evidence) > 0 {
+		if baseline := item.Evidence(); baseline != nil {
+			result.Evidence = append(result.Evidence, evidence.Select(baseline, evidence.RoleBaseline, false, "existing input baseline"))
+		}
+	}
+	return result
 }

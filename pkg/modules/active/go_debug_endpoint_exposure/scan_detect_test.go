@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/modules/modtest"
 	"github.com/vigolium/vigolium/pkg/output"
@@ -151,6 +152,31 @@ func TestScanPerRequest_IndexInfersProfileAndTraceWithoutInvoking(t *testing.T) 
 	assert.Contains(t, names, "Go pprof Execution Trace Endpoint Exposed")
 	assert.False(t, profileHit.Load(), "the scanner must never request /debug/pprof/profile (DoS)")
 	assert.False(t, traceHit.Load(), "the scanner must never request /debug/pprof/trace (DoS)")
+	var indexID string
+	for _, result := range res {
+		if result.Info.Name == "Go pprof Debug Index Exposed" {
+			require.NotEmpty(t, result.Evidence)
+			indexID = result.Evidence[0].ExchangeID
+		}
+	}
+	require.NotEmpty(t, indexID)
+	for _, result := range res {
+		if result.Info.Name != "Go pprof Debug Index Exposed" &&
+			result.Info.Name != "Go pprof CPU Profile Endpoint Exposed" &&
+			result.Info.Name != "Go pprof Execution Trace Endpoint Exposed" {
+			continue
+		}
+		require.NotEmpty(t, result.Evidence)
+		primary := result.Evidence[0]
+		assert.True(t, primary.Primary)
+		assert.Equal(t, evidence.RoleObservation, primary.Role)
+		assert.Equal(t, indexID, primary.ExchangeID, "inferred endpoints reuse the proving index execution")
+		require.NotNil(t, primary.Exchange)
+		assert.Contains(t, string(primary.Exchange.Request), "GET /debug/pprof/ HTTP/1.1")
+		assert.Contains(t, string(primary.Exchange.Response), indexBody)
+		assert.Equal(t, string(primary.Exchange.Request), result.Request)
+		assert.Equal(t, string(primary.Exchange.Response), result.Response)
+	}
 }
 
 // TestScanPerRequest_WalksContextPath confirms a pprof handler mounted under a

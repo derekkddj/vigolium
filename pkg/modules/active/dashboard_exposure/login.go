@@ -5,9 +5,11 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra/dashboardsig"
+	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
 	"github.com/vigolium/vigolium/pkg/utils"
@@ -54,7 +56,8 @@ func (m *Module) tryDefaultLogin(
 	}
 	bogusUser := "vigolium-" + utils.RandomString(8)
 	bogusPass := utils.RandomString(16)
-	if neg := m.attemptLogin(client, rawHTTP, svc, prefix, lp, lp.Paths[0], bogusUser, bogusPass); neg != nil &&
+	neg := m.attemptLogin(client, rawHTTP, svc, prefix, lp, lp.Paths[0], bogusUser, bogusPass)
+	if neg != nil &&
 		lp.Success.Match(neg.status, neg.get, neg.body, neg.bodyLower) {
 		return nil // non-discriminating endpoint/matcher — abort to avoid a false positive
 	}
@@ -69,7 +72,11 @@ func (m *Module) tryDefaultLogin(
 				continue
 			}
 			if lp.Success.Match(pr.status, pr.get, pr.body, pr.bodyLower) {
-				return buildLoginResult(p, host, baseURL+prefix+path, cred)
+				result := buildLoginResult(p, host, baseURL+prefix+path, cred, pr.exchange)
+				if neg != nil {
+					result.Evidence = append(result.Evidence, evidence.Select(neg.exchange, evidence.RoleControl, false, "random credential"))
+				}
+				return result
 			}
 		}
 	}
@@ -127,13 +134,13 @@ func (m *Module) attemptLogin(
 // buildLoginResult reports a confirmed default-credential login as Critical. The
 // working credentials are shown unredacted (they are a target-discovered secret,
 // not an operator credential).
-func buildLoginResult(p *dashboardsig.Product, host, url string, cred [2]string) *output.ResultEvent {
+func buildLoginResult(p *dashboardsig.Product, host, url string, cred [2]string, receipts ...*evidence.Exchange) *output.ResultEvent {
 	creds := cred[0] + ":" + cred[1]
 	tags := append([]string{"dashboard", "default-login", "default-creds", "credential"}, p.Tags...)
 	desc := "The " + p.Name + " console at " + url + " accepted vendor-default credentials (" + creds + "). " +
 		"This grants an attacker authenticated access — usually a direct path to data exfiltration, stored secrets, or remote code execution via job/plugin/tool definitions. " +
 		"The login was confirmed against a negative control (a random credential pair was rejected), so it reflects a genuinely valid default account, not a permissive endpoint."
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		ModuleID:         ModuleID,
 		Host:             host,
 		URL:              url,
@@ -155,4 +162,13 @@ func buildLoginResult(p *dashboardsig.Product, host, url string, cred [2]string)
 			"password":      cred[1],
 		},
 	}
+	modkit.SetPrimaryEvidence(result, loginReceipt(receipts), evidence.RoleAttack, "selected probe")
+	return result
+}
+
+func loginReceipt(receipts []*evidence.Exchange) *evidence.Exchange {
+	if len(receipts) > 0 {
+		return receipts[0]
+	}
+	return nil
 }

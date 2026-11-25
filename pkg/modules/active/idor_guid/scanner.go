@@ -9,6 +9,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -181,7 +182,7 @@ func (m *Module) tryPredictedID(
 	baselineBody string,
 	baselineStatus int,
 	technique string,
-) (*output.ResultEvent, error) {
+) (finding *output.ResultEvent, err error) {
 	fuzzedRaw := ip.BuildRequest([]byte(predictedID))
 	// fuzzedRaw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
 	fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
@@ -234,6 +235,8 @@ func (m *Module) tryPredictedID(
 		// a couple of times and keep the finding only when the predicted-id
 		// difference exceeds the endpoint's own same-id variation. Fail open
 		// (keep) if the refetch could not run.
+		guardProof := modkit.NewEvidenceCollector()
+		defer func() { modkit.AppendEvidence(finding, guardProof) }()
 		verdict := modkit.ConfirmCrossIDDifferential(
 			httpClient,
 			ctx.Service(),
@@ -241,7 +244,7 @@ func (m *Module) tryPredictedID(
 			baselineBody,
 			baselineStatus,
 			respBody,
-			modkit.CrossIDConfig{},
+			modkit.CrossIDConfig{Evidence: guardProof},
 		)
 		if verdict.Ran && !verdict.Trustworthy {
 			return nil, nil
@@ -249,7 +252,7 @@ func (m *Module) tryPredictedID(
 
 		// Same endpoint-determinism gate as idor_detection.probeNeighbor: the
 		// SelfRounds envelope above is too few samples to see a bimodal endpoint.
-		if modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+		if modkit.EndpointVolatileWithEvidence(scanCtx, ctx, httpClient, guardProof) {
 			return nil, nil
 		}
 
@@ -263,6 +266,10 @@ func (m *Module) tryPredictedID(
 			confidence = severity.Tentative
 		}
 
+		selectedExchange := http.CaptureEvidence(resp)
+		defer func() {
+			modkit.SetPrimaryEvidence(finding, selectedExchange, evidence.RoleAttack, "predicted-ID probe")
+		}()
 		return &output.ResultEvent{
 			URL:              urlStr,
 			Matched:          urlStr,

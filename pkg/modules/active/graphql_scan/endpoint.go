@@ -1,6 +1,7 @@
 package graphql_scan
 
 import (
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -10,10 +11,11 @@ import (
 // gqlResp is a snapshot of a GraphQL probe response, captured before the
 // underlying ResponseChain is closed (its pooled buffers are recycled on Close).
 type gqlResp struct {
-	status  int
-	ctype   string
-	body    string
-	blocked bool
+	Exchange *evidence.Exchange
+	status   int
+	ctype    string
+	body     string
+	blocked  bool
 }
 
 // isHTML reports whether the response was served as HTML — the precondition for
@@ -82,8 +84,9 @@ func (m *Module) send(
 	defer resp.Close()
 
 	out := &gqlResp{
-		body:    resp.BodyString(),
-		blocked: infra.IsBlockedResponse(resp),
+		Exchange: http.CaptureEvidence(resp),
+		body:     resp.BodyString(),
+		blocked:  infra.IsBlockedResponse(resp),
 	}
 	if r := resp.Response(); r != nil {
 		out.status = r.StatusCode

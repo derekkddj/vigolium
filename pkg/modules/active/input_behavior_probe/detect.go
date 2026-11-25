@@ -1,6 +1,7 @@
 package input_behavior_probe
 
 import (
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -127,7 +128,7 @@ func probeOptions(noClustering bool) http.Options {
 // the requester's 500ms response cache so each sample is a genuinely fresh render —
 // a cached replay would report zero variance and defeat both jitter calibration and
 // the confirm re-fetch.
-func fetchProbeResponse(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte) (int, string, bool) {
+func fetchProbeResponse(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte, exchanges ...**evidence.Exchange) (int, string, bool) {
 	// raw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
 	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
 	resp, _, err := httpClient.Execute(req, probeOptions(true))
@@ -135,6 +136,12 @@ func fetchProbeResponse(ctx *httpmsg.HttpRequestResponse, httpClient *http.Reque
 		return 0, "", false
 	}
 	defer resp.Close()
+	x := http.CaptureEvidence(resp)
+	for _, selected := range exchanges {
+		if selected != nil {
+			*selected = x.Clone()
+		}
+	}
 	if resp.Response() == nil {
 		return 0, "", false
 	}
@@ -144,8 +151,8 @@ func fetchProbeResponse(ctx *httpmsg.HttpRequestResponse, httpClient *http.Reque
 // fetchTagCounts re-issues raw and returns its response body's tag multiset,
 // discarding the status — used by jitter calibration, which only measures body
 // variance. ok is false on any parse/transport error or nil response.
-func fetchTagCounts(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte) (map[string]int, bool) {
-	_, body, ok := fetchProbeResponse(ctx, httpClient, raw)
+func fetchTagCounts(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte, exchanges ...**evidence.Exchange) (map[string]int, bool) {
+	_, body, ok := fetchProbeResponse(ctx, httpClient, raw, exchanges...)
 	if !ok {
 		return nil, false
 	}
@@ -162,6 +169,7 @@ type behaviorChange struct {
 	FuzzStatus        int
 	IsInteresting     bool
 	statusInteresting bool // interest came from a notable status transition (not tags)
+	contextEvidence   *modkit.EvidenceCollector
 }
 
 // isAccessDenied returns true for status codes that indicate the request was
@@ -277,10 +285,13 @@ func confirmChange(
 	if change == nil || !change.IsInteresting {
 		return false
 	}
+	change.contextEvidence = modkit.NewEvidenceCollector()
 	if change.statusInteresting {
-		return confirmStatusTransition(ctx, httpClient, baseline, probeRaw)
+		return confirmStatusTransition(ctx, httpClient, baseline, probeRaw, change.contextEvidence)
 	}
-	counts, ok := fetchTagCounts(ctx, httpClient, probeRaw)
+	var reproduction *evidence.Exchange
+	counts, ok := fetchTagCounts(ctx, httpClient, probeRaw, &reproduction)
+	change.contextEvidence.AddExchange(reproduction, evidence.RoleConfirmation, "tag-change reproduction")
 	if !ok {
 		return false
 	}
@@ -300,7 +311,9 @@ func confirmChange(
 	// feed, personalized SSR shell, A/B block) and the tag delta is that noise, not
 	// input handling. Only a control that itself carries real structure can disprove;
 	// a near-empty flaky control is inconclusive and left to the probe evidence.
-	ctrlCounts, ok := fetchTagCounts(ctx, httpClient, ctx.Request().Raw())
+	var control *evidence.Exchange
+	ctrlCounts, ok := fetchTagCounts(ctx, httpClient, ctx.Request().Raw(), &control)
+	change.contextEvidence.AddExchange(control, evidence.RoleControl, "fresh no-payload tag control")
 	if !ok {
 		return false
 	}
@@ -327,8 +340,13 @@ func confirmStatusTransition(
 	httpClient *http.Requester,
 	baseline *detectionBaseline,
 	probeRaw []byte,
+	collectors ...*modkit.EvidenceCollector,
 ) bool {
-	probeStatus, probeBody, ok := fetchProbeResponse(ctx, httpClient, probeRaw)
+	var reproduction *evidence.Exchange
+	probeStatus, probeBody, ok := fetchProbeResponse(ctx, httpClient, probeRaw, &reproduction)
+	for _, ev := range collectors {
+		ev.AddExchange(reproduction, evidence.RoleConfirmation, "status-change reproduction")
+	}
 	if !ok || !notableStatusTransition(baseline.statusCode, probeStatus) {
 		return false
 	}
@@ -338,7 +356,11 @@ func confirmStatusTransition(
 	if probeStatus >= 500 && !bodyLeaksServerError(probeBody) {
 		return false
 	}
-	ctrlStatus, _, ok := fetchProbeResponse(ctx, httpClient, ctx.Request().Raw())
+	var control *evidence.Exchange
+	ctrlStatus, _, ok := fetchProbeResponse(ctx, httpClient, ctx.Request().Raw(), &control)
+	for _, ev := range collectors {
+		ev.AddExchange(control, evidence.RoleControl, "fresh no-payload status control")
+	}
 	if !ok {
 		return false
 	}
@@ -352,13 +374,21 @@ func buildProbeResult(
 	resp string,
 	param, probeType, payload string,
 	change *behaviorChange,
-) *output.ResultEvent {
+	exchanges ...*evidence.Exchange,
+) (finding *output.ResultEvent) {
+	defer func() {
+		if len(exchanges) > 0 {
+			modkit.SetPrimaryEvidence(finding, exchanges[0], evidence.RoleObservation, "input behavior probe")
+		}
+	}()
 	return &output.ResultEvent{
-		URL:              urlStr,
-		Request:          string(raw),
-		Response:         resp,
-		FuzzingParameter: param,
-		ExtractedResults: []string{payload},
+		AdditionalEvidence: change.contextEvidence.Entries(),
+		Evidence:           change.contextEvidence.Evidence(),
+		URL:                urlStr,
+		Request:            string(raw),
+		Response:           resp,
+		FuzzingParameter:   param,
+		ExtractedResults:   []string{payload},
 		Metadata: map[string]any{
 			"probe_type":  probeType,
 			"base_tags":   change.BaseTags,

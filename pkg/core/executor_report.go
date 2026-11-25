@@ -16,7 +16,8 @@ import (
 // did. This is that missing channel.
 type ExecutionReport struct {
 	// StoppedEarly — the input source was not read to EOF (cancelled, deadline,
-	// or a paused scan that was stopped while waiting).
+	// a paused scan stopped while waiting, or a fatal source error). Fatal source
+	// errors are also returned by Execute, after draining accepted work.
 	StoppedEarly bool
 	// DrainStalled — the feedback drain was abandoned with workers still in
 	// flight and making no progress.
@@ -68,9 +69,17 @@ type ExecutionReport struct {
 	// constants). Cumulative over the executor's lifetime; an executor normally
 	// runs one Execute. The runner persists it to scans.module_stats.
 	ModuleSkips map[string]map[string]int64
+	// FindingStoreFailed counts direct repository finding saves that returned
+	// an error during this run. Writer-backed saves are excluded: their shutdown
+	// outcome owns rejections, inline failures and async failures, so combining
+	// this report with it never charges the same finding twice. This covers all
+	// persisted ResultEvent kinds, including candidates and observations.
+	FindingStoreFailed int64
 }
 
-// Clean reports whether the run covered its whole input with nothing abandoned.
+// Clean reports whether the run covered its whole input with nothing abandoned
+// and no direct finding save failures. Writer-backed persistence needs its own
+// shutdown outcome as well: a clean execution does not promise a clean drain.
 //
 // A convenience for callers and tests that want the one-line question. The
 // runner's own consumer (phaseTracker.noteExecution) deliberately does not use
@@ -78,7 +87,7 @@ type ExecutionReport struct {
 // individually.
 func (r ExecutionReport) Clean() bool {
 	return !r.StoppedEarly && !r.DrainStalled && !r.WorkersAbandoned &&
-		!r.DeferredFlushSkipped && r.Unacked == 0
+		!r.DeferredFlushSkipped && r.Unacked == 0 && r.FindingStoreFailed == 0
 }
 
 // Report returns this executor's coverage self-report. Call it after Execute has
@@ -91,6 +100,7 @@ func (e *Executor) Report() ExecutionReport {
 	rep.Responded = e.responded.Load() - e.reportBase.responded
 	rep.FeedbackDropped = e.FeedbackDropped() - e.reportBase.feedbackDropped
 	rep.ModuleSkips = e.ModuleSkips()
+	rep.FindingStoreFailed = e.findingStoreFailed.Load() - e.reportBase.findingStoreFailed
 	e.quarantineReport(&rep)
 	rep.FindingsCapped = e.admission().Capped()
 	rep.ModuleStats = e.ModuleMetrics()

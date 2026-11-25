@@ -53,14 +53,17 @@ type bundleFilters struct {
 }
 
 // exportBundle writes the .tar.gz bundle (export.jsonl + report.html +
-// manifest.json + any requested agent session dirs) from the run's shared item set.
+// manifest.json + any requested agent session dirs) from a disk-backed snapshot.
 func (r *exportRun) exportBundle(ctx context.Context, outputPath string) ([]exportedFile, error) {
 	db, err := r.openDB()
 	if err != nil {
 		return nil, err
 	}
 
-	items, err := r.loadItems(ctx, db)
+	if !r.multi {
+		defer r.closeSpool()
+	}
+	spool, err := r.loadSpool(ctx, db)
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +78,7 @@ func (r *exportRun) exportBundle(ctx context.Context, outputPath string) ([]expo
 	root := bundleRootName(outputPath)
 
 	includedSessions, err := publishTarGz(outputPath, func(tw *tar.Writer) ([]string, error) {
-		return writeBundleMembers(tw, root, items, meta, settings.Agent.EffectiveSessionsDir(), r.projectUUID)
+		return spool.writeBundleMembers(tw, root, meta, settings.Agent.EffectiveSessionsDir(), r.projectUUID)
 	})
 	if err != nil {
 		return nil, err
@@ -88,7 +91,7 @@ func (r *exportRun) exportBundle(ctx context.Context, outputPath string) ([]expo
 	if len(includedSessions) > 0 {
 		entry.detail = fmt.Sprintf("%d sessions", len(includedSessions))
 	}
-	r.printStats("bundle", outputPath, countExportItems(items))
+	r.printStats("bundle", outputPath, spool.counts)
 	if entry.detail != "" && !r.multi {
 		fmt.Fprintf(os.Stderr, "  Sessions:           %d included\n", len(includedSessions))
 	}
@@ -153,7 +156,8 @@ func writeBundleStream(w io.Writer, root string, items []any, meta output.HTMLRe
 	})
 }
 
-// writeBundleMembers writes every archive member into tw.
+// writeBundleMembers is a slice-based compatibility/test wrapper. Production
+// exportBundle uses exportSpool.writeBundleMembers without collecting raw data.
 func writeBundleMembers(tw *tar.Writer, root string, items []any, meta output.HTMLReportMeta, sessionsBase, projectUUID string) ([]string, error) {
 	now := time.Now().UTC()
 
@@ -186,27 +190,7 @@ func writeBundleMembers(tw *tar.Writer, root string, items []any, meta output.HT
 		return nil, err
 	}
 
-	manifest := bundleManifest{
-		VigoliumVersion: getVersion(),
-		GeneratedAt:     now.Format(time.RFC3339),
-		BundleRoot:      root,
-		ProjectUUID:     projectUUID,
-		ItemCounts:      countItemsByType(items),
-		TotalItems:      len(items),
-		Sessions:        includedSessions,
-		Filters: bundleFilters{
-			Only:         topExportOnly,
-			Exclude:      topExportExclude,
-			OmitResponse: topExportOmitResponse,
-			Search:       topExportSearch,
-			Severity:     topExportSeverity,
-			Limit:        topExportLimit,
-		},
-	}
-	manifest.Report.Title = meta.Title
-	manifest.Report.Target = meta.ScanTarget
-	manifest.Report.Duration = meta.ScanDuration
-	manifest.Report.GeneratedAt = meta.GeneratedAt
+	manifest := makeBundleManifest(root, projectUUID, countExportItems(items), includedSessions, meta, now)
 
 	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -217,6 +201,20 @@ func writeBundleMembers(tw *tar.Writer, root string, items []any, meta output.HT
 		return nil, err
 	}
 	return includedSessions, nil
+}
+
+func makeBundleManifest(root, projectUUID string, counts exportCounts, sessions []string, meta output.HTMLReportMeta, now time.Time) bundleManifest {
+	manifest := bundleManifest{
+		VigoliumVersion: getVersion(), GeneratedAt: now.Format(time.RFC3339),
+		BundleRoot: root, ProjectUUID: projectUUID, ItemCounts: counts.byType,
+		TotalItems: counts.total, Sessions: sessions,
+		Filters: bundleFilters{Only: topExportOnly, Exclude: topExportExclude,
+			OmitResponse: topExportOmitResponse, Search: topExportSearch,
+			Severity: topExportSeverity, Limit: topExportLimit},
+	}
+	manifest.Report.Title, manifest.Report.Target = meta.Title, meta.ScanTarget
+	manifest.Report.Duration, manifest.Report.GeneratedAt = meta.ScanDuration, meta.GeneratedAt
+	return manifest
 }
 
 // bundleRootName returns the top-level directory inside the tarball, derived
@@ -296,8 +294,8 @@ func encodeItemsAsJSONL(items []any) ([]byte, error) {
 
 // renderBundleHTML is the bundle's HTML renderer, indirected through a package
 // var so a test can make the render fail and assert that the archive is not
-// published. Both bundle writers (`export --format bundle` and `db export
-// --format bundle`) go through it.
+// published by the compatibility wrapper. Production general/DB bundles use
+// renderExportBundleHTML/renderDBBundleHTML's raw-free disk-backed producers.
 var renderBundleHTML = renderHTMLToBytes
 
 // renderHTMLToBytes calls output.GenerateHTMLReport with a temp file, reads

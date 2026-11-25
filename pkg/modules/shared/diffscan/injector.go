@@ -183,6 +183,7 @@ func (s *PayloadInjector) verify(
 			return nil, err
 		}
 		mergedBreakAttack.AddAttack(tempBreakAttack)
+		mergedBreakAttack.recordConfirmation(tempBreakAttack)
 
 		similarCheck1 := Similar(mergedBaselineAttack, tempBreakAttack)
 		toleranceCheck1 := probe.RequireConsistentEvidence &&
@@ -218,6 +219,7 @@ func (s *PayloadInjector) verify(
 			return nil, err
 		}
 		mergedBaselineAttack.AddAttack(tempBaselineAttack)
+		mergedBaselineAttack.recordConfirmation(tempBaselineAttack)
 
 		similarCheck2 := Similar(mergedBreakAttack, tempBaselineAttack)
 		toleranceCheck2 := probe.RequireConsistentEvidence &&
@@ -258,12 +260,14 @@ func (s *PayloadInjector) verify(
 		return nil, err
 	}
 	mergedBaselineAttack.AddAttack(tempBaselineAttack)
+	mergedBaselineAttack.recordConfirmation(tempBaselineAttack)
 
 	tempBreakAttack, err := s.buildAttackFromProbe(probe, probe.GetNextBreakPayload())
 	if err != nil {
 		return nil, err
 	}
 	mergedBreakAttack.AddAttack(tempBreakAttack)
+	mergedBreakAttack.recordConfirmation(tempBreakAttack)
 
 	toleranceCheck3 := SimilarWithTolerance(
 		mergedBaselineAttack,
@@ -381,7 +385,11 @@ func (s *PayloadInjector) buildRequest(
 	}
 
 	// Create snapshot and close ResponseChain immediately
-	return NewResponseSnapshot(resp), nil
+	snap := NewResponseSnapshot(resp, s.Options.CaptureEvidence)
+	if snap != nil {
+		snap.Payload = payload
+	}
+	return snap, nil
 }
 
 func (s *PayloadInjector) ProbeAttack(payload string) (*Attack, error) {

@@ -133,16 +133,18 @@ func (m *Module) probeUI(ctx *httpmsg.HttpRequestResponse, client *http.Requeste
 		if modkit.ResemblesObservedPage(ctx, res.Body) {
 			continue
 		}
-		if modkit.SiblingServesAnyMarker(nil, ctx, client, path, s.markers[0]) {
+		guardEvidence := modkit.NewEvidenceCollector()
+		if modkit.SiblingServesAnyMarkerWithEvidence(nil, ctx, client, path, s.markers[0], guardEvidence) {
 			continue
 		}
+		proof := aem.NewProof(res)
 		if !aem.ReproduceMarker(ctx, client, path, reproduceRounds, func(r aem.ProbeResult) bool {
 			_, ok := modkit.MatchAllGroups(r.Body, s.markers)
 			return r.Status == 200 && ok
-		}) {
+		}, proof) {
 			continue
 		}
-		return &output.ResultEvent{
+		result := proof.Observation(&output.ResultEvent{
 			ModuleID:      ModuleID,
 			Host:          aem.HostFromBase(baseURL),
 			URL:           baseURL + path,
@@ -164,7 +166,9 @@ func (m *Module) probeUI(ctx *httpmsg.HttpRequestResponse, client *http.Requeste
 				Tags:       append([]string{"aem", "adobe", "rce"}, s.tags...),
 				Reference:  s.ref,
 			},
-		}
+		})
+		modkit.AppendEvidence(result, guardEvidence)
+		return result
 	}
 	return nil
 }
@@ -180,15 +184,16 @@ func (m *Module) probeGetDocument(ctx *httpmsg.HttpRequestResponse, client *http
 	if modkit.ResemblesObservedPage(ctx, res.Body) {
 		return nil
 	}
-	if !aem.SiblingIs404(ctx, client, path) {
+	proof := aem.NewProof(res)
+	if !aem.SiblingIs404(ctx, client, path, proof) {
 		return nil
 	}
 	if !aem.ReproduceMarker(ctx, client, path, reproduceRounds, func(r aem.ProbeResult) bool {
 		return aem.ServletResponded(r.Status)
-	}) {
+	}, proof) {
 		return nil
 	}
-	return &output.ResultEvent{
+	return proof.Observation(&output.ResultEvent{
 		ModuleID:      ModuleID,
 		Host:          aem.HostFromBase(baseURL),
 		URL:           baseURL + path,
@@ -209,7 +214,7 @@ func (m *Module) probeGetDocument(ctx *httpmsg.HttpRequestResponse, client *http
 			Confidence: severity.Tentative,
 			Tags:       []string{"aem", "adobe", "rce", "deserialization", "cve", "cve2025"},
 		},
-	}
+	})
 }
 
 // probePutAdvertised reports a content path that advertises the WebDAV PUT method
@@ -224,7 +229,7 @@ func (m *Module) probePutAdvertised(ctx *httpmsg.HttpRequestResponse, client *ht
 		if !strings.Contains(allow, "PUT") {
 			continue
 		}
-		return &output.ResultEvent{
+		return aem.NewProof(res).Observation(&output.ResultEvent{
 			ModuleID:      ModuleID,
 			Host:          aem.HostFromBase(baseURL),
 			URL:           baseURL + path,
@@ -246,7 +251,7 @@ func (m *Module) probePutAdvertised(ctx *httpmsg.HttpRequestResponse, client *ht
 				Confidence: severity.Tentative,
 				Tags:       []string{"aem", "adobe", "webdav", "write"},
 			},
-		}
+		})
 	}
 	return nil
 }

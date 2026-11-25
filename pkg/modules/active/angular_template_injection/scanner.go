@@ -9,6 +9,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -131,6 +132,7 @@ func (m *Module) tryProbeTemplate(
 	tmpl probeTemplate,
 	baselineBody string,
 ) *output.ResultEvent {
+	ev := modkit.NewEvidenceCollector()
 	for attempt := range confirmCount {
 		left := modkit.RandomAlnum(6)
 		right := modkit.RandomAlnum(6)
@@ -156,6 +158,7 @@ func (m *Module) tryProbeTemplate(
 
 		attackBody := resp.Body().String()
 		fullResponse := resp.FullResponseString()
+		exchange := http.CaptureEvidence(resp)
 		resp.Close()
 
 		// Check if the COMPUTED result appears in the response but not in the baseline
@@ -163,13 +166,19 @@ func (m *Module) tryProbeTemplate(
 			break // Not vulnerable via this template
 		}
 
+		if attempt < confirmCount-1 {
+			ev.AddExchange(exchange, evidence.RoleConfirmation, "evaluated expression confirmation")
+		}
+
 		// On final confirmation, report finding
 		if attempt == confirmCount-1 {
-			return &output.ResultEvent{
-				Request:          string(fuzzedRaw),
-				Response:         fullResponse,
-				FuzzingParameter: ip.Name(),
-				ExtractedResults: []string{probe, expectedResult, tmpl.name},
+			result := &output.ResultEvent{
+				Evidence:           ev.Evidence(),
+				AdditionalEvidence: ev.Entries(),
+				Request:            string(fuzzedRaw),
+				Response:           fullResponse,
+				FuzzingParameter:   ip.Name(),
+				ExtractedResults:   []string{probe, expectedResult, tmpl.name},
 				Info: output.Info{
 					Description: fmt.Sprintf(
 						"Angular template injection detected via %s. "+
@@ -183,6 +192,8 @@ func (m *Module) tryProbeTemplate(
 					},
 				},
 			}
+			modkit.SetPrimaryEvidence(result, exchange, evidence.RoleAttack, "selected probe")
+			return result
 		}
 	}
 

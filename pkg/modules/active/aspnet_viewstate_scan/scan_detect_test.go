@@ -66,6 +66,7 @@ func TestScanPerRequest_ViewStateDifferentialCandidate(t *testing.T) {
 	require.Len(t, res, 1)
 	assert.Equal(t, output.RecordKindCandidate, res[0].RecordKind)
 	assert.Equal(t, output.EvidenceGradeDifferential, res[0].EvidenceGrade)
+	assert.False(t, res[0].BaselineEvidence, "ViewState probes must retain their own proof, not inherit input")
 }
 
 func TestScanPerRequest_Generic200DoesNotProveMACDisabled(t *testing.T) {
@@ -99,6 +100,9 @@ func TestScanPerRequest_DetectsCookielessSession(t *testing.T) {
 	res, err := New().ScanPerRequest(rr, client, &modkit.ScanContext{})
 	require.NoError(t, err)
 	require.NotEmpty(t, res, "expected a cookieless-session finding when the body embeds an (S(...)) token")
+	require.True(t, res[0].BaselineEvidence, "pure input analysis explicitly requests its input evidence")
+	require.Empty(t, res[0].Request)
+	require.Empty(t, res[0].Response)
 }
 
 // TestScanPerRequest_NoFalsePositive ensures a page where MAC validation rejects
@@ -138,4 +142,7 @@ func TestEventValidationMissingIsCandidateOnlyWithRealPostback(t *testing.T) {
 	require.NotNil(t, result)
 	assert.Equal(t, output.RecordKindCandidate, result.RecordKind)
 	assert.Contains(t, result.ExtractedResults[0], "ctl00$Main$Save")
+	require.True(t, result.BaselineEvidence)
+	require.Empty(t, result.Request)
+	require.Empty(t, result.Response)
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/vigolium/vigolium/internal/atomicfile"
 	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/terminal"
 	"github.com/vigolium/vigolium/pkg/types/severity"
@@ -29,7 +30,7 @@ var dbExportCmd = &cobra.Command{
 	Short: "Export database records",
 	Long: `Export stored HTTP traffic, and the findings linked to it, with filters by host, method, status, path, scan, severity, time range and record UUID.
 
---format jsonl (the default) writes the same {"type": ..., "data": ...} lines as ` + "`vigolium export --format jsonl`" + `: one http_record line per selected record, then one finding line per confirmed finding linked to those records (--severity narrows the findings). ` + "`vigolium import`" + `, ` + "`finding load`" + ` and ` + "`-S --db`" + ` read it back. --limit and --offset count records, not lines. --table http_records keeps only the record lines, --table findings only the finding lines.
+--format jsonl (the default) writes the same {"type": ..., "data": ...} lines as ` + "`vigolium export --format jsonl`" + `: selected http_record lines followed by selected finding lines, including findings with no HTTP-record links and their exact selected evidence. ` + "`vigolium import`" + `, ` + "`finding load`" + ` and ` + "`-S --db`" + ` read it back. Shared filters apply independently to each type; --severity narrows findings. --limit and --offset paginate each selected type separately. --table http_records keeps only record lines, --table findings only finding lines. The -j receipt counts emitted rows in records and separately in http_record/finding.
 
 --format nuclei keeps the previous jsonl output: one nuclei-style ResultEvent (template-id, matched-at, info{}) per linked finding.`,
 	RunE: runDBExport,
@@ -109,7 +110,7 @@ func validateDBExportFlags() (dateFrom, dateTo *time.Time, err error) {
 // dbExportFilters builds the record selection shared by every export format.
 // runDBExport and runDBExportFS had byte-identical copies of this, which is how
 // --uuid came to be honored by one and ignored by the other.
-func dbExportFilters(db *database.DB, dateFrom, dateTo *time.Time) (database.QueryFilters, error) {
+func dbExportFilters(ctx context.Context, db *database.DB, dateFrom, dateTo *time.Time) (database.QueryFilters, error) {
 	projectUUID, err := resolveProjectUUID()
 	if err != nil {
 		return database.QueryFilters{}, err
@@ -136,7 +137,7 @@ func dbExportFilters(db *database.DB, dateFrom, dateTo *time.Time) (database.Que
 	// the UUID reported an existing record as "not found" whenever it fell
 	// outside --limit/--offset.
 	if exportRecordUUID != "" {
-		resolved, err := resolveRecordRefs(context.Background(), database.NewRepository(db), []string{exportRecordUUID}, projectUUID)
+		resolved, err := resolveRecordRefs(ctx, database.NewRepository(db), []string{exportRecordUUID}, projectUUID)
 		if err != nil {
 			return database.QueryFilters{}, err
 		}
@@ -191,7 +192,7 @@ func runDBExport(cmd *cobra.Command, args []string) error {
 		return emitDBExportReceipt(cmd, []exportedFile{{label: "bundle", path: exportOutput}}, stats.counts)
 	}
 
-	ctx := context.Background()
+	ctx := cmd.Context()
 
 	// A single-shot -o is staged and renamed, so a query that fails — or a
 	// cancelled run — leaves the previous export in place instead of a truncated
@@ -202,16 +203,15 @@ func runDBExport(cmd *cobra.Command, args []string) error {
 	// every tick for as long as it runs, so there is no single publication point
 	// to rename at. It keeps the open-once-and-append behavior it always had.
 	if exportOutput != "" && !dbExportWatching() {
-		var n int
+		var counts map[string]int
 		if err := atomicfile.WriteFile(exportOutput, 0o666, func(w *bufio.Writer) error {
 			var werr error
-			n, werr = writeDBExportCounted(ctx, db, dateFrom, dateTo, w)
+			_, counts, werr = writeDBExportWithCounts(ctx, db, dateFrom, dateTo, w)
 			return werr
 		}); err != nil || !globalJSON {
 			return err
 		}
-		return emitDBExportReceipt(cmd, []exportedFile{{label: exportFormat, path: exportOutput}},
-			map[string]int{"records": n})
+		return emitDBExportReceipt(cmd, []exportedFile{{label: exportFormat, path: exportOutput}}, counts)
 	}
 
 	var out io.Writer = os.Stdout
@@ -274,43 +274,39 @@ func writeDBExport(ctx context.Context, db *database.DB, dateFrom, dateTo *time.
 	return err
 }
 
-// writeDBExportCounted is writeDBExport reporting how many records the query
-// selected, for the -j receipt.
+// writeDBExportCounted reports emitted rows (envelopes for JSONL), not the
+// traffic page previously used to discover findings.
 func writeDBExportCounted(ctx context.Context, db *database.DB, dateFrom, dateTo *time.Time, out io.Writer) (int, error) {
-	filters, err := dbExportFilters(db, dateFrom, dateTo)
+	n, _, err := writeDBExportWithCounts(ctx, db, dateFrom, dateTo, out)
+	return n, err
+}
+
+func writeDBExportWithCounts(ctx context.Context, db *database.DB, dateFrom, dateTo *time.Time, out io.Writer) (int, map[string]int, error) {
+	filters, err := dbExportFilters(ctx, db, dateFrom, dateTo)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
-
-	qb := database.NewQueryBuilder(db, filters)
-	records, err := qb.Execute(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("failed to query database: %w", err)
+	if exportFormat == "jsonl" {
+		return streamDBEnvelopes(ctx, db, filters, out)
 	}
-
-	if exportRecordUUID != "" && len(records) == 0 {
-		return 0, fmt.Errorf("record UUID %s not found", exportRecordUUID)
-	}
-
-	switch exportFormat {
-	case "jsonl":
-		err = exportDBEnvelopes(ctx, db, filters, records, out)
-	case "nuclei":
+	// Preserve the explicitly selected legacy nuclei dialect. JSONL never
+	// materializes traffic to discover findings: receipt-only findings matter.
+	if exportFormat == "nuclei" {
+		if exportRecordUUID != "" {
+			filters.Limit, filters.Offset = 0, 0
+		}
+		records, err := database.NewQueryBuilder(db, filters).Execute(ctx)
+		if err != nil {
+			return 0, nil, fmt.Errorf("failed to query database: %w", err)
+		}
+		if exportRecordUUID != "" && len(records) == 0 {
+			return 0, nil, fmt.Errorf("record UUID %s not found", exportRecordUUID)
+		}
 		err = exportJSONL(ctx, db, records, out)
-	case "json":
-		err = exportJSON(records, out)
-	case "raw":
-		err = exportRaw(records, out)
-	case "csv":
-		err = exportCSV(records, out)
-	case "markdown":
-		err = exportMarkdown(records, out)
-	case "markdown-table":
-		err = exportMarkdownTable(records, out)
-	default:
-		return 0, usageErrorf("unsupported export format: %s", exportFormat)
+		return len(records), map[string]int{"records": len(records)}, err
 	}
-	return len(records), err
+	n, err := streamRecordDBExport(ctx, db, filters, out)
+	return n, map[string]int{"records": n}, err
 }
 
 // runDBExportFS writes the filtered records + findings to a flat
@@ -322,7 +318,7 @@ func runDBExportFS(db *database.DB, dateFrom, dateTo *time.Time) (fsExportStats,
 	// Same builder as every other format. This branch used to keep its own copy,
 	// which is how it came to bind --search to FuzzyTerm while the others used
 	// SearchTerm, and to ignore --uuid entirely.
-	filters, err := dbExportFilters(db, dateFrom, dateTo)
+	filters, err := dbExportFilters(context.Background(), db, dateFrom, dateTo)
 	if err != nil {
 		return fsExportStats{}, err
 	}
@@ -362,60 +358,6 @@ func validateDBExportTable() error {
 	return nil
 }
 
-// exportDBEnvelopes writes db export's jsonl: the selected records as
-// http_record envelopes, then the confirmed findings linked to them as finding
-// envelopes (each once, --severity applied), in the dialect `vigolium export`
-// writes and `vigolium import` reads.
-func exportDBEnvelopes(ctx context.Context, db *database.DB, filters database.QueryFilters, records []*database.HTTPRecord, out io.Writer) error {
-	scope := dbExportScope()
-	enc := json.NewEncoder(out)
-	enc.SetEscapeHTML(false)
-	if scope.includes("http") {
-		for _, rec := range records {
-			if err := enc.Encode(exportEnvelope{Type: "http_record", Data: rec}); err != nil {
-				return fmt.Errorf("failed to write output: %w", err)
-			}
-		}
-	}
-	if !scope.includes("findings") || len(records) == 0 {
-		return nil
-	}
-	uuids := make([]string, 0, len(records))
-	for _, rec := range records {
-		uuids = append(uuids, rec.UUID)
-	}
-	seen := make(map[int64]struct{})
-	// Chunked so a large page stays under the driver's bound-parameter limit.
-	for start := 0; start < len(uuids); start += 500 {
-		chunk := uuids[start:min(start+500, len(uuids))]
-		var findings []*database.Finding
-		q := scopeProjectBun(db.NewSelect().Model(&findings), filters.ProjectUUID).
-			Where("f.id IN (SELECT finding_id FROM finding_records WHERE record_uuid IN (?))", bun.List(chunk)).
-			Where("(f.record_kind IS NULL OR f.record_kind = '' OR f.record_kind = ?)", database.RecordKindFinding).
-			OrderExpr("f.found_at DESC")
-		if len(filters.Severity) > 0 {
-			sevs := make([]string, 0, len(filters.Severity))
-			for _, s := range filters.Severity {
-				sevs = append(sevs, strings.ToLower(strings.TrimSpace(s)))
-			}
-			q = q.Where("LOWER(f.severity) IN (?)", bun.List(sevs))
-		}
-		if err := q.Scan(ctx); err != nil {
-			return fmt.Errorf("export linked findings: %w", err)
-		}
-		for _, f := range findings {
-			if _, dup := seen[f.ID]; dup {
-				continue
-			}
-			seen[f.ID] = struct{}{}
-			if err := enc.Encode(exportEnvelope{Type: "finding", Data: f}); err != nil {
-				return fmt.Errorf("failed to write output: %w", err)
-			}
-		}
-	}
-	return nil
-}
-
 // exportJSONL writes the nuclei-style dialect (--format nuclei): one
 // ResultEvent per finding linked to each record.
 func exportJSONL(ctx context.Context, db *database.DB, records []*database.HTTPRecord, out io.Writer) error {
@@ -439,6 +381,23 @@ func exportJSONL(ctx context.Context, db *database.DB, records []*database.HTTPR
 		}
 	}
 	return nil
+}
+
+// exportFindingJSONL emits exactly one importer-compatible {type,data} envelope
+// per selected finding, including receipt-only findings and complete metadata.
+// Legacy flat ResultEvent conversion is not this format's storage contract.
+func exportFindingJSONL(ctx context.Context, db *database.DB, filters database.QueryFilters, out io.Writer) (int, error) {
+	enc := json.NewEncoder(&dbExportErrorWriter{Writer: out})
+	enc.SetEscapeHTML(false)
+	n := 0
+	err := iterateFilteredEvidenceFindings(ctx, db, filters, func(f *database.Finding) error {
+		if err := enc.Encode(exportEnvelope{Type: "finding", Data: f}); err != nil {
+			return fmt.Errorf("write finding envelope: %w", err)
+		}
+		n++
+		return nil
+	})
+	return n, err
 }
 
 func exportJSON(records []*database.HTTPRecord, out io.Writer) error {
@@ -480,35 +439,42 @@ func exportRaw(records []*database.HTTPRecord, out io.Writer) error {
 // since paths, sources and remarks come from scanned traffic.
 func exportCSV(records []*database.HTTPRecord, out io.Writer) error {
 	cw := output.NewSafeCSVWriter(out)
-	if err := cw.Write([]string{"uuid", "hostname", "port", "method", "path", "status_code", "response_time_ms", "content_type", "source", "risk_score", "surface_score", "remarks", "created_at"}); err != nil {
+	if err := cw.Write(dbRecordCSVColumns); err != nil {
 		return err
 	}
 	for _, rec := range records {
-		statusCode := ""
-		responseTime := ""
-		if rec.HasResponse {
-			statusCode = strconv.Itoa(rec.StatusCode)
-			responseTime = strconv.FormatInt(int64(rec.ResponseTimeMs), 10)
-		}
-		if err := cw.Write([]string{
-			rec.UUID,
-			rec.Hostname,
-			strconv.Itoa(rec.Port),
-			rec.Method,
-			rec.Path,
-			statusCode,
-			responseTime,
-			rec.RequestContentType,
-			rec.Source,
-			strconv.Itoa(rec.RiskScore),
-			strconv.Itoa(rec.SurfaceScore),
-			strings.Join(rec.Remarks, "; "),
-			rec.CreatedAt.Format(time.RFC3339),
-		}); err != nil {
+		if err := writeDBRecordCSV(cw, rec); err != nil {
 			return err
 		}
 	}
 	return cw.Flush()
+}
+
+func writeDBRecordCSV(cw *output.SafeCSVWriter, rec *database.HTTPRecord) error {
+	statusCode := ""
+	responseTime := ""
+	if rec.HasResponse {
+		statusCode = strconv.Itoa(rec.StatusCode)
+		responseTime = strconv.FormatInt(int64(rec.ResponseTimeMs), 10)
+	}
+	if err := cw.Write([]string{
+		rec.UUID,
+		rec.Hostname,
+		strconv.Itoa(rec.Port),
+		rec.Method,
+		rec.Path,
+		statusCode,
+		responseTime,
+		rec.RequestContentType,
+		rec.Source,
+		strconv.Itoa(rec.RiskScore),
+		strconv.Itoa(rec.SurfaceScore),
+		strings.Join(rec.Remarks, "; "),
+		rec.CreatedAt.Format(time.RFC3339),
+	}); err != nil {
+		return err
+	}
+	return nil
 }
 
 func convertFindingToEvent(finding *database.Finding, rec *database.HTTPRecord) *output.ResultEvent {
@@ -528,14 +494,17 @@ func convertFindingToEvent(finding *database.Finding, rec *database.HTTPRecord) 
 			Severity:    parseSeverity(finding.Severity),
 			Confidence:  severity.ToConfidence(finding.Confidence),
 		},
-		Matched:          matched,
-		ExtractedResults: finding.ExtractedResults,
-		Request:          finding.Request,
-		Response:         finding.Response,
+		Matched:            matched,
+		ExtractedResults:   finding.ExtractedResults,
+		Request:            finding.Request,
+		Response:           finding.Response,
+		AdditionalEvidence: append([]string(nil), finding.AdditionalEvidence...),
+		Evidence:           evidence.CloneEntries(finding.Evidence),
+		EvidenceStatus:     finding.EvidenceStatus,
+		Host:               finding.URL,
 	}
 
 	if rec != nil {
-		event.Host = rec.URL
 		if rec.HasResponse {
 			if event.Metadata == nil {
 				event.Metadata = make(map[string]interface{})
@@ -582,30 +551,37 @@ func exportMarkdownTable(records []*database.HTTPRecord, out io.Writer) error {
 	_, _ = fmt.Fprintln(out, "|------|--------|------|--------|------|------|--------------|--------|")
 
 	for _, rec := range records {
-		host := fmt.Sprintf("%s://%s:%d", rec.Scheme, rec.Hostname, rec.Port)
-
-		status := ""
-		responseTime := ""
-		size := ""
-		if rec.HasResponse {
-			status = fmt.Sprintf("%d", rec.StatusCode)
-			responseTime = fmt.Sprintf("%dms", rec.ResponseTimeMs)
-			size = fmt.Sprintf("%d", rec.ResponseContentLength)
+		if err := writeDBMarkdownTableRow(out, rec); err != nil {
+			return err
 		}
-
-		// Escape pipe characters in values
-		_, _ = fmt.Fprintf(out, "| %s | %s | %s | %s | %s | %s | %s | %s |\n",
-			mdEscape(clicommon.Truncate(host, 40)),
-			rec.Method,
-			mdEscape(clicommon.Truncate(rec.Path, 50)),
-			status,
-			responseTime,
-			size,
-			mdEscape(clicommon.Truncate(rec.ResponseContentType, 30)),
-			mdEscape(rec.Source),
-		)
 	}
 	return nil
+}
+
+func writeDBMarkdownTableRow(out io.Writer, rec *database.HTTPRecord) error {
+	host := fmt.Sprintf("%s://%s:%d", rec.Scheme, rec.Hostname, rec.Port)
+
+	status := ""
+	responseTime := ""
+	size := ""
+	if rec.HasResponse {
+		status = fmt.Sprintf("%d", rec.StatusCode)
+		responseTime = fmt.Sprintf("%dms", rec.ResponseTimeMs)
+		size = fmt.Sprintf("%d", rec.ResponseContentLength)
+	}
+
+	// Escape pipe characters in values
+	_, err := fmt.Fprintf(out, "| %s | %s | %s | %s | %s | %s | %s | %s |\n",
+		mdEscape(clicommon.Truncate(host, 40)),
+		rec.Method,
+		mdEscape(clicommon.Truncate(rec.Path, 50)),
+		status,
+		responseTime,
+		size,
+		mdEscape(clicommon.Truncate(rec.ResponseContentType, 30)),
+		mdEscape(rec.Source),
+	)
+	return err
 }
 
 // mdEscape escapes pipe characters for markdown table cells.
@@ -640,21 +616,12 @@ func exportDBBundle(ctx context.Context, db *database.DB, projectUUID string) (d
 func writeDBBundleMembers(ctx context.Context, db *database.DB, projectUUID string, tw *tar.Writer) (dbBundleStats, error) {
 	stats := dbBundleStats{counts: make(map[string]int)}
 	counts := stats.counts
-	var dataLines []byte
-	var envelopes []any
-
-	appendEnvelope := func(typeName string, item any) error {
-		env := exportEnvelope{Type: typeName, Data: item}
-		line, err := json.Marshal(env)
-		if err != nil {
-			return err
-		}
-		dataLines = append(dataLines, line...)
-		dataLines = append(dataLines, '\n')
-		envelopes = append(envelopes, env)
-		counts[typeName]++
-		return nil
+	spool, err := newDBBundleSpool(counts)
+	if err != nil {
+		return stats, err
 	}
+	defer spool.close()
+	appendEnvelope := spool.appendEnvelope
 
 	projectFilter := func(q *bun.SelectQuery) *bun.SelectQuery {
 		if projectUUID != "" {
@@ -664,141 +631,65 @@ func writeDBBundleMembers(ctx context.Context, db *database.DB, projectUUID stri
 	}
 
 	// --- HTTP Records ---
-	qb := database.NewQueryBuilder(db, database.QueryFilters{ProjectUUID: projectUUID})
-	records, err := qb.Execute(ctx)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s Failed to query HTTP records: %v\n", terminal.WarningSymbol(), err)
-	} else {
-		for _, r := range records {
-			if err := appendEnvelope("http_record", r); err != nil {
-				return stats, err
-			}
-		}
+	rq := projectFilter(db.NewSelect().Model((*database.HTTPRecord)(nil)).OrderExpr("uuid ASC"))
+	if err := streamDBBundleRows[database.HTTPRecord](ctx, db, rq, "http_record", appendEnvelope); err != nil {
+		return stats, err
 	}
 
 	// --- Findings ---
-	var findings []*database.Finding
-	fq := projectFilter(db.NewSelect().Model(&findings).OrderExpr("found_at DESC"))
-	if err := fq.Scan(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "%s Failed to query findings: %v\n", terminal.WarningSymbol(), err)
-	} else {
-		for _, fi := range findings {
-			if err := appendEnvelope("finding", fi); err != nil {
-				return stats, err
-			}
-		}
+	fq := projectFilter(db.NewSelect().Model((*database.Finding)(nil)).OrderExpr("found_at DESC, id DESC"))
+	if err := iterateEvidenceFindings(ctx, db, fq, false, 0, func(fi *database.Finding) error {
+		return appendEnvelope("finding", fi)
+	}); err != nil {
+		return stats, fmt.Errorf("export selected finding evidence: %w", err)
 	}
 
-	// --- Scans ---
-	var scans []*database.Scan
-	sq := projectFilter(db.NewSelect().Model(&scans).OrderExpr("created_at DESC"))
-	if err := sq.Scan(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "%s Failed to query scans: %v\n", terminal.WarningSymbol(), err)
-	} else {
-		for _, s := range scans {
-			if err := appendEnvelope("scan", s); err != nil {
-				return stats, err
-			}
-		}
+	// Remaining tables are streamed too. Session references are spooled as rows
+	// arrive rather than retaining complete scan models for later archiving.
+	sq := projectFilter(db.NewSelect().Model((*database.Scan)(nil)).OrderExpr("created_at DESC"))
+	if err := streamDBBundleRows[database.Scan](ctx, db, sq, "scan", appendEnvelope); err != nil {
+		return stats, err
+	}
+	aq := projectFilter(db.NewSelect().Model((*database.AgenticScan)(nil)).OrderExpr("created_at DESC"))
+	if err := streamDBBundleRows[database.AgenticScan](ctx, db, aq, "agentic_scan", appendEnvelope); err != nil {
+		return stats, err
+	}
+	oq := projectFilter(db.NewSelect().Model((*database.OASTInteraction)(nil)).OrderExpr("interacted_at DESC"))
+	if err := streamDBBundleRows[database.OASTInteraction](ctx, db, oq, "oast_interaction", appendEnvelope); err != nil {
+		return stats, err
+	}
+	// Bundle metadata includes pending receipts even with no findings/traffic.
+	// The bundle's project scope is explicit; top-level export flags do not apply.
+	repo := database.NewRepository(db)
+	if err := repo.WalkOASTPayloadContexts(ctx, projectUUID, nil, func(p *database.OASTPayload) error {
+		return appendEnvelope("oast_payload", p)
+	}); err != nil {
+		return stats, err
+	}
+	if err := repo.WalkOASTPlantingReceipts(ctx, projectUUID, nil, func(row *database.OASTPlantingReceipt) error {
+		return appendEnvelope("oast_planting_receipt", row)
+	}); err != nil {
+		return stats, err
+	}
+	scq := projectFilter(db.NewSelect().Model((*database.Scope)(nil)).Where("enabled = ?", true).OrderExpr("priority ASC"))
+	if err := streamDBBundleRows[database.Scope](ctx, db, scq, "scope", appendEnvelope); err != nil {
+		return stats, err
 	}
 
-	// --- Agentic Scans ---
-	var agenticScans []*database.AgenticScan
-	aq := projectFilter(db.NewSelect().Model(&agenticScans).OrderExpr("created_at DESC"))
-	if err := aq.Scan(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "%s Failed to query agentic scans: %v\n", terminal.WarningSymbol(), err)
-	} else {
-		for _, a := range agenticScans {
-			if err := appendEnvelope("agentic_scan", a); err != nil {
-				return stats, err
-			}
-		}
-	}
-
-	// --- OAST Interactions ---
-	var interactions []*database.OASTInteraction
-	oq := projectFilter(db.NewSelect().Model(&interactions).OrderExpr("interacted_at DESC"))
-	if err := oq.Scan(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "%s Failed to query OAST interactions: %v\n", terminal.WarningSymbol(), err)
-	} else {
-		for _, i := range interactions {
-			if err := appendEnvelope("oast_interaction", i); err != nil {
-				return stats, err
-			}
-		}
-	}
-
-	// --- Scopes ---
-	var scopes []*database.Scope
-	scq := projectFilter(db.NewSelect().Model(&scopes).Where("enabled = ?", true).OrderExpr("priority ASC"))
-	if err := scq.Scan(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "%s Failed to query scopes: %v\n", terminal.WarningSymbol(), err)
-	} else {
-		for _, s := range scopes {
-			if err := appendEnvelope("scope", s); err != nil {
-				return stats, err
-			}
-		}
-	}
-
-	// Write data.jsonl into the archive. One mtime for every member, so the
-	// archive's own timestamps describe one export rather than three moments
-	// inside it.
+	// Tar copies files in chunks. The HTML producer sees only manifest/metadata
+	// rows with data.jsonl line references, never authoritative raw evidence.
 	now := time.Now()
-	if len(dataLines) > 0 {
-		if err := writeTarBytes(tw, "data.jsonl", dataLines, now); err != nil {
-			return stats, fmt.Errorf("failed to write data.jsonl into the bundle: %w", err)
-		}
+	autoTarget, autoDuration := computeReportMeta(ctx, db, projectUUID, "")
+	reportMeta := output.HTMLReportMeta{
+		Title:           "Vigolium Export Report",
+		Version:         getVersion(),
+		ScanDuration:    autoDuration,
+		ScanTarget:      autoTarget,
+		ReportSharedURL: exportReportURL,
 	}
-
-	// --- HTML report ---
-	if len(envelopes) > 0 {
-		autoTarget, autoDuration := computeReportMeta(ctx, db, projectUUID)
-		meta := output.HTMLReportMeta{
-			Title:           "Vigolium Export Report",
-			Version:         getVersion(),
-			ScanDuration:    autoDuration,
-			ScanTarget:      autoTarget,
-			ReportSharedURL: exportReportURL,
-		}
-		// report.html is a member of the archive, not a bonus: a bundle without
-		// it is not the artifact the operator asked for, and warning about it on
-		// stderr while publishing the archive anyway meant nothing downstream
-		// could tell the two apart. Same decision as `vigolium export --format
-		// bundle`; renderBundleHTML is the shared renderer.
-		htmlData, err := renderBundleHTML(envelopes, meta)
-		if err != nil {
-			return stats, fmt.Errorf("render report.html for bundle: %w", err)
-		}
-		if err := writeTarBytes(tw, "report.html", htmlData, now); err != nil {
-			return stats, fmt.Errorf("failed to write report.html into the bundle: %w", err)
-		}
-	}
-
-	// --- Agent session directories ---
-	sessionCount := 0
-	sessionsDir := resolveSessionsDir()
-	for _, a := range agenticScans {
-		sessionPath := a.SessionDir
-		if sessionPath == "" && a.UUID != "" {
-			sessionPath = filepath.Join(sessionsDir, a.UUID)
-		}
-		if archiveSessionDir(tw, sessionPath, "sessions") {
-			sessionCount++
-		}
-	}
-
-	// --- Native scan session directories (contain runtime.log when enabled) ---
-	nativeSessionCount := 0
-	nativeSessionsDir := resolveNativeSessionsDir()
-	for _, s := range scans {
-		if s.UUID == "" {
-			continue
-		}
-		sessionPath := filepath.Join(nativeSessionsDir, s.UUID)
-		if archiveSessionDir(tw, sessionPath, "native-sessions") {
-			nativeSessionCount++
-		}
+	sessionCount, nativeSessionCount, err := spool.writeMembers(tw, reportMeta, now)
+	if err != nil {
+		return stats, err
 	}
 
 	// Write metadata.json
@@ -833,6 +724,8 @@ func printDBBundleSummary(projectUUID string, stats dbBundleStats) {
 		{"scan", "Scans"},
 		{"agentic_scan", "Agentic scans"},
 		{"oast_interaction", "OAST interactions"},
+		{"oast_payload", "OAST payload context"},
+		{"oast_planting_receipt", "OAST planting receipts"},
 		{"source_repo", "Source repos"},
 		{"scope", "Scopes"},
 	}
@@ -857,20 +750,29 @@ func printDBBundleSummary(projectUUID string, stats dbBundleStats) {
 // archiveSessionDir walks sessionPath and streams its contents into tw under
 // {prefix}/{basename(sessionPath)}/. Returns true when the directory was
 // successfully archived. Silent no-op when sessionPath is empty or missing.
-func archiveSessionDir(tw *tar.Writer, sessionPath, prefix string) bool {
+func archiveSessionDir(tw *tar.Writer, sessionPath, prefix string) (bool, error) {
 	if sessionPath == "" {
-		return false
+		return false, nil
 	}
 	info, err := os.Stat(sessionPath)
-	if err != nil || !info.IsDir() {
-		return false
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.IsDir() {
+		return false, nil
 	}
 	baseName := filepath.Base(sessionPath)
 	walkErr := filepath.WalkDir(sessionPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			return err
 		}
-		rel, _ := filepath.Rel(sessionPath, path)
+		rel, err := filepath.Rel(sessionPath, path)
+		if err != nil {
+			return err
+		}
 		archivePath := filepath.Join(prefix, baseName, rel)
 
 		if d.IsDir() {
@@ -885,7 +787,7 @@ func archiveSessionDir(tw *tar.Writer, sessionPath, prefix string) bool {
 
 		fi, err := d.Info()
 		if err != nil {
-			return nil
+			return err
 		}
 		hdr := &tar.Header{
 			Name:    archivePath,
@@ -896,18 +798,18 @@ func archiveSessionDir(tw *tar.Writer, sessionPath, prefix string) bool {
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}
-		data, err := os.ReadFile(path)
+		file, err := os.Open(path)
 		if err != nil {
-			return nil
+			return err
 		}
-		_, err = tw.Write(data)
+		defer file.Close()
+		_, err = io.Copy(tw, file)
 		return err
 	})
 	if walkErr != nil {
-		fmt.Fprintf(os.Stderr, "%s Failed to archive session %s: %v\n", terminal.WarningSymbol(), baseName, walkErr)
-		return false
+		return false, fmt.Errorf("archive session %s: %w", baseName, walkErr)
 	}
-	return true
+	return true, nil
 }
 
 // resolveNativeSessionsDir returns the directory where per-scan runtime.log

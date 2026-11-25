@@ -73,15 +73,18 @@ func (m *Module) ScanPerHost(
 
 	var findings []*output.ResultEvent
 	var samples []string
+	var sampleReceipts []*mcpinfra.InitializeResult
 
 	// 1. Sample N session IDs by initializing repeatedly.
 	for i := 0; i < sessionSamples; i++ {
 		client := mcpinfra.NewClient(ctx, httpClient, urlx.Path)
-		if _, err := client.Initialize(); err != nil {
+		init, err := client.Initialize()
+		if err != nil {
 			continue
 		}
 		if sid := client.SessionID(); sid != "" {
 			samples = append(samples, sid)
+			sampleReceipts = append(sampleReceipts, init)
 		}
 	}
 
@@ -105,7 +108,20 @@ func (m *Module) ScanPerHost(
 				sev = severity.Medium
 				description = fmt.Sprintf("Repeated initialization returned only %d unique Mcp-Session-Id value(s) across %d samples, alongside weak length/diversity characteristics. Cross-client session reuse or hijack impact was not tested.", uniqueCount, len(samples))
 			}
-			findings = append(findings, &output.ResultEvent{
+			primaryIndex := 0
+			for i, sample := range samples {
+				if sample == shortest {
+					primaryIndex = i
+					break
+				}
+			}
+			proof := mcpinfra.NewProof(sampleReceipts[primaryIndex].Exchange)
+			for i, sample := range sampleReceipts {
+				if i != primaryIndex {
+					proof.Confirmation(sample.Exchange)
+				}
+			}
+			findings = append(findings, proof.Observation(&output.ResultEvent{
 				ModuleID:      ModuleID,
 				RecordKind:    kind,
 				EvidenceGrade: grade,
@@ -125,7 +141,7 @@ func (m *Module) ScanPerHost(
 					Tags:        []string{"mcp", "session", "weak-secret"},
 				},
 				Metadata: map[string]any{"sample_count": len(samples), "unique_count": uniqueCount, "session_values_redacted": true, "hijack_tested": false},
-			})
+			}))
 		}
 	}
 
@@ -138,12 +154,22 @@ func (m *Module) ScanPerHost(
 
 	// 2. Anonymous tools/list attempt.
 	anonymousWorks := false
+	anonymousProof := &mcpinfra.Proof{}
 	{
 		client := mcpinfra.NewClient(ctx, httpClient, urlx.Path)
 		// Skip initialize -- talk straight to tools/list (fresh client, no session).
-		if r, err := client.ListTools(); err == nil && r != nil && len(r.Tools) > 0 {
+		op, err := client.PostRawEvidence(mcpinfra.BuildToolsListRequest())
+		var r *mcpinfra.ToolsListResult
+		if err == nil {
+			anonymousProof.Control(op.Exchange)
+			r, err = mcpinfra.ParseToolsListResponse(op.Body)
+			if r != nil {
+				r.Exchange = op.Exchange
+			}
+		}
+		if err == nil && r != nil && len(r.Tools) > 0 {
 			anonymousWorks = true
-			findings = append(findings, &output.ResultEvent{
+			findings = append(findings, mcpinfra.NewProof(r.Exchange).Observation(&output.ResultEvent{
 				ModuleID:         ModuleID,
 				RecordKind:       output.RecordKindObservation,
 				EvidenceGrade:    output.EvidenceGradeObservation,
@@ -159,7 +185,7 @@ func (m *Module) ScanPerHost(
 					Tags:        []string{"mcp", "enumeration", "session"},
 				},
 				Metadata: map[string]any{"mcp_session_supplied": false, "http_identity": ctx.Request().IdentityFingerprint(), "authentication_bypass_proven": false},
-			})
+			}))
 		}
 	}
 
@@ -171,10 +197,14 @@ func (m *Module) ScanPerHost(
 	if issuesSessions && !anonymousWorks {
 		client := mcpinfra.NewClient(ctx, httpClient, urlx.Path)
 		client.SetSessionID(fixationCandidate)
-		if _, err := client.Initialize(); err == nil {
+		if init, err := client.Initialize(); err == nil {
 			if got := client.IssuedSessionID(); got == fixationCandidate {
 				if tools, err := client.ListTools(); err == nil && tools != nil {
-					findings = append(findings, &output.ResultEvent{
+					proof := mcpinfra.NewProof(init.Exchange)
+					proof.Context = anonymousProof.Context
+					proof.Payload = fixationCandidate
+					proof.Confirmation(tools.Exchange)
+					findings = append(findings, proof.Attack(&output.ResultEvent{
 						ModuleID:         ModuleID,
 						RecordKind:       output.RecordKindCandidate,
 						EvidenceGrade:    output.EvidenceGradeDifferential,
@@ -190,7 +220,7 @@ func (m *Module) ScanPerHost(
 							Tags:        []string{"mcp", "session", "auth-bypass"},
 						},
 						Metadata: map[string]any{"server_echoed_supplied_id": true, "second_client_replay_tested": false, "victim_adoption_tested": false},
-					})
+					}))
 				}
 			}
 		}

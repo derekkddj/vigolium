@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -110,7 +111,9 @@ func (m *Module) probeEndpoint(
 	httpClient *http.Requester,
 	scanCtx *modkit.ScanContext,
 	p probe,
-) *output.ResultEvent {
+) (guardResult *output.ResultEvent) {
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(guardResult, guardProof) }()
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), p.method)
 	if err != nil {
 		return nil
@@ -177,7 +180,7 @@ func (m *Module) probeEndpoint(
 	// Real Werkzeug detections come from a 500 error page, whose status differs
 	// from the (2xx) wildcard shell, so they are never matched by this gate.
 	location := resp.Response().Header.Get("Location")
-	if !modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, resp.Response().StatusCode, []byte(body), location) {
+	if !modkit.ConfirmNotSoft404WithEvidence(scanCtx, httpClient, ctx, resp.Response().StatusCode, []byte(body), location, guardProof) {
 		return nil
 	}
 
@@ -188,7 +191,7 @@ func (m *Module) probeEndpoint(
 	hasDebugger := strings.Contains(body, "Werkzeug Debugger")
 
 	if hasDebugger {
-		return &output.ResultEvent{
+		result := &output.ResultEvent{
 			URL:              targetURL,
 			Matched:          targetURL,
 			Request:          string(modifiedRaw),
@@ -206,9 +209,11 @@ func (m *Module) probeEndpoint(
 				},
 			},
 		}
+		modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+		return result
 	}
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,
 		Request:          string(modifiedRaw),
@@ -226,4 +231,6 @@ func (m *Module) probeEndpoint(
 			},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+	return result
 }

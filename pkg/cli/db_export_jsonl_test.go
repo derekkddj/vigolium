@@ -33,7 +33,8 @@ func TestDBExportJSONLWritesEnvelopes(t *testing.T) {
 
 	withDBExportTable(t, "jsonl", "")
 	var buf bytes.Buffer
-	require.NoError(t, exportDBEnvelopes(ctx, db, filters, records, &buf))
+	_, _, err = streamDBEnvelopes(ctx, db, filters, &buf)
+	require.NoError(t, err)
 	got := countEnvelopeTypes(t, buf.Bytes())
 	require.Equal(t, map[string]int{"http_record": 1, "finding": 1}, got)
 
@@ -46,7 +47,8 @@ func TestDBExportJSONLWritesEnvelopes(t *testing.T) {
 	withDBExportTable(t, "jsonl", "findings")
 	require.NoError(t, validateDBExportTable())
 	buf.Reset()
-	require.NoError(t, exportDBEnvelopes(ctx, db, filters, records, &buf))
+	_, _, err = streamDBEnvelopes(ctx, db, filters, &buf)
+	require.NoError(t, err)
 	require.Equal(t, map[string]int{"finding": 1}, countEnvelopeTypes(t, buf.Bytes()))
 
 	buf.Reset()

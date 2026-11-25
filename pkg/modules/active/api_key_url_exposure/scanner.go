@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -31,6 +32,7 @@ var credentialHeaders = []string{
 }
 
 type probeObservation struct {
+	exchange *evidence.Exchange
 	status   int
 	body     string
 	response string
@@ -127,7 +129,7 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, httpClient *ht
 			return nil, nil
 		}
 
-		return []*output.ResultEvent{{
+		result := &output.ResultEvent{
 			ModuleID:      ModuleID,
 			RecordKind:    output.RecordKindCandidate,
 			EvidenceGrade: output.EvidenceGradeDifferential,
@@ -154,7 +156,10 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, httpClient *ht
 				"replay_count":        2,
 				"disclosure_observed": false,
 			},
-		}}, nil
+		}
+		result.Evidence = []evidence.Entry{evidence.Select(control.exchange, evidence.RoleControl, false, "no credential"), evidence.Select(invalid.exchange, evidence.RoleControl, false, "invalid credential"), evidence.Select(validReplay.exchange, evidence.RoleConfirmation, false, "valid credential replay")}
+		modkit.SetPrimaryEvidence(result, validFirst.exchange, evidence.RoleAttack, "selected probe")
+		return []*output.ResultEvent{result}, nil
 	}
 	return nil, nil
 }
@@ -178,7 +183,7 @@ func fetch(client *http.Requester, service *httpmsg.Service, raw []byte) probeOb
 	if resp.Response() == nil {
 		return probeObservation{}
 	}
-	return probeObservation{status: resp.Response().StatusCode, body: resp.Body().String(), response: resp.FullResponseString(), ok: true}
+	return probeObservation{status: resp.Response().StatusCode, body: resp.Body().String(), response: resp.FullResponseString(), exchange: http.CaptureEvidence(resp), ok: true}
 }
 
 func stripCredentialHeaders(raw []byte) ([]byte, error) {

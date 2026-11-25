@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -13,6 +14,7 @@ import (
 )
 
 type cloudCapture struct {
+	exchange *evidence.Exchange
 	status   int
 	body     string
 	request  string
@@ -97,7 +99,7 @@ func (m *Module) ScanPerHost(ctx *httpmsg.HttpRequestResponse, httpClient *http.
 	}
 
 	target := ctx.Target()
-	return []*output.ResultEvent{{
+	result := &output.ResultEvent{
 		ModuleID:      ModuleID,
 		RecordKind:    output.RecordKindCandidate,
 		EvidenceGrade: output.EvidenceGradeDifferential,
@@ -105,6 +107,7 @@ func (m *Module) ScanPerHost(ctx *httpmsg.HttpRequestResponse, httpClient *http.
 		Matched:       target,
 		Request:       first.request,
 		Response:      first.response,
+		Evidence:      []evidence.Entry{evidence.Select(second.exchange, evidence.RoleConfirmation, false, "credential-free confirmation")},
 		AdditionalEvidence: []string{
 			output.BuildEvidence("credential-free confirmation", second.request, second.response),
 		},
@@ -128,7 +131,9 @@ func (m *Module) ScanPerHost(ctx *httpmsg.HttpRequestResponse, httpClient *http.
 			"claimability_tested": false,
 			"resource_registered": false,
 		},
-	}}, nil
+	}
+	modkit.SetPrimaryEvidence(result, first.exchange, evidence.RoleObservation, "selected probe")
+	return []*output.ResultEvent{result}, nil
 }
 
 func (m *Module) fetch(ctx *httpmsg.HttpRequestResponse, client *http.Requester, raw []byte) (cloudCapture, error) {
@@ -146,6 +151,7 @@ func (m *Module) fetch(ctx *httpmsg.HttpRequestResponse, client *http.Requester,
 		body:     resp.BodyString(),
 		request:  string(raw),
 		response: resp.FullResponseString(),
+		exchange: http.CaptureEvidence(resp),
 	}, nil
 }
 

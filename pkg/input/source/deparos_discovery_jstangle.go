@@ -232,8 +232,9 @@ func planJSTemplates(
 	return plan
 }
 
-// jsTemplateStubRecord builds the stored request for a stub, attaching the
-// captured response when the template was replayed.
+// jsTemplateStubRecord builds a generated request projection for a stub, retaining
+// any normalized replay response observation. Neither the template body nor that
+// response proves the exact request sent: TemplateOutcome carries no owned receipt.
 func jsTemplateStubRecord(stub discovery.TemplateStub, o discovery.TemplateOutcome) (*httpmsg.HttpRequestResponse, error) {
 	headers := make(map[string]string, len(stub.Headers)+1)
 	for _, header := range stub.Headers {
@@ -267,7 +268,7 @@ func jsTemplateStubRecord(stub discovery.TemplateStub, o discovery.TemplateOutco
 		raw := httpmsg.BuildRawResponse(resp.StatusCode, resp.Headers, string(resp.Body))
 		rr = rr.WithResponse(httpmsg.NewHttpResponseWithDuration(raw, time.Duration(resp.DurationMs)*time.Millisecond))
 	}
-	return rr, nil
+	return withDiscoveryProjectionEvidence(rr), nil
 }
 
 // jsTemplateRemarks are the jstangle:* remarks a template's record carries.

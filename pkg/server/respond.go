@@ -406,6 +406,8 @@ var restObjectRoutes = map[string]bool{
 	"GET /api/db/tables/:table/records/:id":   true,
 	"GET /api/storage/source/:key":            true,
 	"GET /api/storage/results/:scan_uuid":     true,
+
+	"GET /api/findings/:id/evidence/:exchange_id": true,
 }
 
 // routeKey names the route that is answering, "GET /api/findings/:id". Inside

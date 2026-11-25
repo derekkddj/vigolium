@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	php2shellinfra "github.com/vigolium/vigolium/pkg/modules/infra/php2shell"
@@ -154,8 +155,10 @@ func check(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, host, o
 	return nil
 }
 
-// exchange is one sent request's outcome, with the probe body elided.
+// exchange keeps the actual receipt separately from the intended-request
+// display (whose large body is elided). The display cannot repair missing proof.
 type exchange struct {
+	receipt   *evidence.Exchange
 	status    int
 	body      string
 	poweredBy string
@@ -181,6 +184,7 @@ func send(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, path, bo
 		return exchange{}, false
 	}
 	return exchange{
+		receipt:   http.CaptureEvidence(resp),
 		status:    resp.Response().StatusCode,
 		body:      resp.Body().String(),
 		poweredBy: poweredBy(resp.Response().Header.Get("X-Powered-By")),
@@ -234,7 +238,10 @@ func crashSignal(control, probe exchange) (sapi, signal string) {
 	return "", ""
 }
 
-func buildResult(host, origin, path string, index int, p probeSpec, sapi, signal, powered string, control, probe exchange) *output.ResultEvent {
+func buildResult(host, origin, path string, index int, p probeSpec, sapi, signal, powered string, control, probe exchange) (finding *output.ResultEvent) {
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, probe.receipt, evidence.RoleAttack, "multipart parser probe")
+	}()
 	target := origin + path
 	extracted := []string{
 		fmt.Sprintf("Signal: probe %d (%d MiB, %d parts, %d nested keys): %s", index, p.sizeMiB, p.parts, nestedKeys, signal),
@@ -259,6 +266,7 @@ func buildResult(host, origin, path string, index int, p probeSpec, sapi, signal
 		Response:           probe.response,
 		ExtractedResults:   extracted,
 		AdditionalEvidence: []string{"Control request:\n" + control.request + "\n\nControl response:\n" + control.response},
+		Evidence:           []evidence.Entry{evidence.Select(control.receipt, evidence.RoleControl, false, "multipart size control")},
 		Info: output.Info{
 			Name:        "php2shell: PHP multipart parser crash (" + php2shellinfra.CVEs + ")",
 			Description: fmt.Sprintf("Probe %d made the PHP handler at %s fail: %s.", index, path, signal),

@@ -2,7 +2,9 @@
 
 import { useHttpRecord } from '@/api/hooks';
 import { formatDate, formatBytes } from '@/lib/formatters';
-import { rawRequestToCurl } from '@/lib/curl';
+import HttpMessage from '@/components/shared/HttpMessage';
+import RecordCaptureState from '@/components/shared/RecordCaptureState';
+import { recordURLRelation, recordLoadMessage } from '@/lib/findingEvidence';
 import { METHOD_COLORS, STATUS_COLORS } from './theme';
 import { Copy, Check, Filter } from 'lucide-react';
 import { useState, useCallback } from 'react';
@@ -11,14 +13,8 @@ interface Props {
   uuid: string;
   onClose: () => void;
   onFilterHostname?: (hostname: string) => void;
-}
-
-function safeAtob(s: string): string {
-  try {
-    return atob(s);
-  } catch {
-    return s;
-  }
+  findingURL?: string;
+  referenceRole?: string;
 }
 
 function CopyButton({ text, label }: { text: string; label: string }) {
@@ -84,8 +80,9 @@ function HighlightedResponse({ text }: { text: string }) {
   return <>{out}</>;
 }
 
-export default function HttpRecordDetailPanel({ uuid, onClose, onFilterHostname }: Props) {
-  const { data: record, isLoading, isError } = useHttpRecord(uuid);
+export default function HttpRecordDetailPanel({ uuid, onClose, onFilterHostname, findingURL, referenceRole }: Props) {
+  const { data: record, isLoading, isError, error, refetch } = useHttpRecord(uuid);
+  const relation = recordURLRelation(findingURL, record?.url);
 
   return (
     <div className="border-l border-[#2e2b26] bg-[#1c1b19] h-full overflow-y-auto">
@@ -99,16 +96,22 @@ export default function HttpRecordDetailPanel({ uuid, onClose, onFilterHostname 
       )}
 
       {isError && (
-        <div className="p-3 text-xs text-[#ef2f27]">failed to load record</div>
+        <div className="p-3 text-xs text-[#ef2f27]" role="alert">{recordLoadMessage(error)} <button className="underline" onClick={() => void refetch()}>Retry</button></div>
       )}
+      {!isLoading && !isError && !record && <div className="p-3 text-xs text-[#918175]">HTTP record unavailable: no record returned.</div>}
 
-      {record && (
+      {record && !isError && (
         <div className="p-3 space-y-3 text-xs">
+          {referenceRole && <div className="text-[#918175]">{referenceRole}</div>}
+          {referenceRole && relation === 'different' && <p className="text-[#ff9e64]" role="status">Related exchange — URL differs from the finding URL. This reference is not direct proof of the finding by itself; the mismatch does not establish that the finding is false.</p>}
+          {referenceRole && relation === 'same' && <p className="text-[#918175]">URL matches the finding URL. A matching URL alone does not establish proof.</p>}
+          {referenceRole && relation === 'unknown' && <p className="text-[#918175]">URL relationship unknown: finding or record URL is not stored.</p>}
           {/* Method + Status */}
           <div className="flex gap-3 items-center">
             <span className="font-bold" style={{ color: METHOD_COLORS[record.method] || '#918175' }}>
               {record.method}
             </span>
+            {record.status_code <= 0 && <span className="text-[#918175]">Status unavailable / no HTTP response</span>}
             {record.status_code > 0 && (
               <span className="font-bold" style={{ color: STATUS_COLORS[`${Math.floor(record.status_code / 100)}xx`] || '#918175' }}>
                 {record.status_code}
@@ -178,32 +181,9 @@ export default function HttpRecordDetailPanel({ uuid, onClose, onFilterHostname 
             </div>
           )}
 
-          {/* Raw Request */}
-          {record.raw_request && (
-            <div>
-              <div className="flex items-center gap-1.5 mb-0.5">
-                <span className="text-[#918175]">raw_request:</span>
-                <CopyButton text={safeAtob(record.raw_request)} label="request" />
-                <CopyButton text={rawRequestToCurl(safeAtob(record.raw_request), [record.url])} label="curl" />
-              </div>
-              <pre className="bg-[#141310] border border-[#2e2b26] p-2 overflow-x-auto text-[#fce8c3] whitespace-pre-wrap break-all max-h-64 overflow-y-auto">
-                {safeAtob(record.raw_request)}
-              </pre>
-            </div>
-          )}
-
-          {/* Raw Response */}
-          {record.raw_response && (
-            <div>
-              <div className="flex items-center gap-1.5 mb-0.5">
-                <span className="text-[#918175]">raw_response:</span>
-                <CopyButton text={safeAtob(record.raw_response)} label="response" />
-              </div>
-              <pre className="bg-[#141310] border border-[#2e2b26] p-2 overflow-x-auto text-[#fce8c3] whitespace-pre-wrap break-all max-h-96 overflow-y-auto">
-                <HighlightedResponse text={safeAtob(record.raw_response)} />
-              </pre>
-            </div>
-          )}
+          <RecordCaptureState record={record} theme="dark" />
+          <HttpMessage key={`${uuid}-request`} theme="dark" label="Raw request" value={record.raw_request} encoding="base64" requestURLs={[record.url]} />
+          <HttpMessage key={`${uuid}-response`} theme="dark" label="Raw response" value={record.raw_response} encoding="base64" renderPreview={(text) => <HighlightedResponse text={text} />} />
         </div>
       )}
     </div>

@@ -2,9 +2,11 @@ package source
 
 import (
 	"context"
+	"net/url"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	deparosstorage "github.com/vigolium/vigolium/pkg/deparos/storage"
 )
 
@@ -91,4 +93,71 @@ func TestSeedSpideredJS_NoProviderNoOp(t *testing.T) {
 	count := 0
 	_ = siteMap.WalkFiles(func(*deparosstorage.DiscoveredNode) error { count++; return nil })
 	assert.Zero(t, count, "no provider → nothing seeded")
+}
+
+// The URL/MIME/decoded-body bridge is extraction-only: it has no raw request,
+// actual status, capture state or execution identity. Its placeholder GET/200
+// nodes used to flow through readDiscoveredNode into rebuilt HTTP scan inputs.
+func TestSeedSpideredJSNotReimportedAsHTTPProof(t *testing.T) {
+	for _, stream := range []bool{true, false} {
+		name := "end-of-target"
+		if stream {
+			name = "streaming"
+		}
+		t.Run(name, func(t *testing.T) {
+			provider := &fakeJSProvider{
+				captureSaver: *newCaptureSaver(),
+				records: []jsRow{{
+					url: "https://app.example.com/seed.js", contentType: "application/javascript",
+					body: []byte("fetch('/api/seeded-route')"),
+				}},
+			}
+			d := newTestDiscoverySource(provider)
+			d.cfg.FuzzAtEnd = !stream
+			storageCfg := deparosstorage.DefaultConfig()
+			storageCfg.SaveResponseBody = true
+			siteMap, err := deparosstorage.NewSiteMap(storageCfg)
+			require.NoError(t, err)
+			defer func() { _ = siteMap.Close() }()
+
+			ctx, target := context.Background(), "https://app.example.com/"
+			d.seedSpideredJS(ctx, siteMap, target)
+			// Same pre-engine boundary as discoverTarget: route extraction still
+			// walks these nodes, but only later nodes reach the HTTP collector.
+			seededThrough := siteMap.LatestNodeID()
+			require.Positive(t, seededThrough)
+			collector := newTargetCollector(d, target, siteMap)
+			collector.cursor.Store(seededThrough)
+			require.NoError(t, collector.flush(ctx))
+			require.Empty(t, provider.bySource)
+			require.Empty(t, d.items, "seeded bodies must not become baseline scan inputs")
+			require.Zero(t, collector.stats.TotalDiscovered)
+
+			var extractionBodies []string
+			require.NoError(t, siteMap.WalkFiles(func(node *deparosstorage.DiscoveredNode) error {
+				extractionBodies = append(extractionBodies, string(node.Response().Body))
+				return nil
+			}))
+			require.Contains(t, extractionBodies, "fetch('/api/seeded-route')")
+
+			// A real crawl result arriving after the boundary still survives both
+			// the in-crawl flush and final drain, exactly once.
+			fetchedURL, err := url.Parse("https://app.example.com/fetched.js")
+			require.NoError(t, err)
+			fetched := deparosstorage.NewResult(fetchedURL)
+			fetched.Request.Method = "GET"
+			fetched.Response.StatusCode = 200
+			fetched.Response.MIMEType = "application/javascript"
+			fetched.Response.Body = []byte("fetch('/api/fetched-route')")
+			fetched.Metadata.FoundBy = "spider"
+			require.NoError(t, siteMap.Store(fetched))
+			require.NoError(t, collector.flush(ctx))
+			require.NoError(t, collector.finish(ctx, noEngineFacts{}, false))
+			require.Equal(t, 1, provider.bySource[crawlRecordSource])
+			require.Len(t, d.items, 1)
+			item := <-d.items
+			require.Equal(t, fetchedURL.String(), item.Request.Target())
+			require.NotContains(t, collector.acc.uuidByURL, provider.records[0].url, "seed URL must not acquire an invented HTTP record")
+		})
+	}
 }

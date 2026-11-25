@@ -1,7 +1,10 @@
 package modkit
 
 import (
+	"fmt"
+
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 )
@@ -25,9 +28,14 @@ const (
 	stabilityCacheSize = 512
 )
 
-func (sc *ScanContext) getStabilityCache() *lru.Cache[string, bool] {
+type stabilityResult struct {
+	volatile bool
+	proof    []evidence.Entry // immutable cache-owned, at most EndpointStabilitySamples
+}
+
+func (sc *ScanContext) getStabilityCache() *lru.Cache[string, *stabilityResult] {
 	sc.stabilityOnce.Do(func() {
-		sc.stabilityCache, _ = lru.New[string, bool](stabilityCacheSize)
+		sc.stabilityCache, _ = lru.New[string, *stabilityResult](stabilityCacheSize)
 	})
 	return sc.stabilityCache
 }
@@ -60,28 +68,34 @@ func (sc *ScanContext) getStabilityCache() *lru.Cache[string, bool] {
 // method and body; callers on non-idempotent requests inherit that, which is the
 // same trade the differential modules already make when they replay a request
 // dozens of times with mutated values.
-func EndpointVolatile(sc *ScanContext, ctx *httpmsg.HttpRequestResponse, client *http.Requester) bool {
+func EndpointVolatileWithEvidence(sc *ScanContext, ctx *httpmsg.HttpRequestResponse, client *http.Requester, sink *EvidenceCollector) bool {
 	if ctx == nil || ctx.Request() == nil || client == nil {
 		return false
 	}
+	var result *stabilityResult
 	if sc == nil {
-		return sampleVolatile(ctx, client)
-	}
-
-	key := ctx.Request().ID()
-	cache := sc.getStabilityCache()
-	if v, ok := cache.Get(key); ok {
-		return v
-	}
-	res, _, _ := sc.stabilityFlight.Do(key, func() (interface{}, error) {
-		if v, ok := cache.Get(key); ok {
-			return v, nil
+		result = sampleStability(ctx, client)
+	} else {
+		key := ctx.Request().ID()
+		cache := sc.getStabilityCache()
+		if cached, ok := cache.Get(key); ok {
+			result = cached
+		} else {
+			res, _, _ := sc.stabilityFlight.Do(key, func() (interface{}, error) {
+				if cached, ok := cache.Get(key); ok {
+					return cached, nil
+				}
+				v := sampleStability(ctx, client)
+				cache.Add(key, v)
+				return v, nil
+			})
+			result = res.(*stabilityResult)
 		}
-		v := sampleVolatile(ctx, client)
-		cache.Add(key, v)
-		return v, nil
-	})
-	return res.(bool)
+	}
+	for _, entry := range result.proof {
+		sink.AddExchange(entry.Exchange, evidence.RoleControl, entry.Label)
+	}
+	return result.volatile
 }
 
 // sampleVolatile replays the observed request EndpointStabilitySamples times and
@@ -96,6 +110,13 @@ func EndpointVolatile(sc *ScanContext, ctx *httpmsg.HttpRequestResponse, client 
 // the whole-body SHA-256 that NewResponseSignature would compute and that the
 // similarity comparison never reads.
 func sampleVolatile(ctx *httpmsg.HttpRequestResponse, client *http.Requester) bool {
+	return sampleStability(ctx, client).volatile
+}
+
+func sampleStability(ctx *httpmsg.HttpRequestResponse, client *http.Requester) (result *stabilityResult) {
+	proof := NewEvidenceCollector()
+	result = &stabilityResult{}
+	defer func() { result.proof = proof.Evidence() }()
 	req := httpmsg.NewRequestResponseRaw(ctx.Request().Raw(), ctx.Service())
 
 	var firstStatus int
@@ -104,17 +125,18 @@ func sampleVolatile(ctx *httpmsg.HttpRequestResponse, client *http.Requester) bo
 	for i := 0; i < EndpointStabilitySamples; i++ {
 		// NoRedirects keeps the comparison on the endpoint's own answer rather than
 		// on whatever a redirect chain happens to land on.
-		status, body, ok := fetchResponseBodyParsed(client, req, true)
+		status, body, ok := fetchResponseBodyParsedWithEvidence(client, req, true, proof, fmt.Sprintf("unmodified endpoint stability sample %d", i+1))
 		if !ok {
-			return false // transport failure — fail open
+			return result // transport failure — fail open
 		}
 		if i == 0 {
 			firstStatus, firstSig = status, BodySignature(body)
 			continue
 		}
 		if status != firstStatus || !BodiesSimilarSig(firstSig, body) {
-			return true
+			result.volatile = true
+			return result
 		}
 	}
-	return false
+	return result
 }

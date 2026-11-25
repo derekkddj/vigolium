@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -19,6 +20,7 @@ import (
 // nonexistent action, used to fingerprint hosts that aren't actually
 // WordPress (e.g., SPA wildcards returning index.html for every path).
 type controlProbe struct {
+	exchange *evidence.Exchange
 	status   int
 	bodyLen  int
 	bodyHead string
@@ -102,7 +104,8 @@ func (m *Module) ScanPerRequest(
 	if control == nil {
 		return nil, nil
 	}
-	wildcard, _ := scanCtx.WildcardProbe(ctx, httpClient)
+	gateProof := modkit.NewEvidenceCollector()
+	wildcard, _ := scanCtx.WildcardProbeWithEvidence(ctx, httpClient, gateProof)
 	if wildcard.MatchesBody(control.status, []byte(control.bodyHead)) {
 		// admin-ajax.php is returning the host's wildcard shell — not WP.
 		return nil, nil
@@ -118,6 +121,8 @@ func (m *Module) ScanPerRequest(
 	for _, action := range vulnerableActions {
 		result := m.probeAction(ctx, httpClient, urlx.Scheme, urlx.Host, action, control)
 		if result != nil {
+			// The host gate is one actual operation, reused by each action candidate.
+			modkit.AppendEvidence(result, gateProof)
 			results = append(results, result)
 		}
 	}
@@ -168,6 +173,7 @@ func (m *Module) fetchControlProbe(
 		head = head[:256]
 	}
 	return &controlProbe{
+		exchange: http.CaptureEvidence(resp),
 		status:   resp.Response().StatusCode,
 		bodyLen:  len(respBody),
 		bodyHead: head,
@@ -329,7 +335,7 @@ func (m *Module) probeAction(
 		sev = action.sev
 	}
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,
 		Request:          rawReq,
@@ -347,4 +353,11 @@ func (m *Module) probeAction(
 			"plugin": action.plugin,
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected AJAX action response")
+	controlProof := modkit.NewEvidenceCollector()
+	if control != nil {
+		controlProof.AddExchange(control.exchange, evidence.RoleControl, "nonexistent AJAX action")
+	}
+	modkit.AppendEvidence(result, controlProof)
+	return result
 }

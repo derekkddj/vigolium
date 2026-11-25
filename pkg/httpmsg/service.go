@@ -7,6 +7,21 @@ type Service struct {
 	host     string
 	port     int
 	protocol string // "http" or "https"
+	// destinationPinned distinguishes a restored/explicit destination from an
+	// inferred ingestion service. An absolute-form request target must not
+	// replace this service when constructing an outbound URL.
+	destinationPinned bool
+}
+
+// pinServiceDestination returns an immutable copy; it never changes a service
+// shared by other requests. Builders carrying this service preserve the pin.
+func pinServiceDestination(service *Service) *Service {
+	if service == nil || service.destinationPinned {
+		return service
+	}
+	copy := *service
+	copy.destinationPinned = true
+	return &copy
 }
 
 // extractHostname removes port suffix from host:port string.

@@ -48,16 +48,16 @@ func TestConversionStoresRedirectLocation(t *testing.T) {
 	}
 }
 
-// A record's stored destination must describe the response it currently holds.
-// Replacing the response without updating the column left the old destination
-// rendering against the new response.
-func TestUpdateRecordResponseKeepsLocationConsistent(t *testing.T) {
+// Each immutable version's destination must describe its own captured response.
+// New redirects and non-redirects cannot rewrite an earlier version's location.
+func TestRecordResponseVersionKeepsLocationConsistent(t *testing.T) {
 	ctx := context.Background()
 	db := newTestDB(t)
 	repo := NewRepository(db)
 	const project = DefaultProjectUUID
 
-	uuid, err := repo.SaveRecord(ctx, redirectRR(t, 302, "https://example.com/first"), "scanner", project)
+	first := redirectRR(t, 302, "https://example.com/first")
+	uuid, err := repo.SaveRecord(ctx, first, "scanner", project)
 	if err != nil {
 		t.Fatalf("SaveRecord: %v", err)
 	}
@@ -67,39 +67,47 @@ func TestUpdateRecordResponseKeepsLocationConsistent(t *testing.T) {
 
 	// Replay to a different destination.
 	moved := []byte("HTTP/1.1 302 Found\r\nLocation: https://example.com/second\r\nContent-Length: 0\r\n\r\n")
-	if err := repo.UpdateRecordResponse(ctx, uuid, &RecordResponseUpdate{
-		StatusCode: 302, RawResponse: moved,
-	}); err != nil {
-		t.Fatalf("UpdateRecordResponse: %v", err)
+	versionUUID, err := repo.SaveRecordVersion(ctx, uuid, first.WithResponse(httpmsg.NewHttpResponse(moved)))
+	if err != nil || versionUUID == uuid {
+		t.Fatalf("SaveRecordVersion: uuid=%q err=%v", versionUUID, err)
 	}
-	if got := scalarStr(t, db, `SELECT COALESCE(response_location, '') FROM http_records WHERE uuid = ?`, uuid); got != "https://example.com/second" {
+	if got := scalarStr(t, db, `SELECT COALESCE(response_location, '') FROM http_records WHERE uuid = ?`, uuid); got != "https://example.com/first" {
+		t.Fatalf("original redirect destination was rewritten: %q", got)
+	}
+	if got := scalarStr(t, db, `SELECT COALESCE(response_location, '') FROM http_records WHERE uuid = ?`, versionUUID); got != "https://example.com/second" {
 		t.Fatalf("after replay, stored location = %q, want the new destination", got)
 	}
 
 	// Replay to a non-redirect: the destination must be cleared, not kept.
 	ok := []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
-	if err := repo.UpdateRecordResponse(ctx, uuid, &RecordResponseUpdate{
-		StatusCode: 200, RawResponse: ok,
-	}); err != nil {
-		t.Fatalf("UpdateRecordResponse: %v", err)
+	okUUID, err := repo.SaveRecordVersion(ctx, versionUUID, first.WithResponse(httpmsg.NewHttpResponse(ok)))
+	if err != nil || okUUID == versionUUID {
+		t.Fatalf("SaveRecordVersion: uuid=%q err=%v", okUUID, err)
 	}
-	if got := scalarStr(t, db, `SELECT COALESCE(response_location, '') FROM http_records WHERE uuid = ?`, uuid); got != "" {
+	if got := scalarStr(t, db, `SELECT COALESCE(response_location, '') FROM http_records WHERE uuid = ?`, versionUUID); got != "https://example.com/second" {
+		t.Fatalf("previous version destination was rewritten: %q", got)
+	}
+	if got := scalarStr(t, db, `SELECT COALESCE(response_location, '') FROM http_records WHERE uuid = ?`, okUUID); got != "" {
 		t.Fatalf("a record that is no longer a redirect kept location %q", got)
 	}
 }
 
-// A stub filled in by the backfill path must end up with the same derived data a
-// normally-saved record has, the destination included.
-func TestBackfillRecordResponseStoresLocation(t *testing.T) {
+// A fetched version must have complete derived data, including the destination,
+// while a legacy stub stays request-only.
+func TestStubResponseVersionStoresLocation(t *testing.T) {
 	ctx := context.Background()
 	db := newTestDB(t)
 	repo := NewRepository(db)
 
 	insertHTTPRecord(t, db, "stub", DefaultProjectUUID)
-	if err := repo.BackfillRecordResponse(ctx, "stub", redirectRR(t, 301, "/elsewhere")); err != nil {
-		t.Fatalf("BackfillRecordResponse: %v", err)
+	versionUUID, err := repo.SaveRecordVersion(ctx, "stub", redirectRR(t, 301, "/elsewhere"))
+	if err != nil || versionUUID == "stub" {
+		t.Fatalf("SaveRecordVersion: uuid=%q err=%v", versionUUID, err)
 	}
-	if got := scalarStr(t, db, `SELECT COALESCE(response_location, '') FROM http_records WHERE uuid = 'stub'`); got != "/elsewhere" {
+	if got := scalarStr(t, db, `SELECT COALESCE(response_location, '') FROM http_records WHERE uuid = 'stub'`); got != "" {
+		t.Fatalf("stub's response location was rewritten: %q", got)
+	}
+	if got := scalarStr(t, db, `SELECT COALESCE(response_location, '') FROM http_records WHERE uuid = ?`, versionUUID); got != "/elsewhere" {
 		t.Fatalf("backfilled location = %q, want /elsewhere", got)
 	}
 }

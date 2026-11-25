@@ -8,6 +8,7 @@ import (
 	httputil "github.com/projectdiscovery/utils/http"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -239,6 +240,7 @@ func (m *Module) ScanPerInsertionPoint(
 		}
 
 		fullResp := resp.FullResponseString()
+		attackReceipt := http.CaptureEvidence(resp)
 		resp.Close()
 
 		// The markers are deliberately broad, so even a graded hit is confirmed
@@ -253,19 +255,22 @@ func (m *Module) ScanPerInsertionPoint(
 		if sev == severity.Suspect {
 			desc = fmt.Sprintf("Possible SSRF (unconfirmed): %s — marker %q in response, but %s; manual verification required", p.desc, primary, suspectReason)
 		}
-		results = append(results, &output.ResultEvent{
+		result := &output.ResultEvent{
 			URL:                urlx.String(),
 			Request:            string(fuzzedRaw),
 			Response:           fullResp,
 			FuzzingParameter:   ip.Name(),
 			ExtractedResults:   append([]string{p.payload}, all...),
 			AdditionalEvidence: ev.Entries(),
+			Evidence:           ev.Evidence(),
 			Info: output.Info{
 				Severity:    sev,
 				Confidence:  conf,
 				Description: desc,
 			},
-		})
+		}
+		modkit.SetPrimaryEvidence(result, attackReceipt, evidence.RoleAttack, "internal target payload")
+		results = append(results, result)
 		return results, nil
 	}
 
@@ -312,7 +317,7 @@ func (m *Module) confirmSSRFMarker(
 	generic := isGenericMarker(marker)
 
 	// (1) Reproducible under the payload, on a genuine (non-blocked) response.
-	body, blocked, ok := m.fetchBody(ctx, httpClient, payloadRaw, ev, "confirm round 1")
+	body, blocked, ok := m.fetchBody(ctx, httpClient, payloadRaw, ev, evidence.RoleConfirmation, "confirm round 1")
 	if !ok {
 		// A generic marker has nothing going for it but the controls below; if we
 		// can't even reproduce the payload, drop it. A specific marker fails open.
@@ -340,7 +345,7 @@ func (m *Module) confirmSSRFMarker(
 	// /Error.aspx host through.
 	if generic {
 		siblingRaw := ip.BuildRequest([]byte(benignSiblingURL))
-		siblingBody, siblingBlocked, ok := m.fetchBody(ctx, httpClient, siblingRaw, ev, "non-internal control")
+		siblingBody, siblingBlocked, ok := m.fetchBody(ctx, httpClient, siblingRaw, ev, evidence.RoleControl, "non-internal control")
 		if !ok || siblingBlocked {
 			return false
 		}
@@ -365,7 +370,7 @@ func (m *Module) confirmSSRFMarker(
 
 	// (2) Absent from a fresh, non-blocked control fetch of the original value.
 	controlRaw := ip.BuildRequest([]byte(ip.BaseValue()))
-	controlBody, controlBlocked, ok := m.fetchBody(ctx, httpClient, controlRaw, ev, "control")
+	controlBody, controlBlocked, ok := m.fetchBody(ctx, httpClient, controlRaw, ev, evidence.RoleControl, "control")
 	if !ok {
 		// Fail open for a self-evidencing marker (a transient error must not bury a
 		// true positive); fail closed for a generic marker, which depends on this
@@ -393,7 +398,7 @@ func (m *Module) confirmSSRFMarker(
 	// 302. Re-fetch the original value a second time and require the two control
 	// responses to AGREE (both marker-free and mutually similar). A flapping endpoint
 	// disagrees across the two fetches and the generic finding is dropped.
-	control2Body, control2Blocked, ok2 := m.fetchBody(ctx, httpClient, controlRaw, ev, "control stability")
+	control2Body, control2Blocked, ok2 := m.fetchBody(ctx, httpClient, controlRaw, ev, evidence.RoleControl, "control stability")
 	if !ok2 || control2Blocked {
 		return false
 	}
@@ -407,7 +412,7 @@ func (m *Module) confirmSSRFMarker(
 // response was a WAF/CDN/rate-limit page. ok is false on any parse/HTTP error.
 // When ev is non-nil, the full request/response pair is captured under label
 // before the response is closed.
-func (m *Module) fetchBody(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte, ev *modkit.EvidenceCollector, label string) (body string, blocked, ok bool) {
+func (m *Module) fetchBody(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, raw []byte, ev *modkit.EvidenceCollector, role evidence.Role, label string) (body string, blocked, ok bool) {
 	// BuildRequest produces well-formed raw, so wrap directly instead
 	// of re-parsing on this hot path.
 	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
@@ -422,8 +427,10 @@ func (m *Module) fetchBody(ctx *httpmsg.HttpRequestResponse, httpClient *http.Re
 		return "", false, false
 	}
 	defer resp.Close()
-	// Capture before Close: FullResponseString() reads pooled buffers Close() returns.
-	ev.Add(label, string(raw), resp.FullResponseString())
+	// The caller supplies semantic intent; arbitrary labels never define roles.
+	if ev != nil && ev.Len() < modkit.MaxEvidencePairs {
+		ev.AddExchange(http.CaptureEvidence(resp), role, label)
+	}
 	return resp.Body().String(), infra.IsBlockedResponse(resp), true
 }
 

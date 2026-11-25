@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/modules/infra/saasprobe"
 )
 
@@ -80,6 +81,7 @@ const (
 // TableVerdict inspects a table read and returns its classification plus the
 // record count / total when the table is exposed.
 type TableVerdict struct {
+	Exchange *evidence.Exchange
 	Kind     VerdictKind
 	Sample   int  // records returned in this page
 	Total    *int // @odata.count when requested
@@ -98,6 +100,7 @@ func ClassifyTableRead(res saasprobe.Result) TableVerdict {
 			return TableVerdict{Kind: VerdictNone}
 		}
 		return TableVerdict{
+			Exchange: res.Exchange,
 			Kind:     VerdictExposed,
 			Sample:   len(l.Value),
 			Total:    l.Count,
@@ -105,7 +108,7 @@ func ClassifyTableRead(res saasprobe.Result) TableVerdict {
 		}
 	case 403:
 		if isAttributePermissionError(res.Body) {
-			return TableVerdict{Kind: VerdictColumnRestricted}
+			return TableVerdict{Kind: VerdictColumnRestricted, Exchange: res.Exchange}
 		}
 		return TableVerdict{Kind: VerdictNone}
 	default:

@@ -14,6 +14,7 @@ package powerpages
 import (
 	"strings"
 
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra/saasprobe"
@@ -108,7 +109,13 @@ func MatchResponse(setCookies, body string) (ok bool, signals []string) {
 // catch-all. A 200 with data for a bogus table means the endpoint is NOT a
 // discriminating Dataverse API, so this returns false (fail closed).
 func DataverseAPIMounted(ctx *httpmsg.HttpRequestResponse, client *http.Requester) bool {
+	return DataverseAPIMountedWithEvidence(ctx, client, nil)
+}
+
+// DataverseAPIMountedWithEvidence retains the exact bogus-table control.
+func DataverseAPIMountedWithEvidence(ctx *httpmsg.HttpRequestResponse, client *http.Requester, sink *modkit.EvidenceCollector) bool {
 	res := saasprobe.Get(ctx, client, "/_api/"+bogusEntitySet, nil)
+	sink.AddExchange(res.Exchange, evidence.RoleControl, "Bogus Dataverse entity set")
 	if !res.OK {
 		return false
 	}

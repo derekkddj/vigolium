@@ -268,6 +268,8 @@ var schemaTables = []string{
 		response_decoded_from TEXT,
 		request_only_at_store {{TIMESTAMP}},
 		request_identity_hash TEXT,
+		capture_request_state TEXT,
+		capture_response_state TEXT,
 		parameters {{JSON}},
 		sent_at {{TIMESTAMP}} NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		received_at {{TIMESTAMP}},
@@ -313,6 +315,7 @@ var schemaTables = []string{
 		finding_source TEXT DEFAULT '',
 		record_kind TEXT NOT NULL DEFAULT 'finding',
 		evidence_grade TEXT DEFAULT '',
+		evidence_status TEXT,
 		module_short TEXT DEFAULT '',
 		description TEXT,
 		severity TEXT NOT NULL,
@@ -352,6 +355,39 @@ var schemaTables = []string{
 		alias_hash TEXT NOT NULL,
 		finding_id INTEGER NOT NULL,
 		created_at {{TIMESTAMP}} NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`,
+	// Receipts are independent of crawl/request dedup. Binary messages never
+	// pass through TEXT, and the same execution identity is project-scoped.
+	// captured_at is canonical UTC text with nanosecond precision: backend
+	// TIMESTAMP types would silently discard immutable capture metadata.
+	`CREATE TABLE IF NOT EXISTS evidence_exchanges (
+		project_uuid TEXT NOT NULL,
+		id TEXT NOT NULL,
+		url TEXT NOT NULL,
+		service TEXT NOT NULL,
+		raw_request {{BLOB}},
+		raw_response {{BLOB}},
+		request_state TEXT NOT NULL,
+		response_state TEXT NOT NULL,
+		provenance TEXT NOT NULL,
+		content_hash TEXT NOT NULL,
+		captured_at TEXT NOT NULL,
+		PRIMARY KEY (project_uuid, id)
+	)`,
+	// No exchange FK: manifests deliberately retain missing/expired identities.
+	// association_hash identifies the full metadata tuple, not the HTTP content.
+	`CREATE TABLE IF NOT EXISTS finding_evidence (
+		id {{AUTOINC_PK}},
+		finding_id INTEGER NOT NULL,
+		association_hash TEXT NOT NULL,
+		exchange_id TEXT NOT NULL,
+		role TEXT NOT NULL,
+		is_primary {{BOOL}} NOT NULL DEFAULT {{FALSE}},
+		label TEXT NOT NULL,
+		occurrence_id TEXT NOT NULL,
+		finding_url TEXT NOT NULL,
+		scan_uuid TEXT NOT NULL,
+		UNIQUE (finding_id, association_hash)
 	)`,
 	`CREATE TABLE IF NOT EXISTS finding_records (
 		finding_id INTEGER NOT NULL,
@@ -443,7 +479,7 @@ var schemaTables = []string{
 		raw_request TEXT,
 		raw_response TEXT,
 		remote_address TEXT,
-		interacted_at {{TIMESTAMP}} NOT NULL,
+		interacted_at TEXT NOT NULL,
 		target_url TEXT,
 		parameter_name TEXT,
 		injection_type TEXT,
@@ -478,12 +514,22 @@ var schemaTables = []string{
 		project_uuid TEXT NOT NULL,
 		scan_uuid TEXT,
 		class TEXT,
+		injection_type TEXT,
 		module_id TEXT,
 		target_url TEXT,
 		param TEXT,
 		request_hash TEXT,
 		payload TEXT,
-		created_at {{TIMESTAMP}} NOT NULL DEFAULT CURRENT_TIMESTAMP
+		created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`,
+	// Pending OAST bindings reference canonical binary evidence, independently
+	// of findings. No FK: explicit raw cleanup may leave unavailable identities.
+	`CREATE TABLE IF NOT EXISTS oast_planting_receipts (
+		project_uuid TEXT NOT NULL,
+		nonce TEXT NOT NULL,
+		scan_uuid TEXT NOT NULL,
+		exchange_id TEXT NOT NULL,
+		PRIMARY KEY (project_uuid, nonce)
 	)`,
 	`CREATE TABLE IF NOT EXISTS agentic_scans (
 		id {{AUTOINC_PK}},
@@ -739,6 +785,10 @@ var schemaIndexes = []string{
 	// another's. Backs ON CONFLICT (project_uuid, finding_hash).
 	"CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_project_hash_unique ON findings(project_uuid, finding_hash)",
 
+	// -- selected evidence --
+	"CREATE INDEX IF NOT EXISTS idx_finding_evidence_finding ON finding_evidence(finding_id, id)",
+	"CREATE INDEX IF NOT EXISTS idx_finding_evidence_exchange ON finding_evidence(exchange_id)",
+
 	// -- finding_records --
 	"CREATE INDEX IF NOT EXISTS idx_finding_records_record_uuid ON finding_records(record_uuid)",
 	"CREATE INDEX IF NOT EXISTS idx_finding_records_finding_id ON finding_records(finding_id)",
@@ -776,6 +826,8 @@ var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS idx_oast_sessions_open ON oast_sessions(project_uuid, scan_uuid, closed_at)",
 	// -- oast_payloads -- (nonce lookups ride the primary key)
 	"CREATE INDEX IF NOT EXISTS idx_oast_payloads_project_scan ON oast_payloads(project_uuid, scan_uuid)",
+	"CREATE INDEX IF NOT EXISTS idx_oast_planting_receipts_project_scan ON oast_planting_receipts(project_uuid, scan_uuid)",
+	"CREATE INDEX IF NOT EXISTS idx_oast_planting_receipts_exchange ON oast_planting_receipts(project_uuid, exchange_id)",
 
 	// -- agentic_scans --
 	"CREATE INDEX IF NOT EXISTS idx_agentic_scans_uuid ON agentic_scans(uuid)",
@@ -927,6 +979,7 @@ var columnMigrations = []columnMigration{
 	{"findings", "cvss_score", "{{FLOAT}} DEFAULT 0"},
 	{"findings", "source_file", "TEXT"},
 	{"findings", "repo_name", "TEXT"},
+	{"oast_payloads", "injection_type", "TEXT"},
 	{"agentic_scans", "source_path", "TEXT"},
 	{"agentic_scans", "token_usage", "{{JSON}}"},
 	{"agentic_scans", "retry_count", "INTEGER DEFAULT 0"},
@@ -1041,6 +1094,12 @@ var columnMigrations = []columnMigration{
 	// A finding's proof recipe (output.ProofRecipe, additive, nullable, no
 	// backfill): NULL for modules that have not opted in and on older rows.
 	{"findings", "proof", "{{JSON}}"},
+	// Schema v7: no default and no historical evidence inference/backfill.
+	{"findings", "evidence_status", "TEXT"},
+	// Schema v10: known fidelity of raw-record bytes only. NULL preserves the
+	// original behavior of historical rows; no execution identity is restored.
+	{"http_records", "capture_request_state", "TEXT"},
+	{"http_records", "capture_response_state", "TEXT"},
 }
 
 func init() {

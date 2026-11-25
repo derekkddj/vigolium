@@ -1,9 +1,13 @@
 import { useQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query';
 import { useEffect } from 'react';
 import {
-  apiGet, apiPost, apiPut, apiPatch, apiDelete, apiUpload, getProjectUUID, setDemoMode, assertNotDemo, withDemoKey, apiGetJSONOrText } from './client';
+  apiGet, apiPost, apiPut, apiPatch, apiDelete, apiUpload, getProjectUUID, setDemoMode, assertNotDemo, withDemoKey } from './client';
 import { isStaticBuild } from '@/lib/buildMode';
 import { isTerminalAgentStatus } from './types';
+import { useProjectContext } from '@/contexts/ProjectContext';
+import { fetchNativeScan, fetchNativeScanLogs } from '@/lib/nativeScanApi';
+import { fetchSelectedHttpRecord } from '@/lib/selectedRecordApi';
+import { isNativeScanActive } from '@/lib/nativeScan';
 import type {
   Project,
   CreateProjectRequest,
@@ -212,11 +216,14 @@ export function useScanStatus() {
 }
 
 export function useFindings(params: FindingsQueryParams) {
+  const key = projectKey('findings', params);
   return useQuery({
-    queryKey: projectKey('findings', params),
+    queryKey: key,
     queryFn: () =>
       apiGet<PaginatedResponse<Finding>>('/api/findings', params as Record<string, string | number | undefined>),
-    placeholderData: keepPreviousData,
+    // Retain page metadata while fetching, but never borrow another project's rows.
+    placeholderData: (previousData, previousQuery) =>
+      previousQuery?.queryKey[0] === key[0] ? previousData : undefined,
   });
 }
 
@@ -351,9 +358,11 @@ export function useDeleteHttpRecord() {
 }
 
 export function useHttpRecord(uuid: string | null) {
+  const { projectUUID } = useProjectContext();
+  const project = getProjectUUID() ?? projectUUID;
   return useQuery({
-    queryKey: projectKey('http-record', uuid),
-    queryFn: () => apiGet<HTTPRecord>(`/api/http-records/${uuid}`),
+    queryKey: [project ?? 'default', 'http-record', uuid],
+    queryFn: ({ signal }) => fetchSelectedHttpRecord(uuid!, project, signal),
     enabled: uuid !== null,
     staleTime: 30_000,
   });
@@ -474,23 +483,26 @@ export function useResumeScan() {
   });
 }
 
-const SCAN_LOG_TAIL_BYTES = 256 * 1024;
+/** Fetch the selected UUID independently of the currently paginated history. */
+export function useScan(uuid: string | null) {
+  // Subscribe to project changes; storage supplies the hydrated header/key snapshot.
+  const { projectUUID } = useProjectContext();
+  const project = getProjectUUID() ?? projectUUID;
+  return useQuery({
+    queryKey: [project ?? 'default', 'scan', uuid],
+    queryFn: ({ signal }) => fetchNativeScan(uuid!, project, signal),
+    enabled: !!uuid,
+    refetchInterval: (query) => isNativeScanActive(query.state.data?.status) ? 5_000 : false,
+  });
+}
 
 export function useScanLogs(uuid: string | null, params?: ScanLogsQueryParams, isRunning?: boolean) {
-  return useQuery({
-    queryKey: projectKey('scan-logs', uuid, params),
-    queryFn: async (): Promise<ScanLogsResponse> => {
-      // Scans with a runtime.log get its text tail, not the JSON rows; cap it
-      // at what the panel can usefully show (the server default is 2 MiB,
-      // re-downloaded on every poll).
-      const res = await apiGetJSONOrText<ScanLogsResponse>(`/api/scans/${uuid}/logs`, {
-        ...(params as Record<string, string | number | undefined>),
-        strip: 1,
-        max_bytes: SCAN_LOG_TAIL_BYTES,
-      });
-      return typeof res === 'string' ? { logs: [], total: 0, text: res } : res;
-    },
-    enabled: uuid !== null,
+  const { projectUUID } = useProjectContext();
+  const project = getProjectUUID() ?? projectUUID;
+  return useQuery<ScanLogsResponse>({
+    queryKey: [project ?? 'default', 'scan-logs', uuid, params],
+    queryFn: ({ signal }) => fetchNativeScanLogs(uuid!, project, signal, params),
+    enabled: !!uuid,
     refetchInterval: isRunning ? 5_000 : false,
   });
 }

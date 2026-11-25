@@ -295,7 +295,7 @@ func (m *PathModule) scanWithPrefix(
 	primaryPayload := GeneratePrimaryWithPrefix(prefix)
 	result.PrimaryPayload = primaryPayload
 
-	primaryBody, err := sendAndValidatePayload(ctx, ip, primaryPayload, httpClient)
+	primaryBody, err := sendAndValidatePayload(ctx, ip, primaryPayload, httpClient, &result.PrimaryReceipt)
 	if err != nil {
 		return nil, err
 	}
@@ -338,7 +338,7 @@ func (m *PathModule) scanWithPrefix(
 
 	result.SecondaryPayload = secondaryPayload
 
-	secondaryBody, err := sendAndValidatePayload(ctx, ip, secondaryPayload, httpClient)
+	secondaryBody, err := sendAndValidatePayload(ctx, ip, secondaryPayload, httpClient, &result.SecondaryReceipt)
 	if err != nil {
 		return nil, err
 	}

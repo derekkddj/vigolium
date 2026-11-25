@@ -44,7 +44,7 @@ func probeParamFuzz(
 		if confirmChange(ctx, httpClient, baseline, fuzzedRaw, change) {
 			results = append(results, buildProbeResult(
 				urlStr, fuzzedRaw, resp.FullResponseString(),
-				ip.Name(), "param_char_fuzz", payload, change,
+				ip.Name(), "param_char_fuzz", payload, change, http.CaptureEvidence(resp),
 			))
 		}
 		resp.Close()

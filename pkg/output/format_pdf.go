@@ -54,6 +54,21 @@ func GeneratePDFReport(items []any, outputPath string, meta HTMLReportMeta) erro
 // afterwards, and --no-sandbox only where the sandbox cannot work (root, a
 // container) or when VIGOLIUM_CHROME_NO_SANDBOX=1.
 func GeneratePDFReportContext(ctx context.Context, items []any, outputPath string, meta HTMLReportMeta) error {
+	return generatePDFReportContext(ctx, outputPath, meta, func(path string) error {
+		return GenerateDocumentReport(items, path, meta)
+	})
+}
+
+// GeneratePDFReportStreaming keeps raw findings on disk while producing the HTML
+// input. Chrome still owns the rendered document/DOM; it never receives a Go
+// collection of captured HTTP messages.
+func GeneratePDFReportStreaming(produce ReportItemProducer, outputPath string, meta HTMLReportMeta) error {
+	return generatePDFReportContext(context.Background(), outputPath, meta, func(path string) error {
+		return GenerateDocumentReportStreaming(produce, path, meta)
+	})
+}
+
+func generatePDFReportContext(ctx context.Context, outputPath string, meta HTMLReportMeta, generateHTML func(string) error) error {
 	chromePath, found := launcher.LookPath()
 	if !found {
 		return fmt.Errorf("%w: Chrome/Chromium not found; install Google Chrome or Chromium to export PDF", ErrPDFFailed)
@@ -66,7 +81,7 @@ func GeneratePDFReportContext(ctx context.Context, items []any, outputPath strin
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	htmlPath := filepath.Join(tmpDir, "report.html")
-	if err := GenerateDocumentReport(items, htmlPath, meta); err != nil {
+	if err := generateHTML(htmlPath); err != nil {
 		return fmt.Errorf("%w: failed to generate HTML for PDF: %w", ErrPDFFailed, err)
 	}
 

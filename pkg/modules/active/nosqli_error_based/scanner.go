@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -233,6 +234,7 @@ func (m *Module) ScanPerInsertionPoint(
 		}
 
 		fullResp := resp.FullResponseString()
+		selectedExchange := http.CaptureEvidence(resp)
 		resp.Close()
 
 		// Confirm the error is genuinely introduced by the NoSQL payload: it must
@@ -242,7 +244,8 @@ func (m *Module) ScanPerInsertionPoint(
 		// original value (so a page that returns the pattern for any input is
 		// rejected). Fails open on a transport error so a transient failure never
 		// suppresses a true positive.
-		if !modkit.ConfirmMatchReproduces(ctx, ip, httpClient, fuzzedRaw, regExp) {
+		guardProof := modkit.NewEvidenceCollector()
+		if !modkit.ConfirmMatchReproducesWithEvidence(ctx, ip, httpClient, fuzzedRaw, regExp, guardProof) {
 			continue
 		}
 
@@ -256,6 +259,8 @@ func (m *Module) ScanPerInsertionPoint(
 				Description: fmt.Sprintf("DBMS: %s", dbms),
 			},
 		})
+		modkit.SetPrimaryEvidence(results[len(results)-1], selectedExchange, evidence.RoleAttack, "matched NoSQL error probe")
+		modkit.AppendEvidence(results[len(results)-1], guardProof)
 		return results, nil
 	}
 

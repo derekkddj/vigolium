@@ -86,7 +86,7 @@ func testPathVariant(
 	if confirmChange(ctx, httpClient, baseline, raw, change) {
 		return buildProbeResult(
 			urlStr, raw, resp.FullResponseString(),
-			"path", probeType, payload, change,
+			"path", probeType, payload, change, http.CaptureEvidence(resp),
 		)
 	}
 

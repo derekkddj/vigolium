@@ -410,13 +410,14 @@ func deduplicateRecords(records []*httpmsg.HttpRequestResponse) []*httpmsg.HttpR
 // keeping only those whose hostname matches the target URL's hostname.
 // Relative URLs are resolved against the target URL using net/url.ResolveReference
 // for correct path handling (e.g., "../api/v2", "/api/users", "endpoint").
-// Returns records and a parallel slice of notes (aligned 1:1 with records).
-func filterSourceRecordsByHostname(agentRecords []AgentHTTPRecord, targetURL string) ([]*httpmsg.HttpRequestResponse, []string) {
+// Returns records, notes and current saved UUIDs, all aligned 1:1.
+func filterSourceRecordsByHostname(agentRecords []AgentHTTPRecord, targetURL string) ([]*httpmsg.HttpRequestResponse, []string, []string) {
 	if targetURL == "" {
 		// Source-only mode: keep all records without hostname filtering.
 		normalized, _ := parsing.NormalizeAgentRecords(agentRecords)
 		var passthrough []*httpmsg.HttpRequestResponse
 		var passthroughNotes []string
+		var passthroughUUIDs []string
 		for _, rec := range normalized {
 			rr, convertErr := ToHTTPRequestResponse(rec)
 			if convertErr != nil {
@@ -424,12 +425,13 @@ func filterSourceRecordsByHostname(agentRecords []AgentHTTPRecord, targetURL str
 			}
 			passthrough = append(passthrough, rr)
 			passthroughNotes = append(passthroughNotes, rec.Notes)
+			passthroughUUIDs = append(passthroughUUIDs, rec.RecordUUID)
 		}
-		return passthrough, passthroughNotes
+		return passthrough, passthroughNotes, passthroughUUIDs
 	}
 	targetParsed, err := url.Parse(targetURL)
 	if err != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	targetHost := targetParsed.Host // includes port
 
@@ -452,6 +454,7 @@ func filterSourceRecordsByHostname(agentRecords []AgentHTTPRecord, targetURL str
 
 	var filtered []*httpmsg.HttpRequestResponse
 	var notes []string
+	var recordUUIDs []string
 	skipped := 0
 	for _, rec := range normalized {
 		recURL := rec.URL
@@ -484,8 +487,14 @@ func filterSourceRecordsByHostname(agentRecords []AgentHTTPRecord, targetURL str
 			skipped++
 			continue
 		}
+		// Scope the exchange actually sent, not only the agent's original route.
+		if u, err := rr.URL(); err != nil || u == nil || u.Host != targetHost {
+			skipped++
+			continue
+		}
 		filtered = append(filtered, rr)
 		notes = append(notes, rec.Notes)
+		recordUUIDs = append(recordUUIDs, rec.RecordUUID)
 	}
 
 	if skipped > 0 {
@@ -495,7 +504,7 @@ func filterSourceRecordsByHostname(agentRecords []AgentHTTPRecord, targetURL str
 			zap.Int("skipped", skipped))
 	}
 
-	return filtered, notes
+	return filtered, notes, recordUUIDs
 }
 
 // formatRouteStatusSummary returns a parenthesized summary of HTTP status code

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -120,7 +121,9 @@ func (m *Module) probeWithAcceptHTML(
 	httpClient *http.Requester,
 	overridePath string,
 	name string,
-) *output.ResultEvent {
+) (guardResult *output.ResultEvent) {
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(guardResult, guardProof) }()
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
@@ -202,7 +205,7 @@ func (m *Module) probeWithAcceptHTML(
 	// siblings under this path's directory and dropping the finding when they return
 	// the SAME 200 status carrying the same DRF anchor — a real browsable API serves
 	// its markers only at its own route (siblings 404), so a genuine finding stands.
-	if modkit.MultiRoundExtDecoyCatchAll(ctx, httpClient, probePath, body, status, 2, hasDRFBrowsableMarkers) {
+	if modkit.MultiRoundExtDecoyCatchAllWithEvidence(ctx, httpClient, probePath, body, status, 2, hasDRFBrowsableMarkers, guardProof) {
 		return nil
 	}
 
@@ -215,7 +218,7 @@ func (m *Module) probeWithAcceptHTML(
 
 	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		ModuleID:         ModuleID,
 		RecordKind:       output.RecordKindObservation,
 		EvidenceGrade:    output.EvidenceGradeObservation,
@@ -238,4 +241,6 @@ func (m *Module) probeWithAcceptHTML(
 			"write_action_tested":    false,
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+	return result
 }

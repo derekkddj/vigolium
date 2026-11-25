@@ -47,7 +47,7 @@ func drainDA(t *testing.T, src *RiskPrioritizedDBInputSource) []string {
 }
 
 // The write gate reads first-write provenance: an ingested POST/DELETE
-// template is held back even after a baseline was backfilled into it, a
+// template is held back, and so is the exchange fetched from it, a
 // captured POST (stored with its response) is served, safe methods always
 // are, and --allow-writes serves everything. The held-back count is reported.
 func TestRiskPrioritizedSourceWriteTemplateGate(t *testing.T) {
@@ -70,14 +70,23 @@ func TestRiskPrioritizedSourceWriteTemplateGate(t *testing.T) {
 	del := save("DELETE /items/1 HTTP/1.1\r\nHost: "+host+"\r\n\r\n", "/items/1", "")
 	save("PUT /captured HTTP/1.1\r\nHost: "+host+"\r\n\r\n", "/captured", provOK)
 
-	// The executor backfills a baseline into a stub it fetched: the template
-	// must stay a template.
-	if err := repo.BackfillRecordResponse(ctx, del, provRR(t, "DELETE /items/1 HTTP/1.1\r\nHost: "+host+"\r\n\r\n", base+"/items/1", provOK)); err != nil {
-		t.Fatalf("BackfillRecordResponse: %v", err)
+	// Stored exchanges are immutable: the executor saves a baseline it fetched
+	// from a stub as its own observation row, carrying the template's
+	// provenance. Observations are not assessment inputs, but a later crawl
+	// dedup can promote the row to a crawl source; it must still be a template.
+	tmpl, err := repo.GetRecordByUUID(ctx, del)
+	if err != nil || tmpl.RequestOnlyAtStore == nil {
+		t.Fatalf("template: request_only_at_store=%v err=%v", tmpl.RequestOnlyAtStore, err)
 	}
-	rec, err := repo.GetRecordByUUID(ctx, del)
+	fetched, err := repo.SaveRecordWithLineage(ctx,
+		provRR(t, "DELETE /items/1 HTTP/1.1\r\nHost: "+host+"\r\n\r\n", base+"/items/1", provOK),
+		RecordKindObservation, DefaultProjectUUID, RecordLineage{TemplateAt: tmpl.RequestOnlyAtStore})
+	if err != nil || fetched == del {
+		t.Fatalf("fetched version: %s %v", fetched, err)
+	}
+	rec, err := repo.GetRecordByUUID(ctx, fetched)
 	if err != nil || !rec.HasResponse || rec.RequestOnlyAtStore == nil {
-		t.Fatalf("backfilled template: has_response=%v request_only_at_store=%v err=%v", rec.HasResponse, rec.RequestOnlyAtStore, err)
+		t.Fatalf("fetched template version: has_response=%v request_only_at_store=%v err=%v", rec.HasResponse, rec.RequestOnlyAtStore, err)
 	}
 
 	scopes := []HostTarget{{Hostname: host}}
@@ -99,7 +108,7 @@ func TestRiskPrioritizedSourceWriteTemplateGate(t *testing.T) {
 
 	open := NewRiskPrioritizedDBInputSource(db, repo, createTestScan(t, repo)).WithHostScopes(scopes).WithAllowWrites(true)
 	if got := drainDA(t, open); len(got) != 4 {
-		t.Errorf("--allow-writes served %v, want all 4 records", got)
+		t.Errorf("--allow-writes served %v, want the 4 stored inputs (fetched observations are not inputs)", got)
 	}
 	if n := open.SkippedUnsafeMethod(); n != 0 {
 		t.Errorf("SkippedUnsafeMethod with writes allowed = %d, want 0", n)
@@ -157,8 +166,13 @@ func TestDedupIsIdentityAware(t *testing.T) {
 	if anon == alice {
 		t.Error("an anonymous GET landed on a principal's row")
 	}
-	if again := save(get("Cookie: sid=alice\r\nUser-Agent: other\r\n"), "scanner"); again != alice {
-		t.Error("the same principal with another User-Agent did not dedup onto its row")
+	// Identity is the exact exchange for every source: the same principal with
+	// another User-Agent is a different stored exchange, never an alias.
+	if again := save(get("Cookie: sid=alice\r\nUser-Agent: other\r\n"), "scanner"); again == alice {
+		t.Error("a header-varied request aliased another stored exchange")
+	}
+	if same := save(get("Cookie: sid=alice\r\n"), "scanner"); same != alice {
+		t.Error("an identical exchange did not dedup onto its row")
 	}
 
 	// The batched writer's cache key agrees with the lookup.
@@ -171,11 +185,6 @@ func TestDedupIsIdentityAware(t *testing.T) {
 		t.Errorf("writer: carol = %q (%v) reused another principal's row", id, err)
 	}
 
-	for _, source := range []string{RecordSourceReplay, RecordSourceFuzz, RecordSourceParamMining} {
-		if !recordSourceRequiresExactIdentity(source) {
-			t.Errorf("%s does not require exact identity", source)
-		}
-	}
 	first := save(get("Cookie: sid=alice\r\nX-Probe: 1\r\n"), RecordSourceReplay)
 	if second := save(get("Cookie: sid=alice\r\nX-Probe: 2\r\n"), RecordSourceReplay); second == first {
 		t.Error("two replays differing in a header collapsed into one row")
@@ -209,17 +218,20 @@ func TestUpsertCapturedRecordKeepsCaptureTime(t *testing.T) {
 		t.Errorf("scan_uuid = %q, want the importing scan", rec.ScanUUID)
 	}
 
-	// A later capture with a new response moves sent_at to that capture.
+	// Stored exchanges are immutable: a later capture with a new response is
+	// its own row carrying its own capture time; the first row is untouched.
 	later := captured.Add(time.Hour)
-	_, outcome, err = repo.UpsertCapturedRecord(ctx,
+	id2, outcome, err := repo.UpsertCapturedRecord(ctx,
 		provRR(t, "GET /x HTTP/1.1\r\nHost: b.test\r\n\r\n", "https://b.test/x", "HTTP/1.1 500 Oops\r\n\r\nno"),
 		RecordSourceBurp, "", Capture{SentAt: later})
-	if err != nil || outcome != "updated" {
-		t.Fatalf("update: %s %v", outcome, err)
+	if err != nil || outcome != "inserted" || id2 == id {
+		t.Fatalf("later capture: %s %s %v", id2, outcome, err)
 	}
-	rec, _ = repo.GetRecordByUUID(ctx, id)
-	if !rec.SentAt.Equal(later) {
-		t.Errorf("sent_at after update = %v, want %v", rec.SentAt, later)
+	if rec2, _ := repo.GetRecordByUUID(ctx, id2); !rec2.SentAt.Equal(later) {
+		t.Errorf("later capture sent_at = %v, want %v", rec2.SentAt, later)
+	}
+	if rec, _ = repo.GetRecordByUUID(ctx, id); !rec.SentAt.Equal(captured) {
+		t.Errorf("first capture sent_at changed to %v", rec.SentAt)
 	}
 }
 

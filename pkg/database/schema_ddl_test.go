@@ -217,7 +217,7 @@ func TestSchemaDDL_ModelTypesMatchTokens(t *testing.T) {
 	cat := parseDDLCatalog(t, stmts)
 
 	models := []any{User{}, Project{}, Scan{}, HTTPRecord{}, AnalysisArtifact{}, HostObservation{}, Finding{},
-		FindingObservation{}, FindingStatusEvent{}, OASTPayload{}, AuthenticationHostname{}, OASTInteraction{},
+		FindingObservation{}, FindingStatusEvent{}, EvidenceExchange{}, FindingEvidence{}, OASTPayload{}, AuthenticationHostname{}, OASTInteraction{},
 		ScanLog{}, AgenticScan{}, AgentSection{}, AgentFindingCandidate{}, Scope{}}
 	for _, m := range models {
 		rt := reflect.TypeOf(m)

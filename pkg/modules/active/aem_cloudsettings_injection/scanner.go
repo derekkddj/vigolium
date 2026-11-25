@@ -122,6 +122,7 @@ func (m *Module) ScanPerHost(
 
 // pair is a confirmed write/read form and the marker that proved the read-back.
 type pair struct {
+	proof     *aem.Proof
 	writePath string // the (possibly bypassed) bulkimport POST target
 	readPath  string // the (possibly bypassed) ConfDeliveryServlet GET target
 }
@@ -143,7 +144,7 @@ func (m *Module) findWritePrimitive(ctx *httpmsg.HttpRequestResponse, httpClient
 			"sling:resourceType": {"vig/probe"},
 			"vigmark":            {marker},
 		}.Encode()
-		aem.Post(ctx, httpClient, wf, body, map[string]string{"Content-Type": formCT})
+		write := aem.Post(ctx, httpClient, wf, body, map[string]string{"Content-Type": formCT})
 		budget--
 
 		for _, rf := range readForms {
@@ -155,12 +156,15 @@ func (m *Module) findWritePrimitive(ctx *httpmsg.HttpRequestResponse, httpClient
 			if !res.OK || !strings.Contains(res.Body, marker) || modkit.ResemblesObservedPage(ctx, res.Body) {
 				continue
 			}
+			proof := aem.NewProof(write)
+			proof.Payload = body
+			proof.Confirmation(res)
 			if !aem.ReproduceMarker(ctx, httpClient, rf, reproduceRounds, func(r aem.ProbeResult) bool {
 				return strings.Contains(r.Body, marker)
-			}) {
+			}, proof) {
 				continue
 			}
-			return pair{writePath: wf, readPath: rf}, true
+			return pair{writePath: wf, readPath: rf, proof: proof}, true
 		}
 		if budget <= 0 {
 			return pair{}, false
@@ -170,6 +174,7 @@ func (m *Module) findWritePrimitive(ctx *httpmsg.HttpRequestResponse, httpClient
 }
 
 type elResult struct {
+	proof        *aem.Proof
 	resourceType string
 	param        string
 	evaluated    string // the pre49post value proving evaluation
@@ -191,18 +196,21 @@ func (m *Module) probeEL(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requ
 			"sling:resourceType": {c.resourceType},
 			c.param:              {payload},
 		}.Encode()
-		aem.Post(ctx, httpClient, p.writePath, body, map[string]string{"Content-Type": formCT})
+		write := aem.Post(ctx, httpClient, p.writePath, body, map[string]string{"Content-Type": formCT})
+		proof := aem.NewProof(write)
+		proof.Payload = body
 
 		res := aem.Get(ctx, httpClient, p.readPath, nil)
 		if !res.OK || !strings.Contains(res.Body, evaluated) || strings.Contains(res.Body, literal) {
 			continue
 		}
+		proof.Confirmation(res)
 		if !aem.ReproduceMarker(ctx, httpClient, p.readPath, reproduceRounds, func(r aem.ProbeResult) bool {
 			return strings.Contains(r.Body, evaluated) && !strings.Contains(r.Body, literal)
-		}) {
+		}, proof) {
 			continue
 		}
-		return elResult{resourceType: c.resourceType, param: c.param, evaluated: evaluated}, true
+		return elResult{resourceType: c.resourceType, param: c.param, evaluated: evaluated, proof: proof}, true
 	}
 	return elResult{}, false
 }
@@ -235,7 +243,7 @@ func (m *Module) buildPreAuthWrite(p pair, baseURL string) *output.ResultEvent {
 	if p.isBypass() {
 		modkit.AnnotatePathBypassFinding(res, p.writePath)
 	}
-	return res
+	return p.proof.Attack(res)
 }
 
 func (m *Module) buildELInjection(p pair, el elResult, baseURL string) *output.ResultEvent {
@@ -268,5 +276,5 @@ func (m *Module) buildELInjection(p pair, el elResult, baseURL string) *output.R
 	if p.isBypass() {
 		modkit.AnnotatePathBypassFinding(res, p.writePath)
 	}
-	return res
+	return el.proof.Attack(res)
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -126,7 +127,7 @@ func (m *Module) probeEndpoint(
 	httpClient *http.Requester,
 	p probe,
 	fp *notFoundFingerprint,
-) *output.ResultEvent {
+) (finding *output.ResultEvent) {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
@@ -224,13 +225,19 @@ func (m *Module) probeEndpoint(
 	// exposed panel has no such sibling (the decoy 404s), so this costs no true
 	// positives, and it survives the body-truncation quirk because the decoy is
 	// run through the same marker predicate rather than a body-similarity compare.
-	if modkit.MultiRoundExtDecoyCatchAll(ctx, httpClient, p.path, body, status, decoyRounds, p.markerMatch) {
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(finding, guardProof) }()
+	if modkit.MultiRoundExtDecoyCatchAllWithEvidence(ctx, httpClient, p.path, body, status, decoyRounds, p.markerMatch, guardProof) {
 		return nil
 	}
 
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + p.path
 
+	selectedExchange := http.CaptureEvidence(resp)
+	defer func() {
+		modkit.SetPrimaryEvidence(finding, selectedExchange, evidence.RoleObservation, "selected endpoint observation")
+	}()
 	return &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,

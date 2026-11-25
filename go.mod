@@ -2,6 +2,9 @@ module github.com/vigolium/vigolium
 
 go 1.27.4
 
+// v0.6.4 with the first-dial error replay fix; see third_party/fastdialer/VIGOLIUM_PATCH.md.
+replace github.com/projectdiscovery/fastdialer v0.6.4 => ./third_party/fastdialer
+
 require (
 	charm.land/bubbles/v2 v2.2.2
 	charm.land/bubbletea/v2 v2.1.2

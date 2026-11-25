@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -120,7 +121,9 @@ func (m *Module) probeEndpoint(
 	httpClient *http.Requester,
 	scanCtx *modkit.ScanContext,
 	p probe,
-) *output.ResultEvent {
+) (guardResult *output.ResultEvent) {
+	guardProof := modkit.NewEvidenceCollector()
+	defer func() { modkit.AppendEvidence(guardResult, guardProof) }()
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), p.method)
 	if err != nil {
 		return nil
@@ -195,14 +198,14 @@ func (m *Module) probeEndpoint(
 	// Django debug pages are 404/500 responses whose status differs from the
 	// (2xx) wildcard shell, so they are never matched by this gate.
 	location := resp.Response().Header.Get("Location")
-	if !modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, resp.Response().StatusCode, []byte(body), location) {
+	if !modkit.ConfirmNotSoft404WithEvidence(scanCtx, httpClient, ctx, resp.Response().StatusCode, []byte(body), location, guardProof) {
 		return nil
 	}
 
 	urlx, _ := ctx.URL()
 	targetURL := urlx.Scheme + "://" + urlx.Host + p.path
 
-	return &output.ResultEvent{
+	result := &output.ResultEvent{
 		URL:              targetURL,
 		Matched:          targetURL,
 		Request:          string(modifiedRaw),
@@ -217,4 +220,6 @@ func (m *Module) probeEndpoint(
 			Reference:   []string{"https://docs.djangoproject.com/en/stable/ref/settings/#debug"},
 		},
 	}
+	modkit.SetPrimaryEvidence(result, http.CaptureEvidence(resp), evidence.RoleObservation, "selected observation")
+	return result
 }

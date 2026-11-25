@@ -93,6 +93,7 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 	}
 
 	ev := EvidenceContext{
+		Exchange:     ctx.Evidence(),
 		Body:         body,
 		RespHead:     string(resp.Head()),
 		StatusCode:   resp.StatusCode(),

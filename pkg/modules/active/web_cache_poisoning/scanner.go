@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -47,6 +48,7 @@ type cacheObservation struct {
 	location string
 	full     string
 	ok       bool
+	receipt  *evidence.Exchange
 }
 
 // Module implements the Web Cache Poisoning active scanner.
@@ -143,6 +145,7 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, httpClient *ht
 		}
 
 		poisonResponse := poisonResp.FullResponseString()
+		poisonReceipt := http.CaptureEvidence(poisonResp)
 		poisonResp.Close()
 		victimFirst := executeRaw(victimClient, ctx.Service(), isolatedRaw)
 		victimReplay := executeRaw(victimClient, ctx.Service(), isolatedRaw)
@@ -173,7 +176,12 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, httpClient *ht
 			)
 		}
 
-		return []*output.ResultEvent{{
+		ev := modkit.NewEvidenceCollector()
+		ev.AddExchange(before.receipt, evidence.RoleControl, "clean isolated cache key before poison")
+		ev.AddExchange(victimFirst.receipt, evidence.RoleConfirmation, "clean victim replay 1")
+		ev.AddExchange(victimReplay.receipt, evidence.RoleConfirmation, "clean victim replay 2")
+		result := &output.ResultEvent{
+			Evidence:           ev.Evidence(),
 			ModuleID:           ModuleID,
 			RecordKind:         kind,
 			EvidenceGrade:      grade,
@@ -197,7 +205,9 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, httpClient *ht
 				"cross_client_replay": crossClientReplay,
 				"normal_url_poisoned": false,
 			},
-		}}, nil
+		}
+		modkit.SetPrimaryEvidence(result, poisonReceipt, evidence.RoleAttack, "cache-key isolated poison payload")
+		return []*output.ResultEvent{result}, nil
 	}
 	return nil, nil
 }
@@ -218,6 +228,7 @@ func executeRaw(client *http.Requester, service *httpmsg.Service, raw []byte) ca
 		location: resp.Response().Header.Get("Location"),
 		full:     resp.FullResponseString(),
 		ok:       true,
+		receipt:  http.CaptureEvidence(resp),
 	}
 }
 

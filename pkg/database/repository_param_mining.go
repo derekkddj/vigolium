@@ -21,11 +21,11 @@ const ParamMiningRemarkPrefix = "param-mining:"
 
 // paramMiningCandidateColumns are what candidate selection reads: identity,
 // the request to replay, and the ranking/filter columns. No response body.
-var paramMiningCandidateColumns = []string{
+var paramMiningCandidateColumns = append([]string{
 	"uuid", "scheme", "hostname", "port", "method", "path", "url",
 	"raw_request", "request_content_type", "response_content_type",
 	"status_code", "risk_score", "surface_score", "source",
-}
+}, recordCaptureStateColumns...)
 
 // ParamMiningCandidates returns the records the param-mining phase may mine:
 // the ones the dynamic-assessment phase of scanUUID will see (after the scan
@@ -50,10 +50,7 @@ func (r *Repository) ParamMiningCandidates(ctx context.Context, scanUUID string,
 			Where("status_code >= 200 AND status_code < 300").
 			Where("method IN (?)", bun.List([]string{"GET", "POST"})).
 			Where("(source IS NULL OR source != ?)", RecordSourceParamMining)
-		if !scan.CursorAt.IsZero() {
-			at := dbTimestampString(r.db.Driver(), scan.CursorAt)
-			q = q.Where("(created_at > ? OR (created_at = ? AND uuid > ?))", at, at, scan.CursorUUID)
-		}
+		q = applyRecordsAfterCursor(q, r.db.Driver(), scan.CursorAt, scan.CursorUUID)
 		q = runFilter.Apply(applyHostScopeFilter(q, hosts))
 		return applyProjectFilter(q, scan.ProjectUUID)
 	}
@@ -70,7 +67,7 @@ func (r *Repository) ParamMiningCandidates(ctx context.Context, scanUUID string,
 	} else {
 		q = filter(q)
 	}
-	if err := q.OrderExpr("risk_score DESC, surface_score DESC, created_at ASC, uuid ASC").Scan(ctx); err != nil {
+	if err := q.OrderExpr("risk_score DESC, surface_score DESC, " + dbCursorTimeExpr(r.db.Driver(), "created_at") + " ASC, uuid ASC").Scan(ctx); err != nil {
 		return nil, err
 	}
 	return rows, nil

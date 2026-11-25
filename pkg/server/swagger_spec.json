@@ -717,6 +717,9 @@
               "raw_output": {
                 "type": "string"
               },
+              "recording_error": {
+                "type": "string"
+              },
               "saved_count": {
                 "type": "integer"
               },
@@ -2053,6 +2056,73 @@
         ],
         "type": "object"
       },
+      "EvidenceEntry": {
+        "properties": {
+          "exchange": {
+            "$ref": "#/components/schemas/EvidenceExchange"
+          },
+          "exchange_id": {
+            "type": "string"
+          },
+          "finding_url": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "occurrence_id": {
+            "type": "string"
+          },
+          "primary": {
+            "type": "boolean"
+          },
+          "role": {
+            "type": "string"
+          },
+          "scan_uuid": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "EvidenceExchange": {
+        "properties": {
+          "captured_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "content_hash": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "provenance": {
+            "type": "string"
+          },
+          "request": {
+            "format": "byte",
+            "type": "string"
+          },
+          "request_state": {
+            "type": "string"
+          },
+          "response": {
+            "format": "byte",
+            "type": "string"
+          },
+          "response_state": {
+            "type": "string"
+          },
+          "service": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "ExtensionAPIFunction": {
         "properties": {
           "category": {
@@ -2246,7 +2316,16 @@
           "description": {
             "type": "string"
           },
+          "evidence": {
+            "items": {
+              "$ref": "#/components/schemas/EvidenceEntry"
+            },
+            "type": "array"
+          },
           "evidence_grade": {
+            "type": "string"
+          },
+          "evidence_status": {
             "type": "string"
           },
           "extracted_results": {
@@ -2584,6 +2663,12 @@
               }
             },
             "type": "object"
+          },
+          "capture_request_state": {
+            "type": "string"
+          },
+          "capture_response_state": {
+            "type": "string"
           },
           "chain_truncated": {
             "type": "boolean"
@@ -4097,6 +4182,9 @@
               "baseline": {
                 "nullable": true,
                 "properties": {
+                  "exchange_id": {
+                    "type": "string"
+                  },
                   "method": {
                     "type": "string"
                   },
@@ -4104,6 +4192,9 @@
                     "type": "string"
                   },
                   "request": {
+                    "type": "string"
+                  },
+                  "role": {
                     "type": "string"
                   },
                   "source": {
@@ -4114,6 +4205,9 @@
                   }
                 },
                 "type": "object"
+              },
+              "evidence_status": {
+                "type": "string"
               },
               "finding_hash": {
                 "type": "string"
@@ -4180,6 +4274,9 @@
               }
             },
             "type": "object"
+          },
+          "unclassified_matched": {
+            "type": "integer"
           },
           "verdict": {
             "type": "string"
@@ -5045,7 +5142,7 @@
     },
     "/api/burp/sitemap/snapshot": {
       "post": {
-        "description": "Upserts at most 200 base64-encoded Burp request/response records per chunk.",
+        "description": "Imports at most 200 base64-encoded Burp request/response records per chunk, scoped to the request's project. An exact existing exchange is unchanged; any changed request, response (including absence) or destination creates a new immutable version and increments inserted. Historical raw bytes are never overwritten. The legacy updated counter is retained as zero for compatibility. Both API versions return the same snapshot counter object.",
         "operationId": "ingestBurpSiteMapSnapshot",
         "requestBody": {
           "content": {
@@ -5084,7 +5181,41 @@
         },
         "responses": {
           "200": {
-            "description": "Snapshot chunk processed"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "errors": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "inserted": {
+                      "description": "New immutable exchange versions, including changed snapshots",
+                      "type": "integer"
+                    },
+                    "received": {
+                      "type": "integer"
+                    },
+                    "skipped": {
+                      "type": "integer"
+                    },
+                    "unchanged": {
+                      "description": "Exact exchanges already stored in this project",
+                      "type": "integer"
+                    },
+                    "updated": {
+                      "description": "Legacy compatibility counter; immutable snapshots never update an existing exchange",
+                      "example": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Snapshot counter object in both API versions"
           }
         },
         "summary": "Ingest a Burp Site map snapshot chunk",
@@ -6061,7 +6192,7 @@
         ]
       },
       "get": {
-        "description": "Returns a single finding by its numeric ID, including full request/response data and evidence.",
+        "description": "Returns a single finding by its numeric ID in the request's project. Selected evidence is a manifest only: exchange_id, role, primary and occurrence metadata are included, but authoritative raw receipt bytes must be fetched separately through GET /api/findings/{id}/evidence/{exchange_id}. Legacy request/response text fields are not a replacement for selected receipt bytes. The response remains a single object in both API versions.",
         "operationId": "getFinding",
         "parameters": [
           {
@@ -6107,6 +6238,126 @@
           }
         },
         "summary": "Get finding detail",
+        "tags": [
+          "Findings"
+        ]
+      }
+    },
+    "/api/findings/{id}/evidence/{exchange_id}": {
+      "get": {
+        "description": "Loads one exact selected HTTP receipt associated with this finding in the request's project. The finding must own a manifest association to exchange_id; visibility of an exchange alone does not grant access. Unassociated, unavailable and foreign-project receipts return 404 with no fallback to linked traffic, URLs or legacy text. Request and response are base64-encoded raw bytes. The success body is the same single EvidenceExchange object in v1 and v2, never a list envelope; errors use the negotiated error envelope.",
+        "operationId": "getFindingEvidence",
+        "parameters": [
+          {
+            "description": "Finding numeric ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Exact selected exchange identity from the finding's evidence manifest",
+            "in": "path",
+            "name": "exchange_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Project UUID",
+            "in": "header",
+            "name": "X-Project-UUID",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceExchange"
+                }
+              }
+            },
+            "description": "Selected receipt object with base64 raw messages in both API versions"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorEnvelopeV2"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Invalid finding ID or unsupported API version"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorEnvelopeV2"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorEnvelopeV2"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Finding not found in the selected project, exchange not associated with the finding, or receipt unavailable"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorEnvelopeV2"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Database required"
+          }
+        },
+        "summary": "Get one selected finding evidence receipt",
         "tags": [
           "Findings"
         ]

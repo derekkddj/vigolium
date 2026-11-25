@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -18,6 +19,7 @@ import (
 	"github.com/spf13/pflag"
 	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/terminal"
@@ -672,7 +674,7 @@ var (
 		"tags", "principals", "cwe_id", "vuln_class", "claimed_severity", "cvss_score", "remediation", "status", "status_note", "status_actor", "scan_uuid",
 		"agentic_scan_uuid", "repo_name", "source_file", "found_at",
 		"http_record_uuids", "origin_record_uuid", "insertion_point", "payload", "proof", "verification", "verified_at",
-		"response_evidence", "request", "response",
+		"response_evidence", "request", "response", "evidence", "evidence_status", "project_uuid",
 		"records", "records_total", "records_truncated", "records_error",
 	}
 )
@@ -855,15 +857,26 @@ func compactFindingView(f *database.Finding, records []*database.HTTPRecord, opt
 	// every finding of a module) stays out unless --fields names it.
 	prose := func(key string) bool { return !opts.noBodies || wantsField(opts.fields, key) }
 	m := map[string]any{
-		"severity":       f.Severity,
-		"confidence":     f.Confidence,
-		"module_id":      f.ModuleID,
-		"module_name":    f.ModuleName,
-		"module_type":    f.ModuleType,
-		"finding_source": f.FindingSource,
-		"record_kind":    f.RecordKind,
-		"evidence_grade": f.EvidenceGrade,
+		"severity":        f.Severity,
+		"confidence":      f.Confidence,
+		"module_id":       f.ModuleID,
+		"module_name":     f.ModuleName,
+		"module_type":     f.ModuleType,
+		"finding_source":  f.FindingSource,
+		"record_kind":     f.RecordKind,
+		"evidence_grade":  f.EvidenceGrade,
+		"evidence_status": f.EvidenceStatus,
+		"project_uuid":    f.ProjectUUID,
 	}
+	// Selected receipts retain raw base64 bytes independently of legacy text
+	// preview shaping. --compact explicitly requests a manifest-only view.
+	entries := evidence.CloneEntries(f.Evidence)
+	if opts.noBodies {
+		for i := range entries {
+			entries[i] = entries[i].Manifest()
+		}
+	}
+	m["evidence"] = entries
 	// id is the store's row id, absent on a finding that was never persisted
 	// (a direct scan with no store, see findingViewFromEvent) — a 0 would read
 	// as a real id and resolve to nothing, or to another row.
@@ -976,7 +989,8 @@ func compactFindingView(f *database.Finding, records []*database.HTTPRecord, opt
 		// responses is still found (the needle was matched against decoded text).
 		if snip := evidenceSnippet(decodedResponseText(f.Response), needles, agentEvidenceWindow); snip != "" {
 			m["response_evidence"] = snip
-		} else if f.Response != "" && opts.fullBody {
+		}
+		if f.Response != "" && opts.fullBody {
 			m["response"] = redactRaw(opts.redact, f.Response)
 		}
 		if f.Request != "" {
@@ -1072,9 +1086,34 @@ func findingViews(ctx context.Context, db *database.DB, findings []*database.Fin
 		// "the link query failed" and "this finding has no linked records" used to
 		// be the same empty answer. An agent triaging on that concludes there is no
 		// evidence, when in fact the evidence was never read.
-		if withRecords && loadErr != nil && len(f.HTTPRecordUUIDs) > 0 {
-			v["records_error"] = fmt.Sprintf("linked records could not be loaded: %v", loadErr)
+		if withRecords && len(f.HTTPRecordUUIDs) > 0 {
 			v["records_total"] = len(f.HTTPRecordUUIDs)
+			if opts.recordLimit > 0 && len(f.HTTPRecordUUIDs) > opts.recordLimit {
+				v["records_truncated"] = true
+			} else {
+				delete(v, "records_truncated") // unavailability is not a display cap
+			}
+			var problems []string
+			if loadErr != nil {
+				problems = append(problems, fmt.Sprintf("linked records could not be fully loaded: %v", loadErr))
+			}
+			refs := f.HTTPRecordUUIDs
+			if opts.recordLimit > 0 && len(refs) > opts.recordLimit {
+				refs = refs[:opts.recordLimit]
+				v["records_truncated"] = true
+			}
+			var missing []string
+			for _, ref := range refs {
+				if rec := byUUID[ref]; rec == nil || findingRecordProject(rec.ProjectUUID) != findingRecordProject(f.ProjectUUID) {
+					missing = append(missing, ref)
+				}
+			}
+			if len(missing) > 0 {
+				problems = append(problems, "linked record references unavailable in finding project: "+strings.Join(missing, ", "))
+			}
+			if len(problems) > 0 {
+				v["records_error"] = strings.Join(problems, "; ")
+			}
 		}
 		views = append(views, v)
 	}
@@ -1093,17 +1132,25 @@ func findingViews(ctx context.Context, db *database.DB, findings []*database.Fin
 // records, and at ~55 KB of raw request/response each that is ~23 MB read and
 // held to render 20 rows.
 func batchLoadFindingRecords(ctx context.Context, db *database.DB, findings []*database.Finding, perFinding int) (map[string]*database.HTTPRecord, error) {
+	repo := database.NewRepository(db)
+	if err := repo.HydrateFindingRecordRefs(ctx, findings); err != nil {
+		return nil, err
+	}
+	byProject := make(map[string][]string)
 	seen := make(map[string]struct{})
 	var uuids []string
 	for _, f := range findings {
+		project := findingRecordProject(f.ProjectUUID)
 		links := f.HTTPRecordUUIDs
 		if perFinding > 0 && len(links) > perFinding {
 			links = links[:perFinding]
 		}
 		for _, u := range links {
-			if _, ok := seen[u]; !ok {
-				seen[u] = struct{}{}
+			key := project + ":" + u
+			if _, ok := seen[key]; !ok {
+				seen[key] = struct{}{}
 				uuids = append(uuids, u)
+				byProject[project] = append(byProject[project], u)
 			}
 		}
 	}
@@ -1113,18 +1160,100 @@ func batchLoadFindingRecords(ctx context.Context, db *database.DB, findings []*d
 	// When the --glob-db merge left record rows or bodies out, the evidence has to
 	// come from the source files instead. See loadGlobFindingRecords for why the
 	// merge cannot simply keep them.
+	byUUID := make(map[string]*database.HTTPRecord)
 	if globMergeOmittedRecords() {
-		return loadGlobFindingRecords(ctx, findings, uuids), nil
+		// Scope source-file lookups too, BEFORE loading bodies. Even stateless
+		// views can show several projects: every finding retains its own owner.
+		wanted := make(map[string]struct{}, len(uuids))
+		for _, ref := range uuids {
+			wanted[ref] = struct{}{}
+		}
+		order, byFile := globFindingRecordPlan(findings, wanted)
+		for _, source := range globDBSources {
+			if _, attributed := byFile[source.file]; !attributed {
+				order = append(order, source.file)
+			}
+		}
+		// Pending identities are project/ref pairs, not just UUIDs. A record
+		// resolved for one owner cannot satisfy a foreign reference in another.
+		pending := 0
+		for _, refs := range byProject {
+			pending += len(refs)
+		}
+		var sourceErrors []error
+		for _, file := range order {
+			if pending == 0 {
+				break // do not reopen/import unrelated source corpora
+			}
+			sourceDB, closeDB, err := openGlobSourceFile(ctx, file)
+			if err != nil {
+				sourceErrors = append(sourceErrors, fmt.Errorf("linked record source %q: %w", file, err))
+				continue
+			}
+			sourceRepo := database.NewRepository(sourceDB)
+			for project, refs := range byProject {
+				if len(refs) == 0 {
+					continue
+				}
+				records, err := sourceRepo.GetFindingRecordsScoped(ctx, project, refs)
+				if err != nil {
+					sourceErrors = append(sourceErrors, fmt.Errorf("linked record source %q: %w", file, err))
+					continue
+				}
+				resolved := make(map[string]bool, len(records))
+				for _, record := range records {
+					byUUID[record.UUID] = record
+					resolved[record.UUID] = true
+				}
+				outstanding := refs[:0]
+				for _, ref := range refs {
+					if resolved[ref] {
+						pending--
+					} else {
+						outstanding = append(outstanding, ref)
+					}
+				}
+				byProject[project] = outstanding
+			}
+			closeDB()
+		}
+		// Keep successfully resolved proof, but never conceal a failed source:
+		// renderers must expose this error alongside any partial result.
+		return filterFindingRecordProjects(byUUID, findings), errors.Join(sourceErrors...)
 	}
-	records, err := database.NewRepository(db).GetRecordsByUUIDs(ctx, uuids)
-	if err != nil {
-		return nil, err
+	for project, refs := range byProject {
+		records, err := repo.GetFindingRecordsScoped(ctx, project, refs)
+		if err != nil {
+			return nil, err
+		}
+		for _, record := range records {
+			byUUID[record.UUID] = record
+		}
 	}
-	byUUID := make(map[string]*database.HTTPRecord, len(records))
-	for _, r := range records {
-		byUUID[r.UUID] = r
+	return filterFindingRecordProjects(byUUID, findings), nil
+}
+
+// The shared UUID map also feeds human renderers. On a mixed-project page a
+// corrupt foreign reference must not accidentally borrow a record legitimately
+// loaded for a different finding. Withhold contested records for this page;
+// leave the references intact and explicitly unavailable (a scoped drill-down
+// into the legitimate finding can still retrieve them).
+func filterFindingRecordProjects(records map[string]*database.HTTPRecord, findings []*database.Finding) map[string]*database.HTTPRecord {
+	for _, f := range findings {
+		for _, ref := range f.HTTPRecordUUIDs {
+			if record := records[ref]; record != nil && findingRecordProject(record.ProjectUUID) != findingRecordProject(f.ProjectUUID) {
+				delete(records, ref)
+			}
+		}
 	}
-	return byUUID, nil
+	return records
+}
+
+func findingRecordProject(project string) string {
+	if project == "" {
+		return database.DefaultProjectUUID
+	}
+	return project
 }
 
 // projectTypedViews applies a --fields projection to rows that are typed structs
@@ -1166,7 +1295,14 @@ func projectTypedViews(views any, fields []string) (any, error) {
 func loadFindingRecordsOrWarn(ctx context.Context, db *database.DB, findings []*database.Finding) map[string]*database.HTTPRecord {
 	byUUID, err := batchLoadFindingRecords(ctx, db, findings, 0)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s linked HTTP records could not be loaded: %v\n", terminal.WarnPrefix(), err)
+		fmt.Fprintf(os.Stderr, "%s linked HTTP records could not be fully loaded: %v\n", terminal.WarnPrefix(), err)
+	}
+	for _, f := range findings {
+		for _, ref := range f.HTTPRecordUUIDs {
+			if rec := byUUID[ref]; rec == nil || findingRecordProject(rec.ProjectUUID) != findingRecordProject(f.ProjectUUID) {
+				fmt.Fprintf(os.Stderr, "%s finding #%d: linked record %s unavailable in finding project\n", terminal.WarnPrefix(), f.ID, ref)
+			}
+		}
 	}
 	return byUUID
 }

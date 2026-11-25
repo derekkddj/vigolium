@@ -21,6 +21,10 @@ const (
 	EventTurnDone         EventType = "turn_done"          // assistant turn complete (model finished this request)
 	EventRunDone          EventType = "run_done"           // full run complete (no more tool calls pending)
 	EventError            EventType = "error"
+	// EventStreamRetry ends an abandoned provider attempt within the current
+	// turn. It is nonterminal: consumers must separate its partial output from
+	// the next attempt, not treat it as a failed run.
+	EventStreamRetry EventType = "stream_retry"
 	// EventInfo carries a non-fatal engine-level notice (e.g. "transient
 	// upstream stream error; retrying"). Message lives in Delta. Consumers
 	// that don't recognize this type silently drop it — backward compatible.
@@ -41,14 +45,21 @@ type Event struct {
 	ToolArgs     map[string]any `json:"tool_args,omitempty"`
 	ToolResult   string         `json:"tool_result,omitempty"`
 	ToolIsErr    bool           `json:"tool_is_error,omitempty"`
+	// ToolDetails carries the tool's structured evidence/capture/omission
+	// receipts unchanged on EventToolExecEnd, independently of result text.
+	ToolDetails map[string]any `json:"tool_details,omitempty"`
 
 	// Turn / run lifecycle.
 	StopReason stream.StopReason `json:"stop_reason,omitempty"`
 	Usage      *stream.Usage     `json:"usage,omitempty"`
+	// Attempt is the 1-based abandoned provider attempt within the current
+	// turn, populated on EventStreamRetry (not a run-wide invocation ID).
+	Attempt int `json:"attempt,omitempty"`
 
-	// ToolCalls carries the model's tool calls for the just-completed turn.
-	// Populated only on EventTurnDone, and only when the turn produced tool
-	// calls. It exists so out-of-band consumers (the Pi-style JSONL session
+	// ToolCalls carries the model's tool calls for the current provider attempt.
+	// Populated on EventTurnDone and EventStreamRetry when the attempt produced
+	// fully parsed tool calls. Calls from abandoned attempts are not executed.
+	// It exists so out-of-band consumers (the Pi-style JSONL session
 	// transcript in pkg/olium/sessionlog) can render a complete assistant
 	// message with full tool arguments without reconstructing them from the
 	// argument-less EventToolCallStart events — arguments are only known once

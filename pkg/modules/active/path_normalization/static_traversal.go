@@ -8,6 +8,7 @@ import (
 	urlutil "github.com/projectdiscovery/utils/url"
 
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -212,11 +213,12 @@ func (m *Module) scanStaticRootTraversal(
 	}
 	// Lowercase the (constant) baseline once for case-insensitive marker matching
 	// instead of re-lowering it on every probe inside the sweep.
-	bl := baselineRefs{body: baselineBody, lower: strings.ToLower(baselineBody)}
+	bl := baselineRefs{body: baselineBody, lower: strings.ToLower(baselineBody), exchange: ctx.Evidence()}
 
 	// Wildcard/soft-404 reference so a host that 200s every path (SPA shell) is
 	// not mistaken for a successful traversal.
-	wildcard, _ := scanCtx.WildcardProbe(ctx, httpClient)
+	guardProof := modkit.NewEvidenceCollector()
+	wildcard, _ := scanCtx.WildcardProbeWithEvidence(ctx, httpClient, guardProof)
 
 	budget := staticProbeBudget
 
@@ -228,7 +230,7 @@ func (m *Module) scanStaticRootTraversal(
 	cleanReachable := map[string]bool{}
 
 	// Tier 1: canonical shape only.
-	res, promising, fatal := m.sweepStatic(1, httpClient, service, urlx, rawHTTP, mount, segment, bl, wildcard, &budget, cleanReachable)
+	res, promising, fatal := m.sweepStatic(1, httpClient, service, urlx, rawHTTP, mount, segment, bl, wildcard, &budget, cleanReachable, guardProof)
 	if fatal {
 		return res, true
 	}
@@ -241,15 +243,16 @@ func (m *Module) scanStaticRootTraversal(
 
 	// Tier 2: unfurl encodings, control breakers, suffixes and extra targets —
 	// only because Tier 1 already showed the shell reaches something distinct.
-	res, _, fatal = m.sweepStatic(2, httpClient, service, urlx, rawHTTP, mount, segment, bl, wildcard, &budget, cleanReachable)
+	res, _, fatal = m.sweepStatic(2, httpClient, service, urlx, rawHTTP, mount, segment, bl, wildcard, &budget, cleanReachable, guardProof)
 	return res, fatal
 }
 
 // baselineRefs carries the baseline asset body plus its pre-lowercased form so
 // case-insensitive marker matching never re-lowers the constant baseline.
 type baselineRefs struct {
-	body  string
-	lower string
+	body     string
+	lower    string
+	exchange *evidence.Exchange
 }
 
 // sweepStatic runs every shell × token × target × suffix combination whose
@@ -267,6 +270,7 @@ func (m *Module) sweepStatic(
 	wildcard *modkit.WildcardEntry,
 	budget *int,
 	cleanReachable map[string]bool,
+	guardProof *modkit.EvidenceCollector,
 ) ([]*output.ResultEvent, bool, bool) {
 	var promising bool
 
@@ -283,7 +287,8 @@ func (m *Module) sweepStatic(
 						}
 
 						path := sh.build(mount, tk.tok, depth, tgt.path+sf.suf)
-						status, body, ok, fatal := fetchStatic(httpClient, service, rawHTTP, path, false, budget)
+						var primary *evidence.Exchange
+						status, body, ok, fatal := fetchStatic(httpClient, service, rawHTTP, path, false, budget, &primary)
 						if fatal {
 							return nil, promising, true
 						}
@@ -310,13 +315,20 @@ func (m *Module) sweepStatic(
 						if tgt.class == classFileContent {
 							decoyPath = sh.build(mount, tk.tok, depth, staticDecoyFile)
 						}
-						if !m.confirmStatic(httpClient, service, rawHTTP, path, decoyPath, tgt, bl, wildcard, budget, cleanReachable) {
+						collector := modkit.NewEvidenceCollector()
+						collector.AddExchange(bl.exchange, evidence.RoleBaseline, "input asset comparison")
+						if !m.confirmStatic(httpClient, service, rawHTTP, path, decoyPath, tgt, bl, wildcard, budget, cleanReachable, collector) {
 							promising = true
 							continue
 						}
 
 						ev := m.buildStaticFinding(urlx, rawHTTP, path, body, segment, sh.name, tgt, newCount)
 						if ev != nil {
+							ev.AdditionalEvidence = collector.Entries()
+							ev.Evidence = collector.Evidence()
+							modkit.SetPrimaryEvidence(ev, primary, evidence.RoleAttack, "static-root traversal probe")
+							modkit.AppendEvidence(ev, collector)
+							modkit.AppendEvidence(ev, guardProof)
 							return []*output.ResultEvent{ev}, promising, false
 						}
 					}
@@ -362,9 +374,14 @@ func (m *Module) confirmStatic(
 	wildcard *modkit.WildcardEntry,
 	budget *int,
 	cleanReachable map[string]bool,
+	collectors ...*modkit.EvidenceCollector,
 ) bool {
 	// Reproduce the read.
-	status, body, ok, _ := fetchStatic(httpClient, service, rawHTTP, path, true, budget)
+	var replay *evidence.Exchange
+	status, body, ok, _ := fetchStatic(httpClient, service, rawHTTP, path, true, budget, &replay)
+	for _, ev := range collectors {
+		ev.AddExchange(replay, evidence.RoleConfirmation, "traversal reproduction")
+	}
 	if !ok {
 		return false // cannot confirm -> drop (strict)
 	}
@@ -385,7 +402,11 @@ func (m *Module) confirmStatic(
 		reachable, seen := cleanReachable[tgt.path]
 		if !seen {
 			cleanPath := "/" + tgt.path
-			cStatus, cBody, cOK, _ := fetchStatic(httpClient, service, rawHTTP, cleanPath, true, budget)
+			var clean *evidence.Exchange
+			cStatus, cBody, cOK, _ := fetchStatic(httpClient, service, rawHTTP, cleanPath, true, budget, &clean)
+			for _, ev := range collectors {
+				ev.AddExchange(clean, evidence.RoleControl, "clean canonical path")
+			}
 			reachable = cOK && !matchesWildcard(wildcard, cStatus, cBody) &&
 				countNewMarkers(cBody, bl.body, bl.lower, tgt.markers, tgt.ci) >= tgt.minMarkers
 			cleanReachable[tgt.path] = reachable
@@ -398,7 +419,11 @@ func (m *Module) confirmStatic(
 	// Decoy negative for file reads: the same shell around a bogus filename must
 	// NOT surface the markers.
 	if decoyPath != "" {
-		dStatus, dBody, dOK, _ := fetchStatic(httpClient, service, rawHTTP, decoyPath, true, budget)
+		var decoy *evidence.Exchange
+		dStatus, dBody, dOK, _ := fetchStatic(httpClient, service, rawHTTP, decoyPath, true, budget, &decoy)
+		for _, ev := range collectors {
+			ev.AddExchange(decoy, evidence.RoleControl, "nonexistent-file traversal control")
+		}
 		if dOK && !matchesWildcard(wildcard, dStatus, dBody) &&
 			countNewMarkers(dBody, bl.body, bl.lower, tgt.markers, tgt.ci) >= tgt.minMarkers {
 			return false
@@ -467,7 +492,7 @@ func (m *Module) buildStaticFinding(
 // budget is exhausted it short-circuits to ok=false. noClustering bypasses the
 // requester's response cache for back-to-back confirmation replays. fatal is true
 // only when the host is unresponsive.
-func fetchStatic(httpClient *http.Requester, service *httpmsg.Service, rawHTTP []byte, path string, noClustering bool, budget *int) (status int, body string, ok bool, fatal bool) {
+func fetchStatic(httpClient *http.Requester, service *httpmsg.Service, rawHTTP []byte, path string, noClustering bool, budget *int, exchanges ...**evidence.Exchange) (status int, body string, ok bool, fatal bool) {
 	if *budget <= 0 {
 		return 0, "", false, false
 	}
@@ -491,6 +516,12 @@ func fetchStatic(httpClient *http.Requester, service *httpmsg.Service, rawHTTP [
 		return 0, "", false, false
 	}
 	defer resp.Close()
+	x := http.CaptureEvidence(resp)
+	for _, selected := range exchanges {
+		if selected != nil {
+			*selected = x.Clone()
+		}
+	}
 	if resp.Response() == nil {
 		return 0, "", false, false
 	}

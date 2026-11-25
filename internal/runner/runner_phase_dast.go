@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/core/stats"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/http"
+	"github.com/vigolium/vigolium/pkg/input/source"
 	"github.com/vigolium/vigolium/pkg/modules"
 	"github.com/vigolium/vigolium/pkg/modules/active/authz_compare"
 	"github.com/vigolium/vigolium/pkg/oast"
@@ -259,7 +261,7 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 	// Skip reset for scan-on-receive — the cursor tracks which records have been scanned.
 	// A resumed scan (--resume-scan) keeps its cursor: the ledger already says
 	// which records are done, and resetting would re-serve the whole window.
-	if !r.options.ScanOnReceive && r.options.ResumeScanUUID == "" {
+	if !r.options.ScanOnReceive && !r.options.FullNativeScanOnReceive && r.options.ResumeScanUUID == "" {
 		if err := r.repository.ResetScanCursor(ctx, infra.scanUUID); err != nil {
 			zap.L().Warn("DynamicAssessment: failed to reset scan cursor", zap.Error(err))
 		}
@@ -612,16 +614,36 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 			}
 		}
 
-		sorExecutor = core.NewExecutor(sorCfg, continuousSource, activeModules, passiveModules)
+		execCtx, execCancel := context.WithCancel(ctx)
+		defer execCancel()
+		var input source.InputSource = continuousSource
+		admission := r.newHarvestVersionSource(infra, inScopeHosts, continuousSource, execCancel)
+		if admission != nil {
+			input = admission
+			defer admission.Close()
+		} else {
+			defer continuousSource.Close()
+		}
+		// Keep continuousSource itself for activity, IdleFor and status above.
+		sorExecutor = core.NewExecutor(sorCfg, input, activeModules, passiveModules)
 		executor := sorExecutor
 		if oastService != nil {
 			oastService.SetRequestUUIDResolver(executor.ResolveRequestUUID)
 		}
-		_, err := executor.Execute(ctx)
+		_, err := executor.Execute(execCtx)
+		execCancel()
 		r.currentPhase.Load().noteExecution(executor.Report())
 		if metrics := executor.ModuleMetrics(); len(metrics) > 0 {
 			executed.note(r.currentPhase.Load(), metrics)
 			logModuleMetrics(metrics)
+		}
+		var admissionErr error
+		if admission != nil {
+			// Fence late/abandoned callbacks and release unacked UUID leases.
+			admissionErr = errors.Join(admission.Close(), r.reportHarvestAdmission(admission))
+		}
+		if admissionErr != nil {
+			return errors.Join(err, admissionErr)
 		}
 		if err != nil && ctx.Err() == nil {
 			return err
@@ -763,6 +785,21 @@ func dynamicAssessmentExitLine(rounds int, elapsed time.Duration, roundErr error
 	}
 }
 
+// newDynamicAssessmentSource excludes this invocation's superseded harvest seeds
+// BEFORE param-shape selection. Ordinary DA admits saved versions normally after
+// its cursor reset. Receive DA also excludes every explicitly queued version:
+// those UUIDs are admitted independently of the retained cursor and shape slots.
+// The original DB source still owns snapshot coverage and cursor flushing.
+func (r *Runner) newDynamicAssessmentSource(infra *phaseInfra, inScopeHosts []database.HostTarget) *database.RiskPrioritizedDBInputSource {
+	return database.NewRiskPrioritizedDBInputSource(r.repository.DB(), r.repository, infra.scanUUID).
+		WithHostScopes(inScopeHosts).
+		WithRecordUUIDs(r.options.RecordUUIDs).
+		WithRunFilter(r.runRecordFilter(context.Background(), infra.scanUUID)).
+		WithExcludedRecordUUIDs(r.harvestAssessmentExcludedUUIDs(infra.scanUUID)).
+		WithParamShapeCoalescing(r.daParamShapeSamples()).
+		WithAllowWrites(r.options.AllowWrites)
+}
+
 func (r *Runner) runDynamicAssessmentRound(
 	ctx context.Context,
 	infra *phaseInfra,
@@ -777,18 +814,8 @@ func (r *Runner) runDynamicAssessmentRound(
 	if ledger != nil {
 		return r.runTieredRound(ctx, infra, round, inScopeHosts, passiveModules, baseCfg, oastService, ledger)
 	}
-	dbSource := r.newDASource(infra, inScopeHosts)
-	return r.runDAPass(ctx, infra, round, activeModules, passiveModules, baseCfg, oastService, dbSource)
-}
-
-// newDASource is the round's risk-prioritized record source.
-func (r *Runner) newDASource(infra *phaseInfra, inScopeHosts []database.HostTarget) *database.RiskPrioritizedDBInputSource {
-	return database.NewRiskPrioritizedDBInputSource(r.repository.DB(), r.repository, infra.scanUUID).
-		WithHostScopes(inScopeHosts).
-		WithRecordUUIDs(r.options.RecordUUIDs).
-		WithRunFilter(r.runRecordFilter(context.Background(), infra.scanUUID)).
-		WithParamShapeCoalescing(r.daParamShapeSamples()).
-		WithAllowWrites(r.options.AllowWrites)
+	dbSource := r.newDynamicAssessmentSource(infra, inScopeHosts)
+	return r.runDAPass(ctx, infra, round, inScopeHosts, activeModules, passiveModules, baseCfg, oastService, dbSource)
 }
 
 // runDAPass runs one executor over dbSource: one feedback round, or one tier
@@ -797,6 +824,7 @@ func (r *Runner) runDAPass(
 	ctx context.Context,
 	infra *phaseInfra,
 	round int,
+	inScopeHosts []database.HostTarget,
 	activeModules []modules.ActiveModule,
 	passiveModules []modules.PassiveModule,
 	baseCfg core.ExecutorConfig,
@@ -806,15 +834,32 @@ func (r *Runner) runDAPass(
 	var res daRoundResult
 	roundStart := time.Now()
 
-	executor := core.NewExecutor(baseCfg, dbSource, activeModules, passiveModules)
+	execCtx, execCancel := context.WithCancel(ctx)
+	defer execCancel()
+	var input source.InputSource = dbSource
+	admission := r.newHarvestVersionSource(infra, inScopeHosts, dbSource, execCancel)
+	if admission != nil {
+		input = admission
+		defer admission.Close()
+	} else {
+		defer dbSource.Close()
+	}
+
+	executor := core.NewExecutor(baseCfg, input, activeModules, passiveModules)
 	if oastService != nil {
 		oastService.SetRequestUUIDResolver(executor.ResolveRequestUUID)
 	}
-	_, err := executor.Execute(ctx)
+	_, err := executor.Execute(execCtx)
+	execCancel()
 	tracker := r.currentPhase.Load()
 	tracker.noteExecution(executor.Report())
 	tracker.noteWriteTemplatesSkipped(dbSource.SkippedUnsafeMethod() + executor.WriteTemplatesSkipped())
 	res.moduleMetrics = executor.ModuleMetrics()
+	if admission != nil {
+		// Close fences late callbacks before reporting their results, and makes
+		// unacknowledged versions available to a later receive batch/round.
+		err = errors.Join(err, admission.Close(), r.reportHarvestAdmission(admission))
+	}
 
 	// Checkpoint the round's cursor, with a reported result.
 	//
@@ -869,6 +914,11 @@ func (r *Runner) runDAPass(
 			terminal.Orange(fmt.Sprintf("%d", r.resolveMaxParamShapeSamples()))))
 		r.scanLogger.Info("DynamicAssessment", fmt.Sprintf("param-shape coalescing skipped %d redundant records", dropped))
 	}
+	if excluded := dbSource.ExcludedRecords(); excluded > 0 {
+		r.printPhaseFeedback("DynamicAssessment", fmt.Sprintf("excluded %s mapped harvest rows handled by version adoption",
+			terminal.Orange(fmt.Sprintf("%d", excluded))))
+		r.scanLogger.Info("DynamicAssessment", fmt.Sprintf("explicit version adoption excluded %d mapped harvest rows", excluded))
+	}
 	r.printPhaseComplete("DynamicAssessment",
 		fmt.Sprintf("round %d — %s items in %s", round+1, terminal.Orange(fmt.Sprintf("%d", processed)), terminal.HiPurple(fmtDuration(roundElapsed))))
 	fields := []zap.Field{
@@ -907,7 +957,14 @@ func (r *Runner) countRemainingDynamicAssessmentRecords(ctx context.Context, sca
 	if err != nil {
 		return 0, err
 	}
-	return r.repository.CountRecordsAfterCursor(ctx, r.options.ProjectUUID, currentScan.CursorAt, currentScan.CursorUUID, hosts...)
+	n, err := r.repository.CountRecordsAfterCursor(ctx, r.options.ProjectUUID, currentScan.CursorAt, currentScan.CursorUUID, hosts...)
+	if err != nil {
+		return 0, err
+	}
+	// Explicit dedup versions can precede the receive cursor. Keep UUID-only
+	// pending work visible to feedback and the full-native receive wait loop.
+	// The DB candidate count is approximate (it can still include exclusions).
+	return n + r.pendingHarvestVersionCount(scanUUID), nil
 }
 
 // waitForNewRecords polls until at least one record exists after the scan cursor,

@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/evidence"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -224,6 +225,7 @@ func (m *Module) ScanPerInsertionPoint(
 		if resp.Response() != nil {
 			respContentType = resp.Response().Header.Get("Content-Type")
 		}
+		receipt := http.CaptureEvidence(resp)
 		resp.Close()
 
 		// XSS probes are pure markup-reflection oracles: the injected tag echoed
@@ -257,7 +259,7 @@ func (m *Module) ScanPerInsertionPoint(
 			pl := strings.ToLower(pattern)
 			// Must appear in the fuzzed response AND be absent from the baseline.
 			if strings.Contains(matchBody, pl) && !strings.Contains(origBodyLower, pl) {
-				results = append(results, &output.ResultEvent{
+				result := &output.ResultEvent{
 					URL:     urlx.String(),
 					Matched: urlx.String(),
 					ExtractedResults: []string{
@@ -267,7 +269,9 @@ func (m *Module) ScanPerInsertionPoint(
 						fmt.Sprintf("Matched pattern: %s", pattern),
 					},
 					MatcherStatus: true,
-				})
+				}
+				modkit.SetPrimaryEvidence(result, receipt, evidence.RoleAttack, "matched injection payload")
+				results = append(results, result)
 				// One match per test is enough; move to next test.
 				break
 			}
