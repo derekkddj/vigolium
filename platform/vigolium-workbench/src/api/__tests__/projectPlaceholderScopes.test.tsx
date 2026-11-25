@@ -12,10 +12,10 @@ vi.mock('@/api/client', async importOriginal => ({
 }));
 
 const scenarios = [
-  { name: 'HTTP records', hook: (offset: number) => useHttpRecords({ limit: 5, offset }) },
-  { name: 'OAST interactions', hook: (offset: number) => useOASTInteractions({ limit: 5, offset }) },
-  { name: 'agent sessions', hook: (offset: number) => useAgentSessions({ limit: 5, offset }) },
-  { name: 'database records', hook: (offset: number) => useDbRecords('findings', { limit: 5, offset }) },
+  { name: 'HTTP records', useList: (offset: number) => useHttpRecords({ limit: 5, offset }) },
+  { name: 'OAST interactions', useList: (offset: number) => useOASTInteractions({ limit: 5, offset }) },
+  { name: 'agent sessions', useList: (offset: number) => useAgentSessions({ limit: 5, offset }) },
+  { name: 'database records', useList: (offset: number) => useDbRecords('findings', { limit: 5, offset }) },
 ] as const;
 
 function response(project: string, row = 'shared-row-uuid') {
@@ -29,17 +29,20 @@ function response(project: string, row = 'shared-row-uuid') {
 
 function wrapper() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+  function Wrapper({ children }: { children: ReactNode }) {
+    return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+  }
+  return Wrapper;
 }
 
 beforeEach(() => { mocks.project = 'project-a'; mocks.get.mockReset(); });
 
 describe('project-scoped list placeholders', () => {
-  it.each(scenarios)('$name does not expose the previous project while the new scope is pending', async ({ hook }) => {
+  it.each(scenarios)('$name does not expose the previous project while the new scope is pending', async ({ useList }) => {
     const original = response('project-a');
     const nextProject = response('project-b');
     mocks.get.mockResolvedValueOnce(original);
-    const { result, rerender } = renderHook((offset: number) => hook(offset), { initialProps: 0, wrapper: wrapper() });
+    const { result, rerender } = renderHook((offset: number) => useList(offset), { initialProps: 0, wrapper: wrapper() });
     await waitFor(() => expect(result.current.data).toEqual(original));
 
     let finish!: (value: ReturnType<typeof response>) => void;
@@ -53,11 +56,11 @@ describe('project-scoped list placeholders', () => {
     await waitFor(() => expect(result.current.data).toEqual(nextProject));
   });
 
-  it.each(scenarios)('$name retains placeholders for same-project pagination', async ({ hook }) => {
+  it.each(scenarios)('$name retains placeholders for same-project pagination', async ({ useList }) => {
     const original = response('project-a', 'page-zero-row');
     const nextPage = response('project-a', 'page-five-row');
     mocks.get.mockResolvedValueOnce(original);
-    const { result, rerender } = renderHook((offset: number) => hook(offset), { initialProps: 0, wrapper: wrapper() });
+    const { result, rerender } = renderHook((offset: number) => useList(offset), { initialProps: 0, wrapper: wrapper() });
     await waitFor(() => expect(result.current.data).toEqual(original));
 
     let finish!: (value: ReturnType<typeof response>) => void;

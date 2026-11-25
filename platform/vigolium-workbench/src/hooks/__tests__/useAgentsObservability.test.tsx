@@ -14,12 +14,13 @@ const mocks = vi.hoisted(() => ({
   detail: { data: undefined as AgentSessionDetail | undefined, error: null as Error | null, isPending: false, refetch: vi.fn() },
   status: { data: undefined as AgentRunStatusResponse | undefined, error: null as Error | null, refetch: vi.fn() },
   start: { isPending: false, mutate: vi.fn() },
-  cancel: { isPending: false, mutate: vi.fn() },
+  cancel: { isPending: false, mutate: vi.fn(), mutateAsync: vi.fn() },
   tail: { logs: 'retained unrelated console', connection: 'complete', error: '', truncated: false, logSize: 120, retry: vi.fn() },
   detailCalls: vi.fn(),
   listCalls: vi.fn(),
   requestEffects: vi.fn(),
 }));
+vi.mock('@tanstack/react-query', async importOriginal => ({ ...await importOriginal<typeof import('@tanstack/react-query')>(), useQueryClient: () => ({ invalidateQueries: vi.fn() }) }));
 vi.mock('@/contexts/ProjectContext', () => ({ useProjectContext: () => mocks.project }));
 vi.mock('@/lib/useAgentSessionLogs', () => ({ useAgentSessionLogs: () => mocks.tail }));
 vi.mock('@/components/shared/AgentArtifactsPanel', () => ({ default: ({ selectedArtifact, onSelectArtifact }: AgentArtifactsPanelProps) => <div>
@@ -72,6 +73,7 @@ beforeEach(() => {
   Object.assign(mocks.status, { data: undefined, error: null });
   mocks.start.mutate.mockReset();
   mocks.cancel.mutate.mockReset();
+  mocks.cancel.mutateAsync.mockReset().mockResolvedValue({ status: 'cancelling' });
   mocks.cancel.isPending = false;
 });
 afterEach(() => { window.history.replaceState({}, '', '/'); localStorage.clear(); });
@@ -299,6 +301,48 @@ describe.each([['dark', DarkAgentsPage], ['light', LightAgentsPage]] as const)('
       expect(owners[0].className).toBe('flex-1 min-h-0 flex flex-col overflow-auto');
       expect(table.compareDocumentPosition(panel) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     }
+  });
+
+  it('shows STOP only for nonterminal rows and keeps eight columns for empty history', () => {
+    const statuses = ['pending', 'running', 'cancelling', 'completed', 'completed_with_errors', 'completed_with_warnings', 'failed', 'cancelled', 'timeout', 'budget_exhausted', 'error'];
+    mocks.sessions.data = { data: statuses.map((status, i) => ({ ...sessions(1)[0], uuid: `st-${i}`, status })) };
+    const { rerender } = render(<Page />);
+    statuses.forEach((_status, i) => {
+      const button = screen.queryByRole('button', { name: `Stop run st-${i}` });
+      if (i < 3) expect(button).toBeInTheDocument(); else expect(button).not.toBeInTheDocument();
+      expect(within(screen.getByText(`st-${i}`, { exact: true }).closest('tr')!).getAllByRole('cell')).toHaveLength(8);
+    });
+    mocks.sessions.data = { data: [] }; rerender(<Page />);
+    expect(screen.getByText('No session history in the active project')).toHaveAttribute('colspan', '8');
+  });
+
+  it('stops a historical row without expanding it and disables only its pending action', async () => {
+    mocks.sessions.data = { data: sessions(2).map(item => ({ ...item, status: 'running' })) };
+    let resolve!: (value: unknown) => void;
+    mocks.cancel.mutateAsync.mockReturnValue(new Promise(done => { resolve = done; }));
+    render(<Page />);
+    const stop = screen.getByRole('button', { name: 'Stop run session-0' });
+    fireEvent.click(stop); fireEvent.click(stop);
+    expect(mocks.cancel.mutateAsync).toHaveBeenCalledExactlyOnceWith({ runId: 'session-0', projectUUID: 'project-a', isCurrent: expect.any(Function) });
+    expect(stop).toBeDisabled(); expect(stop).toHaveTextContent('STOPPING…');
+    expect(screen.getByRole('button', { name: 'Stop run session-1' })).toBeEnabled();
+    expect(window.location.search).toBe('');
+    expect(screen.queryByText('SESSION DETAILS')).not.toBeInTheDocument();
+    await act(async () => { resolve({ status: 'cancelling' }); });
+    expect(stop).toBeEnabled();
+  });
+
+  it('shows a readable 404 below the correct row without hiding its stop/retry action', async () => {
+    mocks.sessions.data = { data: sessions(2).map(item => ({ ...item, status: 'running' })) };
+    mocks.cancel.mutateAsync.mockRejectedValue(new Error('run not found or already finished'));
+    render(<Page />);
+    fireEvent.click(screen.getByRole('button', { name: 'Stop run session-0' }));
+    const error = await screen.findByRole('alert');
+    expect(error).toHaveTextContent('session-0');
+    expect(error).toHaveTextContent('run not found or already finished');
+    expect(error).toHaveTextContent('may no longer track this run');
+    expect(screen.getByRole('button', { name: 'Stop run session-0' })).toBeEnabled();
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
   });
 
   it('shows 20-row pagination with unknown totals and supports previous/next', () => {
