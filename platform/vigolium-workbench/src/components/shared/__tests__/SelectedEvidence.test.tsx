@@ -19,9 +19,9 @@ for (const theme of ['dark', 'light'] as const) describe(`${theme} selected evid
     expect(await screen.findByText(/proof bytes/)).toBeInTheDocument();
     expect(state.fetchEvidence).toHaveBeenCalledTimes(1);
     expect(state.fetchEvidence).toHaveBeenCalledWith(7, 'proof-id', 'project-a', expect.any(AbortSignal));
-    expect(screen.getByText('Baseline context (not proof)')).toBeInTheDocument();
+    expect(screen.getByText('Original context (not proof)')).toBeInTheDocument();
     expect(screen.getByText(/Legacy inline evidence — role unknown/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'role: baseline · primary declaration: no — exchange: baseline-id' }));
+    fireEvent.click(screen.getByRole('button', { name: /role: baseline · primary declaration: no — exchange: baseline-id$/ }));
     await waitFor(() => expect(state.fetchEvidence).toHaveBeenCalledWith(7, 'baseline-id', 'project-a', expect.any(AbortSignal)));
     expect(screen.getAllByText(/role: baseline/).length).toBeGreaterThan(0);
   });
@@ -75,9 +75,7 @@ for (const theme of ['dark', 'light'] as const) describe(`${theme} selected evid
     expect(within(groups[1]).getByRole('button', { name: /old-primary/ })).toHaveAttribute('aria-pressed', 'false');
 
     const headings = within(groups[0]).getAllByRole('heading').map((heading) => heading.textContent);
-    expect(headings.indexOf('Explicit primary selections')).toBeLessThan(headings.indexOf('Confirmations'));
-    expect(headings.indexOf('Confirmations')).toBeLessThan(headings.indexOf('Controls'));
-    expect(headings.indexOf('Controls')).toBeLessThan(headings.indexOf('Baseline context (not proof)'));
+    expect(headings).toEqual(['Detection 2 · latest', 'Main selections', 'Repeat checks (not a verdict)', 'Comparison controls', 'Original context (not proof)']);
   });
   it('labels inline request/response bytes with their first-observation scan', () => {
     render(view({ ...finding, scan_uuid: 'scan-b', inline_evidence_scan_uuid: 'scan-a', request: 'first request', response: 'first response' }));
@@ -108,7 +106,7 @@ for (const theme of ['dark', 'light'] as const) describe(`${theme} selected evid
     expect(await screen.findByText(/Cached observation: not a newly sent exchange/)).toBeInTheDocument();
     expect(screen.getByText(/provenance: cached_observation/)).toBeInTheDocument();
     expect(screen.getByText('request state: unknown · response state: unknown')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'role: observation · primary declaration: yes — exchange: proof-id' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: /role: observation · primary declaration: yes — exchange: proof-id$/ })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.queryByText(/Legacy capture with unknown provenance/)).not.toBeInTheDocument();
     expect(screen.getByText(/proof bytes/)).toBeInTheDocument();
   });
@@ -116,12 +114,12 @@ for (const theme of ['dark', 'light'] as const) describe(`${theme} selected evid
     const malformed = { exchange_id, role: 'attack', primary: true, label: 'claimed proof', occurrence_id: 'malformed', finding_url: exchange.url, exchange } as EvidenceEntry;
     render(view({ ...finding, url: exchange.url, evidence: [malformed], request: 'legacy bytes', evidence_status: 'selected' }));
     const invalidGroup = screen.getByRole('heading', { name: 'Invalid / unavailable primary declarations' }).parentElement!;
-    const button = within(invalidGroup).getByRole('button', { name: 'role: attack · primary declaration: yes — exchange: Missing exchange identity' });
+    const button = within(invalidGroup).getByRole('button', { name: /role: attack · primary declaration: yes — exchange: Missing exchange identity$/ });
     expect(button).toBeDisabled();
     expect(button).toHaveAttribute('aria-pressed', 'false');
     expect(within(invalidGroup).getByText('Producer label: claimed proof')).toBeInTheDocument();
     expect(within(invalidGroup).getByText(/No URL or linked-record fallback is attempted/)).toBeInTheDocument();
-    expect(screen.queryByRole('heading', { name: 'Explicit primary selections' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Main selections' })).not.toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: /Selected primary proof/ })).not.toBeInTheDocument();
     fireEvent.click(button);
     expect(state.fetchEvidence).not.toHaveBeenCalled();
@@ -133,15 +131,15 @@ for (const theme of ['dark', 'light'] as const) describe(`${theme} selected evid
     const valid = { ...entries[2], occurrence_id };
     render(view({ ...finding, evidence: [malformed, valid], evidence_status: 'missing' }));
     expect(screen.getByRole('heading', { name: 'Invalid / unavailable primary declarations' })).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: 'Explicit primary selections' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Main selections' })).toBeInTheDocument();
     if (occurrence_id === 'same') {
       expect(screen.getByRole('alert')).toHaveTextContent(/Ambiguous primary declarations/);
       expect(state.fetchEvidence).not.toHaveBeenCalled();
-      fireEvent.click(screen.getByRole('button', { name: 'role: observation · primary declaration: yes — exchange: proof-id' }));
+      fireEvent.click(screen.getByRole('button', { name: /role: observation · primary declaration: yes — exchange: proof-id$/ }));
     } else {
       expect(screen.queryByText(/Ambiguous primary declarations/)).not.toBeInTheDocument();
       expect(await screen.findByText(/proof bytes/)).toBeInTheDocument();
-      expect(screen.getByRole('button', { name: 'role: observation · primary declaration: yes — exchange: proof-id' })).toHaveAttribute('aria-pressed', 'true');
+      expect(screen.getByRole('button', { name: /role: observation · primary declaration: yes — exchange: proof-id$/ })).toHaveAttribute('aria-pressed', 'true');
     }
     expect(await screen.findByText(/proof bytes/)).toBeInTheDocument();
     expect(state.fetchEvidence).toHaveBeenCalledTimes(1);
@@ -150,18 +148,18 @@ for (const theme of ['dark', 'light'] as const) describe(`${theme} selected evid
   it('keeps a malicious producer label on a primary-flagged baseline in context, not primary selections', async () => {
     const baseline = { ...entries[0], primary: true, label: 'confirmed attack proof' };
     render(view({ ...finding, evidence: [baseline], evidence_status: 'selected' }));
-    const baselineGroup = screen.getByRole('heading', { name: 'Baseline context (not proof)' }).parentElement!;
+    const baselineGroup = screen.getByRole('heading', { name: 'Original context (not proof)' }).parentElement!;
     expect(within(baselineGroup).getByText('Producer label: confirmed attack proof')).toBeInTheDocument();
-    const button = within(baselineGroup).getByRole('button', { name: 'role: baseline · primary declaration: yes — exchange: baseline-id' });
+    const button = within(baselineGroup).getByRole('button', { name: /role: baseline · primary declaration: yes — exchange: baseline-id$/ });
     expect(button).toHaveAttribute('aria-pressed', 'false');
     expect(screen.queryByRole('button', { name: /confirmed attack proof/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole('heading', { name: 'Explicit primary selections' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Main selections' })).not.toBeInTheDocument();
     expect(state.fetchEvidence).not.toHaveBeenCalled();
     fireEvent.click(button);
     expect(await screen.findByText(/proof bytes/)).toBeInTheDocument();
     expect(state.fetchEvidence).toHaveBeenCalledWith(7, 'baseline-id', 'project-a', expect.any(AbortSignal));
     expect(button).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.queryByRole('heading', { name: 'Explicit primary selections' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Main selections' })).not.toBeInTheDocument();
   });
   it.each(['attack', 'confirmation'] as const)('keeps primary %s declarations distinct from producer-supplied capture and confirmation', async (role) => {
     state.fetchEvidence.mockResolvedValue({ ...exchange, provenance: 'producer_supplied' });
@@ -169,9 +167,9 @@ for (const theme of ['dark', 'light'] as const) describe(`${theme} selected evid
     expect(await screen.findByText(/Producer-supplied capture: provenance alone does not establish a newly sent exchange, capture fidelity, or vulnerability confirmation/)).toBeInTheDocument();
     expect(screen.getByText(/provenance: producer_supplied/)).toBeInTheDocument();
     expect(screen.getByText(/Roles and primary flags are stored declarations, not vulnerability confirmation/)).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: 'Explicit primary selections' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Main selections' })).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: /Selected primary proof/ })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: `role: ${role} · primary declaration: yes — exchange: proof-id` })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: new RegExp(`role: ${role} · primary declaration: yes — exchange: proof-id$`) })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByText('Producer label: confirmed attack proof')).toBeInTheDocument();
     expect(screen.getByText('request state: complete · response state: complete')).toBeInTheDocument();
     expect(screen.getByText(/proof bytes/)).toBeInTheDocument();
@@ -189,15 +187,15 @@ for (const theme of ['dark', 'light'] as const) describe(`${theme} selected evid
     const { rerender } = render(view(value));
     expect(await screen.findByText(/proof bytes/)).toBeInTheDocument();
     expect(screen.getByText(`Stored finding evidence status: ${status}`)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: `role: unknown · primary declaration: ${status === 'unclassified' ? 'yes' : 'no'} — exchange: unknown-id` })).toHaveAttribute('aria-pressed', 'false');
-    expect(screen.getByRole('button', { name: 'role: observation · primary declaration: yes — exchange: proof-id' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: new RegExp(`role: unknown · primary declaration: ${status === 'unclassified' ? 'yes' : 'no'} — exchange: unknown-id$`) })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByRole('button', { name: /role: observation · primary declaration: yes — exchange: proof-id$/ })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByText(/later selected evidence does not reclassify historical/)).toBeInTheDocument();
     expect(screen.getByText('legacy historical bytes')).toBeInTheDocument();
     rerender(view({ ...value, evidence: value.evidence.map((entry) => ({ ...entry })) }));
-    expect(screen.getByRole('button', { name: 'role: observation · primary declaration: yes — exchange: proof-id' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: /role: observation · primary declaration: yes — exchange: proof-id$/ })).toHaveAttribute('aria-pressed', 'true');
     expect(state.fetchEvidence).toHaveBeenCalledTimes(1);
     rerender(view({ ...value, evidence: [later, historical] }));
-    expect(screen.getByRole('button', { name: 'role: observation · primary declaration: yes — exchange: proof-id' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: /role: observation · primary declaration: yes — exchange: proof-id$/ })).toHaveAttribute('aria-pressed', 'true');
     expect(state.fetchEvidence).toHaveBeenCalledTimes(1);
     expect(screen.getByText(`Stored finding evidence status: ${status}`)).toBeInTheDocument();
   });
@@ -212,7 +210,8 @@ for (const theme of ['dark', 'light'] as const) describe(`${theme} selected evid
   });
   it('keeps independent historical primaries distinct and preselects the newest occurrence', async () => {
     render(view({ ...finding, evidence_status: 'unclassified', evidence: [{ ...entries[2], occurrence_id: 'first' }, { exchange_id: 'other', role: 'confirmation', primary: true, occurrence_id: 'later' }] }));
-    expect(screen.getByText(/Multiple primary declarations/)).toBeInTheDocument();
+    expect(screen.queryByText(/Multiple primary declarations/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Each detection keeps its own main selection/)).toBeInTheDocument();
     expect(screen.queryByText(/Ambiguous primary declarations/)).not.toBeInTheDocument();
     expect(await screen.findByText(/proof bytes/)).toBeInTheDocument();
     expect(state.fetchEvidence).toHaveBeenCalledTimes(1);
@@ -225,9 +224,9 @@ for (const theme of ['dark', 'light'] as const) describe(`${theme} selected evid
     state.fetchEvidence.mockRejectedValue({ status: 404 });
     const { rerender } = render(view({ ...finding, evidence: entries, request: 'legacy' }));
     expect(await screen.findByRole('alert')).toHaveTextContent(/No fallback evidence is substituted/);
-    expect(screen.getByRole('heading', { name: 'Explicit primary selections' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Main selections' })).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: /Selected primary proof/ })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'role: observation · primary declaration: yes — exchange: proof-id' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: /role: observation · primary declaration: yes — exchange: proof-id$/ })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.queryByText(/proof bytes/)).not.toBeInTheDocument();
     expect(state.fetchEvidence).toHaveBeenCalledTimes(1);
     state.fetchEvidence.mockResolvedValue({ ...exchange, response: undefined, response_state: 'missing' });

@@ -12,7 +12,7 @@ const findings = Array.from({ length: 260 }, (_, index) => ({
   id: highIDs.get(index) ?? 10000 + index,
   severity: highIDs.has(index) ? 'high' : otherSeverities[otherIndex++],
   module_name: `Module ${String(index).padStart(3, '0')}`,
-  confidence: 'high', matched_at: ['https://example.test/path'],
+  hostname: 'example.test', confidence: 'high', matched_at: ['https://example.test/path'],
   found_at: new Date(Date.UTC(2026, 0, 1, 0, 0, 260 - index)).toISOString(),
 })) as Finding[];
 const rank: Record<string, number> = { info: 0, suspect: 1, low: 2, medium: 3, high: 4, critical: 5 };
@@ -26,6 +26,9 @@ for (const theme of ['dark', 'light']) {
 
     test('paginates 260 rows, sorts all results before pagination, and preserves the server order and arrows', async ({ page, consoleErrors }) => {
       const queries: URLSearchParams[] = [];
+      await page.route('**/api/findings/hosts*', route => route.fulfill({
+        json: { data: [{ hostname: 'example.test', total: findings.length }], total: 1, offset: 0, limit: 1, has_more: false },
+      }));
       await page.route('**/api/findings?*', async route => {
         const query = new URL(route.request().url()).searchParams;
         queries.push(query);
@@ -68,7 +71,7 @@ for (const theme of ['dark', 'light']) {
       expect(queries.at(-1)!.get('sort')).toBe('severity');
       expect(queries.at(-1)!.get('order')).toBe('desc');
       await page.getByRole('button', { name: 'By Host', exact: true }).click();
-      await expect(pagination).toContainText('Page 2 of 3');
+      await expect(page.getByRole('button', { name: /example\.test.*260/ })).toBeVisible();
       await page.getByRole('button', { name: 'Table', exact: true }).click();
       await expect(severityHeader).toHaveAttribute('aria-sort', 'descending');
       await expect(pagination).toContainText('Page 2 of 3');
