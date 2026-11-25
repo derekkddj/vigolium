@@ -2359,6 +2359,9 @@
             "format": "int64",
             "type": "integer"
           },
+          "inline_evidence_scan_uuid": {
+            "type": "string"
+          },
           "insertion_point": {
             "nullable": true,
             "properties": {
@@ -2399,6 +2402,29 @@
               "passive"
             ],
             "type": "string"
+          },
+          "occurrences": {
+            "items": {
+              "properties": {
+                "entries": {
+                  "items": {
+                    "$ref": "#/components/schemas/EvidenceEntry"
+                  },
+                  "type": "array"
+                },
+                "evidence_status": {
+                  "type": "string"
+                },
+                "occurrence_id": {
+                  "type": "string"
+                },
+                "scan_uuid": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
           },
           "origin_record_uuid": {
             "type": "string"
@@ -2607,6 +2633,18 @@
           },
           "vuln_class": {
             "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "FindingHostCount": {
+        "properties": {
+          "hostname": {
+            "type": "string"
+          },
+          "total": {
+            "format": "int64",
+            "type": "integer"
           }
         },
         "type": "object"
@@ -5987,7 +6025,7 @@
     },
     "/api/findings": {
       "get": {
-        "description": "Returns a paginated list of vulnerability findings for the current project. Supports extensive filtering by severity, domain, module, scan, and text search. Results can be sorted by any field.",
+        "description": "Returns a paginated list of vulnerability findings for the current project. Supports extensive filtering by severity, domain, module, scan, and text search. Results can be sorted by found_at (or found), created_at (or created), severity, module_name (or module), module_id, confidence, id, module_type, finding_source, status, url, scan_uuid, repo_name, or source_file. Invalid sort and order values return HTTP 400.",
         "operationId": "listFindings",
         "parameters": [
           {
@@ -6081,10 +6119,29 @@
             }
           },
           {
-            "description": "Field to sort by",
+            "description": "Finding sort field",
             "in": "query",
             "name": "sort",
             "schema": {
+              "enum": [
+                "found_at",
+                "found",
+                "created_at",
+                "created",
+                "severity",
+                "module_name",
+                "module",
+                "module_id",
+                "confidence",
+                "id",
+                "module_type",
+                "finding_source",
+                "status",
+                "url",
+                "scan_uuid",
+                "repo_name",
+                "source_file"
+              ],
               "type": "string"
             }
           },
@@ -6113,6 +6170,16 @@
             },
             "description": "Paginated findings list"
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid sort or order value"
+          },
           "401": {
             "content": {
               "application/json": {
@@ -6125,6 +6192,154 @@
           }
         },
         "summary": "List findings",
+        "tags": [
+          "Findings"
+        ]
+      }
+    },
+    "/api/findings/hosts": {
+      "get": {
+        "description": "Returns complete finding counts grouped by stored hostname for the current project. Accepts the same finding filters as GET /api/findings. Pagination and sorting do not affect the aggregate.",
+        "operationId": "listFindingHosts",
+        "parameters": [
+          {
+            "description": "Project UUID",
+            "in": "header",
+            "name": "X-Project-UUID",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by severity (comma-separated)",
+            "in": "query",
+            "name": "severity",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by domain/hostname",
+            "in": "query",
+            "name": "domain",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by scan UUID",
+            "in": "query",
+            "name": "scan_uuid",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by module name",
+            "in": "query",
+            "name": "module_name",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by module type",
+            "in": "query",
+            "name": "module_type",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by finding source",
+            "in": "query",
+            "name": "finding_source",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by record kind (comma-separated)",
+            "in": "query",
+            "name": "record_kind",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by repository name or URL",
+            "in": "query",
+            "name": "repo_name",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by lifecycle status (comma-separated)",
+            "in": "query",
+            "name": "status",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Search across finding fields",
+            "in": "query",
+            "name": "search",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/PaginatedResponse"
+                    },
+                    {
+                      "properties": {
+                        "data": {
+                          "items": {
+                            "$ref": "#/components/schemas/FindingHostCount"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Paginated host aggregate list"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid finding filter"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          }
+        },
+        "summary": "Count findings by host",
         "tags": [
           "Findings"
         ]

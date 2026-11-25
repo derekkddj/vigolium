@@ -178,6 +178,14 @@ func (e *Executor) finalizeEvidence(result *output.ResultEvent) {
 			entry.Primary = false
 			continue
 		}
+		if entry.Exchange == nil && entry.ExchangeID == "" {
+			// Preserve an unavailable association rather than letting a malformed
+			// optional selection reject the entire finding during persistence.
+			entry.ExchangeID, entry.Exchange = "rejected-evidence:"+uuid.NewString(), nil
+			entry.Label = strings.TrimSpace(entry.Label + " [exchange identity missing]")
+			result.Error = strings.TrimSpace(result.Error + " evidence exchange identity missing")
+			continue
+		}
 		if entry.Exchange != nil && (entry.Exchange.Validate() != nil || entry.ExchangeID != entry.Exchange.ID) {
 			// Keep the rejected declaration as an explicitly unavailable manifest.
 			// Its claimed ID must not resolve a different stored receipt later.

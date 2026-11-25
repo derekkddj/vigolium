@@ -78,6 +78,13 @@ export interface EvidenceEntry {
   exchange?: EvidenceExchange;
 }
 
+export interface FindingOccurrence {
+  occurrence_id: string;
+  scan_uuid?: string;
+  entries: EvidenceEntry[];
+  evidence_status: string;
+}
+
 export interface Finding {
   id: number;
   project_uuid?: string;
@@ -91,6 +98,8 @@ export interface Finding {
   evidence_grade?: string;
   evidence?: EvidenceEntry[];
   evidence_status?: string;
+  inline_evidence_scan_uuid?: string;
+  occurrences?: FindingOccurrence[];
   module_id: string;
   module_name: string;
   module_type?: string;
@@ -211,6 +220,11 @@ export interface ErrorResponse {
   code?: number;
   error_code?: string;
   details?: string;
+}
+
+export interface FindingHostCount {
+  hostname: string;
+  total: number;
 }
 
 export interface FindingsQueryParams {

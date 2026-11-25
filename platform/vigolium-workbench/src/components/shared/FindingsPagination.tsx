@@ -8,10 +8,11 @@ interface Props {
   hasMore?: boolean;
   busy: boolean;
   onPageChange: (page: number) => void;
+  ariaLabel?: string;
 }
 
 /** The same server-page controls in table and grouped views, in both themes. */
-export default function FindingsPagination({ offset, pageSize, returned, total, hasMore, busy, onPageChange }: Props) {
+export default function FindingsPagination({ offset, pageSize, returned, total, hasMore, busy, onPageChange, ariaLabel = 'Findings pagination' }: Props) {
   const page = Math.floor(offset / pageSize) + 1;
   const pages = Math.max(1, Math.ceil(total / pageSize));
   const canNext = hasMore ?? offset + pageSize < total;
@@ -20,7 +21,7 @@ export default function FindingsPagination({ offset, pageSize, returned, total, 
 
   return (
     <nav
-      aria-label="Findings pagination"
+      aria-label={ariaLabel}
       aria-busy={busy}
       className="shrink-0 flex items-center justify-between flex-wrap gap-2 px-3 py-2 border-t text-xs"
       style={{ borderColor: 'var(--v-border)', color: 'var(--v-text-muted)' }}

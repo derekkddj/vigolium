@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
@@ -416,6 +417,161 @@ func TestFindingsQueryBuilder_SeverityAndModuleFilter(t *testing.T) {
 	}
 }
 
+func TestFindingsQueryBuilder_AdditionalSortFields(t *testing.T) {
+	fields := []struct {
+		name   string
+		first  string
+		second string
+		set    func(*Finding, string)
+	}{
+		{name: "module_type", first: "z-type", second: "a-type", set: func(f *Finding, value string) { f.ModuleType = value }},
+		{name: "finding_source", first: "z-source", second: "a-source", set: func(f *Finding, value string) { f.FindingSource = value }},
+		{name: "status", first: "triaged", second: "draft", set: func(f *Finding, value string) { f.Status = value }},
+		{name: "url", first: "https://z.example/", second: "https://a.example/", set: func(f *Finding, value string) { f.URL = value }},
+		{name: "scan_uuid", first: "z-scan", second: "a-scan", set: func(f *Finding, value string) { f.ScanUUID = value }},
+		{name: "repo_name", first: "z-repo", second: "a-repo", set: func(f *Finding, value string) { f.RepoName = value }},
+		{name: "source_file", first: "z.go", second: "a.go", set: func(f *Finding, value string) { f.SourceFile = value }},
+	}
+	for _, field := range fields {
+		t.Run(field.name, func(t *testing.T) {
+			db := newTestDB(t)
+			repo := NewRepository(db)
+			first := &Finding{FindingHash: field.name + "-first", ModuleID: "test", ModuleName: "test", FoundAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+			second := &Finding{FindingHash: field.name + "-second", ModuleID: "test", ModuleName: "test", FoundAt: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)}
+			field.set(first, field.first)
+			field.set(second, field.second)
+			firstID := saveFindingFull(t, repo, first)
+			secondID := saveFindingFull(t, repo, second)
+			assertFindingSortOrder(t, db, field.name, []int64{secondID, firstID}, []int64{firstID, secondID})
+		})
+	}
+
+	t.Run("id", func(t *testing.T) {
+		db := newTestDB(t)
+		repo := NewRepository(db)
+		first := &Finding{FindingHash: "id-first", ModuleID: "test", ModuleName: "test", FoundAt: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)}
+		second := &Finding{FindingHash: "id-second", ModuleID: "test", ModuleName: "test", FoundAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+		firstID := saveFindingFull(t, repo, first)
+		secondID := saveFindingFull(t, repo, second)
+		assertFindingSortOrder(t, db, "id", []int64{firstID, secondID}, []int64{secondID, firstID})
+	})
+}
+
+func assertFindingSortOrder(t *testing.T, db *DB, field string, asc, desc []int64) {
+	t.Helper()
+	for _, tc := range []struct {
+		name string
+		asc  bool
+		want []int64
+	}{
+		{name: "ascending", asc: true, want: asc},
+		{name: "descending", want: desc},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			findings, err := NewFindingsQueryBuilder(db, QueryFilters{ProjectUUID: DefaultProjectUUID, SortBy: field, SortAsc: tc.asc}).Execute(context.Background())
+			if err != nil {
+				t.Fatalf("Execute sort=%s: %v", field, err)
+			}
+			if len(findings) != len(tc.want) {
+				t.Fatalf("got %d findings, want %d", len(findings), len(tc.want))
+			}
+			for i, finding := range findings {
+				if finding.ID != tc.want[i] {
+					t.Errorf("sort=%s %s position %d: got id=%d, want id=%d", field, tc.name, i, finding.ID, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestFindingsQueryBuilder_GroupByHostnameIgnoresPaginationAndScopesFilters(t *testing.T) {
+	db := newTestDB(t)
+	repo := NewRepository(db)
+	for i := 0; i < 150; i++ {
+		hosts := []string{"alpha.example", "bravo.example", "charlie.example"}
+		severity := SeverityLow
+		if i%2 == 0 {
+			severity = SeverityHigh
+		}
+		finding := &Finding{
+			FindingHash: fmt.Sprintf("host-group-%d", i),
+			ModuleID:    "host-group-test",
+			ModuleName:  "Host group test",
+			Hostname:    hosts[i%len(hosts)],
+			Severity:    severity,
+		}
+		saveFindingFull(t, repo, finding)
+	}
+	for i := 0; i < 5; i++ {
+		finding := &Finding{ProjectUUID: "other-project", FindingHash: fmt.Sprintf("other-host-%d", i), ModuleID: "other", ModuleName: "other", Hostname: "other.example", Severity: SeverityHigh}
+		saveFindingFull(t, repo, finding)
+	}
+
+	groups, err := NewFindingsQueryBuilder(db, QueryFilters{
+		ProjectUUID: DefaultProjectUUID,
+		Severity:    []string{SeverityHigh},
+		Limit:       1,
+		Offset:      99,
+	}).GroupByHostname(context.Background())
+	if err != nil {
+		t.Fatalf("GroupByHostname: %v", err)
+	}
+	if len(groups) != 3 {
+		t.Fatalf("got %d host groups, want 3: %+v", len(groups), groups)
+	}
+	for i, hostname := range []string{"alpha.example", "bravo.example", "charlie.example"} {
+		if groups[i].Hostname != hostname || groups[i].Total != 25 {
+			t.Errorf("group %d = %+v, want hostname=%s total=25", i, groups[i], hostname)
+		}
+	}
+}
+
+func TestFindingsQueryBuilder_ConfidenceSortRanks(t *testing.T) {
+	assertFindingsConfidenceSortRanks(t, newTestDB(t))
+}
+
+func assertFindingsConfidenceSortRanks(t *testing.T, db *DB) {
+	t.Helper()
+	repo := NewRepository(db)
+	ctx := context.Background()
+	insert := func(hash, confidence string) int64 {
+		t.Helper()
+		return saveFindingFull(t, repo, &Finding{FindingHash: hash, ModuleID: hash, ModuleName: hash, Confidence: confidence})
+	}
+	tentativeID := insert("confidence-tentative", "tentative")
+	firmFirstID := insert("confidence-firm-first", "firm")
+	firmSecondID := insert("confidence-firm-second", "firm")
+	certainID := insert("confidence-certain", "certain")
+
+	for _, tc := range []struct {
+		name string
+		asc  bool
+		want []int64
+	}{
+		{name: "descending risk rank", want: []int64{certainID, firmSecondID, firmFirstID, tentativeID}},
+		{name: "ascending risk rank", asc: true, want: []int64{tentativeID, firmFirstID, firmSecondID, certainID}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			findings, err := NewFindingsQueryBuilder(db, QueryFilters{
+				ProjectUUID: DefaultProjectUUID,
+				SortBy:      "confidence",
+				SortAsc:     tc.asc,
+			}).Execute(ctx)
+			if err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+			if len(findings) != len(tc.want) {
+				t.Fatalf("got %d findings, want %d", len(findings), len(tc.want))
+			}
+			for i, finding := range findings {
+				if finding.ID != tc.want[i] {
+					t.Errorf("position %d: got id=%d confidence=%s, want id=%d", i, finding.ID, finding.Confidence, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestFindingsQueryBuilder_MapFindingSortColumn(t *testing.T) {
 	fqb := &FindingsQueryBuilder{}
 	tests := map[string]string{
@@ -423,12 +579,20 @@ func TestFindingsQueryBuilder_MapFindingSortColumn(t *testing.T) {
 		"found_at": "f.found_at",
 		"created":  "f.created_at",
 		// severity sorts by risk rank, not lexically — see severitySortRankExpr.
-		"severity":    severitySortRankExpr,
-		"module":      "f.module_name",
-		"module_name": "f.module_name",
-		"module_id":   "f.module_id",
-		"confidence":  "f.confidence",
-		"bogus":       "f.found_at", // default fallback
+		"severity":       severitySortRankExpr,
+		"module":         "f.module_name",
+		"module_name":    "f.module_name",
+		"module_id":      "f.module_id",
+		"confidence":     confidenceSortRankExpr,
+		"id":             "f.id",
+		"module_type":    "f.module_type",
+		"finding_source": "f.finding_source",
+		"status":         "f.status",
+		"url":            "f.url",
+		"scan_uuid":      "f.scan_uuid",
+		"repo_name":      "f.repo_name",
+		"source_file":    "f.source_file",
+		"bogus":          "f.found_at", // default fallback
 	}
 	for in, want := range tests {
 		if got := fqb.mapFindingSortColumn(in); got != want {

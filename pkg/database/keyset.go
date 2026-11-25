@@ -112,7 +112,7 @@ func (fqb *FindingsQueryBuilder) keysetOrder() keysetOrder {
 		sortBy = "found_at"
 	}
 	expr := fqb.mapFindingSortColumn(sortBy)
-	return keysetOrder{expr: expr, numeric: expr == severitySortRankExpr, tie: "f.id", desc: !fqb.filters.SortAsc}
+	return keysetOrder{expr: expr, numeric: expr == severitySortRankExpr || expr == confidenceSortRankExpr, tie: "f.id", desc: !fqb.filters.SortAsc}
 }
 
 // KeysetOrder names the order this builder's pages follow; a cursor carries

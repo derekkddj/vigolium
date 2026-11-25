@@ -591,6 +591,10 @@ type Finding struct {
 	Evidence       []evidence.Entry `bun:"-" json:"evidence,omitempty"`
 	EvidenceStatus string           `bun:"evidence_status,nullzero" json:"evidence_status,omitempty"`
 
+	// Detail-only provenance projections, populated by the repository reader.
+	InlineEvidenceScanUUID string              `bun:"-" json:"inline_evidence_scan_uuid,omitempty"`
+	Occurrences            []FindingOccurrence `bun:"-" json:"occurrences,omitempty"`
+
 	Request  string `bun:"request,nullzero" json:"request,omitempty"`
 	Response string `bun:"response,nullzero" json:"response,omitempty"`
 
@@ -618,6 +622,16 @@ type Finding struct {
 	// LastSeenAt is when a scan last detected the finding (schema v6). NULL on
 	// rows no v6 binary has re-detected; FoundAt is then the best answer.
 	LastSeenAt *time.Time `bun:"last_seen_at,nullzero" json:"last_seen_at,omitempty"`
+}
+
+// FindingOccurrence groups selected evidence by one scan occurrence. Entries are
+// manifests only; detail readers hydrate receipt bytes through the exact-exchange
+// endpoint when requested.
+type FindingOccurrence struct {
+	OccurrenceID   string           `json:"occurrence_id"`
+	ScanUUID       string           `json:"scan_uuid,omitempty"`
+	Entries        []evidence.Entry `json:"entries"`
+	EvidenceStatus string           `json:"evidence_status"`
 }
 
 // FindingInsertionPoint names the insertion point a module mutated, e.g.
