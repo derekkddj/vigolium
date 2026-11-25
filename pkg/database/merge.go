@@ -413,7 +413,8 @@ func mergeOnce(ctx context.Context, dest *DB, srcPath string, opts MergeOptions)
 		}
 	}
 
-	if err := mergeOASTPlantingReceipts(ctx, tx, stats); err != nil {
+	receiptScope := newMergeReceiptScope(opts, hosts)
+	if err := mergeOASTPlantingReceipts(ctx, tx, stats, receiptScope, keptKeys["oast_payloads"]); err != nil {
 		return nil, fmt.Errorf("merge OAST planting receipts: %w", err)
 	}
 
@@ -425,7 +426,7 @@ func mergeOnce(ctx context.Context, dest *DB, srcPath string, opts MergeOptions)
 	}
 
 	if !opts.SkipFindings {
-		if err := mergeSelectedEvidence(ctx, tx, idMap); err != nil {
+		if err := mergeSelectedEvidence(ctx, tx, idMap, receiptScope); err != nil {
 			return nil, fmt.Errorf("merge selected evidence: %w", err)
 		}
 	}

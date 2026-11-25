@@ -3,11 +3,11 @@ package database
 import (
 	"context"
 	"encoding/json"
-	"github.com/vigolium/vigolium/internal/config"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/evidence"
 )
 

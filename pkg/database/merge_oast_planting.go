@@ -108,7 +108,25 @@ func validateMergeOASTBoundContexts(ctx context.Context, tx *sql.Tx, label strin
 // mergeOASTPlantingReceipts copies canonical bytes and bindings atomically, one
 // receipt at a time, even with SkipFindings/SkipRecordBodies. Legacy TEXT sources
 // are decoded only at this boundary; the destination never stores receipt JSON.
-func mergeOASTPlantingReceipts(ctx context.Context, tx *sql.Tx, stats *MergeStats) error {
+// mergeOASTPlantingReceipts copies planting receipts and their exchanges. A
+// withholding scope copies none (their exchanges are raw sent requests that
+// cannot be masked); a host-filtered scope copies only kept payload nonces.
+func mergeOASTPlantingReceipts(ctx context.Context, tx *sql.Tx, stats *MergeStats, scope mergeReceiptScope, keptNonces []any) error {
+	if scope.withhold {
+		return nil
+	}
+	var kept map[string]bool
+	if scope.selectedOnly {
+		kept = make(map[string]bool, len(keptNonces))
+		for _, n := range keptNonces {
+			switch v := n.(type) {
+			case string:
+				kept[v] = true
+			case []byte:
+				kept[string(v)] = true
+			}
+		}
+	}
 	var exists, canonical int
 	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM src.sqlite_master WHERE type = 'table' AND name = 'oast_planting_receipts'").Scan(&exists); err != nil {
 		return err
@@ -140,6 +158,10 @@ func mergeOASTPlantingReceipts(ctx context.Context, tx *sql.Tx, stats *MergeStat
 		}
 		if err != nil {
 			return err
+		}
+		if kept != nil && !kept[row.Nonce] {
+			project, nonce = row.ProjectUUID, row.Nonce
+			continue
 		}
 		if canonical > 0 {
 			row.ExchangeID = data

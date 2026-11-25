@@ -460,6 +460,15 @@ func redactFindings(findings []*database.Finding, opts Options) []bool {
 	changed := make([]bool, len(findings))
 	for i, f := range findings {
 		changed[i] = database.RedactFindingCredentials(f, extra)
+		// Selected receipts are immutable records of what was sent: they
+		// cannot be masked, so only their manifests (identity, role, label)
+		// are kept; readers report the receipt as unavailable.
+		for j, e := range f.Evidence {
+			if e.Exchange != nil {
+				f.Evidence[j] = e.Manifest()
+				changed[i] = true
+			}
+		}
 	}
 	return changed
 }
@@ -799,6 +808,12 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 			res.OASTPayloadsImported++
 
 		case "oast_planting_receipt":
+			if opts.RedactCredentials {
+				// A planting receipt is the raw request that carried the
+				// payload and cannot be masked; a redacting import skips it.
+				res.SkippedTypes[envelope.Type]++
+				return nil
+			}
 			var row database.OASTPlantingReceipt
 			if err := json.Unmarshal(envelope.Data, &row); err != nil {
 				return fmt.Errorf("invalid OAST planting metadata: %w", err)
