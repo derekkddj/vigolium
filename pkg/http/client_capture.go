@@ -188,6 +188,10 @@ func (t *captureTransport) RoundTrip(req *stdhttp.Request) (*stdhttp.Response, e
 
 const maxCaptureRequestHeaders = 64 << 10
 
+// captureWriteReportGrace bounds how long a returned response waits for its
+// request's WroteRequest report. The usual gap is microseconds.
+const captureWriteReportGrace = 500 * time.Millisecond
+
 func (t *captureTransport) roundTrip(base stdhttp.RoundTripper, req *stdhttp.Request) (*stdhttp.Response, error) {
 	meta := &captureContext{id: uuid.NewString(), at: time.Now().UTC(), rawUnknown: true, maxBody: t.maxBody}
 	// Capture the body as the transport consumes it, not from an intended
@@ -201,6 +205,10 @@ func (t *captureTransport) roundTrip(base stdhttp.RoundTripper, req *stdhttp.Req
 	var wroteHeaders, wroteRequest, bodyTruncated, finalized bool
 	unsupported := len(req.Trailer) > 0
 	var wireAttempts int
+	// wroteDone closes when the current attempt's WroteRequest fires. net/http
+	// can hand back a response before its write loop reports the finished write.
+	wroteDone := make(chan struct{})
+	var wroteReported bool
 	trace := &httptrace.ClientTrace{
 		GetConn: func(string) {
 			mu.Lock()
@@ -220,6 +228,9 @@ func (t *captureTransport) roundTrip(base stdhttp.RoundTripper, req *stdhttp.Req
 			headers.Reset()
 			body.Reset()
 			wroteHeaders, wroteRequest, bodyTruncated = false, false, false
+			if wroteReported {
+				wroteDone, wroteReported = make(chan struct{}), false
+			}
 			unsupported = len(req.Trailer) > 0
 		},
 		WroteHeaderField: func(name string, values []string) {
@@ -257,6 +268,10 @@ func (t *captureTransport) roundTrip(base stdhttp.RoundTripper, req *stdhttp.Req
 			defer mu.Unlock()
 			if !finalized {
 				wroteRequest = info.Err == nil
+				if !wroteReported {
+					close(wroteDone)
+					wroteReported = true
+				}
 			}
 		},
 	}
@@ -294,6 +309,22 @@ func (t *captureTransport) roundTrip(base stdhttp.RoundTripper, req *stdhttp.Req
 	}
 	resp, err := base.RoundTrip(traced)
 	mu.Lock()
+	if err == nil && resp != nil && wroteHeaders && !wroteReported {
+		// The headers are on the wire and an answer arrived, but the write
+		// loop has not reported yet. Give it a short, bounded grace instead of
+		// recording an actually sent request as missing. A write that stays
+		// unreported (e.g. a body the server never read) remains missing.
+		done := wroteDone
+		mu.Unlock()
+		timer := time.NewTimer(captureWriteReportGrace)
+		select {
+		case <-done:
+		case <-timer.C:
+		case <-req.Context().Done():
+		}
+		timer.Stop()
+		mu.Lock()
+	}
 	requestTarget := ""
 	if traced.URL != nil {
 		requestTarget = traced.URL.RequestURI()
