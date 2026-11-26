@@ -117,6 +117,9 @@ Both listeners bind 127.0.0.1 by default. --host 0.0.0.0 (or $VIGOLIUM_SERVER_HO
 A routable --ingest-proxy-host needs --proxy-token and/or --proxy-allow, or the server refuses to start.
 The MITM CA is managed with 'vigolium server ca print|path|install|uninstall'.
 
+The configured database must initialize successfully before either listener binds,
+including in bridge, view-only, and demo-only modes.
+
 Probes (no auth): GET /health answers 200 {"status":"healthy","pid":N} while the
 process serves; GET /ready answers 200 only when the database responds and the
 record writer accepts writes (503 {"status":"not_ready","reason":…} otherwise).
@@ -348,36 +351,65 @@ func printServerEndpoints(serviceAddr string, showAPIKeyHint bool) {
 	}
 }
 
-// initServerDatabase opens the results database and creates its schema, returning
-// the live handle and repository on success. It returns (nil, nil) in every
-// degraded case: the connection couldn't be opened, or — crucially — the
-// connection opened but schema creation failed (a locked, read-only, disk-full,
-// or schema-incompatible database). That second case previously returned a
-// non-nil db with a nil repo, which the repo-backed API handlers dereferenced
-// into nil-pointer panics (HTTP 500 on /api/scans, /api/projects, etc.). Folding
-// it into the same no-persistence path keeps the whole server consistently
-// DB-less so those handlers return a clean 503. The caller owns closing a
-// non-nil returned db.
-func initServerDatabase(cfg *config.DatabaseConfig, silent bool) (*database.DB, *database.Repository) {
+// initServerDatabase opens and initializes the required results database. A CLI
+// server must not silently serve without persistence after an initialization
+// failure. Every failure closes any opened handle and returns nil dependencies;
+// the caller owns closing the handle returned on success.
+func initServerDatabase(cfg *config.DatabaseConfig, silent bool) (*database.DB, *database.Repository, error) {
 	db, err := database.NewDB(cfg)
 	if err != nil {
-		zap.L().Warn("Failed to create database, results won't be persisted", zap.Error(err))
-		return nil, nil
+		return nil, nil, fmt.Errorf("open database: %w", err)
 	}
-	if err := db.EnsureSchemaReady(context.Background()); err != nil {
-		zap.L().Error("Failed to create database schema; running without persistence", zap.Error(err))
-		if !silent {
-			fmt.Printf("  %s Database schema init failed: %v (running without persistence)\n",
-				terminal.WarningSymbol(), err)
+	initialized := false
+	defer func() {
+		if !initialized {
+			_ = db.Close()
 		}
-		_ = db.Close()
-		return nil, nil
+	}()
+
+	ctx := context.Background()
+	if err := db.EnsureSchemaReady(ctx); err != nil {
+		return nil, nil, fmt.Errorf("initialize database schema: %w", err)
 	}
-	_ = db.SeedDefaults(context.Background())
+	if err := db.SeedDefaults(ctx); err != nil {
+		return nil, nil, fmt.Errorf("seed database defaults: %w", err)
+	}
+	if err := verifyServerDatabasePersistence(ctx, db); err != nil {
+		return nil, nil, err
+	}
 	if !silent {
 		fmt.Printf("  %s Database initialized %s\n", terminal.InfoSymbol(), terminal.Cyan(db.Driver()))
 	}
-	return db, database.NewRepository(db)
+	initialized = true
+	return db, database.NewRepository(db), nil
+}
+
+// SeedDefaults intentionally treats default inserts and optional search indexes
+// as best-effort. For a persisted CLI server, verify the mandatory rows and a
+// write transaction independently: a ping/schema check can succeed on a locked
+// or read-only store. The zero-row update is rolled back, changes no project
+// data, and does not turn optional search-index support into a startup requirement.
+func verifyServerDatabasePersistence(ctx context.Context, db *database.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("verify database persistence: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.NewUpdate().Model((*database.Project)(nil)).
+		Set("uuid = uuid").Where("1 = 0").Exec(ctx); err != nil {
+		return fmt.Errorf("verify database writes: %w", err)
+	}
+	if err := tx.NewSelect().Model(new(database.User)).Where("uuid = ?", database.DefaultUserUUID).Scan(ctx); err != nil {
+		return fmt.Errorf("verify database default user: %w", err)
+	}
+	if err := tx.NewSelect().Model(new(database.Project)).Where("uuid = ?", database.DefaultProjectUUID).Scan(ctx); err != nil {
+		return fmt.Errorf("verify database default project: %w", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		return fmt.Errorf("finish database persistence check: %w", err)
+	}
+	return nil
 }
 
 func runServerCmd(cmd *cobra.Command, args []string) error {
@@ -464,15 +496,14 @@ func runServerCmd(cmd *cobra.Command, args []string) error {
 		showAPIKeyHint = len(serverOpts.APIKeys) == 0
 	}
 
-	// Initialize database for storing scan results. initServerDatabase collapses a
-	// half-initialized DB (connection opened but schema creation failed) into the
-	// same no-persistence mode as an open failure, so the server never runs with a
-	// live db handle paired with a nil repository — a state every repo-backed API
-	// handler would nil-pointer panic on (HTTP 500 instead of a clean 503).
-	db, repo := initServerDatabase(&settings.Database, globalSilent)
-	if db != nil {
-		defer func() { _ = db.Close() }()
+	// All CLI serving modes initialize the configured database: bridge traffic
+	// augments it, and view/demo modes read it. Fail before creating background
+	// services, binding either listener, or announcing server.ready on failure.
+	db, repo, err := initServerDatabase(&settings.Database, globalSilent)
+	if err != nil {
+		return fmt.Errorf("initialize server database: %w", err)
 	}
+	defer func() { _ = db.Close() }()
 
 	// Prune native-scan status.json heartbeat files past their retention
 	// (scanning_strategy.scan_logs.status_retention_days), off the start path.

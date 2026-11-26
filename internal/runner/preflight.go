@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	neturl "net/url"
-	"os"
 	"strings"
 	"sync"
 
@@ -265,12 +264,12 @@ func (r *Runner) runPreflight(ctx context.Context, infra *phaseInfra, admitted [
 	}
 	if len(unreachable) > 0 && !r.options.Silent {
 		for _, issue := range unreachable {
-			fmt.Fprintf(os.Stderr, "  %s %s unreachable %s\n",
+			fmt.Fprintf(r.stderr(), "  %s %s unreachable %s\n",
 				terminal.Red(terminal.SymbolError),
 				terminal.Cyan(issue.Target),
 				terminal.Gray("("+http.DescribeTransportClass(issue.Code)+")"))
 		}
-		fmt.Fprintf(os.Stderr, "  %s Preflight: %s targets answered\n",
+		fmt.Fprintf(r.stderr(), "  %s Preflight: %s targets answered\n",
 			terminal.Yellow(terminal.SymbolWarning),
 			terminal.Orange(fmt.Sprintf("%d/%d", reached, len(admitted))))
 	}

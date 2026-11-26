@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"strings"
 	"time"
@@ -50,18 +51,53 @@ var oastSessionKeysNull = func() string {
 	return strings.Join(sets, ", ")
 }()
 
+// oastPrivateKeyPrefix marks a private_key stored base64-encoded.
+//
+// interactsh exports the private key as raw PKCS#1 DER bytes in a Go string
+// and resumes by parsing that string back, ignoring a parse failure. Stored as
+// text, the dialect strips its NUL bytes and bun rewrites every byte that is not
+// UTF-8 as U+FFFD, so the key came back unusable and the resumed client
+// panicked on the first callback it decrypted. Encoding keeps the bytes exact.
+const oastPrivateKeyPrefix = "b64:"
+
+func encodeOASTPrivateKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	return oastPrivateKeyPrefix + base64.StdEncoding.EncodeToString([]byte(key))
+}
+
+// decodeOASTPrivateKey returns the stored key's original bytes. A value
+// without the prefix (stored before encoding, and corrupted by then) is
+// returned as it is: the poller refuses to resume a key that does not parse.
+func decodeOASTPrivateKey(stored string) string {
+	enc, ok := strings.CutPrefix(stored, oastPrivateKeyPrefix)
+	if !ok {
+		return stored
+	}
+	raw, err := base64.StdEncoding.DecodeString(enc)
+	if err != nil {
+		return stored
+	}
+	return string(raw)
+}
+
 // SaveOASTSession stores a kept session. A session already stored for the
 // same (project, correlation id) is left as it is.
 func (r *Repository) SaveOASTSession(ctx context.Context, s *OASTSession) error {
 	if s == nil || s.CorrelationID == "" {
 		return nil
 	}
-	s.ProjectUUID = defaultProjectUUID(s.ProjectUUID)
-	if _, err := r.db.NewInsert().Model(s).
+	row := *s
+	row.ProjectUUID = defaultProjectUUID(s.ProjectUUID)
+	row.PrivateKey = encodeOASTPrivateKey(s.PrivateKey)
+	if _, err := r.db.NewInsert().Model(&row).
 		On("CONFLICT (project_uuid, correlation_id) DO NOTHING").
 		Exec(ctx); err != nil {
 		return fmt.Errorf("save oast session: %w", err)
 	}
+	s.ID = row.ID
+	s.ProjectUUID = row.ProjectUUID
 	return nil
 }
 
@@ -79,6 +115,9 @@ func (r *Repository) ListOpenOASTSessions(ctx context.Context, projectUUID, scan
 	}
 	if err := q.Scan(ctx); err != nil {
 		return nil, fmt.Errorf("list oast sessions: %w", err)
+	}
+	for _, row := range out {
+		row.PrivateKey = decodeOASTPrivateKey(row.PrivateKey)
 	}
 	return out, nil
 }

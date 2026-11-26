@@ -3,7 +3,7 @@ package runner
 import (
 	"context"
 	"fmt"
-	"os"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
@@ -61,7 +61,7 @@ func (r *Runner) echoLiveFinding(phaseTag string, result *output.ResultEvent) {
 	}
 	line := output.FormatPhaseFindingLine(phaseTag, result)
 	r.writeSessionLog(line)
-	fmt.Fprint(os.Stderr, line)
+	fmt.Fprint(r.stderr(), line)
 }
 
 // NoticeMarkerBlock and NoticeMarkerPacing are the bracketed tags the two
@@ -128,7 +128,7 @@ func (r *Runner) attachWAFBlockNotifier(requester *http.Requester) {
 // stderr — the shared tail of the WAF block/pacing notifiers.
 func (r *Runner) emitNoticeLine(line string) {
 	r.writeSessionLog(line)
-	fmt.Fprint(os.Stderr, line)
+	fmt.Fprint(r.stderr(), line)
 }
 
 // FormatEdgePaceLine renders the one-line notice shown when a host is fingerprinted
@@ -192,7 +192,7 @@ func (r *Runner) printPhaseStart(phase, detail string) {
 	if r.options.Silent {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "\n%s %s  %s\n", terminal.Green(terminal.SymbolStart), terminal.BoldHiBlue(phase), terminal.Muted(detail))
+	fmt.Fprintf(r.stderr(), "\n%s %s  %s\n", terminal.Green(terminal.SymbolStart), terminal.BoldHiBlue(phase), terminal.Muted(detail))
 }
 
 // printPhaseDetail prints an indented detail line under a phase header.
@@ -200,7 +200,7 @@ func (r *Runner) printPhaseDetail(detail string) {
 	if r.options.Silent {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "  %s %s\n", terminal.Purple(terminal.SymbolInfo), detail)
+	fmt.Fprintf(r.stderr(), "  %s %s\n", terminal.Purple(terminal.SymbolInfo), detail)
 }
 
 // formatTargetCounts builds a standardized "Targets: N (M input | K HTTP Records)" string.
@@ -241,7 +241,7 @@ func (r *Runner) printTargetDetail(detail string) {
 	if r.options.Silent {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "  %s %s\n", terminal.Purple(terminal.SymbolTarget), detail)
+	fmt.Fprintf(r.stderr(), "  %s %s\n", terminal.Purple(terminal.SymbolTarget), detail)
 }
 
 // printPhaseComplete prints a phase completion message with elapsed time.
@@ -249,7 +249,7 @@ func (r *Runner) printPhaseComplete(phase, detail string) {
 	if r.options.Silent {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "%s %s  %s\n", terminal.Aqua(terminal.SymbolSuccess), terminal.Aqua(phase), terminal.Muted(detail))
+	fmt.Fprintf(r.stderr(), "%s %s  %s\n", terminal.Aqua(terminal.SymbolSuccess), terminal.Aqua(phase), terminal.Muted(detail))
 }
 
 // printPhaseFeedback prints an informational feedback line during a phase.
@@ -257,7 +257,7 @@ func (r *Runner) printPhaseFeedback(phase, detail string) {
 	if r.options.Silent {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "%s %s  %s\n", terminal.Orange(terminal.SymbolStart), terminal.Orange(phase), terminal.Muted(detail))
+	fmt.Fprintf(r.stderr(), "%s %s  %s\n", terminal.Orange(terminal.SymbolStart), terminal.Orange(phase), terminal.Muted(detail))
 }
 
 // formatStatusCodeArray formats a [5]int status code array (1xx..5xx) with colors.
@@ -308,7 +308,7 @@ func (r *Runner) makeOnTraffic(phaseTag string) func(method, url string, statusC
 		}
 		seen[key] = struct{}{}
 		mu.Unlock()
-		printTrafficLine(phaseTag, method, url, statusCode, contentType)
+		printTrafficLine(r.stderr(), phaseTag, method, url, statusCode, contentType)
 	}
 }
 
@@ -320,8 +320,8 @@ func (r *Runner) makeOnTrafficVerbose(phaseTag string) func(method, url string, 
 }
 
 // printTrafficLine prints an HTTP traffic line to stderr with phase prefix and colors.
-func printTrafficLine(phaseTag, method, url string, statusCode int, contentType string) {
-	fmt.Fprint(os.Stderr, formatTrafficLine(phaseTag, method, url, statusCode, contentType))
+func printTrafficLine(w io.Writer, phaseTag, method, url string, statusCode int, contentType string) {
+	fmt.Fprint(w, formatTrafficLine(phaseTag, method, url, statusCode, contentType))
 }
 
 // formatTrafficLine returns the ANSI-colored traffic line used by
@@ -464,18 +464,18 @@ func (r *Runner) printScanConfig() {
 	opts := r.options
 	settings := r.settings
 
-	fmt.Fprintf(os.Stderr, "\n%s %s\n", terminal.Green(terminal.SymbolStart), terminal.BoldHiBlue("Scan Configuration"))
+	fmt.Fprintf(r.stderr(), "\n%s %s\n", terminal.Green(terminal.SymbolStart), terminal.BoldHiBlue("Scan Configuration"))
 	// In stateless mode the scan lives in a throwaway database, so the UUID
 	// can't be used to query results later — printing it is just noise.
 	if opts.ScanUUID != "" && !opts.Stateless {
-		fmt.Fprintf(os.Stderr, "  %s Scan ID: %s\n", terminal.Purple(terminal.SymbolInfo), terminal.HiTeal(opts.ScanUUID))
+		fmt.Fprintf(r.stderr(), "  %s Scan ID: %s\n", terminal.Purple(terminal.SymbolInfo), terminal.HiTeal(opts.ScanUUID))
 	}
 	if opts.Stateless {
 		statelessLine := "Stateless mode: using temporary database"
 		if opts.Verbose && settings.Database.SQLite.Path != "" {
 			statelessLine += " " + terminal.Gray("("+settings.Database.SQLite.Path+")")
 		}
-		fmt.Fprintf(os.Stderr, "  %s %s\n", terminal.Purple(terminal.SymbolInfo), statelessLine)
+		fmt.Fprintf(r.stderr(), "  %s %s\n", terminal.Purple(terminal.SymbolInfo), statelessLine)
 	}
 
 	// Only surface the project when it's a real, operator-chosen one. The
@@ -483,7 +483,7 @@ func (r *Runner) printScanConfig() {
 	// just clutters the header for the common single-project case — and in
 	// stateless mode the project lives in a throwaway database anyway.
 	if opts.ProjectUUID != "" && opts.ProjectUUID != database.DefaultProjectUUID && !opts.Stateless {
-		fmt.Fprintf(os.Stderr, "  %s Project: %s\n", terminal.Purple(terminal.SymbolInfo), terminal.HiTeal(opts.ProjectUUID))
+		fmt.Fprintf(r.stderr(), "  %s Project: %s\n", terminal.Purple(terminal.SymbolInfo), terminal.HiTeal(opts.ProjectUUID))
 	}
 
 	// The strategy ApplyScanStrategy resolved for this scan (a REST request's
@@ -495,10 +495,10 @@ func (r *Runner) printScanConfig() {
 	if strategy == "" {
 		strategy = "default"
 	}
-	fmt.Fprintf(os.Stderr, "  %s Strategy: %s\n", terminal.Purple(terminal.SymbolInfo), terminal.HiTeal(strategy))
+	fmt.Fprintf(r.stderr(), "  %s Strategy: %s\n", terminal.Purple(terminal.SymbolInfo), terminal.HiTeal(strategy))
 
 	if opts.ScanningProfile != "" {
-		fmt.Fprintf(os.Stderr, "  %s Profile: %s\n", terminal.Purple(terminal.SymbolInfo), terminal.HiTeal(opts.ScanningProfile))
+		fmt.Fprintf(r.stderr(), "  %s Profile: %s\n", terminal.Purple(terminal.SymbolInfo), terminal.HiTeal(opts.ScanningProfile))
 	}
 
 	// Targets
@@ -516,14 +516,14 @@ func (r *Runner) printScanConfig() {
 				terminal.Orange(fmt.Sprintf("%d", dbCount)))
 		}
 	}
-	fmt.Fprintf(os.Stderr, "  %s %s\n", terminal.Purple(terminal.SymbolTarget), targetsLine)
+	fmt.Fprintf(r.stderr(), "  %s %s\n", terminal.Purple(terminal.SymbolTarget), targetsLine)
 
-	fmt.Fprintf(os.Stderr, "  %s Phases: %s | %s | %s\n",
+	fmt.Fprintf(r.stderr(), "  %s Phases: %s | %s | %s\n",
 		terminal.Purple(terminal.SymbolInfo),
 		PhaseLabel(settings, "ExternalHarvest", "external_harvester", opts.ExternalHarvestEnabled, 0),
 		PhaseLabel(settings, "Spidering", "spidering", opts.SpideringEnabled, SpideringBudget(settings, opts)),
 		PhaseLabel(settings, "Discovery", "discovery", opts.DiscoverEnabled, DiscoveryBudget(settings, opts)))
-	fmt.Fprintf(os.Stderr, "           %s | %s\n",
+	fmt.Fprintf(r.stderr(), "           %s | %s\n",
 		PhaseLabel(settings, "KnownIssueScan", "known-issue-scan", opts.KnownIssueScanEnabled, 0),
 		PhaseLabel(settings, "DynamicAssessment", "dynamic-assessment", !opts.SkipDynamicAssessment, 0))
 
@@ -534,19 +534,19 @@ func (r *Runner) printScanConfig() {
 		"none":     "skip all heuristic probes, run all enabled phases unconditionally",
 	}
 	if desc, ok := heuristicsDesc[opts.HeuristicsCheck]; ok {
-		fmt.Fprintf(os.Stderr, "  %s Heuristics: %s %s\n",
+		fmt.Fprintf(r.stderr(), "  %s Heuristics: %s %s\n",
 			terminal.Purple(terminal.SymbolInfo),
 			terminal.HiTeal(opts.HeuristicsCheck),
 			terminal.Gray(desc))
 	} else if opts.HeuristicsCheck != "" {
-		fmt.Fprintf(os.Stderr, "  %s Heuristics: %s\n",
+		fmt.Fprintf(r.stderr(), "  %s Heuristics: %s\n",
 			terminal.Purple(terminal.SymbolInfo),
 			terminal.HiTeal(opts.HeuristicsCheck))
 	}
 
 	// Speed — same source as the limiter that enforces it (effectiveRateLimit).
 	rateLimit := effectiveRateLimit(opts)
-	fmt.Fprintf(os.Stderr, "  %s Speed: concurrency=%s | rate-limit=%s | max-per-host=%s\n",
+	fmt.Fprintf(r.stderr(), "  %s Speed: concurrency=%s | rate-limit=%s | max-per-host=%s\n",
 		terminal.Purple(terminal.SymbolInfo),
 		terminal.HiBlue(fmt.Sprintf("%d", opts.Concurrency)),
 		terminal.HiBlue(fmt.Sprintf("%d", rateLimit)),
@@ -564,19 +564,19 @@ func (r *Runner) printScanConfig() {
 	if desc, ok := originDesc[scopeOrigin]; ok {
 		originDescStr = " " + terminal.Gray(desc)
 	}
-	fmt.Fprintf(os.Stderr, "  %s Scope: origin=%s | ignore-static=%s%s\n",
+	fmt.Fprintf(r.stderr(), "  %s Scope: origin=%s | ignore-static=%s%s\n",
 		terminal.Purple(terminal.SymbolInfo),
 		terminal.HiPurple(scopeOrigin),
 		terminal.HiPurple(fmt.Sprintf("%v", settings.Scope.IgnoreStaticFile)),
 		originDescStr)
 	if pol := opts.TrafficPolicy; pol != nil && len(pol.AllowedMethods) > 0 {
-		fmt.Fprintf(os.Stderr, "  %s Methods: %s%s\n",
+		fmt.Fprintf(r.stderr(), "  %s Methods: %s%s\n",
 			terminal.Purple(terminal.SymbolInfo),
 			terminal.HiPurple(strings.Join(settings.Scope.Methods, ",")),
 			terminal.Gray(map[bool]string{true: " (read-only: no form submission, logins or uploads)", false: ""}[pol.ReadOnly()]))
 	}
 	if r.offline() {
-		fmt.Fprintf(os.Stderr, "  %s Offline: %s\n",
+		fmt.Fprintf(r.stderr(), "  %s Offline: %s\n",
 			terminal.Purple(terminal.SymbolInfo),
 			terminal.Gray("no OAST, external lookups, template or browser downloads, or update checks"))
 	}
@@ -593,7 +593,7 @@ func (r *Runner) printScanConfig() {
 	if hygieneNote != "" {
 		hygieneNote = " " + hygieneNote
 	}
-	fmt.Fprintf(os.Stderr, "  %s Modules: %s active, %s passive%s\n",
+	fmt.Fprintf(r.stderr(), "  %s Modules: %s active, %s passive%s\n",
 		terminal.Purple(terminal.SymbolInfo),
 		terminal.Orange(fmt.Sprintf("%d", activeCount)),
 		terminal.Orange(fmt.Sprintf("%d", passiveCount)),
@@ -605,18 +605,18 @@ func (r *Runner) printScanConfig() {
 		// No count here: the extension engine is built later, in
 		// buildInfrastructure, so a "N loaded" figure printed now could only
 		// ever have said 0.
-		fmt.Fprintf(os.Stderr, "  %s Extensions: %s\n",
+		fmt.Fprintf(r.stderr(), "  %s Extensions: %s\n",
 			terminal.Purple(terminal.SymbolInfo),
 			terminal.HiGreen("enabled"))
 	} else {
-		fmt.Fprintf(os.Stderr, "  %s Extensions: %s\n",
+		fmt.Fprintf(r.stderr(), "  %s Extensions: %s\n",
 			terminal.Purple(terminal.SymbolInfo),
 			terminal.Gray("disabled"))
 	}
 
 	// Session authentication
 	printSessionAuth := func(detail string) {
-		fmt.Fprintf(os.Stderr, "  %s Session auth: %s %s\n",
+		fmt.Fprintf(r.stderr(), "  %s Session auth: %s %s\n",
 			terminal.Purple(terminal.SymbolInfo),
 			terminal.HiGreen("enabled"),
 			terminal.Gray(detail))
@@ -630,7 +630,7 @@ func (r *Runner) printScanConfig() {
 	case totalAuth > 1:
 		printSessionAuth(fmt.Sprintf("from %d auth source(s)", totalAuth))
 	case opts.NoAuth:
-		fmt.Fprintf(os.Stderr, "  %s Session auth: %s\n",
+		fmt.Fprintf(r.stderr(), "  %s Session auth: %s\n",
 			terminal.Purple(terminal.SymbolInfo),
 			terminal.Gray("none (--no-auth)"))
 	default:
@@ -640,7 +640,7 @@ func (r *Runner) printScanConfig() {
 			printSessionAuth(fmt.Sprintf("from the database: %s (--no-auth to scan without)", sessionNames(stored)))
 			return
 		}
-		fmt.Fprintf(os.Stderr, "  %s Session auth: %s\n",
+		fmt.Fprintf(r.stderr(), "  %s Session auth: %s\n",
 			terminal.Purple(terminal.SymbolInfo),
 			terminal.Gray("none"))
 	}
@@ -717,10 +717,10 @@ func (r *Runner) printVerboseTargets(targets []string) {
 		limit = len(targets)
 	}
 	for _, t := range targets[:limit] {
-		fmt.Fprintf(os.Stderr, "    %s %s\n", terminal.Muted(terminal.SymbolChevron), terminal.Muted(t))
+		fmt.Fprintf(r.stderr(), "    %s %s\n", terminal.Muted(terminal.SymbolChevron), terminal.Muted(t))
 	}
 	if len(targets) > 10 {
-		fmt.Fprintf(os.Stderr, "    %s\n", terminal.Muted(fmt.Sprintf("... and %d more", len(targets)-10)))
+		fmt.Fprintf(r.stderr(), "    %s\n", terminal.Muted(fmt.Sprintf("... and %d more", len(targets)-10)))
 	}
 }
 

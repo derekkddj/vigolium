@@ -75,6 +75,44 @@ func (r *Repository) UpdateScanHeartbeat(ctx context.Context, scanUUID string, h
 	return true, stop, nil
 }
 
+// ResumeNativeScan reopens a terminal native scan for --resume-scan, consuming
+// only the previous run's durable STOP. The caller supplies a database-loaded
+// row whose ownership and resume compatibility it has checked. Unlike ResumeScan
+// (unpausing the SAME run), this starts a new invocation over the saved ledger.
+//
+// Status, captured project, and edit time are compared in one UPDATE, so another
+// resume or reassignment wins rather than being overwritten. Clearing both STOP
+// columns in that SAME transition is essential: a STOP requested once the row
+// becomes running belongs to the new invocation and must never be cleared by a
+// subsequent write. All evidence, cursor, coverage, and outcome columns survive.
+// resumed is false for a nonterminal, missing, or concurrently changed row.
+func (r *Repository) ResumeNativeScan(ctx context.Context, scan *Scan) (resumed bool, err error) {
+	if scan == nil {
+		return false, nil
+	}
+	switch scan.Status {
+	case "completed", "failed", "cancelled":
+	default:
+		return false, nil
+	}
+	q := r.db.NewUpdate().
+		Model((*Scan)(nil)).
+		Set("status = ?", "running").
+		Set("stop_requested_at = NULL").
+		Set("stop_requested_by = NULL").
+		Set("updated_at = ?", time.Now().UTC()).
+		Where("uuid = ?", scan.UUID).
+		Where("project_uuid = ?", scan.ProjectUUID).
+		Where("status = ?", scan.Status)
+	q = scanLivenessTimeEqual(q, r.db.Driver(), "updated_at", scan.UpdatedAt)
+	res, err := q.Exec(ctx)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
 // LastScanLogTimes returns, per scan, the newest scan_logs.created_at — one
 // GROUP BY over every listed scan, for liveness readers that list many scans at
 // once. Scans with no log lines are absent from the map.

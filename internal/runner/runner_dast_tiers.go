@@ -2,10 +2,12 @@ package runner
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"sort"
 	"time"
 
+	"github.com/vigolium/vigolium/pkg/apicontract"
 	"github.com/vigolium/vigolium/pkg/core"
 	"github.com/vigolium/vigolium/pkg/core/stats"
 	"github.com/vigolium/vigolium/pkg/database"
@@ -202,16 +204,30 @@ func mergeModuleMetrics(a, b map[string]stats.ModuleStatsSnapshot) map[string]st
 	return out
 }
 
-// resumeScanRow re-opens an existing scan row for --resume-scan: it must exist
-// in this scan's project (lookupResumeScan); its status goes back to running.
+// resumeScanRow re-opens a terminal row for --resume-scan in its captured
+// project. The old durable STOP is consumed atomically with the transition;
+// live rows (including another resume's winner) must never lose their STOP.
 func (r *Runner) resumeScanRow(ctx context.Context, scanUUID string) error {
-	if _, err := r.lookupResumeScan(ctx, scanUUID); err != nil {
+	scan, err := r.lookupResumeScan(ctx, scanUUID)
+	if err != nil {
 		return err
 	}
-	_, err := r.repository.DB().NewUpdate().Model((*database.Scan)(nil)).
-		Set("status = ?", "running").
-		Set("updated_at = CURRENT_TIMESTAMP").
-		Where("uuid = ?", scanUUID).
-		Exec(ctx)
-	return err
+	switch scan.Status {
+	case "completed", "failed", "cancelled":
+	default:
+		return &ResumeError{ScanUUID: scanUUID, Kind: apicontract.CodeScanRunning,
+			Message: fmt.Sprintf("--resume-scan %s: the scan is not terminal (status %s); stop or reap it before resuming", scanUUID, scan.Status)}
+	}
+	if err := r.checkResumeCompatibility(scan); err != nil {
+		return err
+	}
+	resumed, err := r.repository.ResumeNativeScan(ctx, scan)
+	if err != nil {
+		return err
+	}
+	if !resumed {
+		return &ResumeError{ScanUUID: scanUUID, Kind: apicontract.CodeConflict,
+			Message: fmt.Sprintf("--resume-scan %s: the scan changed while resuming; reload its status before retrying", scanUUID)}
+	}
+	return nil
 }

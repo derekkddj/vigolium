@@ -459,6 +459,7 @@ func (r *Runner) buildSpiderConfig(target string, settingsCfg config.SpideringCo
 	browserCookies, browserHeaders := browserAuthFromHeaders(r.options.Headers)
 
 	cfg := spitolas.SpiderConfig{
+		Console:             r.stderr(),
 		TargetURL:           target,
 		MaxDepth:            settingsCfg.MaxDepth,
 		MaxStates:           settingsCfg.MaxStates,

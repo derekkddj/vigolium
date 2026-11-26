@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	neturl "net/url"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -106,7 +105,7 @@ func (r *Runner) runHeuristicsCheckPhase(ctx context.Context, infra *phaseInfra)
 				zap.String("target", target),
 				zap.String("class", result.ErrClass))
 			if !r.options.Silent && !result.fromPreflight {
-				fmt.Fprintf(os.Stderr, "  %s %s — %s\n",
+				fmt.Fprintf(r.stderr(), "  %s %s — %s\n",
 					terminal.Orange(terminal.SymbolArrow),
 					terminal.Gray(target),
 					terminal.Orange(result.Reason))
@@ -119,7 +118,7 @@ func (r *Runner) runHeuristicsCheckPhase(ctx context.Context, infra *phaseInfra)
 				zap.String("reason", result.Reason),
 				zap.String("content_type", result.ContentType))
 			if !r.options.Silent {
-				fmt.Fprintf(os.Stderr, "  %s %s — %s\n",
+				fmt.Fprintf(r.stderr(), "  %s %s — %s\n",
 					terminal.Orange(terminal.SymbolArrow),
 					terminal.Gray(target),
 					terminal.Orange(result.Reason))
@@ -129,7 +128,7 @@ func (r *Runner) runHeuristicsCheckPhase(ctx context.Context, infra *phaseInfra)
 				zap.String("target", target),
 				zap.String("content_type", result.ContentType))
 			if r.options.Verbose && !r.options.Silent {
-				fmt.Fprintf(os.Stderr, "  %s HeuristicsCheck: target passed | Target: %s | Content-Type: %s\n",
+				fmt.Fprintf(r.stderr(), "  %s HeuristicsCheck: target passed | Target: %s | Content-Type: %s\n",
 					terminal.Purple(terminal.SymbolInfo),
 					terminal.Orange(target),
 					terminal.Orange(result.ContentType))

@@ -39,9 +39,15 @@ func newLiveApp(t *testing.T) *liveApp {
 			a.current.Store(n)
 			http.SetCookie(w, &http.Cookie{Name: "sid", Value: fmt.Sprint(n), Path: "/"})
 		default:
-			a.mu.Lock()
-			a.cookies = append(a.cookies, r.Header.Get("Cookie"))
-			a.mu.Unlock()
+			// Record only the requests the tests send. A 401 makes the live
+			// session confirm on its own goroutine with a /me check, which
+			// can land after the test's request; recording it would make
+			// lastCookie() report the session's cookie instead.
+			if r.URL.Path != "/me" {
+				a.mu.Lock()
+				a.cookies = append(a.cookies, r.Header.Get("Cookie"))
+				a.mu.Unlock()
+			}
 			if r.Header.Get("Cookie") != fmt.Sprintf("sid=%d", a.current.Load()) {
 				w.WriteHeader(http.StatusUnauthorized)
 				return

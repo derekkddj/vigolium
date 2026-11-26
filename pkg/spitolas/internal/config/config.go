@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/vigolium/vigolium/pkg/deparos/waf"
 	"github.com/vigolium/vigolium/pkg/safety"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -496,6 +497,9 @@ type Config struct {
 
 	// NoColor mode - disable colored output
 	NoColor bool
+
+	// Console receives the live traffic log (nil = process stderr).
+	Console io.Writer
 }
 
 // DefaultIdentityEmailDomain is the default generated-email domain: reserved by

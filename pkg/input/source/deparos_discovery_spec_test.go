@@ -3,6 +3,7 @@ package source
 import (
 	"context"
 	"fmt"
+	"io"
 	"sync"
 	"testing"
 
@@ -104,7 +105,7 @@ func crawledSpecRecord() *httpmsg.HttpRequestResponse {
 // executor backfill depends on: spec-derived endpoints come out as request-only
 // stubs (no response), so they must later be fetched + backfilled to show traffic.
 func TestExtractSpecEndpoints_ProducesRequestOnlyStubs(t *testing.T) {
-	endpoints := extractSpecEndpointsSeen([]*httpmsg.HttpRequestResponse{crawledSpecRecord()}, map[string]struct{}{})
+	endpoints := extractSpecEndpointsSeen(io.Discard, []*httpmsg.HttpRequestResponse{crawledSpecRecord()}, map[string]struct{}{})
 
 	assert.NotEmpty(t, endpoints, "a discovered OpenAPI spec must yield endpoints")
 	for i, rr := range endpoints {
@@ -122,7 +123,7 @@ func TestSaveAndEmit_TagsRecordsWithSource(t *testing.T) {
 	ctx := context.Background()
 
 	crawled := []*httpmsg.HttpRequestResponse{crawledSpecRecord()}
-	specEndpoints := extractSpecEndpointsSeen(crawled, map[string]struct{}{})
+	specEndpoints := extractSpecEndpointsSeen(io.Discard, crawled, map[string]struct{}{})
 	if len(specEndpoints) == 0 {
 		t.Fatal("expected spec endpoints from the fixture")
 	}

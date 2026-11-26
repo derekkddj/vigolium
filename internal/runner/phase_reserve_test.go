@@ -92,3 +92,34 @@ func TestReserveAfterOnlyCountsPlannedPhases(t *testing.T) {
 		t.Fatalf("spidering with nothing planned after it got %v of a 10s budget", time.Until(dl))
 	}
 }
+
+// Discovery bounds itself by its own ceiling, and under a total scan budget it
+// must also leave the reserves of the phases after it, like every other phase.
+// It used a plain context.WithTimeout, so it could spend the whole remaining
+// budget: on a 1h scan discovery ran its full 30m after a 23m crawl and the
+// known-issue scan got 12 seconds.
+func TestDiscoveryPhaseContextKeepsLaterPhasesReserve(t *testing.T) {
+	r := &Runner{
+		options:  &types.Options{KnownIssueScanEnabled: true, DiscoverMaxDuration: 30 * time.Minute},
+		settings: &config.Settings{ScanningPace: *config.DefaultScanningPaceConfig()},
+	}
+	parent, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ctx, c, ok := r.discoveryPhaseContext(parent, 1)
+	defer c()
+	if !ok {
+		t.Fatal("discovery must be bounded")
+	}
+	dl, _ := ctx.Deadline()
+	if left := time.Until(dl); left > 4500*time.Millisecond || left < 3*time.Second {
+		t.Fatalf("discovery got %v of a 10s budget with 60%% reserved for later phases, want ~4s", left)
+	}
+
+	// Without a total budget the phase keeps its own ceiling.
+	ctx2, c2, ok := r.discoveryPhaseContext(context.Background(), 1)
+	defer c2()
+	if dl, has := ctx2.Deadline(); !ok || !has || time.Until(dl) < 29*time.Minute {
+		t.Fatalf("no total budget: discovery must keep its own ~30m ceiling, got ok=%v deadline=%v", ok, has)
+	}
+}

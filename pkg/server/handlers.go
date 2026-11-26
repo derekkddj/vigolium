@@ -117,6 +117,10 @@ type Handlers struct {
 	queue queue.Queue
 	db    *database.DB
 	repo  *database.Repository
+	// databaseRequired remembers the construction-time dependency even if an
+	// invalid db/repo pairing is normalized to nil. DB-less library/test handlers
+	// remain supported when no database dependency was configured or supplied.
+	databaseRequired bool
 	// readDB/readRepo are the read-intent pool list/get handlers use (see
 	// db_read.go); nil when db serves reads itself.
 	readDB        *database.DB
@@ -234,6 +238,8 @@ func NewHandlers(q queue.Queue, db *database.DB, repo *database.Repository, rw *
 		lightMax = 10
 	}
 
+	databaseRequired := db != nil || (settings != nil && settings.Database.Enabled)
+
 	// Invariant: a repository is always derived from a db (NewRepository(db)), so a
 	// non-nil db paired with a nil repo is a half-initialized state — e.g. the
 	// connection opened but schema creation failed. Repo-backed handlers guard only
@@ -241,9 +247,10 @@ func NewHandlers(q queue.Queue, db *database.DB, repo *database.Repository, rw *
 	// each into a nil-pointer panic (HTTP 500). NewHandlers is the single path every
 	// server (CLI, tests, any future entry point) is constructed through, so this is
 	// the universal place to normalize the pairing: drop to a consistent no-DB mode
-	// by nil-ing db, and the h.db == nil guards then return a clean 503. The reverse
-	// pairing (db == nil, repo != nil) is a legitimate, tested config (repo-backed
-	// agent endpoints with no traffic DB) and is deliberately left untouched.
+	// by nil-ing db, and the h.db == nil guards then return a clean 503. Readiness
+	// retains the original database dependency rather than calling this ready.
+	// The reverse pairing (db == nil, repo != nil) is a legitimate, tested config
+	// (repo-backed agent endpoints with no traffic DB) and is left untouched.
 	if db != nil && repo == nil {
 		zap.L().Warn("database handle present without a repository; disabling database-backed endpoints")
 		db = nil
@@ -255,6 +262,7 @@ func NewHandlers(q queue.Queue, db *database.DB, repo *database.Repository, rw *
 		queue:              q,
 		db:                 db,
 		repo:               repo,
+		databaseRequired:   databaseRequired,
 		recordWriter:       rw,
 		config:             cfg,
 		settings:           settings,
@@ -327,9 +335,11 @@ func (h *Handlers) HandleHealth(c fiber.Ctx) error {
 
 // HandleReady handles GET /ready — a readiness probe distinct from liveness. It
 // reports 200 only when the server can actually serve work: the database
-// responds to a lightweight ping within a short timeout and the record writer is
-// still accepting writes. Otherwise it returns 503 so an orchestrator routes
-// traffic elsewhere without killing the (live) process.
+// responds to a lightweight ping within a short timeout and any configured
+// record writer still accepts admission. A missing configured
+// database is not ready; intentionally DB-less library/test handlers have no
+// such dependency. Otherwise it returns 503 so an orchestrator routes traffic
+// elsewhere without killing the (live) process.
 func (h *Handlers) HandleReady(c fiber.Ctx) error {
 	notReady := func(reason string) error {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
@@ -339,12 +349,18 @@ func (h *Handlers) HandleReady(c fiber.Ctx) error {
 		})
 	}
 
+	if h.db == nil && h.databaseRequired {
+		return notReady("database unavailable: database not initialized")
+	}
 	if h.db != nil {
 		ctx, cancel := context.WithTimeout(c.Context(), 2*time.Second)
 		defer cancel()
 		if err := h.db.SQLDB().PingContext(ctx); err != nil {
 			return notReady("database unavailable: " + err.Error())
 		}
+	}
+	if h.recordWriter != nil && !h.recordWriter.Accepting() {
+		return notReady("record writer is not accepting writes")
 	}
 
 	return c.JSON(fiber.Map{

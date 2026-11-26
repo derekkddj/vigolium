@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/uptrace/bun"
 	"github.com/vigolium/vigolium/pkg/evidence"
 )
 
@@ -435,5 +438,230 @@ func scenarioReapTimestampRepresentations(t *testing.T, db *DB) {
 func TestReapAbandonedScanNil(t *testing.T) {
 	if ok, err := NewRepository(newTestDB(t)).ReapAbandonedScan(context.Background(), nil, time.Time{}); err != nil || ok {
 		t.Fatalf("nil reap = %v, %v; want false, nil", ok, err)
+	}
+}
+
+var resumeNativeScanScenarios = []struct {
+	name string
+	run  func(*testing.T, *DB)
+}{
+	{"ClearsStopAndPreservesData", scenarioResumeNativeScanPreservesData},
+	{"CapturedRowChanged", scenarioResumeNativeScanChangedRow},
+	{"StopAfterTransition", scenarioResumeNativeScanStopAfterTransition},
+	{"ConcurrentResumes", scenarioResumeNativeScanConcurrent},
+}
+
+func TestResumeNativeScan(t *testing.T) {
+	for _, sc := range resumeNativeScanScenarios {
+		t.Run(sc.name, func(t *testing.T) { sc.run(t, newTestDB(t)) })
+	}
+}
+
+func TestPg_ResumeNativeScan(t *testing.T) {
+	for _, sc := range resumeNativeScanScenarios {
+		t.Run(sc.name, func(t *testing.T) { sc.run(t, openPGTestDB(t)) })
+	}
+}
+
+func capturedStoppedScan(t *testing.T, repo *Repository, status string) *Scan {
+	t.Helper()
+	ctx := context.Background()
+	scan := capturedReaperScan(t, repo) // Rich fixture: every preserved column is checked below.
+	if ok, err := repo.RequestScanStop(ctx, scan.UUID, "cli:old-stop"); err != nil || !ok {
+		t.Fatalf("fixture STOP = %v, %v", ok, err)
+	}
+	if _, err := repo.DB().NewUpdate().Model((*Scan)(nil)).
+		Set("status = ?", status).Set("finished_at = ?", scan.StartedAt.Add(3*time.Minute)).
+		Where("uuid = ?", scan.UUID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return loadReaperScan(t, repo, scan.UUID)
+}
+
+func scenarioResumeNativeScanPreservesData(t *testing.T, db *DB) {
+	ctx := context.Background()
+	repo := NewRepository(db)
+	for _, status := range []string{"completed", "failed", "cancelled"} {
+		t.Run(status, func(t *testing.T) {
+			before := capturedStoppedScan(t, repo, status)
+			if ok, err := repo.ResumeNativeScan(ctx, before); err != nil || !ok {
+				t.Fatalf("resume = %v, %v; want true, nil", ok, err)
+			}
+			after := loadReaperScan(t, repo, before.UUID)
+			want := *before
+			want.Status = "running"
+			if !after.UpdatedAt.After(before.UpdatedAt) {
+				t.Errorf("updated_at = %v, want after %v", after.UpdatedAt, before.UpdatedAt)
+			}
+			want.UpdatedAt = after.UpdatedAt
+			if !reflect.DeepEqual(&want, after) {
+				t.Fatalf("resume changed preserved columns: got=%+v want=%+v", after, &want)
+			}
+			var stopColumns struct {
+				At *time.Time `bun:"stop_requested_at"`
+				By *string    `bun:"stop_requested_by"`
+			}
+			if err := db.NewSelect().TableExpr("scans").ColumnExpr("stop_requested_at, stop_requested_by").
+				Where("uuid = ?", before.UUID).Scan(ctx, &stopColumns); err != nil {
+				t.Fatal(err)
+			}
+			if stopColumns.At != nil || stopColumns.By != nil {
+				t.Fatalf("resume did not clear BOTH STOP columns: %+v", stopColumns)
+			}
+			if ok, req, err := repo.UpdateScanHeartbeat(ctx, before.UUID, ScanHeartbeat{ProjectUUID: before.ProjectUUID, At: time.Now()}); err != nil || !ok || req != nil {
+				t.Fatalf("resumed heartbeat = %v, %+v, %v", ok, req, err)
+			}
+		})
+	}
+}
+
+func scenarioResumeNativeScanChangedRow(t *testing.T, db *DB) {
+	ctx := context.Background()
+	repo := NewRepository(db)
+	for _, change := range []struct {
+		name string
+		set  string
+	}{
+		{"ReassignedProject", "project_uuid = 'other-project'"},
+		{"Running", "status = 'running'"},
+		{"Paused", "status = 'paused'"},
+		{"TerminalStatusChanged", "status = 'completed'"},
+		{"Edited", "updated_at = '2026-11-06 01:03:04.123400'"},
+		{"Deleted", ""},
+	} {
+		t.Run(change.name, func(t *testing.T) {
+			captured := capturedStoppedScan(t, repo, "cancelled")
+			if change.set == "" {
+				if _, err := db.NewDelete().Model((*Scan)(nil)).Where("uuid = ?", captured.UUID).Exec(ctx); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := db.NewUpdate().Model((*Scan)(nil)).Set(change.set).Where("uuid = ?", captured.UUID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var current *Scan
+			if change.set != "" {
+				current = loadReaperScan(t, repo, captured.UUID)
+			}
+			stopBefore, err := repo.ScanStopRequested(ctx, captured.UUID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ok, err := repo.ResumeNativeScan(ctx, captured); err != nil || ok {
+				t.Fatalf("resume stale capture = %v, %v; want false, nil", ok, err)
+			}
+			if current != nil && !reflect.DeepEqual(current, loadReaperScan(t, repo, captured.UUID)) {
+				t.Fatal("resume overwrote a concurrently changed row")
+			}
+			if stopAfter, err := repo.ScanStopRequested(ctx, captured.UUID); err != nil || !reflect.DeepEqual(stopBefore, stopAfter) {
+				t.Fatalf("refused resume changed STOP: before=%+v after=%+v err=%v", stopBefore, stopAfter, err)
+			}
+		})
+	}
+	for _, status := range []string{"running", "paused", "queued", ""} {
+		t.Run("CapturedNonterminal-"+status, func(t *testing.T) {
+			captured := capturedStoppedScan(t, repo, status)
+			stopBefore, err := repo.ScanStopRequested(ctx, captured.UUID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ok, err := repo.ResumeNativeScan(ctx, captured); err != nil || ok {
+				t.Fatalf("nonterminal %q resume = %v, %v", status, ok, err)
+			}
+			if !reflect.DeepEqual(captured, loadReaperScan(t, repo, captured.UUID)) {
+				t.Fatal("resume changed a live/nonterminal row")
+			}
+			if stopAfter, err := repo.ScanStopRequested(ctx, captured.UUID); err != nil || !reflect.DeepEqual(stopBefore, stopAfter) {
+				t.Fatalf("resume changed a live STOP: %+v, %v", stopAfter, err)
+			}
+		})
+	}
+	if ok, err := repo.ResumeNativeScan(ctx, nil); err != nil || ok {
+		t.Fatalf("nil resume = %v, %v", ok, err)
+	}
+}
+
+// The hook interleaves a fresh STOP after the transition commits, BEFORE the
+// resume method returns. It also catches splitting status and STOP resets into
+// separate statements, without sleeps or scheduler-dependent timing.
+type resumeStopHook struct {
+	repo    *Repository
+	uuid    string
+	fired   atomic.Bool
+	query   string
+	stopErr error
+	stopped bool
+}
+
+func (h *resumeStopHook) BeforeQuery(ctx context.Context, _ *bun.QueryEvent) context.Context {
+	return ctx
+}
+
+func (h *resumeStopHook) AfterQuery(ctx context.Context, event *bun.QueryEvent) {
+	if event.Err != nil || !strings.HasPrefix(event.Query, "UPDATE ") ||
+		!strings.Contains(event.Query, "status = 'running'") || !h.fired.CompareAndSwap(false, true) {
+		return
+	}
+	h.query = event.Query
+	h.stopped, h.stopErr = h.repo.RequestScanStop(ctx, h.uuid, "rest:after-transition")
+}
+
+func scenarioResumeNativeScanStopAfterTransition(t *testing.T, db *DB) {
+	ctx := context.Background()
+	repo := NewRepository(db)
+	captured := capturedStoppedScan(t, repo, "cancelled")
+	hook := &resumeStopHook{repo: repo, uuid: captured.UUID}
+	db.AddQueryHook(hook)
+	if ok, err := repo.ResumeNativeScan(ctx, captured); err != nil || !ok {
+		t.Fatalf("resume = %v, %v", ok, err)
+	}
+	if !hook.fired.Load() || hook.stopErr != nil || !hook.stopped {
+		t.Fatalf("STOP at transition boundary = fired %v, stopped %v, err %v", hook.fired.Load(), hook.stopped, hook.stopErr)
+	}
+	if !strings.Contains(hook.query, "stop_requested_at = NULL") || !strings.Contains(hook.query, "stop_requested_by = NULL") {
+		t.Fatalf("transition and STOP reset must be ONE statement: %s", hook.query)
+	}
+	newStop, err := repo.ScanStopRequested(ctx, captured.UUID)
+	if err != nil || newStop == nil || newStop.By != "rest:after-transition" {
+		t.Fatalf("STOP after transition was lost: %+v, %v", newStop, err)
+	}
+	// The losing resume must not clear the winner's newly received STOP.
+	if ok, err := repo.ResumeNativeScan(ctx, captured); err != nil || ok {
+		t.Fatalf("stale second resume = %v, %v", ok, err)
+	}
+	if ok, req, err := repo.UpdateScanHeartbeat(ctx, captured.UUID, ScanHeartbeat{ProjectUUID: captured.ProjectUUID, At: time.Now()}); err != nil || !ok || !reflect.DeepEqual(newStop, req) {
+		t.Fatalf("heartbeat lost fresh STOP: %v, %+v, %v", ok, req, err)
+	}
+}
+
+func scenarioResumeNativeScanConcurrent(t *testing.T, db *DB) {
+	ctx := context.Background()
+	repo := NewRepository(db)
+	captured := capturedStoppedScan(t, repo, "cancelled")
+	start := make(chan struct{})
+	type result struct {
+		ok  bool
+		err error
+	}
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			<-start
+			ok, err := repo.ResumeNativeScan(ctx, captured)
+			results <- result{ok, err}
+		}()
+	}
+	close(start)
+	winners := 0
+	for range 2 {
+		res := <-results
+		if res.err != nil {
+			t.Fatal(res.err)
+		}
+		if res.ok {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("concurrent resumes had %d winners, want exactly one", winners)
 	}
 }

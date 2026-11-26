@@ -2,6 +2,7 @@ package network
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -68,7 +69,10 @@ func statusColor(status int) string {
 // printLog prints HTTP request log to stderr with optional color.
 // When phaseTag is non-empty, each line is prefixed with a dim phase label and pipe.
 // Thread-safe: fmt.Fprintf to stderr is atomic for single lines (< PIPE_BUF).
-func printLog(entry *TrafficEntry, noColor bool, phaseTag string) {
+func printLog(w io.Writer, entry *TrafficEntry, noColor bool, phaseTag string) {
+	if w == nil {
+		w = os.Stderr
+	}
 	var status string
 	var sColor string
 
@@ -115,9 +119,9 @@ func printLog(entry *TrafficEntry, noColor bool, phaseTag string) {
 	}
 
 	if noColor {
-		fmt.Fprintf(os.Stderr, "%s[%s] %s %s %s\n", prefix, status, method, contentType, url)
+		fmt.Fprintf(w, "%s[%s] %s %s %s\n", prefix, status, method, contentType, url)
 	} else {
-		fmt.Fprintf(os.Stderr, "%s%s[%s]%s %s%s%s %s%s%s %s\n",
+		fmt.Fprintf(w, "%s%s[%s]%s %s%s%s %s%s%s %s\n",
 			prefix,
 			sColor, status, colorReset,
 			mColor, method, colorReset,

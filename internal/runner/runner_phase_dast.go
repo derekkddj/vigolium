@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -107,7 +106,7 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 	}
 	r.printPhaseDetail(fmt.Sprintf("Feedback rounds: %s", terminal.HiBlue(fmt.Sprintf("%d", feedbackRounds))))
 	if feedbackRounds <= 1 && !r.options.Silent {
-		fmt.Fprintf(os.Stderr, "  %s %s %s\n",
+		fmt.Fprintf(r.stderr(), "  %s %s %s\n",
 			terminal.TipPrefix(), terminal.Gray("increase feedback rounds to re-scan newly discovered URLs via"), terminal.HiCyan("vigolium config set dynamic-assessment.max_feedback_rounds 3"))
 	}
 
@@ -353,7 +352,7 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 				terminal.Muted("(skips incompatible modules unless --no-tech-filter)"))
 			r.writeSessionLog(line)
 			if !r.options.Silent {
-				fmt.Fprint(os.Stderr, line)
+				fmt.Fprint(r.stderr(), line)
 			}
 		},
 		// Phase-level ctx already carries the dynamic-assessment deadline; leaving this at 0
@@ -387,7 +386,7 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 			// timedOut is phase-cumulative (shared across feedback rounds); the
 			// helper appends it to the breakdown only when > 0.
 			modulesStr := terminal.FormatModuleProgress(distinctModules, totalModules, activeCount, passiveCount, timedOut)
-			fmt.Fprintf(os.Stderr, "%s %s Records: %s | Findings: %s | Modules: %s | Runtime: %s\n",
+			fmt.Fprintf(r.stderr(), "%s %s Records: %s | Findings: %s | Modules: %s | Runtime: %s\n",
 				prefix,
 				terminal.BoldCyan("[status]"),
 				terminal.HiBlue(recordsStr),
@@ -441,7 +440,7 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 			line := formatTrafficLine("scan-on-receive", method, url, statusCode, contentType)
 			r.writeSessionLog(line)
 			if !r.options.Silent {
-				fmt.Fprint(os.Stderr, line)
+				fmt.Fprint(r.stderr(), line)
 			}
 		}
 		sorCfg.OnResult = func(result *output.ResultEvent) {
@@ -459,7 +458,7 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 				terminal.Gray(result.URL))
 			r.writeSessionLog(line)
 			if !r.options.Silent {
-				fmt.Fprint(os.Stderr, line)
+				fmt.Fprint(r.stderr(), line)
 			}
 		}
 		shortScanID := strings.TrimPrefix(infra.scanUUID, "scan-")
@@ -513,7 +512,7 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 				// ingested request was picked up for scanning. Without this the
 				// ingest HTTP log is the only signal, and the 2-min status tick
 				// is too late.
-				fmt.Fprint(os.Stderr, line)
+				fmt.Fprint(r.stderr(), line)
 			})
 
 		// Forward-declared so OnStatus can query the executor's in-flight counter.
@@ -600,7 +599,7 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 			}
 
 			prefix := terminal.Muted(terminal.SymbolChevron + " scan-on-receive " + terminal.SymbolPipe)
-			fmt.Fprintf(os.Stderr, "%s %s %s Processed Records: %s | Findings: %s | Modules: %s | Runtime: %s%s\n",
+			fmt.Fprintf(r.stderr(), "%s %s %s Processed Records: %s | Findings: %s | Modules: %s | Runtime: %s%s\n",
 				prefix,
 				terminal.BoldCyan("[status]"),
 				terminal.Cyan("scan-"+shortScanID),
@@ -746,9 +745,9 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 		if round == feedbackRounds-1 {
 			newCount, countErr := r.countRemainingDynamicAssessmentRecords(ctx, infra.scanUUID, inScopeHosts)
 			if countErr == nil && newCount > 0 {
-				fmt.Fprintf(os.Stderr, "  %s %s %s\n",
+				fmt.Fprintf(r.stderr(), "  %s %s %s\n",
 					terminal.TipPrefix(), terminal.Orange(fmt.Sprintf("%d", newCount)), terminal.Gray(fmt.Sprintf("new records discovered but skipped (max_feedback_rounds=%d)", feedbackRounds)))
-				fmt.Fprintf(os.Stderr, "  %s %s %s\n",
+				fmt.Fprintf(r.stderr(), "  %s %s %s\n",
 					terminal.TipPrefix(), terminal.Gray("enable multi-round scanning via"), terminal.Cyan("vigolium config set dynamic-assessment.max_feedback_rounds 3"))
 			}
 		}
