@@ -399,6 +399,7 @@ Branch on the code, then run the command in the right column (read
 | `source_missing` / `source_unreadable` / `source_incompatible` | 1 | see [Source codes](#source-codes) below; never fall back to another store |
 | `database_locked` | 1 | another writer holds the store: wait for it (`vigolium scan ls -j`), or read with `--read-only` |
 | `schema_outdated` | 1 | `vigolium db migrate` (not under `--read-only`) |
+| `schema_lineage_requires_conversion` | 1 | stop: ordinary `vigolium db migrate` is unsafe for this lineage; preserve the source and use an explicitly validated distinct-output conversion workflow |
 | `schema_too_new` | 1 | the store was written by a newer vigolium: upgrade the binary |
 | `project_not_found` / `invalid_project_uuid` | 1 | `vigolium project list -j`, then pin a real one; `vigolium project create <name>` to make it |
 | `record_not_found` / `ambiguous_id` | 1 | `vigolium traffic --compact --fields uuid_short,url -j`; give a longer prefix |

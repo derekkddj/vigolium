@@ -84,9 +84,24 @@ func columnMigrationDDL(m columnMigration) string {
 	return fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", m.Table, m.Column, m.Def)
 }
 
-// schemaDDLStatements renders, for driver, every DDL statement CreateSchema
-// issues, in the order it issues them: tables, column migrations, indexes, then
-// the deferrable http_records indexes.
+// schemaDDLName uses the same object parser as readiness. An unparsed table
+// declaration must not silently bypass the pre-receipts prerequisite phase.
+var schemaDDLNamePattern = sync.OnceValue(func() *regexp.Regexp {
+	return regexp.MustCompile(ddlObjectPattern)
+})
+
+func schemaDDLName(ddl string) (string, error) {
+	match := schemaDDLNamePattern().FindStringSubmatch(ddl)
+	if match == nil {
+		return "", fmt.Errorf("unparsed schema DDL: %s", ddl)
+	}
+	return strings.ToLower(match[1]), nil
+}
+
+// schemaDDLStatements renders the complete DDL catalog for driver: tables,
+// column migrations, indexes, then deferrable http_records indexes. CreateSchema
+// also applies the lineage prerequisite columns before the first receipts table;
+// their ordinary column-migration entries remain in this catalog.
 func schemaDDLStatements(driver string) []string {
 	out := make([]string, 0, len(schemaTables)+len(columnMigrations)+len(schemaIndexes)+len(recordSecondaryIndexes))
 	for _, ddl := range schemaTables {
