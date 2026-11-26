@@ -2,6 +2,7 @@ package oast
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"os"
@@ -216,6 +217,16 @@ func pollSession(ctx context.Context, repo *database.Repository, row *database.O
 	res := PollResult{SessionID: row.ID, ScanUUID: row.ScanUUID}
 	if row.SecretKey == "" || row.PrivateKey == "" {
 		res.Error = "session has no key material"
+		return res
+	}
+	// interactsh ignores a private key it cannot parse and resumes with a nil
+	// key; the first callback it then decrypts panics the whole process. A
+	// session whose key does not parse can never be polled, so close it.
+	if _, err := x509.ParsePKCS1PrivateKey([]byte(row.PrivateKey)); err != nil {
+		res.Error = "unreadable private key, session closed: " + err.Error()
+		if repo.CloseOASTSession(context.Background(), row.ID, time.Now().UTC()) == nil {
+			res.Closed = true
+		}
 		return res
 	}
 	client, err := resumeClient(&options.SessionInfo{
