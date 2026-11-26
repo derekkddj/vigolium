@@ -3,7 +3,6 @@ package runner
 import (
 	"context"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -94,7 +93,7 @@ func (r *Runner) runKnownIssueScanPhase(ctx context.Context, infra *phaseInfra) 
 		enrichTargets = r.settings.KnownIssueScan.EnrichTargets
 	}
 	if !enrichTargets && !r.options.Silent {
-		fmt.Fprintf(os.Stderr, "  %s %s %s\n",
+		fmt.Fprintf(r.stderr(), "  %s %s %s\n",
 			terminal.TipPrefix(), terminal.Gray("enrich KnownIssueScan targets with discovered paths via"), terminal.HiCyan("vigolium config set known_issue_scan.enrich_targets true"))
 	}
 	// Surface the active severity filter and how to widen it. An empty list means
@@ -103,7 +102,7 @@ func (r *Runner) runKnownIssueScanPhase(ctx context.Context, infra *phaseInfra) 
 	if r.settings != nil && !r.options.Silent {
 		sevs := r.settings.KnownIssueScan.Severities
 		if len(sevs) > 0 && !coversAllSeverities(sevs) {
-			fmt.Fprintf(os.Stderr, "  %s %s %s\n",
+			fmt.Fprintf(r.stderr(), "  %s %s %s\n",
 				terminal.TipPrefix(),
 				terminal.Gray(fmt.Sprintf("known-issue-scan limited to %s severities; scan all via", strings.Join(sevs, ","))),
 				terminal.HiCyan(`vigolium config set known_issue_scan.severities "critical,high,medium,low,info"`))

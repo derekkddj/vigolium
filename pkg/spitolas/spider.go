@@ -6,6 +6,7 @@ package spitolas
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"sync"
@@ -59,16 +60,19 @@ type SpiderConfig struct {
 	IncludeResponseBody bool
 	IncludeHeaders      bool
 	Silent              bool
-	Verbose             bool   // show all traffic including static files
-	BrowserEngine       string // "chromium" or "ungoogled"
-	BrowserPath         string // explicit path to browser binary (overrides auto-detection)
-	NoCDP               bool   // disable CDP event listener detection
-	Stealth             string // "auto" (or ""), "on", "off"; see StealthModes
-	NoForms             bool   // disable automatic form filling
-	ProxyURL            string // HTTP proxy URL for browser traffic
-	ScopeFilter         func(host, path string) bool
-	ProjectUUID         string
-	Source              string // http_records source tag; "" defaults to "spidering"
+	Verbose             bool // show all traffic including static files
+	// Console receives the live traffic log (nil = process stderr). A caller
+	// that keeps per-scan console output (the native runner) sets its own.
+	Console       io.Writer
+	BrowserEngine string // "chromium" or "ungoogled"
+	BrowserPath   string // explicit path to browser binary (overrides auto-detection)
+	NoCDP         bool   // disable CDP event listener detection
+	Stealth       string // "auto" (or ""), "on", "off"; see StealthModes
+	NoForms       bool   // disable automatic form filling
+	ProxyURL      string // HTTP proxy URL for browser traffic
+	ScopeFilter   func(host, path string) bool
+	ProjectUUID   string
+	Source        string // http_records source tag; "" defaults to "spidering"
 
 	// MaxListenerProbeNodes caps the listener-bearing nodes the CDP listener
 	// pass turns into click candidates per state (0 = default 2000, negative =
@@ -380,6 +384,7 @@ func buildCrawlerConfig(cfg SpiderConfig) (*config.Config, error) {
 	crawlerCfg.Headless = cfg.Headless
 	crawlerCfg.Silent = cfg.Silent
 	crawlerCfg.Verbose = cfg.Verbose
+	crawlerCfg.Console = cfg.Console
 	crawlerCfg.IncludeResponseBody = cfg.IncludeResponseBody
 	crawlerCfg.IncludeResponseHeaders = cfg.IncludeHeaders
 	crawlerCfg.MaxCaptureBodyBytes = cfg.MaxCaptureBodyBytes

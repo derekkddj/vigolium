@@ -68,7 +68,10 @@ type spideredJSProvider interface {
 
 // DeparosDiscoveryConfig configures the deparos content discovery source.
 type DeparosDiscoveryConfig struct {
-	Targets     []string      // Target URLs
+	Targets []string // Target URLs
+	// Console receives operator notices (nil = process stderr); the native
+	// runner sets its own so they land in that scan's logs only.
+	Console     io.Writer
 	Concurrency int           // Worker threads (from -t flag), split across concurrent targets; default: 25
 	MaxDuration time.Duration // default: 1h
 
@@ -1051,7 +1054,7 @@ func (d *DeparosDiscoverySource) discoverTarget(parentCtx context.Context, targe
 		if ev.Detail != "" {
 			detail = terminal.Gray(" (" + ev.Detail + ")")
 		}
-		terminal.AgentNotice("ext-fuzz", fmt.Sprintf(
+		terminal.AgentNoticeTo(d.cfg.Console, "ext-fuzz", fmt.Sprintf(
 			"%s detected as a valid route via %s%s — fuzzing wordlist for hidden %s files on %s",
 			terminal.BoldOrange("."+ev.Extension),
 			terminal.HiTeal(ev.Source),
@@ -1339,7 +1342,7 @@ func (d *DeparosDiscoverySource) seedSpideredJS(ctx context.Context, siteMap *de
 			zap.String("target", target), zap.Error(walkErr))
 	}
 	if seeded > 0 {
-		terminal.NoticeArrow("jstangle", fmt.Sprintf(
+		terminal.NoticeArrowTo(d.cfg.Console, "jstangle", fmt.Sprintf(
 			"Recovering endpoints from %d browser-spidered JS bundle(s) the crawl never fetched — %s",
 			seeded, terminal.Gray(target)))
 	}
@@ -1448,7 +1451,7 @@ func originAnchorRecords(recordUUIDByURL map[string]string) map[string]string {
 // (OpenAPI/Swagger/Postman/WSDL) and returns parsed endpoints as additional
 // HttpRequestResponse items. specSeen is a caller-owned set of spec body hashes
 // already parsed, so a target read in batches parses each spec document once.
-func extractSpecEndpointsSeen(records []*httpmsg.HttpRequestResponse, specSeen map[string]struct{}) []*httpmsg.HttpRequestResponse {
+func extractSpecEndpointsSeen(console io.Writer, records []*httpmsg.HttpRequestResponse, specSeen map[string]struct{}) []*httpmsg.HttpRequestResponse {
 	var allEndpoints []*httpmsg.HttpRequestResponse
 
 	for _, rr := range records {
@@ -1498,7 +1501,7 @@ func extractSpecEndpointsSeen(records []*httpmsg.HttpRequestResponse, specSeen m
 				zap.Error(err))
 			continue
 		}
-		terminal.Notice("api-spec", fmt.Sprintf(
+		terminal.NoticeTo(console, "api-spec", fmt.Sprintf(
 			"Discovered %s %s — parsed %d endpoints for ingestion",
 			st.Label(), rr.Target(), len(endpoints)))
 		allEndpoints = append(allEndpoints, endpoints...)

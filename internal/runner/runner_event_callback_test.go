@@ -707,8 +707,8 @@ func TestRunnerEventCallbackSkipsGlobalStderrCapture(t *testing.T) {
 	r.phaseRunners = map[NativePhase]phaseRunner{}
 	for _, phase := range []NativePhase{PhaseDiscovery, PhaseDynamicAssessment} {
 		r.phaseRunners[phase] = phaseRunner{tag: string(phase), label: string(phase), run: func(r *Runner, _ context.Context, _ *phaseInfra) error {
-			if os.Stderr != stderr || r.teeWriter != nil || stderrCaptureActive.Load() {
-				t.Error("callback scan claimed process-global stderr capture")
+			if os.Stderr != stderr || r.teeWriter != nil || r.console.Load() != nil {
+				t.Error("callback scan captured console output into scan logs")
 			}
 			return nil
 		}}

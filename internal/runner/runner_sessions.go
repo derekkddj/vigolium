@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"slices"
 	"time"
 
@@ -410,7 +409,7 @@ func (r *Runner) warnAuth(msg string) {
 		r.scanLogger.Warn("auth", msg)
 	}
 	if r.options != nil && !r.options.Silent {
-		fmt.Fprintf(os.Stderr, "%s %s\n", terminal.WarnPrefix(), msg)
+		fmt.Fprintf(r.stderr(), "%s %s\n", terminal.WarnPrefix(), msg)
 	}
 }
 

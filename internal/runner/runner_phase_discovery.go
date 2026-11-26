@@ -301,7 +301,7 @@ func (r *Runner) runDiscoveryPhase(ctx context.Context, infra *phaseInfra) error
 	// --no-discovery-fuzz the operator asked for the opposite, and a tip telling
 	// them how to enable what they just disabled reads as the flag not working.
 	if fuzzEnabled, _ := r.discoveryFuzzingState(); !fuzzEnabled && !r.options.NoDiscoveryFuzz && !r.options.Silent {
-		fmt.Fprintf(os.Stderr, "  %s %s %s\n",
+		fmt.Fprintf(r.stderr(), "  %s %s %s\n",
 			terminal.TipPrefix(), terminal.Gray("enable on-the-fly directory fuzzing with a custom wordlist via"), terminal.HiCyan("--discovery-wordlist <path>"))
 	}
 
@@ -310,7 +310,7 @@ func (r *Runner) runDiscoveryPhase(ctx context.Context, infra *phaseInfra) error
 		enrichTargetsEnabled = r.settings.Discovery.EnrichTargets
 	}
 	if !enrichTargetsEnabled && !r.options.Silent {
-		fmt.Fprintf(os.Stderr, "  %s %s %s\n",
+		fmt.Fprintf(r.stderr(), "  %s %s %s\n",
 			terminal.TipPrefix(), terminal.Gray("enrich discovery targets with discovered paths via"), terminal.HiCyan("vigolium config set discovery.enrich_targets true"))
 	}
 

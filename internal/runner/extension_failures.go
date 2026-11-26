@@ -3,7 +3,6 @@ package runner
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/apicontract"
@@ -64,7 +63,7 @@ func (r *Runner) reportExtensionFailures(engine *jsext.Engine) error {
 			zap.String("path", f.Path), zap.String("stage", string(f.Stage)),
 			zap.Bool("explicit", f.Explicit), zap.Error(f.Err))
 		if !r.options.Silent {
-			fmt.Fprintf(os.Stderr, "  %s extension %s failed to load (%s): %s\n",
+			fmt.Fprintf(r.stderr(), "  %s extension %s failed to load (%s): %s\n",
 				terminal.Yellow(terminal.SymbolWarning), terminal.Cyan(f.Path), f.Stage, loadErrText(f.Err))
 		}
 	}

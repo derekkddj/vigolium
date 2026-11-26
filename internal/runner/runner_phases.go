@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,23 +23,11 @@ import (
 	"go.uber.org/zap"
 )
 
-// stderrCaptureActive guards the process-global os.Stderr redirection used for
-// raw-stderr scan-log capture. Only the scan that wins the claim redirects
-// os.Stderr; concurrent scans skip capture so they can't restore/close each
-// other's descriptors.
-var stderrCaptureActive atomic.Bool
-
 // cursorFlushBudget bounds the post-round cursor checkpoint. It runs on a
 // context detached from the phase's, so it needs a bound of its own; ten seconds
 // is generous for one UPDATE and short enough that a wedged database delays
 // teardown by a visible-but-tolerable amount rather than hanging it.
 const cursorFlushBudget = 10 * time.Second
-
-// teeDrainTimeout bounds the wait for the stderr-capture reader to finish after
-// the write end is closed. The healthy path takes microseconds and never
-// reaches it; the timeout exists only so a wedged reader cannot hang a scan's
-// teardown, at the cost of a few trailing log lines.
-const teeDrainTimeout = 2 * time.Second
 
 // RunNativeScan orchestrates the native scan plan:
 //
@@ -267,21 +254,15 @@ func (r *Runner) RunNativeScan() (err error) {
 		}
 	}
 
-	// Set up TeeWriter to capture raw stderr output as trace-level scan logs.
-	//
-	// This redirects the PROCESS-GLOBAL os.Stderr to a pipe, so only one scan may
-	// own the capture at a time: two concurrent scans (server mode) would otherwise
-	// restore or close each other's descriptors and corrupt process-wide stderr.
-	// A single-owner claim keeps the common single-scan (CLI) case fully captured
-	// while a concurrent secondary scan simply skips raw capture rather than racing.
-	// Embedded callback scans use instance-owned events, never process stderr
-	// capture (which can contain traffic from unrelated concurrent runners).
-	if r.repository != nil && r.getEventCallback() == nil && stderrCaptureActive.CompareAndSwap(false, true) {
-		defer stderrCaptureActive.Store(false)
-		origStderr := os.Stderr
-		// Optionally mirror raw console output to ~/.vigolium/native-sessions/{uuid}/run.log.
+	// Capture this scan's console output as trace-level scan logs (and, with
+	// persist_logs, the session runtime.log). The capture is per runner: the
+	// runner's console (stderr()) writes to the real stderr and to this scan's
+	// capture only, so concurrent scans in one process (server mode) each keep
+	// their own output and never store another scan's. Embedded callback scans
+	// use instance-owned events instead.
+	if r.repository != nil && r.getEventCallback() == nil {
 		var sessionLogFile *os.File
-		var teeInner io.Writer = origStderr
+		var teeInner io.Writer = os.Stderr
 		if r.settings != nil && r.settings.ScanningStrategy.ScanLogs.IsPersistLogsEnabled() {
 			// Honor the same stateless/session-root policy as the heartbeat.
 			sessionDir, pathErr := sessionpath.RunDir(sessionsDirFor(r.settings), infra.scanUUID)
@@ -291,8 +272,10 @@ func (r *Runner) RunNativeScan() (err error) {
 				logPath := filepath.Join(sessionDir, config.RuntimeLogFilename)
 				if f, openErr := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); openErr == nil {
 					sessionLogFile = f
+					r.sessionLogMu.Lock()
 					r.sessionLogFile = f
-					teeInner = io.MultiWriter(origStderr, sessionLogFile)
+					r.sessionLogMu.Unlock()
+					teeInner = io.MultiWriter(os.Stderr, sessionLogFile)
 				} else {
 					zap.L().Warn("Failed to open native session log file", zap.String("path", logPath), zap.Error(openErr))
 				}
@@ -301,54 +284,17 @@ func (r *Runner) RunNativeScan() (err error) {
 			}
 		}
 		r.teeWriter = newTeeWriter(teeInner, r.scanLogger)
-		pr, pw, err := os.Pipe()
-		if err == nil {
-			os.Stderr = pw
-			// Goroutine reads from the pipe and writes through the tee, and
-			// closes drained when the pipe reports EOF.
-			drained := make(chan struct{})
-			go func() {
-				defer close(drained)
-				buf := make([]byte, 4096)
-				for {
-					n, readErr := pr.Read(buf)
-					if n > 0 {
-						_, _ = r.teeWriter.Write(buf[:n])
-					}
-					if readErr != nil {
-						break
-					}
-				}
-			}()
-			defer func() {
-				// Closing the write end is what ends the reader's loop, so wait
-				// for the goroutine to say it is done rather than guessing how
-				// long that takes. The old blind 50ms sleep was both a floor on
-				// every scan's teardown - visible on a probe that finishes in
-				// under a fifth of a second - and no guarantee at all on a busy
-				// machine, where the drain could still be unfinished when the
-				// descriptor was yanked. The timeout only bounds a reader that
-				// is stuck, which costs at most a few trailing log lines.
-				_ = pw.Close()
-				select {
-				case <-drained:
-				case <-time.After(teeDrainTimeout):
-					zap.L().Warn("stderr capture did not drain within the timeout; some trace logs may be missing")
-				}
-				_ = pr.Close()
-				os.Stderr = origStderr
-				r.teeWriter.Flush()
-				if sessionLogFile != nil {
-					r.sessionLogMu.Lock()
-					r.sessionLogFile = nil
-					r.sessionLogMu.Unlock()
-					_ = sessionLogFile.Close()
-				}
-			}()
-		} else if sessionLogFile != nil {
-			// Pipe setup failed; still close the log file we opened.
-			defer func() { _ = sessionLogFile.Close() }()
-		}
+		r.setConsole(r.teeWriter)
+		defer func() {
+			r.setConsole(nil)
+			r.teeWriter.Flush()
+			if sessionLogFile != nil {
+				r.sessionLogMu.Lock()
+				r.sessionLogFile = nil
+				r.sessionLogMu.Unlock()
+				_ = sessionLogFile.Close()
+			}
+		}()
 	}
 
 	// Print scan configuration summary
@@ -374,10 +320,11 @@ func (r *Runner) RunNativeScan() (err error) {
 			if scopeErr := scope.validate(finalCtx, r); scopeErr != nil {
 				return
 			}
-			r.printFinishedBanner(finalCtx, os.Stderr, infra.scanUUID, time.Since(scanStartedAt), scope.projectUUID)
-			r.printModuleErrorSummary(os.Stderr, infra.scanUUID)
-			r.printCoverageCaveats(os.Stderr)
-			r.printSafeSkipped(finalCtx, os.Stderr)
+			out := r.stderr()
+			r.printFinishedBanner(finalCtx, out, infra.scanUUID, time.Since(scanStartedAt), scope.projectUUID)
+			r.printModuleErrorSummary(out, infra.scanUUID)
+			r.printCoverageCaveats(out)
+			r.printSafeSkipped(finalCtx, out)
 		}()
 	}
 

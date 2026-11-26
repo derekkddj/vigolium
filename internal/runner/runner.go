@@ -76,10 +76,11 @@ type Runner struct {
 	// scan start, consumed by the harvest phase.
 	harvestPrefetchMu sync.Mutex
 	harvestPrefetch   *harvestPrefetch
-	scanLogger        *database.ScanLogger // Optional: structured scan logging
-	teeWriter         *teeWriter           // Optional: captures stderr for trace logging
-	sessionLogFile    *os.File             // Optional: runtime.log handle for verbose file-only writes
-	sessionLogMu      sync.Mutex           // serializes concurrent writes to sessionLogFile
+	scanLogger        *database.ScanLogger       // Optional: structured scan logging
+	teeWriter         *teeWriter                 // Optional: this scan's console capture for trace logging
+	console           atomic.Pointer[consoleRef] // this scan's console (see stderr()); nil = process stderr
+	sessionLogFile    *os.File                   // Optional: runtime.log handle for verbose file-only writes
+	sessionLogMu      sync.Mutex                 // serializes concurrent writes to sessionLogFile
 	// targetsAreInput is set by New when the input source was built from
 	// options.Targets alone, so scope admission over them covers the whole
 	// input (see targetAdmission).

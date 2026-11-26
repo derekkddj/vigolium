@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"net/url"
@@ -113,8 +114,9 @@ type Capture struct {
 	// Atomic because it is read from the capture goroutines while the crawler
 	// may update it during initial navigation.
 	targetHost atomic.Pointer[string]
-	phaseTag   string // Phase label for console log prefix (e.g. "spider")
-	verbose    bool   // Show all traffic including static files
+	phaseTag   string    // Phase label for console log prefix (e.g. "spider")
+	console    io.Writer // live traffic log destination; nil = os.Stderr
+	verbose    bool      // Show all traffic including static files
 
 	// sent / sentInScope count every http(s) requestWillBeSent (see
 	// RequestCounters); counterSinks are the caller's live counters, guarded by mu.
@@ -169,6 +171,10 @@ func New(writer Writer, noColor, silent, verbose, includeResponseBody, includeRe
 	c.SetTargetHost(targetHost)
 	return c
 }
+
+// SetConsole sets where the live traffic log goes (nil = process stderr). Set
+// it before the capture starts.
+func (c *Capture) SetConsole(w io.Writer) { c.console = w }
 
 // SetMaxBodyBytes sets the ceiling on the encoded size of a dynamic response
 // body the capture pulls over CDP (n == 0 keeps DefaultMaxDynamicBodyBytes,
@@ -1113,7 +1119,7 @@ func (c *Capture) writeEntry(entry *TrafficEntry) {
 	// debugging.
 	if isCatchAllAssetShell(entry) {
 		if !c.silent && c.verbose {
-			printLog(entry, c.noColor, c.phaseTag)
+			printLog(c.console, entry, c.noColor, c.phaseTag)
 		}
 		zap.L().Debug("Dropping catch-all soft-404 asset shell",
 			zap.String("url", entry.Request.URL),
@@ -1193,7 +1199,7 @@ func (c *Capture) writeEntry(entry *TrafficEntry) {
 
 		// Print log OUTSIDE mutex if not already logged, not silent, and not noisy
 		if !alreadyLogged && !silent && c.shouldLogEntry(entry) {
-			printLog(entry, noColor, c.phaseTag)
+			printLog(c.console, entry, noColor, c.phaseTag)
 		}
 
 		// Debug log for duplicate skip
@@ -1253,7 +1259,7 @@ func (c *Capture) writeEntry(entry *TrafficEntry) {
 
 	// Print log OUTSIDE mutex - fmt.Fprintf to stderr is atomic
 	if !alreadyLogged && !silent && c.shouldLogEntry(entry) {
-		printLog(entry, noColor, c.phaseTag)
+		printLog(c.console, entry, noColor, c.phaseTag)
 	}
 }
 

@@ -2,6 +2,7 @@ package terminal
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -12,16 +13,30 @@ import (
 // Notice prints a normal, prefixed console line to stderr (not a structured
 // log). Format: "  ◆ [prefix] message". Color honors NO_COLOR / CI detection
 // via the shared color helpers.
-func Notice(prefix, message string) {
-	fmt.Fprintf(os.Stderr, "  %s %s %s\n",
+func Notice(prefix, message string) { NoticeTo(nil, prefix, message) }
+
+// NoticeTo is Notice written to w (nil = os.Stderr), for callers that keep a
+// per-scan console.
+func NoticeTo(w io.Writer, prefix, message string) {
+	fmt.Fprintf(orStderr(w), "  %s %s %s\n",
 		Purple(SymbolInfo), BoldCyan("["+prefix+"]"), message)
+}
+
+func orStderr(w io.Writer) io.Writer {
+	if w == nil {
+		return os.Stderr
+	}
+	return w
 }
 
 // AgentNotice prints a prefixed console line to stderr like Notice but with the
 // join / relation glyph (⋈). Used for autonomous engine decisions
 // (e.g. discovery confirming an extension and queuing it for fuzzing).
-func AgentNotice(prefix, message string) {
-	fmt.Fprintf(os.Stderr, "  %s %s %s\n",
+func AgentNotice(prefix, message string) { AgentNoticeTo(nil, prefix, message) }
+
+// AgentNoticeTo is AgentNotice written to w (nil = os.Stderr).
+func AgentNoticeTo(w io.Writer, prefix, message string) {
+	fmt.Fprintf(orStderr(w), "  %s %s %s\n",
 		Purple(SymbolBowtie), BoldCyan("["+prefix+"]"), message)
 }
 
@@ -29,8 +44,11 @@ func AgentNotice(prefix, message string) {
 // flow glyph (▷) instead of the info diamond (◆). Used for notices about
 // requests/endpoints being carried forward into a later phase (e.g. jstangle
 // recovering or preserving endpoints for dynamic assessment).
-func NoticeArrow(prefix, message string) {
-	fmt.Fprintf(os.Stderr, "  %s %s %s\n",
+func NoticeArrow(prefix, message string) { NoticeArrowTo(nil, prefix, message) }
+
+// NoticeArrowTo is NoticeArrow written to w (nil = os.Stderr).
+func NoticeArrowTo(w io.Writer, prefix, message string) {
+	fmt.Fprintf(orStderr(w), "  %s %s %s\n",
 		Purple(SymbolArrow), BoldCyan("["+prefix+"]"), message)
 }
 

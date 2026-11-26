@@ -677,6 +677,7 @@ func (r *Runner) buildDeparosConfig(additionalTargets []string, wls resolvedDisc
 	targets := dedupTargets(r.options.Targets, additionalTargets)
 
 	cfg := source.DeparosDiscoveryConfig{
+		Console:       r.stderr(),
 		Targets:       targets,
 		Concurrency:   discoveryConcurrency,
 		RateLimit:     r.discoveryRateLimit(),

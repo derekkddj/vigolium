@@ -358,7 +358,7 @@ func fuzzDedupKey(rec collectedRecord, body []byte) hardDedupKey {
 // batchSpecEndpoints extracts API-spec endpoints from the current batch,
 // skipping spec documents an earlier batch already parsed.
 func (c *targetCollector) batchSpecEndpoints() []*httpmsg.HttpRequestResponse {
-	return extractSpecEndpointsSeen(c.batch, c.specSeen)
+	return extractSpecEndpointsSeen(c.d.cfg.Console, c.batch, c.specSeen)
 }
 
 // flush reads what landed since the last read and persists + emits its
@@ -549,7 +549,7 @@ func (c *targetCollector) finish(ctx context.Context, engine targetEngineFacts, 
 	// uniform 401) baseline response.
 	specEndpoints := c.batchSpecEndpoints()
 	if total := len(specEndpoints) + c.specStreamed; total > 0 {
-		terminal.Notice("api-spec", fmt.Sprintf(
+		terminal.NoticeTo(c.d.cfg.Console, "api-spec", fmt.Sprintf(
 			"Ingested %d API spec endpoints from discovery of %s — extra requests "+
 				"queued for dynamic assessment (longer scan, more results)",
 			total, c.target))
@@ -560,7 +560,7 @@ func (c *targetCollector) finish(ctx context.Context, engine targetEngineFacts, 
 		if c.refStreamed > 0 {
 			streamed = fmt.Sprintf(" (%d streamed during the crawl)", c.refStreamed)
 		}
-		terminal.NoticeArrow("jstangle", fmt.Sprintf(
+		terminal.NoticeArrowTo(c.d.cfg.Console, "jstangle", fmt.Sprintf(
 			"Preserved %d JS/form-referenced request(s)%s, kept out of fuzz-noise "+
 				"dedup so real methods/bodies/baselines survive to assessment — %s",
 			c.refTotal, streamed, terminal.Gray(c.target)))

@@ -546,6 +546,7 @@ func (c *Crawler) Run(ctx context.Context) (*Result, error) {
 	// Keep several distinct query-value variants per endpoint shape (category/
 	// filter/tab/search links) instead of collapsing them to one representative.
 	capture.SetMaxParamValueVariants(c.config.MaxParamValueVariants)
+	capture.SetConsole(c.config.Console)
 	capture.SetMaxBodyBytes(c.config.MaxCaptureBodyBytes)
 	for _, rc := range c.requestCounters {
 		capture.AddRequestCounters(rc)
