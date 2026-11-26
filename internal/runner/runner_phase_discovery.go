@@ -188,12 +188,12 @@ func (r *Runner) runDiscoveryPhase(ctx context.Context, infra *phaseInfra) error
 		deparosCfg.Egress = discoveryEgress(infra, deparosCfg.RateLimit)
 		// Phase ceiling (discovery.phase_max_duration): every target keeps its
 		// own budget, but the phase as a whole is bounded too.
-		if d := r.discoveryPhaseMaxDuration(len(discoveryTargets)); d > 0 {
-			var deadlineCancel context.CancelFunc
-			phaseCtx, deadlineCancel = context.WithTimeout(phaseCtx, d)
+		if bounded, deadlineCancel, ok := r.discoveryPhaseContext(phaseCtx, len(discoveryTargets)); ok {
+			phaseCtx = bounded
 			defer deadlineCancel()
 			discoveryDeadline = true
-			zap.L().Info("Discovery: phase ceiling", zap.Duration("max", d), zap.Int("targets", len(discoveryTargets)))
+			dl, _ := phaseCtx.Deadline()
+			zap.L().Info("Discovery: phase ceiling", zap.Duration("max", time.Until(dl)), zap.Int("targets", len(discoveryTargets)))
 		}
 		src, srcErr := source.NewDeparosDiscoverySource(phaseCtx, deparosCfg)
 		if srcErr != nil {
@@ -733,6 +733,24 @@ func (r *Runner) cleanupDeparosRecords(ctx context.Context) {
 	} else {
 		report("soft-deduplicated", softRes)
 	}
+}
+
+// discoveryPhaseContext bounds the discovery phase by its own ceiling
+// (discovery.phase_max_duration) and, under a total scan budget, by the share
+// left after the reserves of the planned phases that follow it — the same rule
+// every tracked phase applies. Without it, discovery could use the whole
+// remaining budget and starve the known-issue scan. ok is false when nothing
+// bounds it.
+func (r *Runner) discoveryPhaseContext(ctx context.Context, targets int) (context.Context, context.CancelFunc, bool) {
+	d := r.discoveryPhaseMaxDuration(targets)
+	reserve := r.reserveAfter(string(PhaseDiscovery))
+	if d <= 0 {
+		if _, budgeted := ctx.Deadline(); !budgeted || reserve <= 0 || reserve >= 1 {
+			return ctx, func() {}, false
+		}
+	}
+	bounded, cancel := phaseDeadlineReserved(ctx, d, reserve)
+	return bounded, cancel, true
 }
 
 // discoveryPhaseMaxDuration resolves the discovery phase ceiling from
